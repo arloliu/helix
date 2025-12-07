@@ -1,0 +1,54 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+*.coverprofile
+.coverage/
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build output
+bin/
+dist/
+tmp/
+
+# Debug files
+*.pprof
+debug.log
+
+# Local environment files
+.env
+.env.local
+.env.*.local
+
+# Test artifacts
+test.log
+testdata/tmp/
+
+# Generated files (keep tracked, but ignore if regenerated)
+# replay/nats_message_gen.go  # Uncomment to ignore generated msgp files
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
