@@ -12,6 +12,7 @@ COVERAGE_HTML   := $(COVERAGE_DIR)/coverage.html
 ALL_GO_FILES    := $(shell find . -name "*.go" -not -path "./vendor/*")
 TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./vendor/*" -not -path "./test/integration/*")))
 INTEGRATION_DIR := ./test/integration/...
+LATEST_GIT_TAG  := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
 
 # Linter configuration
 LINTER_GOMOD          := -modfile=linter.go.mod
@@ -149,3 +150,9 @@ clean: clean-test-results
 
 ## ci: Run all CI checks (lint, vet, test, coverage)
 ci: lint vet test-all coverage
+
+.PHONY: update-pkg-cache
+update-pkg-cache:
+	@echo "Updating package cache with latest git tag: $(LATEST_GIT_TAG)"
+	@curl -sf https://proxy.golang.org/github.com/arloliu/helix/@v/$(LATEST_GIT_TAG).info > /dev/null || \
+		echo "Warning: Failed to update package cache"
