@@ -295,6 +295,8 @@ breaker := policy.NewCircuitBreaker(
 
 **State Machine:**
 ```mermaid
+%%{init:{'theme':'neutral'}}%%
+
 stateDiagram-v2
     [*] --> CLOSED
     CLOSED --> OPEN : failures >= threshold

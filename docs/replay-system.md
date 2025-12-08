@@ -5,6 +5,8 @@ The Helix Replay System provides **asynchronous reconciliation** for partial wri
 ## Overview
 
 ```mermaid
+%%{init:{'theme':'neutral'}}%%
+
 flowchart TB
     subgraph Application
         A[Application] --> B["CQLClient.Query().Exec()"]
@@ -67,6 +69,8 @@ type ReplayWorker interface {
 The worker runs in the same process as the application. This is the simplest setup but offers limited durability.
 
 ```mermaid
+%%{init:{'theme':'neutral'}}%%
+
 flowchart LR
     subgraph "Application Process"
         A[CQLClient<br/>writes] --> B[MemoryReplayer<br/>in-memory]
@@ -165,6 +169,8 @@ func main() {
 Durable queue with NATS JetStream, worker still in same process:
 
 ```mermaid
+%%{init:{'theme':'neutral'}}%%
+
 flowchart TB
     subgraph "Application Process"
         A[CQLClient<br/>writes] --> B[NATSReplayer]
@@ -295,6 +301,8 @@ func createExecuteFunc(sessionA, sessionB cql.Session) replay.ExecuteFunc {
 For production deployments, run the replay worker as a **separate service**:
 
 ```mermaid
+%%{init:{'theme':'neutral'}}%%
+
 flowchart TB
     subgraph "Application Pod 1"
         A1[CQLClient] --> B1[NATSReplayer<br/>Enqueue only]

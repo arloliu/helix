@@ -122,24 +122,43 @@ func main() {
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph "Helix Client"
-        subgraph "Write Path"
-            WS[WriteStrategy<br/>ConcurrentDualWrite]
-            WS --> CA[Cluster A]
-            WS --> CB[Cluster B]
-            CA --> R[(Replayer<br/>on fail)]
-            CB --> R
-        end
+%%{init:{'theme':'neutral'}}%%
+flowchart TD
+    Client[Dual-Session Client]
 
-        subgraph "Read Path"
-            RS[ReadStrategy<br/>StickyRead]
-            RS --> PC[Preferred<br/>Cluster]
-            RS -.-> FC[Failover<br/>Cluster]
-            PC --> FP[FailoverPolicy<br/>ActiveFailover]
-            FC --> FP
-        end
+    subgraph Clusters [Cassandra Clusters]
+        CA[(Cassandra Cluster A)]
+        CB[(Cassandra Cluster B)]
     end
+
+    subgraph ReplaySys [Replay System]
+        NATS["NATS JetStream<br/>(DLQ / Replay Log)"]
+        Worker[Background Replay Worker]
+    end
+
+    %% Dual Write Path
+    Client -- "1. Dual Write (Concurrent)" --> CA
+    Client -- "1. Dual Write (Concurrent)" --> CB
+
+    %% Failure Path
+    Client -- "2. On Failure (e.g., B fails)" --> NATS
+
+    %% Replay Path
+    NATS -- "3. Consume Failed Write" --> Worker
+    Worker -- "4. Replay Write (Idempotent)" --> CB
+
+    classDef db fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef component fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    class CA,CB db;
+    class NATS,Worker component;
+    %% --- Stylesheet ---
+    classDef app fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000;
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000;
+    classDef infra fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#000;
+
+    class Client app;
+    class CA,CB db;
+    class NATS,Worker infra;
 ```
 
 ## Strategies & Policies
