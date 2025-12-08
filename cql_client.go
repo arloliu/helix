@@ -22,6 +22,38 @@ import (
 //   - Migrating existing applications to Helix incrementally
 //   - Development and testing environments
 //   - Applications that don't need dual-cluster redundancy yet
+//
+// # Thread Safety
+//
+// CQLClient is safe for concurrent use from multiple goroutines. A single client
+// instance can be shared across your application:
+//
+//	// Create once, share everywhere
+//	client, err := helix.NewCQLClient(sessionA, sessionB, ...)
+//	defer client.Close()
+//
+//	// Use from multiple goroutines safely
+//	go func() { client.Query("INSERT ...").Exec() }()
+//	go func() { client.Query("SELECT ...").Scan(&result) }()
+//
+// All internal state is protected by atomic operations or appropriate locking.
+//
+// # Lifecycle
+//
+// Create a client with NewCQLClient() and clean up resources with Close():
+//
+//	client, err := helix.NewCQLClient(sessionA, sessionB, opts...)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer client.Close()  // Always close to release resources
+//
+// After Close() is called:
+//   - All ongoing operations complete or are cancelled
+//   - Replay worker is stopped (enqueued replays are lost if using MemoryReplayer)
+//   - Topology watcher is stopped
+//   - Underlying sessions are closed
+//   - The client cannot be reused (operations return ErrSessionClosed)
 type CQLClient struct {
 	sessionA cql.Session
 	sessionB cql.Session // nil for single-cluster mode

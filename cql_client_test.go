@@ -890,3 +890,91 @@ func TestCQLClient_DrainMode(t *testing.T) {
 		require.Len(t, sessionB.queries, 1)
 	})
 }
+
+// ExampleNewCQLClient demonstrates creating a Helix CQL client with custom strategies.
+func ExampleNewCQLClient() {
+	// Note: This example uses nil sessions for illustration purposes.
+	// In real code, create proper gocql sessions wrapped with v1.NewSession() or v2.NewSession().
+
+	// Simulating session creation (replace with actual gocql sessions in real code)
+	var sessionA, sessionB cql.Session // would be v1.NewSession(gocqlSession)
+
+	// Create Helix client with custom strategies
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(nil),   // e.g., policy.NewStickyRead()
+		WithWriteStrategy(nil),  // e.g., policy.NewConcurrentDualWrite()
+		WithFailoverPolicy(nil), // e.g., policy.NewActiveFailover()
+	)
+	if err != nil {
+		// Handle error
+		return
+	}
+	defer client.Close()
+
+	// Client is now ready for dual-cluster operations
+	_ = client
+}
+
+// ExampleCQLClient_Query demonstrates basic query operations with dual-cluster client.
+func ExampleCQLClient_Query() {
+	// Note: Assumes client is already created (see ExampleNewCQLClient)
+	var client *CQLClient
+
+	// Write operation - triggers dual-write to both clusters
+	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").Exec()
+	if err != nil {
+		// Both clusters failed
+		return
+	}
+
+	// Read operation - uses sticky read strategy
+	var name string
+	err = client.Query("SELECT name FROM users WHERE id = ?", "user-1").Scan(&name)
+	if err != nil {
+		// Read failed (with failover attempted)
+		return
+	}
+
+	_ = name
+}
+
+// Example_errorHandling demonstrates inspecting DualClusterError when both clusters fail.
+func Example_errorHandling() {
+	var client *CQLClient
+
+	// Perform a write operation
+	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").Exec()
+	// Check if both clusters failed
+	if err != nil {
+		var dualErr *types.DualClusterError
+		if errors.As(err, &dualErr) {
+			// Inspect individual cluster errors
+			_ = dualErr.ErrorA // Error from cluster A
+			_ = dualErr.ErrorB // Error from cluster B
+		}
+
+		// Check for specific sentinel errors
+		if errors.Is(err, types.ErrSessionClosed) {
+			// Session was closed, recreate client or handle gracefully
+			return
+		}
+	}
+}
+
+// Example_contextUsage demonstrates two patterns for context handling in queries.
+func Example_contextUsage() {
+	var client *CQLClient
+	ctx := context.Background()
+
+	// Pattern 1: Direct context method (simple cases)
+	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").
+		ExecContext(ctx)
+	_ = err
+
+	// Pattern 2: Method chaining (multiple options)
+	err = client.Query("SELECT name FROM users WHERE id = ?", "user-1").
+		Consistency(Quorum).
+		WithContext(ctx).
+		Exec()
+	_ = err
+}

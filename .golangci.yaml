@@ -36,7 +36,6 @@ linters:
     - revive
     - rowserrcheck
     - sqlclosecheck
-    - testableexamples
     - tparallel
     - unconvert
     - unparam

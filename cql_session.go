@@ -94,6 +94,21 @@ type CQLSession interface {
 // The method called to execute the query determines whether it's a read or write:
 //   - Exec/ExecContext → Write Strategy (Dual Write)
 //   - Scan/Iter/MapScan → Read Strategy (Sticky Read)
+//
+// # Context Usage Patterns
+//
+// Two equivalent patterns are supported for context handling:
+//
+//	// Pattern 1: Direct context method (recommended for simple cases)
+//	err := query.ExecContext(ctx)
+//	result := query.ScanContext(ctx, &dest)
+//
+//	// Pattern 2: Method chaining (useful with multiple options)
+//	err := query.Consistency(helix.Quorum).WithContext(ctx).Exec()
+//
+// Both patterns respect context cancellation and timeouts. Choose Pattern 1
+// when you only need to set a context. Choose Pattern 2 when chaining multiple
+// configuration calls (consistency, page size, timestamps, etc.).
 type Query interface {
 	// WithContext associates a context with the query.
 	//

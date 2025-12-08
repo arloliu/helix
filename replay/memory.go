@@ -10,12 +10,20 @@ import (
 
 // MemoryReplayer implements an in-memory replay queue using a buffered channel.
 //
-// WARNING: Data in this queue is volatile and will be lost on process crash.
-// For production use with durability requirements, use NATSReplayer (Phase N).
+// # Durability Warning
 //
-// Thread-safety: All methods are safe for concurrent use. The Close method
-// marks the replayer as closed but does not close the underlying channel,
-// preventing panics from concurrent Enqueue calls during shutdown.
+// Enqueued replays are LOST on process restart or client.Close().
+// Use MemoryReplayer for:
+//   - Development and testing
+//   - Scenarios where replay loss is acceptable
+//
+// For production durability, use NATSReplayer with JetStream persistence.
+//
+// # Thread Safety
+//
+// All methods are safe for concurrent use. The Close method marks the replayer
+// as closed but does not close the underlying channel, preventing panics from
+// concurrent Enqueue calls during shutdown.
 type MemoryReplayer struct {
 	queue    chan types.ReplayPayload
 	closed   atomic.Bool
