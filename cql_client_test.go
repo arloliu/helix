@@ -313,6 +313,33 @@ func TestNewCQLClient(t *testing.T) {
 	require.NotNil(t, client)
 }
 
+func TestCQLClientImplementsCQLSession(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Verify Session() returns the client as CQLSession
+	session := client.Session()
+	require.NotNil(t, session)
+
+	// Verify it's the same client
+	require.Equal(t, client, session)
+
+	// Verify CQLSession methods work through the interface
+	query := session.Query("SELECT * FROM test")
+	require.NotNil(t, query)
+
+	batch := session.Batch(LoggedBatch)
+	require.NotNil(t, batch)
+
+	// Verify deprecated methods also work
+	batch2 := session.NewBatch(UnloggedBatch)
+	require.NotNil(t, batch2)
+}
+
 func TestNewCQLClientNilSession(t *testing.T) {
 	sessionA := newMockSession()
 

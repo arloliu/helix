@@ -67,6 +67,9 @@ type CQLClient struct {
 	topologyClose context.CancelFunc
 }
 
+// Compile-time assertion that CQLClient implements CQLSession.
+var _ CQLSession = (*CQLClient)(nil)
+
 // NewCQLClient creates a new Helix CQL client.
 //
 // The client supports two modes:
@@ -315,6 +318,25 @@ func (c *CQLClient) Close() {
 			c.sessionB.Close()
 		}
 	}
+}
+
+// Session returns the CQLClient as a CQLSession interface.
+//
+// This allows the CQLClient to be used as a drop-in replacement for gocql.Session
+// in code that expects a session-like interface.
+//
+// Example:
+//
+//	client, _ := helix.NewCQLClient(sessionA, sessionB)
+//	session := client.Session()
+//
+//	// Use session like a regular gocql.Session
+//	err := session.Query("INSERT INTO ...").Exec()
+//
+// Returns:
+//   - CQLSession: The client as a CQLSession interface
+func (c *CQLClient) Session() CQLSession {
+	return c
 }
 
 // IsSingleCluster returns true if the client is operating in single-cluster mode.
