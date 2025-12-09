@@ -1,0 +1,24 @@
+simulation:
+  duration: 5m
+  seed: 42
+  report_dir: ./reports
+  console_interval: 5s
+
+clusters:
+  type: scylladb
+  memory_mb: 1024
+  cpu_limit: 2.0
+
+helix:
+  write_strategy:
+    type: adaptive
+    delta_threshold: 100ms
+    strike_threshold: 3
+
+  read_strategy:
+    type: sticky
+    cooldown: 1m
+
+  replay:
+    type: memory
+    queue_size: 1000
