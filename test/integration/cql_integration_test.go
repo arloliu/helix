@@ -7,7 +7,7 @@ import (
 
 	"github.com/arloliu/helix"
 	"github.com/arloliu/helix/adapter/cql"
-	v1 "github.com/arloliu/helix/adapter/cql/v1" //nolint:revive // goimports requires explicit alias
+	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
 	"github.com/arloliu/helix/policy"
 	"github.com/gocql/gocql"
 	"github.com/stretchr/testify/require"
@@ -27,8 +27,8 @@ func TestCQLDualWriteIntegration(t *testing.T) {
 	// Create Helix CQL client with v1 adapters
 	// Note: We don't defer client.Close() because it would close the shared gocql sessions.
 	// The sessions are managed by TestMain and cleaned up in teardownSharedContainers.
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -73,8 +73,8 @@ func TestCQLDualWriteWithUpdateIntegration(t *testing.T) {
 
 	productsTable := createTestTableOnBoth(t, "products", productsTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -120,8 +120,8 @@ func TestCQLReadWithStickyRoutingIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	// Create client with sticky read strategy
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB,
@@ -157,8 +157,8 @@ func TestCQLBatchWriteIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -211,8 +211,8 @@ func TestCQLDeleteIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -251,8 +251,8 @@ func TestCQLConsistencyLevelIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -283,8 +283,8 @@ func TestCQLIteratorIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -324,8 +324,8 @@ func TestCQLRoundRobinReadIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	// Create client with round-robin read strategy
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB,
@@ -364,8 +364,8 @@ func TestCQLFailoverReadIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	// Create client with active failover policy
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB,
@@ -401,8 +401,8 @@ func TestCQLMultipleWritesIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -439,8 +439,8 @@ func TestCQLClientLifecycleIntegration(t *testing.T) {
 
 	sessionA, sessionB := getSharedSessions(t)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	// Create client multiple times to verify it can be done
 	// Note: We do NOT call client.Close() because that would close the shared
@@ -466,8 +466,8 @@ func TestCQLPaginationIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -508,8 +508,8 @@ func TestCQLMapScanIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -544,8 +544,8 @@ func TestCQLSliceMapIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -580,8 +580,8 @@ func TestCQLContextTimeoutIntegration(t *testing.T) {
 
 	sessionA, sessionB := getSharedSessions(t)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -610,8 +610,8 @@ func TestCQLIteratorMapScanIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	helixSessionA := v1.NewSession(sessionA)
-	helixSessionB := v1.NewSession(sessionB)
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
 
 	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 	require.NoError(t, err)
@@ -656,7 +656,7 @@ func TestCQLAdapterScanCASIntegration(t *testing.T) {
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
 	// Test adapter directly using v1.Session
-	adapter := v1.NewSession(sessionA)
+	adapter := cqlv1.NewSession(sessionA)
 
 	userID := gocql.TimeUUID()
 
@@ -702,7 +702,7 @@ func TestCQLAdapterMapScanCASIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	adapter := v1.NewSession(sessionA)
+	adapter := cqlv1.NewSession(sessionA)
 
 	userID := gocql.TimeUUID()
 
@@ -759,7 +759,7 @@ func TestCQLAdapterBatchCASIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	adapter := v1.NewSession(sessionA)
+	adapter := cqlv1.NewSession(sessionA)
 
 	userID := gocql.TimeUUID()
 
@@ -822,7 +822,7 @@ func TestCQLAdapterMapExecCASIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	adapter := v1.NewSession(sessionA)
+	adapter := cqlv1.NewSession(sessionA)
 
 	userID := gocql.TimeUUID()
 
@@ -877,7 +877,7 @@ func TestCQLAdapterContextMethodsIntegration(t *testing.T) {
 
 	usersTable := createTestTableOnBoth(t, "users", usersTableSchema)
 
-	adapter := v1.NewSession(sessionA)
+	adapter := cqlv1.NewSession(sessionA)
 
 	userID := gocql.TimeUUID()
 

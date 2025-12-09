@@ -6,6 +6,7 @@ require (
 	github.com/VictoriaMetrics/metrics v1.40.2
 	github.com/apache/cassandra-gocql-driver/v2 v2.0.0
 	github.com/gocql/gocql v1.7.0
+	github.com/google/uuid v1.6.0
 	github.com/mattn/go-sqlite3 v1.14.32
 	github.com/nats-io/nats-server/v2 v2.12.2
 	github.com/nats-io/nats.go v1.47.0
@@ -39,7 +40,6 @@ require (
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/golang/snappy v0.0.3 // indirect
 	github.com/google/go-tpm v0.9.6 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.3 // indirect
 	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed // indirect
 	github.com/klauspost/compress v1.18.2 // indirect

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	gocqlv2 "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gocql/gocql"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/cassandra"
@@ -44,9 +45,10 @@ func (t CQLClusterType) String() string {
 // CQLCluster represents a CQL-compatible database cluster for testing.
 // It abstracts over ScyllaDB and Cassandra containers.
 type CQLCluster struct {
-	Type    CQLClusterType
-	Host    string
-	Session *gocql.Session
+	Type      CQLClusterType
+	Host      string
+	Session   *gocql.Session
+	SessionV2 *gocqlv2.Session
 
 	// Internal container references for cleanup
 	scyllaContainer    *scylladb.Container
@@ -58,6 +60,10 @@ func (c *CQLCluster) Close() {
 	if c.Session != nil {
 		c.Session.Close()
 		c.Session = nil
+	}
+	if c.SessionV2 != nil {
+		c.SessionV2.Close()
+		c.SessionV2 = nil
 	}
 }
 
@@ -216,10 +222,18 @@ func startScyllaDBCluster(ctx context.Context, opts CQLClusterOptions) (*CQLClus
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
+	sessionV2, err := createCQLSessionV2(host, opts.Keyspace, 30*time.Second)
+	if err != nil {
+		session.Close()
+		_ = container.Terminate(ctx)
+		return nil, fmt.Errorf("failed to create session v2: %w", err)
+	}
+
 	return &CQLCluster{
 		Type:            CQLClusterTypeScyllaDB,
 		Host:            host,
 		Session:         session,
+		SessionV2:       sessionV2,
 		scyllaContainer: container,
 	}, nil
 }
@@ -248,10 +262,18 @@ func startCassandraCluster(ctx context.Context, opts CQLClusterOptions) (*CQLClu
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
+	sessionV2, err := createCQLSessionV2(host, opts.Keyspace, 60*time.Second)
+	if err != nil {
+		session.Close()
+		_ = container.Terminate(ctx)
+		return nil, fmt.Errorf("failed to create session v2: %w", err)
+	}
+
 	return &CQLCluster{
 		Type:               CQLClusterTypeCassandra,
 		Host:               host,
 		Session:            session,
+		SessionV2:          sessionV2,
 		cassandraContainer: container,
 	}, nil
 }
@@ -282,6 +304,16 @@ func createCQLSession(host, keyspace string, timeout time.Duration) (*gocql.Sess
 	session.Close()
 
 	// Reconnect to test keyspace
+	cluster.Keyspace = keyspace
+
+	return cluster.CreateSession()
+}
+
+func createCQLSessionV2(host, keyspace string, timeout time.Duration) (*gocqlv2.Session, error) {
+	cluster := gocqlv2.NewCluster(host)
+	cluster.Consistency = gocqlv2.Quorum
+	cluster.Timeout = timeout
+	cluster.ConnectTimeout = timeout
 	cluster.Keyspace = keyspace
 
 	return cluster.CreateSession()

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	gocqlv2 "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gocql/gocql"
 
 	"github.com/arloliu/helix/test/testutil"
@@ -96,6 +97,21 @@ func getSharedSessions(t *testing.T) (sessionA *gocql.Session, sessionB *gocql.S
 	}
 
 	return sharedClusters.clusterA.Session, sharedClusters.clusterB.Session
+}
+
+// getSharedSessionsV2 returns the shared gocql v2 sessions for tests.
+func getSharedSessionsV2(t *testing.T) (sessionA *gocqlv2.Session, sessionB *gocqlv2.Session) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	if sharedClusters.clusterA == nil || sharedClusters.clusterB == nil {
+		t.Skip("shared clusters not available (run with -short=false and Docker)")
+	}
+
+	return sharedClusters.clusterA.SessionV2, sharedClusters.clusterB.SessionV2
 }
 
 // createTestTableOnBoth creates a table with a unique name on both clusters.

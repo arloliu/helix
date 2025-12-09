@@ -745,6 +745,7 @@ func (r *trackingReplayer) Enqueue(_ context.Context, payload types.ReplayPayloa
 	if r.onEnqueue != nil {
 		r.onEnqueue(payload)
 	}
+
 	return nil
 }
 
@@ -759,6 +760,7 @@ func (s *slowDBAdapter) ExecContext(ctx context.Context, query string, args ...a
 		return nil, ctx.Err()
 	case <-time.After(s.delay):
 	}
+
 	return s.DB.ExecContext(ctx, query, args...)
 }
 
@@ -768,6 +770,7 @@ func (s *slowDBAdapter) QueryContext(ctx context.Context, query string, args ...
 		return nil, ctx.Err()
 	case <-time.After(s.delay):
 	}
+
 	return s.DB.QueryContext(ctx, query, args...)
 }
 

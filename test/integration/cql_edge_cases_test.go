@@ -111,8 +111,8 @@ func TestCQLConcurrentDualWritesIntegration(t *testing.T) {
 	numGoroutines := 10
 	insertsPerGoroutine := 20
 	var wg sync.WaitGroup
-	var successCount atomic.Int32
-	var failCount atomic.Int32
+	var successCount atomic.Int64
+	var failCount atomic.Int64
 
 	insertedIDs := make(chan gocql.UUID, numGoroutines*insertsPerGoroutine)
 
@@ -141,7 +141,7 @@ func TestCQLConcurrentDualWritesIntegration(t *testing.T) {
 		successCount.Load(), failCount.Load())
 
 	// All inserts should succeed
-	require.Equal(t, int32(numGoroutines*insertsPerGoroutine), successCount.Load())
+	require.Equal(t, int64(numGoroutines*insertsPerGoroutine), successCount.Load())
 
 	// Verify all successful inserts exist in both clusters
 	verifiedA, verifiedB := 0, 0
@@ -178,7 +178,7 @@ func TestCQLConcurrentBatchWritesIntegration(t *testing.T) {
 	batchesPerGoroutine := 10
 	usersPerBatch := 3
 	var wg sync.WaitGroup
-	var successCount atomic.Int32
+	var successCount atomic.Int64
 
 	for range numGoroutines {
 		wg.Go(func() {
@@ -203,7 +203,7 @@ func TestCQLConcurrentBatchWritesIntegration(t *testing.T) {
 		successCount.Load(), numGoroutines*batchesPerGoroutine)
 
 	// Most batches should succeed
-	require.GreaterOrEqual(t, successCount.Load(), int32(numGoroutines*batchesPerGoroutine*8/10))
+	require.GreaterOrEqual(t, successCount.Load(), int64(numGoroutines*batchesPerGoroutine*8/10))
 }
 
 // =============================================================================
@@ -506,6 +506,7 @@ func (r *testReplayerTracker) Enqueue(_ context.Context, payload types.ReplayPay
 	if r.onEnqueue != nil {
 		r.onEnqueue(payload)
 	}
+
 	return nil
 }
 
@@ -556,11 +557,13 @@ type partialFailureCQLQuery struct {
 
 func (p *partialFailureCQLQuery) WithContext(ctx context.Context) cql.Query {
 	p.Query = p.Query.WithContext(ctx)
+
 	return p
 }
 
 func (p *partialFailureCQLQuery) Consistency(c cql.Consistency) cql.Query {
 	p.Query = p.Query.Consistency(c)
+
 	return p
 }
 
@@ -570,24 +573,29 @@ func (p *partialFailureCQLQuery) SetConsistency(c cql.Consistency) {
 
 func (p *partialFailureCQLQuery) PageSize(n int) cql.Query {
 	p.Query = p.Query.PageSize(n)
+
 	return p
 }
 
 func (p *partialFailureCQLQuery) PageState(state []byte) cql.Query {
 	p.Query = p.Query.PageState(state)
+
 	return p
 }
 
 func (p *partialFailureCQLQuery) WithTimestamp(ts int64) cql.Query {
 	p.Query = p.Query.WithTimestamp(ts)
+
 	return p
 }
 
 func (p *partialFailureCQLQuery) Exec() error {
 	if p.failNextWrite.Load() > 0 {
 		p.failNextWrite.Add(-1)
+
 		return errors.New("simulated partial failure")
 	}
+
 	return p.Query.Exec()
 }
 

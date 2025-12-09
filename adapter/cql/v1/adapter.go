@@ -263,13 +263,13 @@ func (b *Batch) SetConsistency(c cql.Consistency) {
 
 // WithContext associates a context with the batch.
 func (b *Batch) WithContext(ctx context.Context) cql.Batch {
-	b.batch.WithContext(ctx)
+	b.batch = b.batch.WithContext(ctx)
 	return b
 }
 
 // WithTimestamp sets the write timestamp for all statements.
 func (b *Batch) WithTimestamp(ts int64) cql.Batch {
-	b.batch.WithTimestamp(ts)
+	b.batch = b.batch.WithTimestamp(ts)
 	return b
 }
 
@@ -280,18 +280,16 @@ func (b *Batch) Exec() error {
 
 // ExecContext executes the batch with context.
 func (b *Batch) ExecContext(ctx context.Context) error {
-	b.batch.WithContext(ctx)
-	return b.session.ExecuteBatch(b.batch)
+	return b.session.ExecuteBatch(b.batch.WithContext(ctx))
 }
 
 // IterContext executes the batch with context and returns an iterator.
 // Note: gocql v1 doesn't have a direct IterContext for batches,
 // so we execute and return a nil-safe iterator.
 func (b *Batch) IterContext(ctx context.Context) cql.Iter {
-	b.batch.WithContext(ctx)
 	// v1 doesn't return an iterator from ExecuteBatch, return empty iter
 	// This is mainly for API compatibility with v2
-	_ = b.session.ExecuteBatch(b.batch)
+	_ = b.session.ExecuteBatch(b.batch.WithContext(ctx))
 	return &Iter{iter: nil}
 }
 

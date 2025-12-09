@@ -401,6 +401,7 @@ func TestTopologyWatcherWithCQLClientIntegration(t *testing.T) {
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
+
 		return drainState[types.ClusterB]
 	}, time.Second, 10*time.Millisecond)
 

@@ -264,7 +264,7 @@ type Batch struct {
 
 // Query adds a statement to the batch.
 func (b *Batch) Query(stmt string, args ...any) cql.Batch {
-	b.batch.Query(stmt, args...)
+	b.batch = b.batch.Query(stmt, args...)
 	b.entries = append(b.entries, cql.BatchEntry{
 		Statement: stmt,
 		Args:      args,
@@ -299,7 +299,7 @@ func (b *Batch) WithContext(ctx context.Context) cql.Batch {
 
 // WithTimestamp sets the write timestamp for all statements.
 func (b *Batch) WithTimestamp(ts int64) cql.Batch {
-	b.batch.WithTimestamp(ts)
+	b.batch = b.batch.WithTimestamp(ts)
 
 	return b
 }
