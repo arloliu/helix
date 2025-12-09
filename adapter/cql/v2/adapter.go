@@ -370,36 +370,57 @@ type Iter struct {
 
 // Scan reads the next row.
 func (i *Iter) Scan(dest ...any) bool {
+	if i.iter == nil {
+		return false
+	}
 	return i.iter.Scan(dest...)
 }
 
 // Close closes the iterator.
 func (i *Iter) Close() error {
+	if i.iter == nil {
+		return nil
+	}
 	return i.iter.Close()
 }
 
 // MapScan reads the next row into a map.
 func (i *Iter) MapScan(m map[string]any) bool {
+	if i.iter == nil {
+		return false
+	}
 	return i.iter.MapScan(m)
 }
 
 // SliceMap reads all rows into a slice of maps.
 func (i *Iter) SliceMap() ([]map[string]any, error) {
+	if i.iter == nil {
+		return nil, nil
+	}
 	return i.iter.SliceMap()
 }
 
 // PageState returns the pagination token.
 func (i *Iter) PageState() []byte {
+	if i.iter == nil {
+		return nil
+	}
 	return i.iter.PageState()
 }
 
 // NumRows returns the number of rows in the current page.
 func (i *Iter) NumRows() int {
+	if i.iter == nil {
+		return 0
+	}
 	return i.iter.NumRows()
 }
 
 // Columns returns metadata about the columns in the result set.
 func (i *Iter) Columns() []cql.ColumnInfo {
+	if i.iter == nil {
+		return nil
+	}
 	gocqlCols := i.iter.Columns()
 	result := make([]cql.ColumnInfo, len(gocqlCols))
 	for idx, col := range gocqlCols {
@@ -416,11 +437,17 @@ func (i *Iter) Columns() []cql.ColumnInfo {
 
 // Scanner returns a database/sql-style scanner for the iterator.
 func (i *Iter) Scanner() cql.Scanner {
+	if i.iter == nil {
+		return &scanner{scanner: nil}
+	}
 	return &scanner{scanner: i.iter.Scanner()}
 }
 
 // Warnings returns any warnings from the Cassandra server.
 func (i *Iter) Warnings() []string {
+	if i.iter == nil {
+		return nil
+	}
 	return i.iter.Warnings()
 }
 
@@ -430,13 +457,22 @@ type scanner struct {
 }
 
 func (s *scanner) Next() bool {
+	if s.scanner == nil {
+		return false
+	}
 	return s.scanner.Next()
 }
 
 func (s *scanner) Scan(dest ...any) error {
+	if s.scanner == nil {
+		return nil
+	}
 	return s.scanner.Scan(dest...)
 }
 
 func (s *scanner) Err() error {
+	if s.scanner == nil {
+		return nil
+	}
 	return s.scanner.Err()
 }
