@@ -943,3 +943,234 @@ func TestCQLAdapterContextMethodsIntegration(t *testing.T) {
 	require.NotNil(t, batchIter)
 	require.NoError(t, batchIter.Close())
 }
+
+// TestCQLQueryConfigPropagation verifies that query configuration options
+// (PageSize, PageState, Consistency, etc.) are properly propagated to the
+// underlying gocql queries and work correctly with real Cassandra/ScyllaDB.
+func TestCQLQueryConfigPropagation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	sessionA, sessionB := getSharedSessions(t)
+
+	// Create a table with many rows for pagination testing
+	paginationTable := createTestTableOnBoth(t, "pagination", `
+		CREATE TABLE IF NOT EXISTS %s (
+			partition_key INT,
+			row_id INT,
+			data TEXT,
+			PRIMARY KEY (partition_key, row_id)
+		)
+	`)
+
+	helixSessionA := cqlv1.NewSession(sessionA)
+	helixSessionB := cqlv1.NewSession(sessionB)
+
+	client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
+	require.NoError(t, err)
+
+	t.Run("PageSize controls number of rows per page", func(t *testing.T) {
+		// Insert 25 rows into a single partition for predictable pagination
+		const totalRows = 25
+		const partitionKey = 1
+
+		for i := 0; i < totalRows; i++ {
+			err := client.Query(
+				"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
+				partitionKey, i, "data-"+string(rune('A'+i%26)),
+			).ExecContext(ctx)
+			require.NoError(t, err)
+		}
+
+		// Query with PageSize of 10 - NumRows() should return 10 for first page
+		const pageSize = 10
+		iter := client.Query(
+			"SELECT row_id, data FROM "+paginationTable+" WHERE partition_key = ?",
+			partitionKey,
+		).PageSize(pageSize).Iter()
+
+		// NumRows() returns the number of rows in the CURRENT page, not total
+		// This is the key test: PageSize should control NumRows()
+		numRowsInPage := iter.NumRows()
+		require.Equal(t, pageSize, numRowsInPage, "NumRows() should equal PageSize for first page")
+
+		// Verify we can read exactly that many rows from the page
+		var rowCount int
+		var rowID int
+		var data string
+		for rowCount < numRowsInPage && iter.Scan(&rowID, &data) {
+			rowCount++
+		}
+
+		// PageState should be non-empty since we have more rows
+		pageState := iter.PageState()
+		require.NotEmpty(t, pageState, "should have PageState for next page")
+		require.NoError(t, iter.Close())
+
+		t.Logf("First page: NumRows()=%d, read %d rows, PageState len=%d", numRowsInPage, rowCount, len(pageState))
+	})
+
+	t.Run("PageState enables resumable iteration", func(t *testing.T) {
+		// Insert rows if not already present (from previous subtest)
+		const totalRows = 25
+		const partitionKey = 2 // Use different partition to isolate tests
+
+		for i := 0; i < totalRows; i++ {
+			err := client.Query(
+				"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
+				partitionKey, i, "data-"+string(rune('A'+i%26)),
+			).ExecContext(ctx)
+			require.NoError(t, err)
+		}
+
+		// First query with small page size
+		const pageSize = 5
+		iter := client.Query(
+			"SELECT row_id FROM "+paginationTable+" WHERE partition_key = ?",
+			partitionKey,
+		).PageSize(pageSize).Iter()
+
+		// Read only the first page using NumRows()
+		numRowsInPage := iter.NumRows()
+		require.Equal(t, pageSize, numRowsInPage, "first page should have PageSize rows")
+
+		var firstPageIDs []int
+		var rowID int
+		for len(firstPageIDs) < numRowsInPage && iter.Scan(&rowID) {
+			firstPageIDs = append(firstPageIDs, rowID)
+		}
+
+		// Get page state BEFORE calling Scan() again (which would fetch next page)
+		pageState := iter.PageState()
+		require.NotEmpty(t, pageState, "should have PageState for continuation")
+		require.NoError(t, iter.Close())
+
+		t.Logf("First page: NumRows()=%d, read %d rows, PageState len=%d", numRowsInPage, len(firstPageIDs), len(pageState))
+
+		// Use page state to get the next page
+		iter2 := client.Query(
+			"SELECT row_id FROM "+paginationTable+" WHERE partition_key = ?",
+			partitionKey,
+		).PageSize(pageSize).PageState(pageState).Iter()
+
+		numRowsInPage2 := iter2.NumRows()
+		require.Equal(t, pageSize, numRowsInPage2, "second page should have PageSize rows")
+
+		var secondPageIDs []int
+		for len(secondPageIDs) < numRowsInPage2 && iter2.Scan(&rowID) {
+			secondPageIDs = append(secondPageIDs, rowID)
+		}
+		require.NoError(t, iter2.Close())
+
+		t.Logf("Second page: NumRows()=%d, read %d rows", numRowsInPage2, len(secondPageIDs))
+
+		// Verify we got different rows in the second page
+		require.Len(t, secondPageIDs, pageSize, "second page should have pageSize rows")
+
+		// Verify no overlap between first and second page
+		firstPageSet := make(map[int]bool)
+		for _, id := range firstPageIDs {
+			firstPageSet[id] = true
+		}
+		for _, id := range secondPageIDs {
+			require.False(t, firstPageSet[id], "second page should not contain rows from first page (id=%d)", id)
+		}
+	})
+
+	t.Run("Consistency is applied to queries", func(t *testing.T) {
+		const partitionKey = 3
+
+		// Insert a row
+		err := client.Query(
+			"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
+			partitionKey, 1, "consistency-test",
+		).Consistency(helix.Quorum).ExecContext(ctx)
+		require.NoError(t, err)
+
+		// Read with different consistency levels - all should work
+		var data string
+
+		// Read with ONE
+		err = client.Query(
+			"SELECT data FROM "+paginationTable+" WHERE partition_key = ? AND row_id = ?",
+			partitionKey, 1,
+		).Consistency(helix.One).Scan(&data)
+		require.NoError(t, err)
+		require.Equal(t, "consistency-test", data)
+
+		// Read with QUORUM (note: single-node cluster, so this is effectively same as ONE)
+		err = client.Query(
+			"SELECT data FROM "+paginationTable+" WHERE partition_key = ? AND row_id = ?",
+			partitionKey, 1,
+		).Consistency(helix.Quorum).Scan(&data)
+		require.NoError(t, err)
+		require.Equal(t, "consistency-test", data)
+	})
+
+	t.Run("complete pagination through all rows", func(t *testing.T) {
+		const totalRows = 17
+		const partitionKey = 4
+		const pageSize = 5
+
+		// Insert rows
+		for i := 0; i < totalRows; i++ {
+			err := client.Query(
+				"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
+				partitionKey, i, "row-data",
+			).ExecContext(ctx)
+			require.NoError(t, err)
+		}
+
+		// Paginate through all rows
+		var allRowIDs []int
+		var pageState []byte
+		pageNum := 0
+
+		for {
+			pageNum++
+			query := client.Query(
+				"SELECT row_id FROM "+paginationTable+" WHERE partition_key = ?",
+				partitionKey,
+			).PageSize(pageSize)
+
+			if len(pageState) > 0 {
+				query = query.PageState(pageState)
+			}
+
+			iter := query.Iter()
+			var rowID int
+			rowsInPage := 0
+			for iter.Scan(&rowID) {
+				allRowIDs = append(allRowIDs, rowID)
+				rowsInPage++
+			}
+
+			pageState = iter.PageState()
+			require.NoError(t, iter.Close())
+
+			t.Logf("Page %d: %d rows", pageNum, rowsInPage)
+
+			// Stop when no more pages
+			if len(pageState) == 0 {
+				break
+			}
+
+			// Safety limit
+			if pageNum > 10 {
+				t.Fatal("too many pages, possible infinite loop")
+			}
+		}
+
+		// Verify we got all rows
+		require.Len(t, allRowIDs, totalRows, "should retrieve all rows through pagination")
+
+		// Verify no duplicates
+		seen := make(map[int]bool)
+		for _, id := range allRowIDs {
+			require.False(t, seen[id], "should not have duplicate row_id: %d", id)
+			seen[id] = true
+		}
+	})
+}

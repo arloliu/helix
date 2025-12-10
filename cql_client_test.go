@@ -20,6 +20,7 @@ type mockSession struct {
 	scanErr    error
 	scanValues []any
 	closed     atomic.Bool
+	lastQuery  *mockQuery // Track last query for inspection
 }
 
 func newMockSession() *mockSession {
@@ -28,11 +29,14 @@ func newMockSession() *mockSession {
 
 func (m *mockSession) Query(stmt string, values ...any) cql.Query {
 	m.queries = append(m.queries, stmt)
-	return &mockQuery{
+	q := &mockQuery{
 		session:   m,
 		statement: stmt,
 		values:    values,
 	}
+	m.lastQuery = q
+
+	return q
 }
 
 func (m *mockSession) Batch(kind cql.BatchType) cql.Batch {
@@ -61,21 +65,44 @@ func (m *mockSession) Close() {
 
 // mockQuery implements cql.Query for testing.
 type mockQuery struct {
-	session   *mockSession
-	statement string
-	values    []any
+	session           *mockSession
+	statement         string
+	values            []any
+	pageSize          *int
+	pageState         []byte
+	consistency       *cql.Consistency
+	serialConsistency *cql.Consistency
+	timestamp         *int64
 }
 
-func (q *mockQuery) WithContext(_ context.Context) cql.Query       { return q }
-func (q *mockQuery) Consistency(_ cql.Consistency) cql.Query       { return q }
-func (q *mockQuery) SetConsistency(c cql.Consistency)              { q.Consistency(c) }
-func (q *mockQuery) SerialConsistency(_ cql.Consistency) cql.Query { return q }
-func (q *mockQuery) PageSize(_ int) cql.Query                      { return q }
-func (q *mockQuery) PageState(_ []byte) cql.Query                  { return q }
-func (q *mockQuery) WithTimestamp(_ int64) cql.Query               { return q }
-func (q *mockQuery) Statement() string                             { return q.statement }
-func (q *mockQuery) Values() []any                                 { return q.values }
-func (q *mockQuery) Release()                                      {}
+func (q *mockQuery) WithContext(_ context.Context) cql.Query { return q }
+func (q *mockQuery) Consistency(c cql.Consistency) cql.Query {
+	q.consistency = &c
+	return q
+}
+func (q *mockQuery) SetConsistency(c cql.Consistency) { q.Consistency(c) }
+func (q *mockQuery) SerialConsistency(c cql.Consistency) cql.Query {
+	q.serialConsistency = &c
+	return q
+}
+
+func (q *mockQuery) PageSize(n int) cql.Query {
+	q.pageSize = &n
+	return q
+}
+
+func (q *mockQuery) PageState(state []byte) cql.Query {
+	q.pageState = state
+	return q
+}
+
+func (q *mockQuery) WithTimestamp(ts int64) cql.Query {
+	q.timestamp = &ts
+	return q
+}
+func (q *mockQuery) Statement() string { return q.statement }
+func (q *mockQuery) Values() []any     { return q.values }
+func (q *mockQuery) Release()          {}
 
 func (q *mockQuery) Exec() error {
 	return q.session.execErr
@@ -514,6 +541,123 @@ func TestCQLClientQueryScan(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "test-value", name)
 	require.Equal(t, 42, count)
+}
+
+func TestCQLClientQueryConfigPropagation(t *testing.T) {
+	t.Run("PageSize is propagated to underlying query", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// Execute a query with PageSize
+		_ = client.Query("SELECT * FROM test").PageSize(100).Iter()
+
+		// Verify PageSize was set on the underlying query
+		require.NotNil(t, sessionA.lastQuery)
+		require.NotNil(t, sessionA.lastQuery.pageSize)
+		require.Equal(t, 100, *sessionA.lastQuery.pageSize)
+	})
+
+	t.Run("PageState is propagated to underlying query", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		pageToken := []byte{0x01, 0x02, 0x03, 0x04}
+
+		// Execute a query with PageState
+		_ = client.Query("SELECT * FROM test").PageState(pageToken).Iter()
+
+		// Verify PageState was set on the underlying query
+		require.NotNil(t, sessionA.lastQuery)
+		require.Equal(t, pageToken, sessionA.lastQuery.pageState)
+	})
+
+	t.Run("Consistency is propagated to underlying query", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// Execute a query with Consistency
+		_ = client.Query("SELECT * FROM test").Consistency(Quorum).Iter()
+
+		// Verify Consistency was set on the underlying query
+		require.NotNil(t, sessionA.lastQuery)
+		require.NotNil(t, sessionA.lastQuery.consistency)
+		require.Equal(t, Quorum, *sessionA.lastQuery.consistency)
+	})
+
+	t.Run("SerialConsistency is propagated to underlying query", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// Execute a query with SerialConsistency
+		_ = client.Query("SELECT * FROM test").SerialConsistency(LocalSerial).Iter()
+
+		// Verify SerialConsistency was set on the underlying query
+		require.NotNil(t, sessionA.lastQuery)
+		require.NotNil(t, sessionA.lastQuery.serialConsistency)
+		require.Equal(t, LocalSerial, *sessionA.lastQuery.serialConsistency)
+	})
+
+	t.Run("WithTimestamp is propagated to underlying query on Exec", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		ts := int64(1234567890)
+
+		// Execute a write with explicit timestamp
+		err = client.Query("INSERT INTO test (id) VALUES (?)", 1).WithTimestamp(ts).Exec()
+		require.NoError(t, err)
+
+		// Verify timestamp was set on the underlying query
+		require.NotNil(t, sessionA.lastQuery)
+		require.NotNil(t, sessionA.lastQuery.timestamp)
+		require.Equal(t, ts, *sessionA.lastQuery.timestamp)
+	})
+
+	t.Run("multiple configs are propagated together", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		pageToken := []byte{0xAB, 0xCD}
+
+		// Execute a query with multiple configurations
+		_ = client.Query("SELECT * FROM test").
+			PageSize(50).
+			PageState(pageToken).
+			Consistency(LocalQuorum).
+			Iter()
+
+		// Verify all configs were set
+		require.NotNil(t, sessionA.lastQuery)
+		require.NotNil(t, sessionA.lastQuery.pageSize)
+		require.Equal(t, 50, *sessionA.lastQuery.pageSize)
+		require.Equal(t, pageToken, sessionA.lastQuery.pageState)
+		require.NotNil(t, sessionA.lastQuery.consistency)
+		require.Equal(t, LocalQuorum, *sessionA.lastQuery.consistency)
+	})
 }
 
 // mockFailoverPolicy implements FailoverPolicy for testing.

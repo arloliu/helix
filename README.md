@@ -202,6 +202,38 @@ See [Replay System Documentation](docs/replay-system.md) for detailed usage patt
 
 ## Configuration Options
 
+### Production Recommendations
+
+For production dual-cluster deployments, always configure:
+
+| Component | Why It Matters |
+|-----------|----------------|
+| `Replayer` | **Critical**: Without a replayer, partial write failures are lost permanently. Use `NATSReplayer` for durability. |
+| `ReadStrategy` | Improves read performance. `StickyRead` maximizes cache hits by routing reads to the same cluster. |
+| `WriteStrategy` | Controls write behavior. `AdaptiveDualWrite` handles degraded clusters gracefully. |
+| `FailoverPolicy` | Enables automatic read failover. `ActiveFailover` immediately retries on the secondary cluster. |
+
+> **Warning**: A warning is logged if you create a dual-cluster client without a Replayer configured.
+
+### Minimal Production Example
+
+```go
+client, err := helix.NewCQLClient(
+    v1.NewSession(sessionA),
+    v1.NewSession(sessionB),
+    // REQUIRED for production: enables failure recovery
+    helix.WithReplayer(replay.NewNATSReplayer(nc, nats.JetStreamContext(nc))),
+    helix.WithReplayWorker(replay.NewWorker(replayer)),
+
+    // RECOMMENDED: optimizes read/write behavior
+    helix.WithReadStrategy(policy.NewStickyRead()),
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithFailoverPolicy(policy.NewActiveFailover()),
+)
+```
+
+### All Configuration Options
+
 ```go
 helix.NewCQLClient(sessionA, sessionB,
     // Strategies

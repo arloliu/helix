@@ -117,6 +117,11 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// Propagate cluster names to components that support it
 	propagateClusterNames(config)
 
+	// Warn about missing Replayer in dual-cluster mode
+	if sessionB != nil && config.Replayer == nil {
+		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &CQLClient{

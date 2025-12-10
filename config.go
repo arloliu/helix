@@ -43,10 +43,26 @@ type ClientConfig struct {
 
 // DefaultConfig returns a ClientConfig with sensible defaults.
 //
-// Default strategies:
-//   - ReadStrategy: nil (falls back to ClusterA, use policy.NewStickyRead() for production)
-//   - WriteStrategy: nil (concurrent dual-write, use policy.NewAdaptiveDualWrite() for production)
-//   - FailoverPolicy: nil (no circuit breaker, use policy.NewActiveFailover() for immediate failover)
+// The default configuration provides minimal, non-nil infrastructure:
+//   - TimestampProvider: Uses time.Now().UnixMicro() for idempotent writes
+//   - Metrics: No-op collector (silent, no overhead)
+//   - Logger: No-op logger (silent, no overhead)
+//   - ClusterNames: "ClusterA" and "ClusterB"
+//
+// Strategy and policy defaults (all nil):
+//   - ReadStrategy: nil - Falls back to ClusterA only (no load balancing)
+//   - WriteStrategy: nil - Concurrent dual-write to both clusters
+//   - FailoverPolicy: nil - Always attempts failover on read failure
+//   - Replayer: nil - CAUTION: Partial write failures will be lost!
+//
+// Production recommendations:
+//   - ReadStrategy: policy.NewStickyRead() for cache-efficient reads
+//   - WriteStrategy: policy.NewAdaptiveDualWrite() for latency-aware writes
+//   - FailoverPolicy: policy.NewActiveFailover() for immediate failover
+//   - Replayer: replay.NewNATSReplayer() for durable failure recovery
+//
+// A warning is logged during client creation if dual-cluster mode is used
+// without a Replayer configured.
 //
 // Returns:
 //   - *ClientConfig: Configuration with default settings
