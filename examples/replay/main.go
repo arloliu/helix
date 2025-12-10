@@ -34,7 +34,12 @@ func main() {
 	fmt.Println("=== Helix Replay System Demo ===")
 	fmt.Println()
 
-	// Run the in-memory replay demo (simulated)
+	// Run the simplified auto-worker demo
+	demoAutoMemoryWorker()
+
+	fmt.Println()
+
+	// Run the manual in-memory replay demo
 	demoInMemoryReplay()
 
 	fmt.Println()
@@ -42,10 +47,49 @@ func main() {
 	fmt.Println("Requires: nats-server -js running on localhost:4222")
 }
 
-// demoInMemoryReplay demonstrates the in-memory replay pattern.
-// This is suitable for development and testing.
+// demoAutoMemoryWorker demonstrates the simplest setup with WithAutoMemoryWorker.
+// This eliminates boilerplate by creating the replayer and worker automatically.
+func demoAutoMemoryWorker() {
+	fmt.Println("--- Auto Memory Worker Demo (Simplest Setup) ---")
+
+	// In production, you would create real gocql sessions:
+	// sessionA := v1.NewSession(gocqlSessionA)
+	// sessionB := v1.NewSession(gocqlSessionB)
+	//
+	// Simplest setup - everything is automatic:
+	// client, err := helix.NewCQLClient(sessionA, sessionB,
+	//     helix.WithAutoMemoryWorker(0), // Use default capacity (10000)
+	// )
+	//
+	// With custom capacity and callbacks:
+	// client, err := helix.NewCQLClient(sessionA, sessionB,
+	//     helix.WithAutoMemoryWorker(50000,
+	//         replay.WithPollInterval(50*time.Millisecond),
+	//         replay.WithOnSuccess(func(p types.ReplayPayload) {
+	//             log.Printf("Replay succeeded: cluster=%s", p.TargetCluster)
+	//         }),
+	//         replay.WithOnError(func(p types.ReplayPayload, err error, attempt int) {
+	//             log.Printf("Replay failed: cluster=%s err=%v", p.TargetCluster, err)
+	//         }),
+	//     ),
+	// )
+	// defer client.Close() // Auto-stops worker
+
+	fmt.Println("WithAutoMemoryWorker creates:")
+	fmt.Println("  1. MemoryReplayer with specified capacity (default 10000)")
+	fmt.Println("  2. Worker using client.DefaultExecuteFunc()")
+	fmt.Println("  3. Automatically starts worker on client creation")
+	fmt.Println("  4. Automatically stops worker on client.Close()")
+	fmt.Println()
+	fmt.Println("This is ideal for development and simple deployments.")
+	fmt.Println("For production with durability, use NATSReplayer instead.")
+}
+
+// demoInMemoryReplay demonstrates the manual in-memory replay pattern.
+// This shows full control over replayer and worker creation.
+// For simpler setup, see demoAutoMemoryWorker().
 func demoInMemoryReplay() {
-	fmt.Println("--- In-Memory Replay Demo ---")
+	fmt.Println("--- Manual In-Memory Replay Demo ---")
 
 	// For this demo, we'll simulate without real Cassandra
 	// In production, you would create real gocql sessions
@@ -303,36 +347,11 @@ func demoWithRealClusters() {
 	sessionA := v1.NewSession(gocqlSessionA)
 	sessionB := v1.NewSession(gocqlSessionB)
 
-	// Create replayer
-	replayer := replay.NewMemoryReplayer()
-
-	// Create execute function for worker
-	executeFunc := func(ctx context.Context, payload types.ReplayPayload) error {
-		var session interface {
-			Query(string, ...any) interface {
-				WithTimestamp(int64) interface{ Exec() error }
-			}
-			Batch(types.BatchType) interface {
-				Query(string, ...any) interface{ Query(string, ...any) any }
-				WithTimestamp(int64) interface{ Exec() error }
-			}
-		}
-		if payload.TargetCluster == types.ClusterA {
-			_ = sessionA // In real code: session = sessionA
-		} else {
-			_ = sessionB // In real code: session = sessionB
-		}
-		_ = session
-		return nil
-	}
-
-	// Create worker
-	worker := replay.NewMemoryWorker(replayer, executeFunc)
-
-	// Create Helix client with both replayer and worker
+	// ============================================================
+	// OPTION 1: Simplest - WithAutoMemoryWorker (Recommended for dev)
+	// ============================================================
 	client, err := helix.NewCQLClient(sessionA, sessionB,
-		helix.WithReplayer(replayer),
-		helix.WithReplayWorker(worker), // Worker auto-starts
+		helix.WithAutoMemoryWorker(10000), // Replayer + Worker auto-created
 		helix.WithReadStrategy(policy.NewStickyRead()),
 		helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
 		helix.WithFailoverPolicy(policy.NewActiveFailover()),
@@ -341,6 +360,16 @@ func demoWithRealClusters() {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 	defer client.Close() // Worker auto-stops
+
+	// ============================================================
+	// OPTION 2: Manual setup (for custom ExecuteFunc or NATS worker)
+	// ============================================================
+	// replayer := replay.NewMemoryReplayer()
+	// worker := replay.NewMemoryWorker(replayer, client.DefaultExecuteFunc())
+	// client, err := helix.NewCQLClient(sessionA, sessionB,
+	//     helix.WithReplayer(replayer),
+	//     helix.WithReplayWorker(worker),
+	// )
 
 	// Now use the client - partial failures are automatically replayed
 	ctx := context.Background()

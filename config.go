@@ -5,6 +5,7 @@ import (
 
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
+	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
 
@@ -39,6 +40,17 @@ type ClientConfig struct {
 	Logger            types.Logger
 	ClusterNames      types.ClusterNames
 	OnReplayDropped   ReplayDroppedHandler
+
+	// AutoMemoryWorker enables automatic in-process replay with MemoryReplayer.
+	// When true, a MemoryReplayer and Worker are created automatically.
+	AutoMemoryWorker bool
+
+	// AutoMemoryCapacity is the queue capacity for auto-created MemoryReplayer.
+	// Default: 10000
+	AutoMemoryCapacity int
+
+	// AutoMemoryWorkerOpts are options passed to the auto-created Worker.
+	AutoMemoryWorkerOpts []replay.WorkerOption
 }
 
 // DefaultConfig returns a ClientConfig with sensible defaults.
@@ -172,6 +184,54 @@ func WithReplayWorker(worker ReplayWorker) Option {
 func WithOnReplayDropped(handler ReplayDroppedHandler) Option {
 	return func(c *ClientConfig) {
 		c.OnReplayDropped = handler
+	}
+}
+
+// WithAutoMemoryWorker enables automatic in-process replay with MemoryReplayer.
+//
+// This is a convenience option that creates both a MemoryReplayer and a Worker
+// automatically, eliminating boilerplate setup code. The worker uses the client's
+// DefaultExecuteFunc() to route replays to the correct cluster.
+//
+// Use this for:
+//   - Development and testing environments
+//   - Simple deployments where in-process replay is acceptable
+//
+// For production with durable replay, use WithReplayer() with NATSReplayer instead.
+// NATS workers typically run as separate consumer services.
+//
+// Parameters:
+//   - queueCapacity: Maximum pending replays (0 uses default of 10000)
+//   - workerOpts: Optional worker configuration (poll interval, callbacks, etc.)
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	// Simple setup with defaults
+//	client, _ := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithAutoMemoryWorker(0),
+//	)
+//
+//	// Custom capacity and callbacks
+//	client, _ := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithAutoMemoryWorker(50000,
+//	        replay.WithPollInterval(50*time.Millisecond),
+//	        replay.WithOnSuccess(func(p types.ReplayPayload) {
+//	            log.Printf("Replay succeeded: cluster=%s", p.TargetCluster)
+//	        }),
+//	    ),
+//	)
+func WithAutoMemoryWorker(queueCapacity int, workerOpts ...replay.WorkerOption) Option {
+	return func(c *ClientConfig) {
+		c.AutoMemoryWorker = true
+		if queueCapacity > 0 {
+			c.AutoMemoryCapacity = queueCapacity
+		} else {
+			c.AutoMemoryCapacity = 10000 // default
+		}
+		c.AutoMemoryWorkerOpts = workerOpts
 	}
 }
 

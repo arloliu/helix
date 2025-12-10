@@ -9,6 +9,7 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
+	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
 
@@ -118,7 +119,7 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	propagateClusterNames(config)
 
 	// Warn about missing Replayer in dual-cluster mode
-	if sessionB != nil && config.Replayer == nil {
+	if sessionB != nil && config.Replayer == nil && !config.AutoMemoryWorker {
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
 
@@ -130,6 +131,19 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config:        config,
 		topologyCtx:   ctx,
 		topologyClose: cancel,
+	}
+
+	// Create auto memory worker if configured
+	if config.AutoMemoryWorker {
+		memReplayer := replay.NewMemoryReplayer(
+			replay.WithQueueCapacity(config.AutoMemoryCapacity),
+		)
+		config.Replayer = memReplayer
+		config.ReplayWorker = replay.NewMemoryWorker(
+			memReplayer,
+			client.DefaultExecuteFunc(),
+			config.AutoMemoryWorkerOpts...,
+		)
 	}
 
 	// Start replay worker if configured
@@ -342,6 +356,50 @@ func (c *CQLClient) Close() {
 //   - CQLSession: The client as a CQLSession interface
 func (c *CQLClient) Session() CQLSession {
 	return c
+}
+
+// DefaultExecuteFunc returns an ExecuteFunc for use with replay workers.
+//
+// This is a convenience method that creates an executor which routes replay
+// payloads to the appropriate cluster session. It handles both single queries
+// and batch operations, preserving the original timestamp for idempotency.
+//
+// The returned function:
+//   - Routes to sessionA or sessionB based on payload.TargetCluster
+//   - Handles batch operations (IsBatch=true) with proper BatchType
+//   - Preserves the original write timestamp for idempotent replays
+//   - Respects context cancellation and timeouts via ExecContext
+//
+// Example:
+//
+//	client, _ := helix.NewCQLClient(sessionA, sessionB, helix.WithReplayer(replayer))
+//
+//	// Create worker with the default executor
+//	worker := replay.NewMemoryWorker(replayer, client.DefaultExecuteFunc(),
+//	    replay.WithOnSuccess(func(p types.ReplayPayload) {
+//	        log.Printf("Replay succeeded for cluster %s", p.TargetCluster)
+//	    }),
+//	)
+//
+// Returns:
+//   - replay.ExecuteFunc: A function that executes replay payloads
+func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
+	return func(ctx context.Context, payload types.ReplayPayload) error {
+		session := c.getSession(payload.TargetCluster)
+
+		if payload.IsBatch {
+			batch := session.Batch(payload.BatchType)
+			for _, stmt := range payload.BatchStatements {
+				batch = batch.Query(stmt.Query, stmt.Args...)
+			}
+
+			return batch.WithTimestamp(payload.Timestamp).ExecContext(ctx)
+		}
+
+		return session.Query(payload.Query, payload.Args...).
+			WithTimestamp(payload.Timestamp).
+			ExecContext(ctx)
+	}
 }
 
 // IsSingleCluster returns true if the client is operating in single-cluster mode.
