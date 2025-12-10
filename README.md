@@ -265,6 +265,7 @@ See the [examples](examples/) directory:
 
 ## Documentation
 
+- [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) - Latency-aware write strategy tuning
 - [Replay System](docs/replay-system.md) - Replay patterns and best practices
 - [Strategy & Policy](docs/strategy-policy.md) - Read/write strategies and failover policies
 
