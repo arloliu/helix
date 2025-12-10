@@ -589,14 +589,16 @@ func (c *CQLClient) executeDualWrite(
 	writeFunc func(cql.Session) error,
 ) error {
 	// Dual-cluster mode: concurrent writes with replay support
-	var startA, startB time.Time
+	// Note: We capture start times outside the write functions to avoid data races
+	// when WriteStrategy uses fire-and-forget (background goroutines).
+	var startA, startB atomic.Int64
 
 	writeA := func(_ context.Context) error {
-		startA = time.Now()
+		startA.Store(time.Now().UnixNano())
 		return writeFunc(c.sessionA)
 	}
 	writeB := func(_ context.Context) error {
-		startB = time.Now()
+		startB.Store(time.Now().UnixNano())
 		return writeFunc(c.sessionB)
 	}
 
@@ -620,15 +622,22 @@ func (c *CQLClient) executeDualWrite(
 	}
 
 	// Record metrics for both clusters
+	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines
 	now := time.Now()
+	nowNano := now.UnixNano()
+
 	c.config.Metrics.IncWriteTotal(ClusterA)
-	c.config.Metrics.ObserveWriteDuration(ClusterA, now.Sub(startA).Seconds())
+	if startANano := startA.Load(); startANano > 0 {
+		c.config.Metrics.ObserveWriteDuration(ClusterA, float64(nowNano-startANano)/float64(time.Second))
+	}
 	if errA != nil {
 		c.config.Metrics.IncWriteError(ClusterA)
 	}
 
 	c.config.Metrics.IncWriteTotal(ClusterB)
-	c.config.Metrics.ObserveWriteDuration(ClusterB, now.Sub(startB).Seconds())
+	if startBNano := startB.Load(); startBNano > 0 {
+		c.config.Metrics.ObserveWriteDuration(ClusterB, float64(nowNano-startBNano)/float64(time.Second))
+	}
 	if errB != nil {
 		c.config.Metrics.IncWriteError(ClusterB)
 	}
