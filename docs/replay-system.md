@@ -2,6 +2,38 @@
 
 The Helix Replay System provides **asynchronous reconciliation** for partial write failures in dual-cluster deployments. When a write succeeds on one cluster but fails on another, the failed write is enqueued for later replay.
 
+## Quick Reference: Replayer vs ReplayWorker
+
+| Component | Purpose | Config Option | Required? |
+|-----------|---------|---------------|-----------|
+| **Replayer** | **Queue** - stores failed writes | `WithReplayer()` | Yes, for production |
+| **ReplayWorker** | **Consumer** - processes the queue | `WithReplayWorker()` | Optional* |
+
+**In simple terms:**
+- `Replayer` = "Where do I put failed writes?" (the queue)
+- `ReplayWorker` = "Who processes the queue?" (the consumer)
+
+**\*When to use each:**
+
+```go
+// Development: Both in same process (simple)
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReplayer(replayer),       // Queue
+    helix.WithReplayWorker(worker),     // Consumer (auto-starts)
+)
+
+// Production microservices: Separate processes
+// App instances: Only the queue
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReplayer(replayer),       // Queue only
+    // No worker - handled by dedicated replay service
+)
+```
+
+See [Deployment Patterns](#deployment-patterns) for detailed examples.
+
+---
+
 ## Overview
 
 ```mermaid
