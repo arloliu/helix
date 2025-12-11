@@ -10,28 +10,22 @@ import (
 )
 
 func TestWorkerBackoffCalculation(t *testing.T) {
-	replayer := NewMemoryReplayer(WithQueueCapacity(10))
-	defer replayer.Close()
-
-	worker := NewMemoryWorker(replayer, nil,
-		WithRetryDelay(100*time.Millisecond),
-		WithMaxRetryDelay(1*time.Second),
-	)
-
 	tests := []struct {
-		attempt  int
-		expected time.Duration
+		attempt    int
+		retryDelay time.Duration
+		maxDelay   time.Duration
+		expected   time.Duration
 	}{
-		{1, 100 * time.Millisecond},
-		{2, 200 * time.Millisecond},
-		{3, 400 * time.Millisecond},
-		{4, 800 * time.Millisecond},
-		{5, 1 * time.Second}, // Capped at max
-		{10, 1 * time.Second},
+		{1, 100 * time.Millisecond, 1 * time.Second, 100 * time.Millisecond},
+		{2, 100 * time.Millisecond, 1 * time.Second, 200 * time.Millisecond},
+		{3, 100 * time.Millisecond, 1 * time.Second, 400 * time.Millisecond},
+		{4, 100 * time.Millisecond, 1 * time.Second, 800 * time.Millisecond},
+		{5, 100 * time.Millisecond, 1 * time.Second, 1 * time.Second}, // Capped at max
+		{10, 100 * time.Millisecond, 1 * time.Second, 1 * time.Second},
 	}
 
 	for _, tt := range tests {
-		delay := worker.calculateBackoff(tt.attempt)
+		delay := calculateBackoff(tt.attempt, tt.retryDelay, tt.maxDelay)
 		assert.Equal(t, tt.expected, delay, "attempt %d", tt.attempt)
 	}
 }

@@ -209,26 +209,39 @@ func WithWorkerClusterNames(names types.ClusterNames) WorkerOption {
 
 // Worker processes replay messages from a queue and re-executes failed writes.
 //
-// The worker runs one goroutine per cluster to allow parallel processing.
-// It supports both MemoryReplayer and NATSReplayer through the Replayer interface.
+// The worker uses a backend strategy pattern to support different queue implementations.
+// It manages the lifecycle (Start/Stop) while delegating queue-specific processing to the backend.
 type Worker struct {
 	config  WorkerConfig
 	execute ExecuteFunc
+	backend workerBackend
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 	running atomic.Bool
+}
 
-	// For MemoryReplayer
-	memoryReplayer *MemoryReplayer
+// workerBackend abstracts queue-specific processing logic.
+// This interface is unexported - users interact with Worker via NewMemoryWorker/NewNATSWorker.
+type workerBackend interface {
+	// start begins processing for a specific cluster.
+	// For memory backend, cluster parameter is ignored (single worker processes all).
+	// For NATS backend, one goroutine per cluster is started.
+	// Must call wg.Done() when finished.
+	start(cluster types.ClusterID)
 
-	// For NATSReplayer
-	natsReplayer *NATSReplayer
+	// numWorkers returns how many goroutines should be spawned.
+	// Memory: 1, NATS: 2 (one per cluster)
+	numWorkers() int
+
+	// backendType returns a string identifier for debugging/logging.
+	backendType() string
 }
 
 // Start begins processing replay messages.
 //
-// For MemoryReplayer: Starts a single worker goroutine that processes all messages.
-// For NATSReplayer: Starts two goroutines, one per cluster, for parallel processing.
+// The number of worker goroutines depends on the backend:
+//   - MemoryBackend: Single goroutine processing all messages
+//   - NATSBackend: Two goroutines, one per cluster for parallel processing
 //
 // Returns:
 //   - error: ErrWorkerAlreadyRunning if already started
@@ -237,15 +250,16 @@ func (w *Worker) Start() error {
 		return errors.New("helix: worker already running")
 	}
 
-	if w.natsReplayer != nil {
-		// Start one worker per cluster for NATS
-		w.wg.Add(2)
-		go w.processNATSCluster(types.ClusterA)
-		go w.processNATSCluster(types.ClusterB)
-	} else if w.memoryReplayer != nil {
-		// Single worker for memory replayer
-		w.wg.Add(1)
-		go w.processMemory()
+	numWorkers := w.backend.numWorkers()
+	w.wg.Add(numWorkers)
+
+	if numWorkers == 1 {
+		// Single worker (memory backend)
+		go w.backend.start(types.ClusterA) // cluster param ignored for memory
+	} else {
+		// One worker per cluster (NATS backend)
+		go w.backend.start(types.ClusterA)
+		go w.backend.start(types.ClusterB)
 	}
 
 	return nil
@@ -280,15 +294,25 @@ func (w *Worker) SetClusterNames(names types.ClusterNames) {
 	w.config.ClusterNames = names
 }
 
-// executeOnce executes a single replay attempt.
-func (w *Worker) executeOnce(payload types.ReplayPayload) error {
-	ctx, cancel := context.WithTimeout(context.Background(), w.config.ExecuteTimeout)
-	defer cancel()
-
-	return w.execute(ctx, payload)
+// BackendType returns the type of backend being used ("memory" or "nats").
+// Useful for debugging and logging.
+func (w *Worker) BackendType() string {
+	return w.backend.backendType()
 }
 
-// clusterName returns the display name for the given cluster.
-func (w *Worker) clusterName(cluster types.ClusterID) string {
-	return w.config.ClusterNames.Name(cluster)
+// calculateBackoff calculates the backoff delay with exponential increase.
+// This is a standalone function used by memory backend for retry logic.
+func calculateBackoff(attempt int, retryDelay, maxRetryDelay time.Duration) time.Duration {
+	delay := retryDelay
+
+	// Exponential backoff: delay * 2^(attempt-1)
+	for i := 1; i < attempt && delay < maxRetryDelay; i++ {
+		delay *= 2
+	}
+
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
+
+	return delay
 }
