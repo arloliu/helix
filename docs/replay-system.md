@@ -499,6 +499,9 @@ func main() {
 | `WithMaxBytes(n)` | 1 GB | Maximum stream size |
 | `WithReplicas(n)` | 1 | Replication factor (use 3 for production) |
 | `WithPublishTimeout(d)` | 5s | Publish timeout |
+| `WithMaxAckPending(n)` | 1000 | Max unacked messages per consumer (backpressure) |
+| `WithMaxRequestBatch(n)` | 100 | Max batch size per pull request |
+| `WithAckWait(d)` | 30s | Time before unacked message is redelivered |
 
 ### Worker Options
 

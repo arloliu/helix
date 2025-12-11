@@ -44,6 +44,24 @@ type NATSReplayerConfig struct {
 	// PublishTimeout is the timeout for publishing messages.
 	// Default: 5 seconds
 	PublishTimeout time.Duration
+
+	// MaxAckPending is the maximum number of outstanding unacknowledged messages
+	// per consumer. Once reached, the server suspends message delivery until
+	// acknowledgments are received. This provides backpressure to prevent
+	// slow consumers from causing unbounded memory growth.
+	// Default: 1000
+	MaxAckPending int
+
+	// MaxRequestBatch is the maximum batch size for a single pull request.
+	// This limits memory consumption per fetch operation.
+	// Default: 100
+	MaxRequestBatch int
+
+	// AckWait is how long the server waits for acknowledgment before
+	// redelivering a message. Should be longer than your expected
+	// processing time.
+	// Default: 30 seconds
+	AckWait time.Duration
 }
 
 // DefaultNATSReplayerConfig returns the default configuration.
@@ -52,13 +70,16 @@ type NATSReplayerConfig struct {
 //   - NATSReplayerConfig: Default configuration with reasonable defaults
 func DefaultNATSReplayerConfig() NATSReplayerConfig {
 	return NATSReplayerConfig{
-		StreamName:     "helix-replay",
-		SubjectPrefix:  "helix.replay",
-		MaxAge:         24 * time.Hour,
-		MaxMsgs:        1_000_000,
-		MaxBytes:       1 << 30, // 1GB
-		Replicas:       1,
-		PublishTimeout: 5 * time.Second,
+		StreamName:      "helix-replay",
+		SubjectPrefix:   "helix.replay",
+		MaxAge:          24 * time.Hour,
+		MaxMsgs:         1_000_000,
+		MaxBytes:        1 << 30, // 1GB
+		Replicas:        1,
+		PublishTimeout:  5 * time.Second,
+		MaxAckPending:   1000,
+		MaxRequestBatch: 100,
+		AckWait:         30 * time.Second,
 	}
 }
 
@@ -165,6 +186,56 @@ func WithReplicas(n int) NATSReplayerOption {
 func WithPublishTimeout(d time.Duration) NATSReplayerOption {
 	return func(c *NATSReplayerConfig) {
 		c.PublishTimeout = d
+	}
+}
+
+// WithMaxAckPending sets the maximum number of unacknowledged messages per consumer.
+//
+// This provides backpressure to prevent slow consumers from causing unbounded
+// memory growth on the NATS server. Once the limit is reached, message delivery
+// is suspended until acknowledgments are received.
+//
+// Parameters:
+//   - n: Maximum pending acknowledgments (default: 1000)
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithMaxAckPending(n int) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.MaxAckPending = n
+	}
+}
+
+// WithMaxRequestBatch sets the maximum batch size for pull requests.
+//
+// This limits memory consumption per fetch operation on both the client
+// and server side.
+//
+// Parameters:
+//   - n: Maximum batch size (default: 100)
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithMaxRequestBatch(n int) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.MaxRequestBatch = n
+	}
+}
+
+// WithAckWait sets how long the server waits for acknowledgment before redelivery.
+//
+// This should be set longer than your expected message processing time to avoid
+// unnecessary redeliveries. If processing takes longer than AckWait, the message
+// will be redelivered even if still being processed.
+//
+// Parameters:
+//   - d: Acknowledgment wait duration (default: 30 seconds)
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithAckWait(d time.Duration) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.AckWait = d
 	}
 }
 
@@ -332,12 +403,15 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 	filterSubject := fmt.Sprintf("%s.*.%s", n.config.SubjectPrefix, cluster)
 
 	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:          consumerName,
-		Durable:       consumerName,
-		FilterSubject: filterSubject,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		MaxDeliver:    5, // Retry up to 5 times
+		Name:            consumerName,
+		Durable:         consumerName,
+		FilterSubject:   filterSubject,
+		AckPolicy:       jetstream.AckExplicitPolicy,
+		DeliverPolicy:   jetstream.DeliverAllPolicy,
+		MaxDeliver:      5, // Retry up to 5 times
+		MaxAckPending:   n.config.MaxAckPending,
+		MaxRequestBatch: n.config.MaxRequestBatch,
+		AckWait:         n.config.AckWait,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("helix: failed to create consumer: %w", err)
@@ -453,12 +527,15 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 	filterSubject := fmt.Sprintf("%s.%s.%s", n.config.SubjectPrefix, priorityStr, cluster)
 
 	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:          consumerName,
-		Durable:       consumerName,
-		FilterSubject: filterSubject,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		MaxDeliver:    5, // Retry up to 5 times
+		Name:            consumerName,
+		Durable:         consumerName,
+		FilterSubject:   filterSubject,
+		AckPolicy:       jetstream.AckExplicitPolicy,
+		DeliverPolicy:   jetstream.DeliverAllPolicy,
+		MaxDeliver:      5, // Retry up to 5 times
+		MaxAckPending:   n.config.MaxAckPending,
+		MaxRequestBatch: n.config.MaxRequestBatch,
+		AckWait:         n.config.AckWait,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("helix: failed to create consumer: %w", err)
