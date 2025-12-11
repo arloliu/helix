@@ -110,18 +110,17 @@ flowchart LR
     end
 ```
 
-**Code Example:**
+**Code Example (Recommended - using DefaultExecuteFunc):**
 
 ```go
 package main
 
 import (
-    "context"
     "log"
+    "time"
 
     "github.com/arloliu/helix"
     "github.com/arloliu/helix/replay"
-    "github.com/arloliu/helix/types"
 )
 
 func main() {
@@ -134,45 +133,23 @@ func main() {
         replay.WithQueueCapacity(10000),
     )
 
-    // Create execute function for worker
-    executeFunc := func(ctx context.Context, payload types.ReplayPayload) error {
-        // Determine target session
-        var session cql.Session
-        if payload.TargetCluster == types.ClusterA {
-            session = sessionA
-        } else {
-            session = sessionB
-        }
-
-        // Execute the replay
-        if payload.IsBatch {
-            batch := session.Batch(payload.BatchType)
-            for _, stmt := range payload.BatchStatements {
-                batch = batch.Query(stmt.Query, stmt.Args...)
-            }
-            batch = batch.WithTimestamp(payload.Timestamp)
-            return batch.Exec()
-        }
-
-        query := session.Query(payload.Query, payload.Args...)
-        query = query.WithTimestamp(payload.Timestamp)
-        return query.Exec()
-    }
-
-    // Create worker
-    worker := replay.NewMemoryWorker(replayer, executeFunc,
-        replay.WithPollInterval(100*time.Millisecond),
-        replay.WithExecuteTimeout(30*time.Second),
-    )
-
-    // Create client with both replayer and worker
+    // Create client first (needed for DefaultExecuteFunc)
     client, err := helix.NewCQLClient(sessionA, sessionB,
         helix.WithReplayer(replayer),
-        helix.WithReplayWorker(worker), // Auto-starts and stops with client
     )
     if err != nil {
         log.Fatal(err)
     }
+
+    // Create worker using DefaultExecuteFunc - automatically routes
+    // replays to the correct cluster and preserves timestamps
+    worker := replay.NewMemoryWorker(replayer, client.DefaultExecuteFunc(),
+        replay.WithPollInterval(100*time.Millisecond),
+        replay.WithExecuteTimeout(30*time.Second),
+    )
+
+    // Attach worker to client for automatic lifecycle management
+    client.SetReplayWorker(worker)
     defer client.Close() // Stops worker and closes sessions
 
     // Use client normally
@@ -218,7 +195,6 @@ flowchart TB
 package main
 
 import (
-    "context"
     "log"
     "time"
 
@@ -261,11 +237,16 @@ func main() {
     }
     defer replayer.Close()
 
-    // Create execute function
-    executeFunc := createExecuteFunc(sessionA, sessionB)
+    // Create client first (needed for DefaultExecuteFunc)
+    client, err := helix.NewCQLClient(sessionA, sessionB,
+        helix.WithReplayer(replayer),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    // Create NATS worker
-    worker := replay.NewNATSWorker(replayer, executeFunc,
+    // Create NATS worker using DefaultExecuteFunc
+    worker := replay.NewNATSWorker(replayer, client.DefaultExecuteFunc(),
         replay.WithBatchSize(100),
         replay.WithPollInterval(500*time.Millisecond),
         replay.WithExecuteTimeout(30*time.Second),
@@ -279,41 +260,11 @@ func main() {
         }),
     )
 
-    // Create client
-    client, err := helix.NewCQLClient(sessionA, sessionB,
-        helix.WithReplayer(replayer),
-        helix.WithReplayWorker(worker),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
+    // Attach worker to client
+    client.SetReplayWorker(worker)
     defer client.Close()
 
     // Use client...
-}
-
-func createExecuteFunc(sessionA, sessionB cql.Session) replay.ExecuteFunc {
-    return func(ctx context.Context, payload types.ReplayPayload) error {
-        var session cql.Session
-        if payload.TargetCluster == types.ClusterA {
-            session = sessionA
-        } else {
-            session = sessionB
-        }
-
-        if payload.IsBatch {
-            batch := session.Batch(payload.BatchType)
-            for _, stmt := range payload.BatchStatements {
-                batch = batch.Query(stmt.Query, stmt.Args...)
-            }
-            batch = batch.WithTimestamp(payload.Timestamp)
-            return batch.Exec()
-        }
-
-        query := session.Query(payload.Query, payload.Args...)
-        query = query.WithTimestamp(payload.Timestamp)
-        return query.Exec()
-    }
 }
 ```
 
@@ -325,6 +276,26 @@ func createExecuteFunc(sessionA, sessionB cql.Session) replay.ExecuteFunc {
 **Limitations:**
 - Worker lifecycle tied to application
 - Limited horizontal scaling
+
+---
+
+### Using DefaultExecuteFunc
+
+The `client.DefaultExecuteFunc()` method provides a convenient way to create the execute function
+for replay workers. It automatically handles:
+
+- **Routing**: Directs replays to the correct cluster (A or B) based on `payload.TargetCluster`
+- **Batch Operations**: Properly handles batch payloads with correct `BatchType`
+- **Timestamp Preservation**: Applies the original write timestamp for idempotency
+- **Context Handling**: Respects context cancellation and timeouts
+
+**When to use DefaultExecuteFunc:**
+- All patterns (embedded worker or dedicated service)
+- When you want the simplest setup with automatic routing
+
+**When NOT to use DefaultExecuteFunc:**
+- When you need custom logic (transformations, filtering, custom metrics per query)
+- When you want to use raw `gocql.Session` without helix adapters
 
 ---
 
@@ -409,16 +380,16 @@ func main() {
 package main
 
 import (
-    "context"
     "log"
     "os"
     "os/signal"
     "syscall"
+    "time"
 
-    "github.com/gocql/gocql"
     "github.com/nats-io/nats.go"
     "github.com/nats-io/nats.go/jetstream"
 
+    "github.com/arloliu/helix"
     "github.com/arloliu/helix/replay"
     "github.com/arloliu/helix/types"
 )
@@ -436,8 +407,6 @@ func main() {
     // Create sessions to both clusters
     sessionA := createSession("cluster-a.example.com")
     sessionB := createSession("cluster-b.example.com")
-    defer sessionA.Close()
-    defer sessionB.Close()
 
     // Create replayer (same config as application)
     replayer, err := replay.NewNATSReplayer(js,
@@ -448,31 +417,16 @@ func main() {
     }
     defer replayer.Close()
 
-    // Create execute function
-    executeFunc := func(ctx context.Context, payload types.ReplayPayload) error {
-        var session *gocql.Session
-        if payload.TargetCluster == types.ClusterA {
-            session = sessionA
-        } else {
-            session = sessionB
-        }
-
-        if payload.IsBatch {
-            batch := session.NewBatch(gocql.BatchType(payload.BatchType))
-            for _, stmt := range payload.BatchStatements {
-                batch.Query(stmt.Query, stmt.Args...)
-            }
-            batch.SetTimestamp(payload.Timestamp)
-            return session.ExecuteBatch(batch)
-        }
-
-        query := session.Query(payload.Query, payload.Args...)
-        query.SetTimestamp(payload.Timestamp)
-        return query.Exec()
+    // Create a CQLClient to get DefaultExecuteFunc
+    // Note: This client is only used for replay execution, not for writes
+    client, err := helix.NewCQLClient(sessionA, sessionB)
+    if err != nil {
+        log.Fatal(err)
     }
+    defer client.Close()
 
-    // Create worker with callbacks for observability
-    worker := replay.NewNATSWorker(replayer, executeFunc,
+    // Create worker with DefaultExecuteFunc and callbacks for observability
+    worker := replay.NewNATSWorker(replayer, client.DefaultExecuteFunc(),
         replay.WithBatchSize(100),
         replay.WithPollInterval(500*time.Millisecond),
         replay.WithOnSuccess(func(p types.ReplayPayload) {
@@ -530,7 +484,9 @@ func main() {
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithQueueCapacity(n)` | 10,000 | Maximum pending messages |
+| `WithQueueCapacity(n)` | 10,000 | Total capacity shared across high/low priority queues |
+| `WithMemoryHighPriorityRatio(n)` | 10 | Process N high-priority items before 1 low-priority |
+| `WithMemoryStrictPriority(bool)` | false | Drain all high-priority before any low-priority |
 
 ### NATSReplayer Options
 
@@ -553,6 +509,8 @@ func main() {
 | `WithRetryDelay(d)` | 100ms | Initial retry delay |
 | `WithMaxRetryDelay(d)` | 30s | Maximum retry delay |
 | `WithExecuteTimeout(d)` | 30s | Timeout per replay execution |
+| `WithHighPriorityRatio(n)` | 10 | Process N high-priority batches before 1 low-priority |
+| `WithStrictPriority(bool)` | false | Drain all high-priority before any low-priority |
 | `WithWorkerMetrics(m)` | nil | Metrics collector for statistics |
 | `WithWorkerLogger(l)` | nil | Structured logger for events |
 | `WithWorkerClusterNames(n)` | A/B | Custom cluster display names |
@@ -630,17 +588,58 @@ replay.NewNATSWorker(replayer, executeFunc,
 
 ### 5. Use Priority Levels
 
-Helix supports two priority levels:
+Helix supports two priority levels for replay operations:
 
 ```go
 // High priority (default) - critical writes, processed first
-payload.Priority = types.PriorityHigh
+client.Query("INSERT INTO orders ...").
+    WithPriority(helix.PriorityHigh).
+    Exec()
 
 // Low priority - best-effort writes, processed after high priority
-payload.Priority = types.PriorityLow
+client.Query("INSERT INTO analytics ...").
+    WithPriority(helix.PriorityLow).
+    Exec()
+
+// Batches also support priority
+client.Batch(helix.LoggedBatch).
+    Query("INSERT ...").
+    WithPriority(helix.PriorityLow).
+    Exec()
 ```
 
-The NATS replayer uses separate subjects per priority, allowing you to prioritize processing.
+**Priority Processing Modes:**
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Ratio-based (default)** | Process N high-priority batches, then 1 low-priority | Fair scheduling with priority preference |
+| **Strict priority** | Drain all high-priority before any low-priority | Absolute priority (may starve low) |
+
+**Configure worker priority behavior:**
+
+```go
+// Default: 10:1 ratio (process 10 high-priority batches, then 1 low-priority)
+worker := replay.NewMemoryWorker(replayer, executeFunc,
+    replay.WithHighPriorityRatio(10),   // Default
+    replay.WithStrictPriority(false),   // Default
+)
+
+// Strict priority mode: high must be empty before processing low
+worker := replay.NewMemoryWorker(replayer, executeFunc,
+    replay.WithStrictPriority(true),
+)
+
+// Equal priority (1:1 ratio)
+worker := replay.NewMemoryWorker(replayer, executeFunc,
+    replay.WithHighPriorityRatio(0),
+)
+```
+
+**Starvation Prevention:**
+
+The default ratio-based scheduling ensures low-priority messages are eventually processed even under continuous high-priority load. For every 10 high-priority batches processed, 1 low-priority batch is processed.
+
+The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `helix.replay.low.B`), enabling independent monitoring and processing.
 
 ---
 

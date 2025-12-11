@@ -18,11 +18,11 @@ type ExecuteFunc func(ctx context.Context, payload types.ReplayPayload) error
 // WorkerConfig configures the replay worker.
 type WorkerConfig struct {
 	// BatchSize is the number of messages to fetch per dequeue operation.
-	// Default: 10
+	// Default: 100
 	BatchSize int
 
 	// PollInterval is the interval between dequeue attempts when the queue is empty.
-	// Default: 1 second
+	// Default: 100ms
 	PollInterval time.Duration
 
 	// RetryDelay is the initial delay before retrying a failed replay.
@@ -37,6 +37,20 @@ type WorkerConfig struct {
 	// ExecuteTimeout is the timeout for each replay execution.
 	// Default: 30 seconds
 	ExecuteTimeout time.Duration
+
+	// HighPriorityRatio controls the ratio of high-priority to low-priority message processing.
+	// For every N high-priority batches processed, 1 low-priority batch is processed.
+	// This prevents low-priority starvation while ensuring high-priority messages are preferred.
+	// Set to 0 for equal priority processing (1:1 ratio).
+	// Default: 10 (10:1 ratio - process 10 high-priority batches, then 1 low-priority)
+	HighPriorityRatio int
+
+	// StrictPriority when true, drains all high-priority messages before processing any
+	// low-priority messages. This provides absolute priority but may cause low-priority
+	// starvation under continuous high-priority load.
+	// When false (default), uses HighPriorityRatio for fair scheduling.
+	// Default: false
+	StrictPriority bool
 
 	// Metrics is the metrics collector for recording replay statistics.
 	// If nil, no metrics are recorded.
@@ -65,12 +79,14 @@ type WorkerConfig struct {
 // DefaultWorkerConfig returns the default worker configuration.
 func DefaultWorkerConfig() WorkerConfig {
 	return WorkerConfig{
-		BatchSize:      100,
-		PollInterval:   100 * time.Millisecond,
-		RetryDelay:     100 * time.Millisecond,
-		MaxRetryDelay:  30 * time.Second,
-		ExecuteTimeout: 30 * time.Second,
-		ClusterNames:   types.DefaultClusterNames(),
+		BatchSize:         100,
+		PollInterval:      100 * time.Millisecond,
+		RetryDelay:        100 * time.Millisecond,
+		MaxRetryDelay:     30 * time.Second,
+		ExecuteTimeout:    30 * time.Second,
+		HighPriorityRatio: 10,
+		StrictPriority:    false,
+		ClusterNames:      types.DefaultClusterNames(),
 	}
 }
 
@@ -109,6 +125,43 @@ func WithMaxRetryDelay(d time.Duration) WorkerOption {
 func WithExecuteTimeout(d time.Duration) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.ExecuteTimeout = d
+	}
+}
+
+// WithHighPriorityRatio sets the ratio of high-priority to low-priority processing.
+//
+// For every N high-priority batches processed, 1 low-priority batch is processed.
+// This prevents low-priority starvation while ensuring high-priority messages are preferred.
+// Set to 0 for equal priority processing (1:1 ratio).
+// Default: 10 (10:1 ratio)
+//
+// Parameters:
+//   - n: Number of high-priority batches to process before 1 low-priority batch
+//
+// Returns:
+//   - WorkerOption: Configuration option
+func WithHighPriorityRatio(n int) WorkerOption {
+	return func(c *WorkerConfig) {
+		c.HighPriorityRatio = n
+	}
+}
+
+// WithStrictPriority enables strict priority mode.
+//
+// When enabled, all high-priority messages are drained before processing any
+// low-priority messages. This provides absolute priority but may cause low-priority
+// starvation under continuous high-priority load.
+//
+// When disabled (default), uses HighPriorityRatio for fair scheduling.
+//
+// Parameters:
+//   - strict: true to enable strict priority mode
+//
+// Returns:
+//   - WorkerOption: Configuration option
+func WithStrictPriority(strict bool) WorkerOption {
+	return func(c *WorkerConfig) {
+		c.StrictPriority = strict
 	}
 }
 

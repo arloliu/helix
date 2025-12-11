@@ -875,6 +875,7 @@ type cqlQuery struct {
 	pageSize          *int
 	pageState         []byte
 	timestamp         *int64
+	priority          *PriorityLevel
 }
 
 func (q *cqlQuery) WithContext(ctx context.Context) Query {
@@ -915,6 +916,11 @@ func (q *cqlQuery) WithTimestamp(ts int64) Query {
 	return q
 }
 
+func (q *cqlQuery) WithPriority(p PriorityLevel) Query {
+	q.priority = &p
+	return q
+}
+
 func (q *cqlQuery) getContext() context.Context {
 	if q.ctx != nil {
 		return q.ctx
@@ -927,6 +933,13 @@ func (q *cqlQuery) getTimestamp() int64 {
 		return *q.timestamp
 	}
 	return q.client.config.TimestampProvider()
+}
+
+func (q *cqlQuery) getPriority() PriorityLevel {
+	if q.priority != nil {
+		return *q.priority
+	}
+	return PriorityHigh
 }
 
 func (q *cqlQuery) applyConfig(query cql.Query) cql.Query {
@@ -957,7 +970,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 		statement: q.statement,
 		args:      q.values,
 		timestamp: ts,
-		priority:  PriorityHigh, // Default to high priority for individual queries
+		priority:  q.getPriority(),
 	}
 
 	return q.client.executeWriteWithReplay(ctx, wc, func(session cql.Session) error {
@@ -1088,6 +1101,7 @@ type cqlBatch struct {
 	consistency       *Consistency
 	serialConsistency *Consistency
 	timestamp         *int64
+	priority          *PriorityLevel
 }
 
 func (b *cqlBatch) Query(stmt string, args ...any) Batch {
@@ -1130,6 +1144,11 @@ func (b *cqlBatch) WithTimestamp(ts int64) Batch {
 	return b
 }
 
+func (b *cqlBatch) WithPriority(p PriorityLevel) Batch {
+	b.priority = &p
+	return b
+}
+
 func (b *cqlBatch) getContext() context.Context {
 	if b.ctx != nil {
 		return b.ctx
@@ -1144,6 +1163,13 @@ func (b *cqlBatch) getTimestamp() int64 {
 	return b.client.config.TimestampProvider()
 }
 
+func (b *cqlBatch) getPriority() PriorityLevel {
+	if b.priority != nil {
+		return *b.priority
+	}
+	return PriorityHigh
+}
+
 func (b *cqlBatch) Exec() error {
 	return b.ExecContext(b.getContext())
 }
@@ -1155,7 +1181,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 		statement:    "", // Empty for batch
 		args:         nil,
 		timestamp:    ts,
-		priority:     PriorityHigh,
+		priority:     b.getPriority(),
 		isBatch:      true,
 		batchType:    b.kind,
 		batchEntries: b.entries, // Pass directly, convert lazily if needed for replay

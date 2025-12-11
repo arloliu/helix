@@ -166,6 +166,19 @@ type Query interface {
 	//   - Query: The same query for chaining
 	WithTimestamp(ts int64) Query
 
+	// WithPriority sets the replay priority level for this write operation.
+	//
+	// Priority affects replay processing order when a write fails on one cluster.
+	// High priority writes are processed before low priority writes.
+	// If not set, defaults to PriorityHigh.
+	//
+	// Parameters:
+	//   - p: Priority level (PriorityHigh or PriorityLow)
+	//
+	// Returns:
+	//   - Query: The same query for chaining
+	WithPriority(p PriorityLevel) Query
+
 	// SerialConsistency sets the consistency level for the serial phase of CAS operations.
 	//
 	// This only applies to conditional updates (INSERT/UPDATE with IF clause).
@@ -357,6 +370,19 @@ type Batch interface {
 	// Returns:
 	//   - Batch: The same batch for chaining
 	WithTimestamp(ts int64) Batch
+
+	// WithPriority sets the replay priority level for this batch operation.
+	//
+	// Priority affects replay processing order when a write fails on one cluster.
+	// High priority writes are processed before low priority writes.
+	// If not set, defaults to PriorityHigh.
+	//
+	// Parameters:
+	//   - p: Priority level (PriorityHigh or PriorityLow)
+	//
+	// Returns:
+	//   - Batch: The same batch for chaining
+	WithPriority(p PriorityLevel) Batch
 
 	// SerialConsistency sets the consistency level for the serial phase of CAS operations.
 	//

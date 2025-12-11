@@ -415,6 +415,127 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 	return result, nil
 }
 
+// DequeueByPriority retrieves a batch of replay messages for a specific priority.
+//
+// This creates a pull consumer for the specific priority/cluster combination
+// and fetches messages. The returned messages must be acknowledged after
+// successful processing using the Ack method on each message.
+//
+// Use this method for priority-aware processing where you want to control
+// the order of high vs low priority message processing.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - cluster: Target cluster to get messages for (ClusterA or ClusterB)
+//   - priority: Priority level to fetch (PriorityHigh or PriorityLow)
+//   - batchSize: Maximum number of messages to fetch
+//
+// Returns:
+//   - []ReplayMessage: Batch of messages to process
+//   - error: Error if fetch fails
+func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.ClusterID, priority types.PriorityLevel, batchSize int) ([]ReplayMessage, error) {
+	n.mu.RLock()
+	if n.closed {
+		n.mu.RUnlock()
+
+		return nil, types.ErrSessionClosed
+	}
+	n.mu.RUnlock()
+
+	// Build priority-specific subject
+	priorityStr := "low"
+	if priority == types.PriorityHigh {
+		priorityStr = "high"
+	}
+
+	// Create a consumer for this specific priority/cluster combination
+	consumerName := fmt.Sprintf("helix-worker-%s-%s", priorityStr, cluster)
+	filterSubject := fmt.Sprintf("%s.%s.%s", n.config.SubjectPrefix, priorityStr, cluster)
+
+	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Name:          consumerName,
+		Durable:       consumerName,
+		FilterSubject: filterSubject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		MaxDeliver:    5, // Retry up to 5 times
+	})
+	if err != nil {
+		return nil, fmt.Errorf("helix: failed to create consumer: %w", err)
+	}
+
+	// Fetch messages
+	msgs, err := consumer.Fetch(batchSize, jetstream.FetchMaxWait(time.Second))
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, jetstream.ErrNoMessages) {
+			return nil, nil // No messages available
+		}
+
+		return nil, fmt.Errorf("helix: failed to fetch messages: %w", err)
+	}
+
+	result := make([]ReplayMessage, 0, batchSize)
+	for msg := range msgs.Messages() {
+		var natsMsg natsReplayMessage
+		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
+			// Skip malformed messages but nak them for retry
+			_ = msg.Nak()
+
+			continue
+		}
+
+		// Decode Args from msgp.Raw
+		args, err := decodeArgs(natsMsg.Args)
+		if err != nil {
+			_ = msg.Nak()
+
+			continue
+		}
+
+		// Decode batch statements if this is a batch
+		var batchStmts []types.BatchStatement
+		if natsMsg.IsBatch {
+			batchStmts = make([]types.BatchStatement, len(natsMsg.BatchStatements))
+			for i, stmt := range natsMsg.BatchStatements {
+				stmtArgs, err := decodeArgs(stmt.Args)
+				if err != nil {
+					_ = msg.Nak()
+
+					continue
+				}
+				batchStmts[i] = types.BatchStatement{
+					Query: stmt.Query,
+					Args:  stmtArgs,
+				}
+			}
+		}
+
+		result = append(result, ReplayMessage{
+			Payload: types.ReplayPayload{
+				TargetCluster:   types.ClusterID(natsMsg.TargetCluster),
+				Query:           natsMsg.Query,
+				Args:            args,
+				Timestamp:       natsMsg.Timestamp,
+				Priority:        types.PriorityLevel(natsMsg.Priority),
+				IsBatch:         natsMsg.IsBatch,
+				BatchType:       types.BatchType(natsMsg.BatchType),
+				BatchStatements: batchStmts,
+			},
+			ackFunc: msg.Ack,
+			nakFunc: msg.Nak,
+		})
+	}
+
+	// Check for errors during iteration
+	if err := msgs.Error(); err != nil {
+		if !errors.Is(err, jetstream.ErrNoMessages) {
+			return result, fmt.Errorf("helix: error during message fetch: %w", err)
+		}
+	}
+
+	return result, nil
+}
+
 // encodeArgs encodes []any arguments to msgp.Raw.
 //
 // msgp doesn't directly support []any, so we use msgp's AppendIntf which

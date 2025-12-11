@@ -570,8 +570,10 @@ func TestMemoryReplayerDrainAllUnderLoad(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
+	// Capacity is split between high and low priority queues (half each)
+	// We need 1000 capacity for high priority messages, so total capacity = 2000
 	replayer := replay.NewMemoryReplayer(
-		replay.WithQueueCapacity(1000),
+		replay.WithQueueCapacity(2000),
 	)
 
 	ctx := t.Context()

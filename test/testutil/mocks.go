@@ -242,6 +242,11 @@ func (m *MockQuery) SerialConsistency(_ helix.Consistency) helix.Query {
 	return m
 }
 
+// WithPriority sets the replay priority level for this query.
+func (m *MockQuery) WithPriority(_ helix.PriorityLevel) helix.Query {
+	return m
+}
+
 // Exec executes the query.
 func (m *MockQuery) Exec() error {
 	m.mu.RLock()
@@ -470,6 +475,11 @@ func (m *MockBatch) WithTimestamp(ts int64) helix.Batch {
 
 // SerialConsistency sets the serial consistency level for CAS operations.
 func (m *MockBatch) SerialConsistency(_ helix.Consistency) helix.Batch {
+	return m
+}
+
+// WithPriority sets the replay priority level for this batch.
+func (m *MockBatch) WithPriority(_ helix.PriorityLevel) helix.Batch {
 	return m
 }
 
