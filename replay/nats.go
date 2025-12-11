@@ -62,6 +62,12 @@ type NATSReplayerConfig struct {
 	// processing time.
 	// Default: 30 seconds
 	AckWait time.Duration
+
+	// MaxDeliver is the maximum number of delivery attempts for a message.
+	// After this many failed attempts, the message is dropped by NATS.
+	// The OnDrop callback will be called when this occurs.
+	// Default: 5
+	MaxDeliver int
 }
 
 // DefaultNATSReplayerConfig returns the default configuration.
@@ -80,6 +86,7 @@ func DefaultNATSReplayerConfig() NATSReplayerConfig {
 		MaxAckPending:   1000,
 		MaxRequestBatch: 100,
 		AckWait:         30 * time.Second,
+		MaxDeliver:      5,
 	}
 }
 
@@ -236,6 +243,22 @@ func WithMaxRequestBatch(n int) NATSReplayerOption {
 func WithAckWait(d time.Duration) NATSReplayerOption {
 	return func(c *NATSReplayerConfig) {
 		c.AckWait = d
+	}
+}
+
+// WithMaxDeliver sets the maximum number of delivery attempts for a message.
+//
+// After this many failed delivery attempts (Nak's), the message is dropped by NATS.
+// The OnDrop callback in WorkerConfig will be called when this occurs.
+//
+// Parameters:
+//   - n: Maximum delivery attempts (default: 5)
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithMaxDeliver(n int) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.MaxDeliver = n
 	}
 }
 
@@ -408,7 +431,7 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 		FilterSubject:   filterSubject,
 		AckPolicy:       jetstream.AckExplicitPolicy,
 		DeliverPolicy:   jetstream.DeliverAllPolicy,
-		MaxDeliver:      5, // Retry up to 5 times
+		MaxDeliver:      n.config.MaxDeliver,
 		MaxAckPending:   n.config.MaxAckPending,
 		MaxRequestBatch: n.config.MaxRequestBatch,
 		AckWait:         n.config.AckWait,
@@ -427,8 +450,16 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 		return nil, fmt.Errorf("helix: failed to fetch messages: %w", err)
 	}
 
+	maxDeliver := n.config.MaxDeliver
 	result := make([]ReplayMessage, 0, batchSize)
 	for msg := range msgs.Messages() {
+		// Extract delivery metadata
+		meta, metaErr := msg.Metadata()
+		var deliveryCount uint64 = 1
+		if metaErr == nil {
+			deliveryCount = meta.NumDelivered
+		}
+
 		var natsMsg natsReplayMessage
 		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
 			// Skip malformed messages but nak them for retry
@@ -474,8 +505,11 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 				BatchType:       types.BatchType(natsMsg.BatchType),
 				BatchStatements: batchStmts,
 			},
-			ackFunc: msg.Ack,
-			nakFunc: msg.Nak,
+			ackFunc:       msg.Ack,
+			nakFunc:       msg.Nak,
+			termFunc:      msg.Term,
+			DeliveryCount: deliveryCount,
+			MaxDeliver:    maxDeliver,
 		})
 	}
 
@@ -532,7 +566,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		FilterSubject:   filterSubject,
 		AckPolicy:       jetstream.AckExplicitPolicy,
 		DeliverPolicy:   jetstream.DeliverAllPolicy,
-		MaxDeliver:      5, // Retry up to 5 times
+		MaxDeliver:      n.config.MaxDeliver,
 		MaxAckPending:   n.config.MaxAckPending,
 		MaxRequestBatch: n.config.MaxRequestBatch,
 		AckWait:         n.config.AckWait,
@@ -551,8 +585,16 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		return nil, fmt.Errorf("helix: failed to fetch messages: %w", err)
 	}
 
+	maxDeliver := n.config.MaxDeliver
 	result := make([]ReplayMessage, 0, batchSize)
 	for msg := range msgs.Messages() {
+		// Extract delivery metadata
+		meta, metaErr := msg.Metadata()
+		var deliveryCount uint64 = 1
+		if metaErr == nil {
+			deliveryCount = meta.NumDelivered
+		}
+
 		var natsMsg natsReplayMessage
 		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
 			// Skip malformed messages but nak them for retry
@@ -598,8 +640,11 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 				BatchType:       types.BatchType(natsMsg.BatchType),
 				BatchStatements: batchStmts,
 			},
-			ackFunc: msg.Ack,
-			nakFunc: msg.Nak,
+			ackFunc:       msg.Ack,
+			nakFunc:       msg.Nak,
+			termFunc:      msg.Term,
+			DeliveryCount: deliveryCount,
+			MaxDeliver:    maxDeliver,
 		})
 	}
 
@@ -737,9 +782,18 @@ func decodeArgs(raw msgp.Raw) ([]any, error) {
 
 // ReplayMessage wraps a replay payload with acknowledgment functions.
 type ReplayMessage struct {
-	Payload types.ReplayPayload
-	ackFunc func() error
-	nakFunc func() error
+	Payload  types.ReplayPayload
+	ackFunc  func() error
+	nakFunc  func() error
+	termFunc func() error
+
+	// DeliveryCount is the number of times this message has been delivered.
+	// Starts at 1 for the first delivery.
+	DeliveryCount uint64
+
+	// MaxDeliver is the maximum delivery attempts configured for this consumer.
+	// When DeliveryCount equals MaxDeliver and the message is Nak'd, it will be dropped.
+	MaxDeliver int
 }
 
 // Ack acknowledges successful processing of the message.
@@ -761,6 +815,22 @@ func (m *ReplayMessage) Ack() error {
 func (m *ReplayMessage) Nak() error {
 	if m.nakFunc != nil {
 		return m.nakFunc()
+	}
+
+	return nil
+}
+
+// Term terminates the message, preventing any further redelivery.
+//
+// Use this when you want to permanently stop processing a message,
+// regardless of remaining delivery attempts. This is called automatically
+// when MaxDeliver is reached and the message execution fails.
+//
+// Returns:
+//   - error: Error if termination fails
+func (m *ReplayMessage) Term() error {
+	if m.termFunc != nil {
+		return m.termFunc()
 	}
 
 	return nil

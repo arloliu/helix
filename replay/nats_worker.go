@@ -186,16 +186,40 @@ func (w *Worker) processNATSMessages(msgs []ReplayMessage) {
 		elapsed := time.Since(start).Seconds()
 
 		if err != nil {
-			// Nak for redelivery (NATS handles retry count via MaxDeliver)
-			_ = msg.Nak()
+			// Compare using uint64 to avoid integer overflow warning
+			// MaxDeliver is always a small positive int (typically 1-10), so this is safe
+			isLastAttempt := msg.MaxDeliver > 0 && msg.DeliveryCount >= uint64(msg.MaxDeliver)
+
 			w.config.Metrics.IncReplayError(msg.Payload.TargetCluster)
 			w.config.Metrics.ObserveReplayDuration(msg.Payload.TargetCluster, elapsed)
-			w.config.Logger.Warn("replay execution failed, will retry",
-				"cluster", w.clusterName(msg.Payload.TargetCluster),
-				"error", err.Error(),
-			)
-			if w.config.OnError != nil {
-				w.config.OnError(msg.Payload, err, 1)
+
+			if isLastAttempt {
+				// This is the last attempt - message will be dropped
+				// Use Term() to explicitly terminate, preventing any redelivery
+				_ = msg.Term()
+				w.config.Metrics.IncReplayDropped(msg.Payload.TargetCluster)
+				w.config.Logger.Error("replay execution failed, max retries exceeded, message dropped",
+					"cluster", w.clusterName(msg.Payload.TargetCluster),
+					"attempt", msg.DeliveryCount,
+					"maxDeliver", msg.MaxDeliver,
+					"error", err.Error(),
+				)
+				if w.config.OnDrop != nil {
+					w.config.OnDrop(msg.Payload, err)
+				}
+			} else {
+				// Nak for redelivery
+				_ = msg.Nak()
+				w.config.Logger.Warn("replay execution failed, will retry",
+					"cluster", w.clusterName(msg.Payload.TargetCluster),
+					"attempt", msg.DeliveryCount,
+					"maxDeliver", msg.MaxDeliver,
+					"error", err.Error(),
+				)
+				if w.config.OnError != nil {
+					// Safe cast: DeliveryCount is always a small positive number (typically 1-10)
+					w.config.OnError(msg.Payload, err, int(msg.DeliveryCount)) //nolint:gosec // safe conversion for small values
+				}
 			}
 		} else {
 			// Ack on success

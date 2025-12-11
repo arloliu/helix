@@ -502,6 +502,7 @@ func main() {
 | `WithMaxAckPending(n)` | 1000 | Max unacked messages per consumer (backpressure) |
 | `WithMaxRequestBatch(n)` | 100 | Max batch size per pull request |
 | `WithAckWait(d)` | 30s | Time before unacked message is redelivered |
+| `WithMaxDeliver(n)` | 5 | Max delivery attempts before dropping message |
 
 ### Worker Options
 
