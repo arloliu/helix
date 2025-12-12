@@ -49,6 +49,23 @@ func WithClusterNames(names types.ClusterNames) Option {
 	}
 }
 
+// WithMetricsSet sets the metrics set to use.
+//
+// If provided, the collector will register metrics with this set instead of
+// creating a new one. The caller is responsible for exposing this set
+// (e.g., via metrics.WritePrometheus or a custom handler).
+//
+// Parameters:
+//   - set: The metrics set to use
+//
+// Returns:
+//   - Option: A configuration option
+func WithMetricsSet(set *metrics.Set) Option {
+	return func(c *Collector) {
+		c.set = set
+	}
+}
+
 // Collector implements types.MetricsCollector using VictoriaMetrics.
 //
 // All metrics are pre-created at initialization time for optimal performance.
@@ -126,7 +143,6 @@ type Collector struct {
 //	)
 func New(opts ...Option) *Collector {
 	c := &Collector{
-		set:          metrics.NewSet(),
 		prefix:       "helix",
 		clusterNames: types.DefaultClusterNames(),
 	}
@@ -135,8 +151,14 @@ func New(opts ...Option) *Collector {
 		opt(c)
 	}
 
+	// If no set is provided, create a new one and register it globally.
+	// If a set is provided, we assume the caller manages it.
+	if c.set == nil {
+		c.set = metrics.NewSet()
+		metrics.RegisterSet(c.set)
+	}
+
 	c.initMetrics()
-	metrics.RegisterSet(c.set)
 
 	return c
 }
@@ -206,6 +228,10 @@ func (c *Collector) initMetrics() {
 	c.drainModeEnteredB = c.set.NewCounter(fmt.Sprintf(`%s_drain_mode_entered_total{cluster="%s"}`, p, nB))
 	c.drainModeExitedA = c.set.NewCounter(fmt.Sprintf(`%s_drain_mode_exited_total{cluster="%s"}`, p, nA))
 	c.drainModeExitedB = c.set.NewCounter(fmt.Sprintf(`%s_drain_mode_exited_total{cluster="%s"}`, p, nB))
+}
+
+func (c *Collector) Set() *metrics.Set {
+	return c.set
 }
 
 // Handler returns an HTTP handler that exposes metrics in Prometheus format.
