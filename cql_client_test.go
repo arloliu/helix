@@ -73,9 +73,13 @@ type mockQuery struct {
 	consistency       *cql.Consistency
 	serialConsistency *cql.Consistency
 	timestamp         *int64
+	ctx               context.Context // Track context
 }
 
-func (q *mockQuery) WithContext(_ context.Context) cql.Query { return q }
+func (q *mockQuery) WithContext(ctx context.Context) cql.Query {
+	q.ctx = ctx
+	return q
+}
 func (q *mockQuery) Consistency(c cql.Consistency) cql.Query {
 	q.consistency = &c
 	return q
@@ -138,19 +142,23 @@ func (q *mockQuery) MapScan(m map[string]any) error {
 	return q.session.scanErr
 }
 
-func (q *mockQuery) ExecContext(_ context.Context) error {
+func (q *mockQuery) ExecContext(ctx context.Context) error {
+	q.ctx = ctx
 	return q.session.execErr
 }
 
-func (q *mockQuery) ScanContext(_ context.Context, dest ...any) error {
+func (q *mockQuery) ScanContext(ctx context.Context, dest ...any) error {
+	q.ctx = ctx
 	return q.Scan(dest...)
 }
 
-func (q *mockQuery) IterContext(_ context.Context) cql.Iter {
+func (q *mockQuery) IterContext(ctx context.Context) cql.Iter {
+	q.ctx = ctx
 	return &mockIter{}
 }
 
-func (q *mockQuery) MapScanContext(_ context.Context, m map[string]any) error {
+func (q *mockQuery) MapScanContext(ctx context.Context, m map[string]any) error {
+	q.ctx = ctx
 	return q.session.scanErr
 }
 
@@ -158,7 +166,8 @@ func (q *mockQuery) ScanCAS(_ ...any) (applied bool, err error) {
 	return true, q.session.execErr
 }
 
-func (q *mockQuery) ScanCASContext(_ context.Context, _ ...any) (applied bool, err error) {
+func (q *mockQuery) ScanCASContext(ctx context.Context, _ ...any) (applied bool, err error) {
+	q.ctx = ctx
 	return true, q.session.execErr
 }
 
@@ -166,7 +175,8 @@ func (q *mockQuery) MapScanCAS(_ map[string]any) (applied bool, err error) {
 	return true, q.session.execErr
 }
 
-func (q *mockQuery) MapScanCASContext(_ context.Context, _ map[string]any) (applied bool, err error) {
+func (q *mockQuery) MapScanCASContext(ctx context.Context, _ map[string]any) (applied bool, err error) {
+	q.ctx = ctx
 	return true, q.session.execErr
 }
 
@@ -174,6 +184,7 @@ func (q *mockQuery) MapScanCASContext(_ context.Context, _ map[string]any) (appl
 type mockBatch struct {
 	session *mockSession
 	entries []cql.BatchEntry
+	ctx     context.Context // Track context
 }
 
 func (b *mockBatch) Query(stmt string, args ...any) cql.Batch {
@@ -184,20 +195,25 @@ func (b *mockBatch) Query(stmt string, args ...any) cql.Batch {
 func (b *mockBatch) Consistency(_ cql.Consistency) cql.Batch       { return b }
 func (b *mockBatch) SetConsistency(c cql.Consistency)              { b.Consistency(c) }
 func (b *mockBatch) SerialConsistency(_ cql.Consistency) cql.Batch { return b }
-func (b *mockBatch) WithContext(_ context.Context) cql.Batch       { return b }
-func (b *mockBatch) WithTimestamp(_ int64) cql.Batch               { return b }
-func (b *mockBatch) Size() int                                     { return len(b.entries) }
-func (b *mockBatch) Statements() []cql.BatchEntry                  { return b.entries }
+func (b *mockBatch) WithContext(ctx context.Context) cql.Batch {
+	b.ctx = ctx
+	return b
+}
+func (b *mockBatch) WithTimestamp(_ int64) cql.Batch { return b }
+func (b *mockBatch) Size() int                       { return len(b.entries) }
+func (b *mockBatch) Statements() []cql.BatchEntry    { return b.entries }
 
 func (b *mockBatch) Exec() error {
 	return b.session.execErr
 }
 
-func (b *mockBatch) ExecContext(_ context.Context) error {
+func (b *mockBatch) ExecContext(ctx context.Context) error {
+	b.ctx = ctx
 	return b.session.execErr
 }
 
-func (b *mockBatch) IterContext(_ context.Context) cql.Iter {
+func (b *mockBatch) IterContext(ctx context.Context) cql.Iter {
+	b.ctx = ctx
 	return &mockIter{}
 }
 
@@ -205,7 +221,8 @@ func (b *mockBatch) ExecCAS(_ ...any) (applied bool, iter cql.Iter, err error) {
 	return true, &mockIter{}, b.session.execErr
 }
 
-func (b *mockBatch) ExecCASContext(_ context.Context, _ ...any) (applied bool, iter cql.Iter, err error) {
+func (b *mockBatch) ExecCASContext(ctx context.Context, _ ...any) (applied bool, iter cql.Iter, err error) {
+	b.ctx = ctx
 	return true, &mockIter{}, b.session.execErr
 }
 
@@ -213,7 +230,8 @@ func (b *mockBatch) MapExecCAS(_ map[string]any) (applied bool, iter cql.Iter, e
 	return true, &mockIter{}, b.session.execErr
 }
 
-func (b *mockBatch) MapExecCASContext(_ context.Context, _ map[string]any) (applied bool, iter cql.Iter, err error) {
+func (b *mockBatch) MapExecCASContext(ctx context.Context, _ map[string]any) (applied bool, iter cql.Iter, err error) {
+	b.ctx = ctx
 	return true, &mockIter{}, b.session.execErr
 }
 
@@ -657,6 +675,28 @@ func TestCQLClientQueryConfigPropagation(t *testing.T) {
 		require.Equal(t, pageToken, sessionA.lastQuery.pageState)
 		require.NotNil(t, sessionA.lastQuery.consistency)
 		require.Equal(t, LocalQuorum, *sessionA.lastQuery.consistency)
+	})
+
+	t.Run("context is propagated to underlying query", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+
+		client, err := NewCQLClient(sessionA, sessionB)
+		require.NoError(t, err)
+		defer client.Close()
+
+		type contextKey string
+		key := contextKey("test-key")
+		ctx := context.WithValue(context.Background(), key, "test-value")
+
+		// Execute a query with context
+		err = client.Query("SELECT * FROM test").ExecContext(ctx)
+		require.NoError(t, err)
+
+		// Verify context was set on the underlying query
+		require.NotNil(t, sessionA.lastQuery)
+		require.NotNil(t, sessionA.lastQuery.ctx)
+		require.Equal(t, "test-value", sessionA.lastQuery.ctx.Value(key))
 	})
 }
 
