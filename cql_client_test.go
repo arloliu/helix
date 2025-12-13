@@ -80,6 +80,7 @@ func (q *mockQuery) WithContext(ctx context.Context) cql.Query {
 	q.ctx = ctx
 	return q
 }
+
 func (q *mockQuery) Consistency(c cql.Consistency) cql.Query {
 	q.consistency = &c
 	return q
