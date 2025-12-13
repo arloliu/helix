@@ -123,14 +123,10 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	client := &CQLClient{
-		sessionA:      sessionA,
-		sessionB:      sessionB,
-		config:        config,
-		topologyCtx:   ctx,
-		topologyClose: cancel,
+		sessionA: sessionA,
+		sessionB: sessionB,
+		config:   config,
 	}
 
 	// Create auto memory worker if configured
@@ -149,14 +145,15 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// Start replay worker if configured
 	if config.ReplayWorker != nil {
 		if err := config.ReplayWorker.Start(); err != nil {
-			cancel()
-
 			return nil, err
 		}
 	}
 
 	// Start topology watcher if configured
 	if config.TopologyWatcher != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		client.topologyCtx = ctx
+		client.topologyClose = cancel
 		go client.watchTopology()
 	}
 
