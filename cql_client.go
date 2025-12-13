@@ -723,7 +723,7 @@ func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64) {
 // In single-cluster mode, the read is executed directly on sessionA.
 // In dual-cluster mode, reads use sticky routing with failover to the alternative cluster.
 // Clusters in drain mode are skipped unless both clusters are draining.
-func (c *CQLClient) executeRead(ctx context.Context, readFunc func(cql.Session) error) error {
+func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Context, cql.Session) error) error {
 	if c.closed.Load() {
 		return types.ErrSessionClosed
 	}
@@ -731,7 +731,7 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(cql.Session) 
 	// Single-cluster mode: direct execution, no failover
 	if c.IsSingleCluster() {
 		start := time.Now()
-		err := readFunc(c.sessionA)
+		err := readFunc(ctx, c.sessionA)
 		elapsed := time.Since(start).Seconds()
 
 		c.config.Metrics.IncReadTotal(ClusterA)
@@ -770,7 +770,7 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(cql.Session) 
 	// Note: Timeouts should be configured on the underlying gocql session.
 	session := c.getSession(selectedCluster)
 	start := time.Now()
-	err := readFunc(session)
+	err := readFunc(ctx, session)
 	elapsed := time.Since(start).Seconds()
 
 	c.config.Metrics.IncReadTotal(selectedCluster)
@@ -831,7 +831,7 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(cql.Session) 
 	// Try alternative cluster
 	alternativeSession := c.getSession(alternativeCluster)
 	startSecondary := time.Now()
-	errSecondary := readFunc(alternativeSession)
+	errSecondary := readFunc(ctx, alternativeSession)
 	elapsedSecondary := time.Since(startSecondary).Seconds()
 
 	c.config.Metrics.IncReadTotal(alternativeCluster)
@@ -1004,7 +1004,7 @@ func (q *cqlQuery) Scan(dest ...any) error {
 }
 
 func (q *cqlQuery) ScanContext(ctx context.Context, dest ...any) error {
-	return q.client.executeRead(ctx, func(session cql.Session) error {
+	return q.client.executeRead(ctx, func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 
@@ -1042,7 +1042,7 @@ func (q *cqlQuery) MapScan(m map[string]any) error {
 }
 
 func (q *cqlQuery) MapScanContext(ctx context.Context, m map[string]any) error {
-	return q.client.executeRead(ctx, func(session cql.Session) error {
+	return q.client.executeRead(ctx, func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 
