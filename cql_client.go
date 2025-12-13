@@ -980,7 +980,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 		// to ensure consistency across clusters
 		query = query.WithTimestamp(ts)
 
-		return query.Exec()
+		return query.ExecContext(ctx)
 	})
 }
 
@@ -1199,9 +1199,8 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 			batch = batch.SerialConsistency(*b.serialConsistency)
 		}
 		batch = batch.WithTimestamp(ts)
-		batch = batch.WithContext(ctx)
 
-		return batch.Exec()
+		return batch.ExecContext(ctx)
 	})
 }
 
