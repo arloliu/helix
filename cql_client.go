@@ -488,7 +488,7 @@ func (wc *writeContext) toBatchStatements() []types.BatchStatement {
 func (c *CQLClient) executeWriteWithReplay(
 	ctx context.Context,
 	wc writeContext,
-	writeFunc func(cql.Session) error,
+	writeFunc func(context.Context, cql.Session) error,
 ) error {
 	if c.closed.Load() {
 		return types.ErrSessionClosed
@@ -496,7 +496,7 @@ func (c *CQLClient) executeWriteWithReplay(
 
 	// Single-cluster mode: direct execution, no dual-write logic
 	if c.IsSingleCluster() {
-		return writeFunc(c.sessionA)
+		return writeFunc(ctx, c.sessionA)
 	}
 
 	// Check drain mode
@@ -522,7 +522,7 @@ func (c *CQLClient) executeWriteWithReplay(
 func (c *CQLClient) executeWriteWithDrain(
 	ctx context.Context,
 	wc writeContext,
-	writeFunc func(cql.Session) error,
+	writeFunc func(context.Context, cql.Session) error,
 	drainA, _ bool,
 ) error {
 	var session cql.Session
@@ -540,7 +540,7 @@ func (c *CQLClient) executeWriteWithDrain(
 
 	// Execute write on the healthy cluster
 	start := time.Now()
-	err := writeFunc(session)
+	err := writeFunc(ctx, session)
 	elapsed := time.Since(start).Seconds()
 
 	if err != nil {
@@ -586,20 +586,20 @@ func (c *CQLClient) executeWriteWithDrain(
 func (c *CQLClient) executeDualWrite(
 	ctx context.Context,
 	wc writeContext,
-	writeFunc func(cql.Session) error,
+	writeFunc func(context.Context, cql.Session) error,
 ) error {
 	// Dual-cluster mode: concurrent writes with replay support
 	// Note: We capture start times outside the write functions to avoid data races
 	// when WriteStrategy uses fire-and-forget (background goroutines).
 	var startA, startB atomic.Int64
 
-	writeA := func(_ context.Context) error {
+	writeA := func(ctx context.Context) error {
 		startA.Store(time.Now().UnixNano())
-		return writeFunc(c.sessionA)
+		return writeFunc(ctx, c.sessionA)
 	}
-	writeB := func(_ context.Context) error {
+	writeB := func(ctx context.Context) error {
 		startB.Store(time.Now().UnixNano())
-		return writeFunc(c.sessionB)
+		return writeFunc(ctx, c.sessionB)
 	}
 
 	var errA, errB error
@@ -988,7 +988,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 		priority:  q.getPriority(),
 	}
 
-	return q.client.executeWriteWithReplay(ctx, wc, func(session cql.Session) error {
+	return q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 		// Important for writes to generate the timestamp on the client side
@@ -1218,7 +1218,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 		batchEntries: b.entries, // Pass directly, convert lazily if needed for replay
 	}
 
-	return b.client.executeWriteWithReplay(ctx, wc, func(session cql.Session) error {
+	return b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
 		batch := session.Batch(b.kind)
 		for _, entry := range b.entries {
 			batch = batch.Query(entry.statement, entry.args...)
