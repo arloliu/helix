@@ -599,6 +599,16 @@ func (p *partialFailureCQLQuery) Exec() error {
 	return p.Query.Exec()
 }
 
+func (p *partialFailureCQLQuery) ExecContext(ctx context.Context) error {
+	if p.failNextWrite.Load() > 0 {
+		p.failNextWrite.Add(-1)
+
+		return errors.New("simulated partial failure")
+	}
+
+	return p.Query.ExecContext(ctx)
+}
+
 func (p *partialFailureCQLQuery) Scan(dest ...any) error {
 	return p.Query.Scan(dest...)
 }

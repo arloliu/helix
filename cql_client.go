@@ -966,6 +966,21 @@ func (q *cqlQuery) Exec() error {
 func (q *cqlQuery) ExecContext(ctx context.Context) error {
 	ts := q.getTimestamp()
 
+	// Fast path for single-cluster mode to avoid allocations
+	if q.client.IsSingleCluster() {
+		if q.client.closed.Load() {
+			return types.ErrSessionClosed
+		}
+
+		query := q.client.sessionA.Query(q.statement, q.values...)
+		query = q.applyConfig(query)
+		// Important for writes to generate the timestamp on the client side
+		// to ensure consistency across clusters
+		query = query.WithTimestamp(ts)
+
+		return query.ExecContext(ctx)
+	}
+
 	wc := writeContext{
 		statement: q.statement,
 		args:      q.values,
@@ -1171,6 +1186,27 @@ func (b *cqlBatch) Exec() error {
 
 func (b *cqlBatch) ExecContext(ctx context.Context) error {
 	ts := b.getTimestamp()
+
+	// Fast path for single-cluster mode to avoid allocations
+	if b.client.IsSingleCluster() {
+		if b.client.closed.Load() {
+			return types.ErrSessionClosed
+		}
+
+		batch := b.client.sessionA.Batch(b.kind)
+		for _, entry := range b.entries {
+			batch = batch.Query(entry.statement, entry.args...)
+		}
+		if b.consistency != nil {
+			batch = batch.Consistency(*b.consistency)
+		}
+		if b.serialConsistency != nil {
+			batch = batch.SerialConsistency(*b.serialConsistency)
+		}
+		batch = batch.WithTimestamp(ts)
+
+		return batch.ExecContext(ctx)
+	}
 
 	wc := writeContext{
 		statement:    "", // Empty for batch
