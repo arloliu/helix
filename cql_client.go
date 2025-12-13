@@ -992,9 +992,8 @@ func (q *cqlQuery) ScanContext(ctx context.Context, dest ...any) error {
 	return q.client.executeRead(ctx, func(session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
-		query = query.WithContext(ctx)
 
-		return query.Scan(dest...)
+		return query.ScanContext(ctx, dest...)
 	})
 }
 
@@ -1015,10 +1014,9 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 	session := q.client.getSession(selectedCluster)
 	query := session.Query(q.statement, q.values...)
 	query = q.applyConfig(query)
-	query = query.WithContext(ctx)
 
 	return &cqlIter{
-		iter:    query.Iter(),
+		iter:    query.IterContext(ctx),
 		client:  q.client,
 		cluster: selectedCluster,
 	}
@@ -1032,9 +1030,8 @@ func (q *cqlQuery) MapScanContext(ctx context.Context, m map[string]any) error {
 	return q.client.executeRead(ctx, func(session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
-		query = query.WithContext(ctx)
 
-		return query.MapScan(m)
+		return query.MapScanContext(ctx, m)
 	})
 }
 
@@ -1057,9 +1054,8 @@ func (q *cqlQuery) ScanCASContext(ctx context.Context, dest ...any) (applied boo
 	session := q.client.getSession(selectedCluster)
 	query := session.Query(q.statement, q.values...)
 	query = q.applyConfig(query)
-	query = query.WithContext(ctx)
 
-	return query.ScanCAS(dest...)
+	return query.ScanCASContext(ctx, dest...)
 }
 
 // MapScanCAS executes a lightweight transaction and scans the result into a map.
@@ -1081,9 +1077,8 @@ func (q *cqlQuery) MapScanCASContext(ctx context.Context, dest map[string]any) (
 	session := q.client.getSession(selectedCluster)
 	query := session.Query(q.statement, q.values...)
 	query = q.applyConfig(query)
-	query = query.WithContext(ctx)
 
-	return query.MapScanCAS(dest)
+	return query.MapScanCASContext(ctx, dest)
 }
 
 // batchEntry holds a single statement in a batch.
@@ -1227,7 +1222,6 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 		batch = batch.SerialConsistency(*b.serialConsistency)
 	}
 	batch = batch.WithTimestamp(ts)
-	batch = batch.WithContext(ctx)
 
 	return &cqlIter{
 		iter:    batch.IterContext(ctx),
@@ -1266,9 +1260,8 @@ func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied boo
 		batch = batch.SerialConsistency(*b.serialConsistency)
 	}
 	batch = batch.WithTimestamp(ts)
-	batch = batch.WithContext(ctx)
 
-	applied, cqlItr, err := batch.ExecCAS(dest...)
+	applied, cqlItr, err := batch.ExecCASContext(ctx, dest...)
 	if cqlItr == nil {
 		return applied, nil, err
 	}
@@ -1310,9 +1303,8 @@ func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (
 		batch = batch.SerialConsistency(*b.serialConsistency)
 	}
 	batch = batch.WithTimestamp(ts)
-	batch = batch.WithContext(ctx)
 
-	applied, cqlItr, err := batch.MapExecCAS(dest)
+	applied, cqlItr, err := batch.MapExecCASContext(ctx, dest)
 	if cqlItr == nil {
 		return applied, nil, err
 	}
