@@ -562,7 +562,8 @@ func (c *CQLClient) executeWriteWithDrain(
 			Timestamp:       wc.timestamp,
 			Priority:        wc.priority,
 		}
-		if enqueueErr := c.config.Replayer.Enqueue(ctx, payload); enqueueErr == nil {
+		// Use context.WithoutCancel to ensure replay is enqueued even if the request context is cancelled
+		if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
 			c.config.Metrics.IncReplayEnqueued(drainingCluster)
 		} else {
 			c.config.Metrics.IncReplayDropped(drainingCluster)
@@ -677,7 +678,8 @@ func (c *CQLClient) executeDualWrite(
 		}
 
 		// Best effort enqueue - don't fail the operation if replay fails
-		if enqueueErr := c.config.Replayer.Enqueue(ctx, payload); enqueueErr == nil {
+		// Use context.WithoutCancel to ensure replay is enqueued even if the request context is cancelled
+		if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
 			c.config.Metrics.IncReplayEnqueued(targetCluster)
 			c.config.Logger.Warn("write failed on cluster, enqueued for replay",
 				"cluster", c.clusterName(targetCluster),
@@ -1013,6 +1015,11 @@ func (q *cqlQuery) Iter() Iter {
 	return q.IterContext(q.getContext())
 }
 
+// IterContext executes the query and returns an iterator.
+//
+// NOTE: Iterators do NOT support automatic failover. If the selected cluster
+// fails during iteration, the error is returned to the caller.
+// ReadStrategy.OnSuccess is only called if the iterator is closed successfully.
 func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 	// For Iter, we need to handle failover differently since we return an iterator
 	// We'll attempt to get an iterator from the preferred cluster
@@ -1233,6 +1240,9 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 }
 
 // IterContext executes the batch and returns an iterator for the results.
+//
+// NOTE: Iterators do NOT support automatic failover. If the selected cluster
+// fails during iteration, the error is returned to the caller.
 func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 	ts := b.getTimestamp()
 
