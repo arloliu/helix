@@ -3,8 +3,10 @@ package replay
 
 import (
 	"context"
+	"encoding"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -712,18 +714,17 @@ func appendArg(buf []byte, arg any) ([]byte, error) {
 }
 
 // tryConvertToUUID attempts to convert an argument to a UUID extension.
-// It handles gocql.UUID and any other [16]byte array types.
+// It handles gocql.UUID, google/uuid.UUID, and any other [16]byte array types.
 func tryConvertToUUID(arg any) (UUID, bool) {
 	switch v := arg.(type) {
 	case [16]byte:
-		// Direct [16]byte array (covers gocql.UUID which is type UUID [16]byte)
+		// Direct [16]byte array
 		return UUID(v), true
 	case *[16]byte:
 		// Pointer to [16]byte array
 		if v != nil {
 			return UUID(*v), true
 		}
-
 		return UUID{}, false
 	case UUID:
 		// Already our UUID type
@@ -733,9 +734,43 @@ func tryConvertToUUID(arg any) (UUID, bool) {
 		if v != nil {
 			return *v, true
 		}
-
 		return UUID{}, false
 	default:
+		// Optimization: Check for encoding.BinaryMarshaler (implemented by google/uuid)
+		if bm, ok := arg.(encoding.BinaryMarshaler); ok {
+			if data, err := bm.MarshalBinary(); err == nil && len(data) == 16 {
+				var u UUID
+				copy(u[:], data)
+				return u, true
+			}
+		}
+
+		// Fallback: Use reflection to handle named types that are underlying [16]byte
+		// This covers gocql.UUID (which doesn't implement BinaryMarshaler) without importing it
+		rv := reflect.ValueOf(arg)
+
+		// Handle pointers by dereferencing
+		if rv.Kind() == reflect.Ptr {
+			if rv.IsNil() {
+				return UUID{}, false
+			}
+			rv = rv.Elem()
+		}
+
+		// Check if it's an array of 16 bytes
+		if rv.Kind() == reflect.Array && rv.Type().Len() == 16 && rv.Type().Elem().Kind() == reflect.Uint8 {
+			// Create a new UUID and copy bytes
+			var u UUID
+			// We can't directly cast, so we copy
+			// reflect.Copy requires both to be slices or arrays, but we can iterate
+			// or use Unsafe, but iteration is safer and fast enough for 16 bytes
+			for i := range 16 {
+				u[i] = byte(rv.Index(i).Uint())
+			}
+
+			return u, true
+		}
+
 		return UUID{}, false
 	}
 }
