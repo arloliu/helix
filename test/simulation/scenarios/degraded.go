@@ -20,21 +20,22 @@ func (s *DegradedCluster) Description() string {
 
 func (s *DegradedCluster) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting DegradedCluster scenario")
+	startCount := env.Tracker.Count()
 
 	// 1. Baseline: Normal operation
 	env.Logger.Info("Phase 1: Normal operation")
-	time.Sleep(5 * time.Second)
+	_ = waitUntil(ctx, 5*time.Second, func() bool {
+		return env.Tracker.Count() > startCount
+	})
 
 	// 2. Inject latency into Cluster A
 	env.Logger.Info("Phase 2: Injecting latency into Cluster A")
 	env.ChaosA.SetLatency(500 * time.Millisecond)
 
 	// Run for a while
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(10 * time.Second):
-	}
+	_ = waitUntil(ctx, 10*time.Second, func() bool {
+		return env.Tracker.Count() >= startCount+100
+	})
 
 	// 3. Verify failover (metrics check would go here)
 	env.Logger.Info("Phase 3: Verifying failover behavior")
@@ -42,8 +43,9 @@ func (s *DegradedCluster) Run(ctx context.Context, env *types.Environment) error
 	// 4. Recovery
 	env.Logger.Info("Phase 4: Recovering Cluster A")
 	env.ChaosA.SetLatency(0)
-
-	time.Sleep(5 * time.Second)
+	_ = waitUntil(ctx, 5*time.Second, func() bool {
+		return env.Tracker.Count() >= startCount+150
+	})
 	env.Logger.Info("DegradedCluster scenario completed")
 
 	return nil

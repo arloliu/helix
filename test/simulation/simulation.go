@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/arloliu/helix"
-	"github.com/arloliu/helix/adapter/cql"
 	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/replay"
@@ -20,7 +20,7 @@ import (
 	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/topology"
 	"github.com/arloliu/helix/types"
-	"github.com/google/uuid"
+	"github.com/gocql/gocql"
 )
 
 // Config holds simulation configuration.
@@ -41,6 +41,7 @@ type Simulation struct {
 	scenarios    []simtypes.Scenario
 	stopWorkload context.CancelFunc
 	rng          *rand.Rand
+	rngMu        sync.Mutex
 }
 
 // New creates a new simulation instance.
@@ -177,32 +178,24 @@ func (s *Simulation) setupEnvironment() error {
 
 	topo := topology.NewLocal()
 
-	// Define replay execution logic
-	executeReplay := func(_ context.Context, payload types.ReplayPayload) error {
-		var session cql.Session
-		if payload.TargetCluster == types.ClusterA {
-			session = sessionA
-		} else {
-			session = sessionB
-		}
-		// Note: In a real app, we'd need to handle args properly.
-		// ReplayPayload stores args as []interface{}.
-		return session.Query(payload.Query, payload.Args...).Exec()
-	}
-
-	worker := replay.NewMemoryWorker(memReplayer, executeReplay)
-
 	client, err := helix.NewCQLClient(sessionA, sessionB,
 		helix.WithWriteStrategy(writeStrategy),
 		helix.WithReadStrategy(readStrategy),
 		helix.WithFailoverPolicy(failoverPolicy),
 		helix.WithReplayer(replayer),
-		helix.WithReplayWorker(worker),
 		helix.WithTopologyWatcher(topo),
 	)
 	if err != nil {
 		return err
 	}
+
+	// Wire replay worker to the client's default executor so it honors batch payloads.
+	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc())
+	if err := worker.Start(); err != nil {
+		client.Close()
+		return err
+	}
+	client.Config().ReplayWorker = worker
 
 	tracker := workload.NewWriteTracker()
 
@@ -236,7 +229,31 @@ func (s *Simulation) teardown() {
 }
 
 func (s *Simulation) generateTraffic(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	interval := 10 * time.Millisecond
+	workers := 1
+	payloadSize := 100
+
+	if s.config.Settings != nil {
+		if s.config.Settings.Workload.Interval > 0 {
+			interval = s.config.Settings.Workload.Interval
+		}
+		if s.config.Settings.Workload.Workers > 0 {
+			workers = s.config.Settings.Workload.Workers
+		}
+		if s.config.Settings.Workload.PayloadSize > 0 {
+			payloadSize = s.config.Settings.Workload.PayloadSize
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		go s.trafficWorker(ctx, interval, payloadSize)
+	}
+
+	<-ctx.Done()
+}
+
+func (s *Simulation) trafficWorker(ctx context.Context, interval time.Duration, payloadSize int) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -244,16 +261,20 @@ func (s *Simulation) generateTraffic(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			id := uuid.New()
-			data := make([]byte, 100)
-			if _, err := s.rng.Read(data); err != nil {
+			id := gocql.TimeUUID()
+			data := make([]byte, payloadSize)
+
+			s.rngMu.Lock()
+			_, err := s.rng.Read(data)
+			s.rngMu.Unlock()
+			if err != nil {
 				s.logger.Error("Failed to generate random data", "error", err)
 				continue
 			}
 
-			err := s.env.Client.Query("INSERT INTO test_data (id, data) VALUES (?, ?)", id.String(), data).Exec()
+			err = s.env.Client.Query("INSERT INTO test_data (id, data) VALUES (?, ?)", id, data).Exec()
 			if err == nil || errors.Is(err, types.ErrWriteAsync) {
-				s.env.Tracker.TrackWrite(id.String(), time.Now().UnixMicro())
+				s.env.Tracker.TrackWrite(id, time.Now().UnixNano())
 			} else {
 				s.logger.Error("Write failed", "error", err)
 			}
@@ -269,12 +290,17 @@ func (s *Simulation) verify() error {
 	s.env.ChaosA.SetConfig(resetConfig)
 	s.env.ChaosB.SetConfig(resetConfig)
 
-	// Wait for eventual consistency (replay to finish)
-	s.logger.Info("Waiting for eventual consistency...")
-	time.Sleep(5 * time.Second)
+	// Wait for eventual consistency (replay to finish).
+	// Use condition-based waiting rather than a fixed sleep to reduce flakiness.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := s.env.Tracker.VerifyConsistency(s.env.ChaosA, s.env.ChaosB); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			return fmt.Errorf("verification failed: %w", err)
+		}
 
-	if err := s.env.Tracker.VerifyConsistency(s.env.ChaosA, s.env.ChaosB); err != nil {
-		return fmt.Errorf("verification failed: %w", err)
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	s.logger.Info("Verification passed!")

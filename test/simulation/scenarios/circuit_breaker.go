@@ -17,8 +17,9 @@ func (s *CircuitBreakerTrip) Description() string {
 	return "Verifies circuit breaker opens after failures and resets after timeout"
 }
 
-func (s *CircuitBreakerTrip) Run(_ context.Context, env *types.Environment) error {
+func (s *CircuitBreakerTrip) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting CircuitBreakerTrip scenario")
+	startCount := env.Tracker.Count()
 
 	// 1. Induce failures in Cluster A
 	env.Logger.Info("Inducing failures in Cluster A to trip breaker")
@@ -26,7 +27,10 @@ func (s *CircuitBreakerTrip) Run(_ context.Context, env *types.Environment) erro
 
 	// 2. Wait for breaker to trip (threshold is usually 3)
 	// We rely on the workload generator to trigger the failures.
-	time.Sleep(5 * time.Second)
+	_ = waitUntil(ctx, 10*time.Second, func() bool {
+		// Best-effort: ensure workload is still running.
+		return env.Tracker.Count() >= startCount+50
+	})
 
 	// 3. Verify failover (Cluster A is down, traffic should go to B)
 	// In a real test we'd check metrics or logs, but here we assume if no panic/error, it's working.
@@ -40,7 +44,10 @@ func (s *CircuitBreakerTrip) Run(_ context.Context, env *types.Environment) erro
 	// Then wait enough to ensure it closes.
 
 	env.Logger.Info("Waiting for Circuit Breaker reset timeout...")
-	time.Sleep(35 * time.Second) // Assuming 30s reset timeout
+	// Best-effort wait: we don't have direct breaker state, so we just wait.
+	_ = waitUntil(ctx, 40*time.Second, func() bool {
+		return env.Tracker.Count() >= startCount+200
+	})
 
 	env.Logger.Info("CircuitBreakerTrip scenario completed")
 

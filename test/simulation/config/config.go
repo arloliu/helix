@@ -13,6 +13,7 @@ type Config struct {
 	Simulation SimulationConfig `yaml:"simulation"`
 	Clusters   ClustersConfig   `yaml:"clusters"`
 	Helix      HelixConfig      `yaml:"helix"`
+	Workload   WorkloadConfig   `yaml:"workload"`
 }
 
 type SimulationConfig struct {
@@ -64,6 +65,12 @@ type ReplayConfig struct {
 	NATSURL   string `yaml:"nats_url"`
 }
 
+type WorkloadConfig struct {
+	Workers     int           `yaml:"workers"`
+	Interval    time.Duration `yaml:"interval"`
+	PayloadSize int           `yaml:"payload_size"`
+}
+
 // Load reads configuration from a YAML file
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -85,6 +92,15 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Simulation.ReportDir == "" {
 		cfg.Simulation.ReportDir = "./reports"
+	}
+	if cfg.Workload.Workers <= 0 {
+		cfg.Workload.Workers = 1
+	}
+	if cfg.Workload.Interval <= 0 {
+		cfg.Workload.Interval = 10 * time.Millisecond
+	}
+	if cfg.Workload.PayloadSize <= 0 {
+		cfg.Workload.PayloadSize = 100
 	}
 
 	return &cfg, nil

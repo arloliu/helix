@@ -61,13 +61,13 @@ func run() error {
 	)
 
 	// Start pprof server
+	pprofServer := &http.Server{
+		Addr:              "127.0.0.1:6060",
+		ReadHeaderTimeout: 3 * time.Second,
+	}
 	go func() {
-		logger.Info("Starting pprof server on :6060")
-		server := &http.Server{
-			Addr:              ":6060",
-			ReadHeaderTimeout: 3 * time.Second,
-		}
-		if err := server.ListenAndServe(); err != nil {
+		logger.Info("Starting pprof server", "addr", pprofServer.Addr)
+		if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("pprof server failed", "error", err)
 		}
 	}()
@@ -75,6 +75,13 @@ func run() error {
 	// Handle signals for graceful shutdown
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer shutdownCancel()
+		if err := pprofServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("pprof server shutdown failed", "error", err)
+		}
+	}()
 
 	// Start Clusters
 	logger.Info("Starting Cluster A...")

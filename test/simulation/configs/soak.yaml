@@ -4,6 +4,11 @@ simulation:
   report_dir: ./reports
   console_interval: 10s
 
+workload:
+  workers: 4
+  interval: 5ms
+  payload_size: 256
+
 clusters:
   type: scylladb
   memory_mb: 1024
@@ -32,4 +37,4 @@ helix:
 
   replay:
     type: memory
-    queue_size: 10000
+    queue_size: 5000

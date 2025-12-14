@@ -21,6 +21,7 @@ func (s *AdaptiveRecovery) Description() string {
 
 func (s *AdaptiveRecovery) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting AdaptiveRecovery scenario")
+	startCount := env.Tracker.Count()
 
 	// Flap Cluster B
 	for i := 0; i < 3; i++ {
@@ -30,13 +31,15 @@ func (s *AdaptiveRecovery) Run(ctx context.Context, env *types.Environment) erro
 
 		env.Logger.Info(fmt.Sprintf("Flapping iteration %d: Cluster B DOWN", i+1))
 		env.ChaosB.SetErrorRate(1.0) // 100% errors
-
-		time.Sleep(3 * time.Second)
+		_ = waitUntil(ctx, 5*time.Second, func() bool {
+			return true
+		})
 
 		env.Logger.Info(fmt.Sprintf("Flapping iteration %d: Cluster B UP", i+1))
 		env.ChaosB.SetErrorRate(0.0)
-
-		time.Sleep(5 * time.Second)
+		_ = waitUntil(ctx, 10*time.Second, func() bool {
+			return env.Tracker.Count() > startCount
+		})
 	}
 
 	env.Logger.Info("AdaptiveRecovery scenario completed")

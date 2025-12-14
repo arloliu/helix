@@ -7,26 +7,27 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/gocql/gocql"
 )
 
 // WriteTracker tracks successful writes for verification.
 type WriteTracker struct {
 	mu     sync.RWMutex
-	writes map[string]int64 // key -> timestamp
+	writes map[gocql.UUID]int64 // key -> timestamp (unix nanos)
 }
 
 // NewWriteTracker creates a new write tracker.
 func NewWriteTracker() *WriteTracker {
 	return &WriteTracker{
-		writes: make(map[string]int64),
+		writes: make(map[gocql.UUID]int64),
 	}
 }
 
 // TrackWrite records a successful write.
-func (t *WriteTracker) TrackWrite(key string, timestamp int64) {
+func (t *WriteTracker) TrackWrite(key gocql.UUID, timestampUnixNano int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.writes[key] = timestamp
+	t.writes[key] = timestampUnixNano
 }
 
 // Verify checks if the tracked writes exist in the database.
@@ -126,8 +127,8 @@ func (t *WriteTracker) VerifyConsistency(sessionA, sessionB cql.Session) error {
 	return nil
 }
 
-func rowExists(session cql.Session, key string) bool {
-	var id string
+func rowExists(session cql.Session, key gocql.UUID) bool {
+	var id gocql.UUID
 	err := session.Query("SELECT id FROM test_data WHERE id = ?", key).Scan(&id)
 	// if err != nil {
 	// 	fmt.Printf("Check failed for key %s: %v\n", key, err)
