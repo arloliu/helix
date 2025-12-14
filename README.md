@@ -5,6 +5,19 @@
 
 **Helix** is a high-availability dual-database client library for Go, designed to support "Shared Nothing" architecture with active-active dual writes, sticky reads, and asynchronous reconciliation.
 
+## Why "Helix"?
+
+**Biomimetic Fault Tolerance.**
+
+Helix is named after the DNA double helix: **two independent strands carrying the same genetic code.**
+
+In this architecture, your database clusters are the strands. They share nothing—no state, no gossip, no master-slave tether. They exist in parallel universes.
+*   **Dual Writes** replicate the code to both strands simultaneously.
+*   **Sticky Reads** latch onto a single strand for maximum locality.
+*   **Replay** acts as the **repair enzyme**, asynchronously healing "mutations" (inconsistencies) when a strand temporarily fails.
+
+If one strand snaps, the other keeps the organism alive. It's 4 billion years of evolution applied to high-availability engineering. 🧬
+
 ## Features
 
 - **Dual Active-Active Writes** - Concurrent writes to two independent clusters for maximum availability
