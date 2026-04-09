@@ -88,6 +88,10 @@ type Collector struct {
 	writeTotalB    *metrics.Counter
 	writeErrorsA   *metrics.Counter
 	writeErrorsB   *metrics.Counter
+	writeAsyncA    *metrics.Counter
+	writeAsyncB    *metrics.Counter
+	writeDroppedA  *metrics.Counter
+	writeDroppedB  *metrics.Counter
 	writeDurationA *metrics.Histogram
 	writeDurationB *metrics.Histogram
 
@@ -182,6 +186,10 @@ func (c *Collector) initMetrics() {
 	c.writeTotalB = c.set.NewCounter(fmt.Sprintf(`%s_write_total{cluster="%s"}`, p, nB))
 	c.writeErrorsA = c.set.NewCounter(fmt.Sprintf(`%s_write_errors_total{cluster="%s"}`, p, nA))
 	c.writeErrorsB = c.set.NewCounter(fmt.Sprintf(`%s_write_errors_total{cluster="%s"}`, p, nB))
+	c.writeAsyncA = c.set.NewCounter(fmt.Sprintf(`%s_write_async_total{cluster="%s"}`, p, nA))
+	c.writeAsyncB = c.set.NewCounter(fmt.Sprintf(`%s_write_async_total{cluster="%s"}`, p, nB))
+	c.writeDroppedA = c.set.NewCounter(fmt.Sprintf(`%s_write_dropped_total{cluster="%s"}`, p, nA))
+	c.writeDroppedB = c.set.NewCounter(fmt.Sprintf(`%s_write_dropped_total{cluster="%s"}`, p, nB))
 	c.writeDurationA = c.set.NewHistogram(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nA))
 	c.writeDurationB = c.set.NewHistogram(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nB))
 
@@ -301,6 +309,24 @@ func (c *Collector) IncWriteError(cluster types.ClusterID) {
 		c.writeErrorsA.Inc()
 	} else {
 		c.writeErrorsB.Inc()
+	}
+}
+
+// IncWriteAsync increments the counter for fire-and-forget writes to degraded clusters.
+func (c *Collector) IncWriteAsync(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.writeAsyncA.Inc()
+	} else {
+		c.writeAsyncB.Inc()
+	}
+}
+
+// IncWriteDropped increments the counter for writes dropped due to the concurrency limit.
+func (c *Collector) IncWriteDropped(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.writeDroppedA.Inc()
+	} else {
+		c.writeDroppedB.Inc()
 	}
 }
 

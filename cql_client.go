@@ -2,6 +2,7 @@ package helix
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -234,9 +235,11 @@ func (c *CQLClient) Query(stmt string, values ...any) Query {
 // Batch creates a new Batch for grouping multiple mutations.
 //
 // WARNING: CounterBatch operations are NOT idempotent. If a counter update
-// partially fails (succeeds on one cluster, fails on another), the Replay
-// System will re-apply the operation, causing double-counting. Avoid using
-// CounterBatch with dual-cluster mode if you require exactly-once semantics.
+// partially fails (succeeds on one cluster, fails on another), or if
+// AdaptiveDualWrite returns ErrWriteAsync and the client eagerly enqueues a replay
+// safety net while the background write also succeeds, the Replay System can
+// apply the same increment twice. Avoid using CounterBatch with dual-cluster mode
+// if you require exactly-once semantics.
 //
 // Parameters:
 //   - kind: Type of batch (Logged, Unlogged, or Counter)
@@ -619,8 +622,16 @@ func (c *CQLClient) executeDualWrite(
 		wg.Wait()
 	}
 
-	// Record metrics for both clusters
-	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines
+	// Classify results: distinguish operational sentinel states from real errors.
+	// ErrWriteAsync  — write is in flight via fire-and-forget (not a cluster error).
+	// ErrWriteDropped — write was not attempted due to concurrency limit (not a cluster error).
+	isAsyncA := errors.Is(errA, types.ErrWriteAsync)
+	isDroppedA := errors.Is(errA, types.ErrWriteDropped)
+	isAsyncB := errors.Is(errB, types.ErrWriteAsync)
+	isDroppedB := errors.Is(errB, types.ErrWriteDropped)
+
+	// Record metrics for both clusters.
+	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines.
 	now := time.Now()
 	nowNano := now.UnixNano()
 
@@ -628,7 +639,12 @@ func (c *CQLClient) executeDualWrite(
 	if startANano := startA.Load(); startANano > 0 {
 		c.config.Metrics.ObserveWriteDuration(ClusterA, float64(nowNano-startANano)/float64(time.Second))
 	}
-	if errA != nil {
+	switch {
+	case isAsyncA:
+		c.config.Metrics.IncWriteAsync(ClusterA)
+	case isDroppedA:
+		c.config.Metrics.IncWriteDropped(ClusterA)
+	case errA != nil:
 		c.config.Metrics.IncWriteError(ClusterA)
 	}
 
@@ -636,70 +652,98 @@ func (c *CQLClient) executeDualWrite(
 	if startBNano := startB.Load(); startBNano > 0 {
 		c.config.Metrics.ObserveWriteDuration(ClusterB, float64(nowNano-startBNano)/float64(time.Second))
 	}
-	if errB != nil {
+	switch {
+	case isAsyncB:
+		c.config.Metrics.IncWriteAsync(ClusterB)
+	case isDroppedB:
+		c.config.Metrics.IncWriteDropped(ClusterB)
+	case errB != nil:
 		c.config.Metrics.IncWriteError(ClusterB)
 	}
 
-	// Handle results
+	// Both succeeded definitively.
 	if errA == nil && errB == nil {
-		// Both succeeded
 		return nil
 	}
 
-	if errA != nil && errB != nil {
-		// Both failed
-		return &types.DualClusterError{
-			ErrorA: errA,
-			ErrorB: errB,
-		}
+	// Both clusters had real (non-operational) failures — hard error, no replay.
+	realErrA := errA != nil && !isAsyncA && !isDroppedA
+	realErrB := errB != nil && !isAsyncB && !isDroppedB
+	if realErrA && realErrB {
+		return &types.DualClusterError{ErrorA: errA, ErrorB: errB}
 	}
 
-	// Partial failure - enqueue for replay
+	// At least one cluster had a non-nil result (error, async, or dropped).
+	// Enqueue replay for each affected cluster to ensure eventual consistency.
+	//
+	// ErrWriteAsync:   write is in flight; replay is a safety net (idempotent for Cassandra
+	//                  because both attempts use the same client-generated timestamp).
+	// ErrWriteDropped: write was never attempted; replay is required for reconciliation.
+	// Real error:      write definitively failed; replay is required.
 	if c.config.Replayer != nil {
-		var targetCluster ClusterID
-		var failedErr error
-		if errA != nil {
-			targetCluster = ClusterA
-			failedErr = errA
-		} else {
-			targetCluster = ClusterB
-			failedErr = errB
-		}
-
-		payload := types.ReplayPayload{
-			TargetCluster:   targetCluster,
-			Query:           wc.statement,
-			Args:            wc.args,
-			IsBatch:         wc.isBatch,
-			BatchType:       wc.batchType,
-			BatchStatements: wc.toBatchStatements(), // Lazy conversion
-			Timestamp:       wc.timestamp,
-			Priority:        wc.priority,
-		}
-
-		// Best effort enqueue - don't fail the operation if replay fails
-		// Use context.WithoutCancel to ensure replay is enqueued even if the request context is cancelled
-		if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
-			c.config.Metrics.IncReplayEnqueued(targetCluster)
-			c.config.Logger.Warn("write failed on cluster, enqueued for replay",
-				"cluster", c.clusterName(targetCluster),
-				"error", failedErr.Error(),
-			)
-		} else {
-			c.config.Metrics.IncReplayDropped(targetCluster)
-			c.config.Logger.Error("failed to enqueue write for replay",
-				"cluster", c.clusterName(targetCluster),
-				"writeError", failedErr.Error(),
-				"enqueueError", enqueueErr.Error(),
-			)
-			if c.config.OnReplayDropped != nil {
-				c.config.OnReplayDropped(payload, enqueueErr)
-			}
-		}
+		c.enqueueReplayIfNeeded(ctx, wc, ClusterA, errA, isAsyncA, isDroppedA)
+		c.enqueueReplayIfNeeded(ctx, wc, ClusterB, errB, isAsyncB, isDroppedB)
 	}
 
-	// Partial success is still success from caller's perspective
+	// Partial success (or all-async) is still success from the caller's perspective.
 	return nil
+}
+
+// enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
+// isAsync and isDropped distinguish the two operational sentinel states so the log message
+// accurately reflects what happened: async means the write is in flight; dropped means the
+// write was never attempted because the concurrency limit was full.
+func (c *CQLClient) enqueueReplayIfNeeded(
+	ctx context.Context,
+	wc writeContext,
+	cluster ClusterID,
+	err error,
+	isAsync, isDropped bool,
+) {
+	if err == nil {
+		return
+	}
+
+	payload := types.ReplayPayload{
+		TargetCluster:   cluster,
+		Query:           wc.statement,
+		Args:            wc.args,
+		IsBatch:         wc.isBatch,
+		BatchType:       wc.batchType,
+		BatchStatements: wc.toBatchStatements(),
+		Timestamp:       wc.timestamp,
+		Priority:        wc.priority,
+	}
+
+	// Use context.WithoutCancel so the enqueue succeeds even if the request context is cancelled.
+	if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
+		c.config.Metrics.IncReplayEnqueued(cluster)
+		switch {
+		case isDropped:
+			c.config.Logger.Info("write dropped (concurrency limit reached) on degraded cluster, enqueued for replay",
+				"cluster", c.clusterName(cluster),
+			)
+		case isAsync:
+			c.config.Logger.Info("write dispatched asynchronously to degraded cluster, enqueued for replay",
+				"cluster", c.clusterName(cluster),
+			)
+		default:
+			c.config.Logger.Warn("write failed on cluster, enqueued for replay",
+				"cluster", c.clusterName(cluster),
+				"error", err.Error(),
+			)
+		}
+	} else {
+		c.config.Metrics.IncReplayDropped(cluster)
+		c.config.Logger.Error("failed to enqueue write for replay",
+			"cluster", c.clusterName(cluster),
+			"writeError", err.Error(),
+			"enqueueError", enqueueErr.Error(),
+		)
+		if c.config.OnReplayDropped != nil {
+			c.config.OnReplayDropped(payload, enqueueErr)
+		}
+	}
 }
 
 // recordReadSuccess records a successful read, using latency-aware recording if supported.

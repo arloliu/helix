@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1171,6 +1173,341 @@ func Example_errorHandling() {
 			return
 		}
 	}
+}
+
+// mockWriteStrategy is a configurable WriteStrategy for unit tests.
+// It returns the pre-set errA/errB values on every Execute call.
+type mockWriteStrategy struct {
+	errA, errB error
+}
+
+func (s *mockWriteStrategy) Execute(
+	ctx context.Context,
+	writeA func(context.Context) error,
+	writeB func(context.Context) error,
+) (errA, errB error) {
+	// Execute both writes so the sessions record the call, then replace results.
+	_ = writeA(ctx)
+	_ = writeB(ctx)
+	return s.errA, s.errB
+}
+
+// ---------------------------------------------------------------------------
+// Tests for executeDualWrite ErrWriteAsync / ErrWriteDropped handling
+// ---------------------------------------------------------------------------
+
+// TestExecuteDualWrite_BothAsync verifies that when both clusters are degraded
+// and return ErrWriteAsync, the client returns nil (writes in flight) and
+// enqueues replay for both clusters — not a DualClusterError.
+func TestExecuteDualWrite_BothAsync(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteAsync, errB: types.ErrWriteAsync}),
+		WithReplayer(replayer),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err, "both-async must not return an error to caller")
+
+	// Both clusters must have replay enqueued
+	payloads := replayer.payloads
+	require.Len(t, payloads, 2, "replay must be enqueued for both clusters")
+	clusters := map[ClusterID]bool{}
+	for _, p := range payloads {
+		clusters[p.TargetCluster] = true
+	}
+	require.True(t, clusters[ClusterA], "replay must include cluster A")
+	require.True(t, clusters[ClusterB], "replay must include cluster B")
+}
+
+// TestExecuteDualWrite_BothDropped verifies that when both clusters are at the
+// fire-and-forget concurrency limit, the client returns nil and enqueues replay
+// for both clusters — not a DualClusterError.
+func TestExecuteDualWrite_BothDropped(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteDropped, errB: types.ErrWriteDropped}),
+		WithReplayer(replayer),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err, "both-dropped must not return an error to caller")
+
+	require.Len(t, replayer.payloads, 2, "replay must be enqueued for both clusters")
+}
+
+// TestExecuteDualWrite_AsyncPlusRealError verifies that one async + one real error
+// enqueues replay for both and returns nil (not a DualClusterError).
+func TestExecuteDualWrite_AsyncPlusRealError(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	replayer := &mockReplayer{}
+	realErr := errors.New("cluster B connection refused")
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteAsync, errB: realErr}),
+		WithReplayer(replayer),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err, "async+error must not return DualClusterError")
+
+	require.Len(t, replayer.payloads, 2, "replay must be enqueued for both A (async) and B (error)")
+}
+
+// TestExecuteDualWrite_DroppedPlusRealError verifies that one dropped + one real error
+// enqueues replay for both and returns nil.
+func TestExecuteDualWrite_DroppedPlusRealError(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	replayer := &mockReplayer{}
+	realErr := errors.New("cluster B timeout")
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteDropped, errB: realErr}),
+		WithReplayer(replayer),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err, "dropped+error must not return DualClusterError")
+
+	require.Len(t, replayer.payloads, 2)
+}
+
+// TestExecuteDualWrite_BothRealErrors still returns DualClusterError.
+func TestExecuteDualWrite_BothRealErrors(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	errA := errors.New("cluster A failed")
+	errB := errors.New("cluster B failed")
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: errA, errB: errB}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.Error(t, err)
+	require.ErrorIs(t, err, types.ErrBothClustersFailed)
+}
+
+// TestExecuteDualWrite_AsyncDoesNotIncrementWriteError verifies that ErrWriteAsync
+// increments IncWriteAsync (not IncWriteError) in the metrics collector.
+func TestExecuteDualWrite_AsyncDoesNotIncrementWriteError(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	met := &mockMetricsCollector{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteAsync, errB: nil}),
+		WithMetrics(met),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	_ = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+
+	require.Equal(t, int64(0), met.writeErrors[ClusterA], "ErrWriteAsync must not increment write_errors")
+	require.Equal(t, int64(1), met.writeAsync[ClusterA], "ErrWriteAsync must increment write_async")
+}
+
+// TestExecuteDualWrite_DroppedDoesNotIncrementWriteError verifies that ErrWriteDropped
+// increments IncWriteDropped (not IncWriteError).
+func TestExecuteDualWrite_DroppedDoesNotIncrementWriteError(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	met := &mockMetricsCollector{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: nil, errB: types.ErrWriteDropped}),
+		WithMetrics(met),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	_ = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+
+	require.Equal(t, int64(0), met.writeErrors[ClusterB], "ErrWriteDropped must not increment write_errors")
+	require.Equal(t, int64(1), met.writeDropped[ClusterB], "ErrWriteDropped must increment write_dropped")
+}
+
+// TestExecuteDualWrite_AsyncEnqueuesReplayForOneCluster verifies that when only
+// cluster A is async (B succeeds), replay is enqueued only for A.
+func TestExecuteDualWrite_AsyncEnqueuesReplayForOneCluster(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteAsync, errB: nil}),
+		WithReplayer(replayer),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err)
+
+	require.Len(t, replayer.payloads, 1)
+	require.Equal(t, ClusterA, replayer.payloads[0].TargetCluster)
+}
+
+// TestExecuteDualWrite_DroppedLogsDroppedNotAsync is a regression test for the bug
+// where ErrWriteDropped (write never attempted) emitted "write dispatched asynchronously"
+// because the log branch checked a single isOperational flag that conflated both states.
+// After the fix, each sentinel has its own log message.
+func TestExecuteDualWrite_DroppedLogsDroppedNotAsync(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	logger := &captureLogger{}
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteDropped, errB: nil}),
+		WithReplayer(replayer),
+		WithLogger(logger),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err)
+
+	require.Len(t, replayer.payloads, 1, "dropped write must be enqueued for replay")
+
+	// The info log must say "dropped", not "dispatched asynchronously".
+	found := false
+	for _, msg := range logger.infoMsgs {
+		if strings.Contains(msg, "dropped") {
+			found = true
+		}
+		assert.NotContains(t, msg, "dispatched asynchronously",
+			"ErrWriteDropped must not log the async message")
+	}
+	assert.True(t, found, "expected a log message containing 'dropped'")
+}
+
+// TestExecuteDualWrite_AsyncLogIsInfoNotWarn verifies that ErrWriteAsync uses an
+// Info log and does not emit the warning reserved for real cluster failures.
+func TestExecuteDualWrite_AsyncLogIsInfoNotWarn(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	logger := &captureLogger{}
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(&mockWriteStrategy{errA: types.ErrWriteAsync, errB: nil}),
+		WithReplayer(replayer),
+		WithLogger(logger),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
+	require.NoError(t, err)
+
+	require.Len(t, replayer.payloads, 1, "async write must be enqueued for replay")
+	require.Empty(t, logger.warnMsgs, "ErrWriteAsync must not emit a warning log")
+
+	found := false
+	for _, msg := range logger.infoMsgs {
+		if strings.Contains(msg, "dispatched asynchronously") {
+			found = true
+		}
+		assert.NotContains(t, msg, "dropped",
+			"ErrWriteAsync must not use the dropped-write log message")
+	}
+	assert.True(t, found, "expected an async info log message")
+}
+
+// captureLogger records Info/Warn/Error messages for assertion in tests.
+type captureLogger struct {
+	sync.Mutex
+	infoMsgs []string
+	warnMsgs []string
+}
+
+func (l *captureLogger) Debug(_ string, _ ...any) {}
+func (l *captureLogger) Info(msg string, _ ...any) {
+	l.Lock()
+	defer l.Unlock()
+	l.infoMsgs = append(l.infoMsgs, msg)
+}
+func (l *captureLogger) Warn(msg string, _ ...any) {
+	l.Lock()
+	defer l.Unlock()
+	l.warnMsgs = append(l.warnMsgs, msg)
+}
+func (l *captureLogger) Error(_ string, _ ...any) {}
+func (l *captureLogger) Fatal(_ string, _ ...any) {}
+
+// mockMetricsCollector is a minimal inline metrics collector for write-classification tests.
+// It avoids the testutil package import cycle inside the helix package tests.
+type mockMetricsCollector struct {
+	sync.Mutex
+	readTotal    map[ClusterID]int64
+	writeErrors  map[ClusterID]int64
+	writeAsync   map[ClusterID]int64
+	writeDropped map[ClusterID]int64
+}
+
+func (m *mockMetricsCollector) inc(mp *map[ClusterID]int64, c ClusterID) {
+	m.Lock()
+	defer m.Unlock()
+	if *mp == nil {
+		*mp = make(map[ClusterID]int64)
+	}
+	(*mp)[c]++
+}
+
+func (m *mockMetricsCollector) IncReadTotal(c ClusterID)                     { m.inc(&m.readTotal, c) }
+func (m *mockMetricsCollector) IncReadError(_ ClusterID)                     {}
+func (m *mockMetricsCollector) ObserveReadDuration(_ ClusterID, _ float64)   {}
+func (m *mockMetricsCollector) IncWriteTotal(_ ClusterID)                    {}
+func (m *mockMetricsCollector) IncWriteError(c ClusterID)                    { m.inc(&m.writeErrors, c) }
+func (m *mockMetricsCollector) IncWriteAsync(c ClusterID)                    { m.inc(&m.writeAsync, c) }
+func (m *mockMetricsCollector) IncWriteDropped(c ClusterID)                  { m.inc(&m.writeDropped, c) }
+func (m *mockMetricsCollector) ObserveWriteDuration(_ ClusterID, _ float64)  {}
+func (m *mockMetricsCollector) IncFailoverTotal(_, _ ClusterID)              {}
+func (m *mockMetricsCollector) SetCircuitBreakerState(_ ClusterID, _ int)    {}
+func (m *mockMetricsCollector) IncCircuitBreakerTrip(_ ClusterID)            {}
+func (m *mockMetricsCollector) IncReplayEnqueued(_ ClusterID)                {}
+func (m *mockMetricsCollector) IncReplaySuccess(_ ClusterID)                 {}
+func (m *mockMetricsCollector) IncReplayError(_ ClusterID)                   {}
+func (m *mockMetricsCollector) IncReplayDropped(_ ClusterID)                 {}
+func (m *mockMetricsCollector) SetReplayQueueDepth(_ ClusterID, _ int)       {}
+func (m *mockMetricsCollector) ObserveReplayDuration(_ ClusterID, _ float64) {}
+func (m *mockMetricsCollector) SetClusterDraining(_ ClusterID, _ bool)       {}
+func (m *mockMetricsCollector) IncDrainModeEntered(_ ClusterID)              {}
+func (m *mockMetricsCollector) IncDrainModeExited(_ ClusterID)               {}
+
+// mockReplayer is a minimal inline replayer for write-classification tests.
+type mockReplayer struct {
+	sync.Mutex
+	payloads []types.ReplayPayload
+}
+
+func (r *mockReplayer) Enqueue(_ context.Context, p types.ReplayPayload) error {
+	r.Lock()
+	defer r.Unlock()
+	r.payloads = append(r.payloads, p)
+	return nil
 }
 
 // Example_contextUsage demonstrates two patterns for context handling in queries.

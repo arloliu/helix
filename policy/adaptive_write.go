@@ -53,11 +53,23 @@ type AdaptiveDualWrite struct {
 }
 
 // clusterWriteState tracks the health state of a single cluster for writes.
+//
+// Concurrency model:
+//   - isDegraded and lastLatency are atomic.Bool / atomic.Int64 so Execute can read
+//     them lock-free on the hot path.
+//   - slowStrikes and fastStrikes are plain int32 values protected by mu. The two
+//     counters must be updated as a compound operation to prevent races where a
+//     concurrent strike resets fastStrikes mid-recovery (or vice-versa), which would
+//     make the effective strikeThreshold / recoveryThreshold unpredictable.
+//   - isDegraded.Store is always called while mu is held, keeping the transition
+//     atomic with the counter changes. Reads of isDegraded in Execute are still
+//     lock-free; a one-call lag on a degradation transition is acceptable.
 type clusterWriteState struct {
-	slowStrikes atomic.Int32 // Consecutive slow writes
-	fastStrikes atomic.Int32 // Consecutive fast writes (for recovery)
-	isDegraded  atomic.Bool  // Fire-and-forget mode
-	lastLatency atomic.Int64 // Last successful write latency in nanoseconds
+	mu          sync.Mutex   // Protects slowStrikes and fastStrikes as a unit.
+	slowStrikes int32        // Consecutive slow writes; guarded by mu.
+	fastStrikes int32        // Consecutive fast writes for recovery; guarded by mu.
+	isDegraded  atomic.Bool  // Lock-free read in Execute fast path; written under mu.
+	lastLatency atomic.Int64 // Last write latency in nanoseconds; written from goroutines.
 }
 
 // AdaptiveDualWriteOption configures an AdaptiveDualWrite strategy.
@@ -359,7 +371,10 @@ func (a *AdaptiveDualWrite) fireAndForget(
 			}
 		}
 
-		// Write succeeded, was fast, and within delta of sibling - record for recovery
+		// Write succeeded, was fast, and within delta of sibling - record for recovery.
+		// Update lastLatency so subsequent fire-and-forget cycles and the sibling's
+		// delta check see a fresh observation rather than a stale pre-degradation value.
+		state.lastLatency.Store(latency.Nanoseconds())
 		a.recordFast(state)
 	}()
 
@@ -391,12 +406,14 @@ func (a *AdaptiveDualWrite) updateHealthState(
 	a.processLatencies(latencyA, latencyB, capViolationA, capViolationB)
 }
 
-// handleErrors records strikes for write errors (excluding async writes).
+// handleErrors records strikes for write errors.
+// ErrWriteAsync and ErrWriteDropped are excluded: both are expected operational
+// states for degraded clusters, not performance signals.
 func (a *AdaptiveDualWrite) handleErrors(errA, errB error) {
-	if errA != nil && !errors.Is(errA, types.ErrWriteAsync) {
+	if errA != nil && !errors.Is(errA, types.ErrWriteAsync) && !errors.Is(errA, types.ErrWriteDropped) {
 		a.recordStrike(&a.stateA)
 	}
-	if errB != nil && !errors.Is(errB, types.ErrWriteAsync) {
+	if errB != nil && !errors.Is(errB, types.ErrWriteAsync) && !errors.Is(errB, types.ErrWriteDropped) {
 		a.recordStrike(&a.stateB)
 	}
 }
@@ -432,12 +449,18 @@ func (a *AdaptiveDualWrite) processLatencies(latA, latB time.Duration, capViolat
 	}
 
 	if delta > a.deltaThreshold {
-		// One is significantly slower
+		// One is significantly slower than the other.
+		// Skip the delta strike if checkAbsoluteCap already issued a strike for
+		// this cluster in the same execution round, to prevent double-counting.
 		if latA > latB {
-			a.recordStrike(&a.stateA)
+			if !capViolationA {
+				a.recordStrike(&a.stateA)
+			}
 			a.recordFastIfNoViolation(&a.stateB, capViolationB)
 		} else {
-			a.recordStrike(&a.stateB)
+			if !capViolationB {
+				a.recordStrike(&a.stateB)
+			}
 			a.recordFastIfNoViolation(&a.stateA, capViolationA)
 		}
 	} else {
@@ -455,27 +478,38 @@ func (a *AdaptiveDualWrite) recordFastIfNoViolation(state *clusterWriteState, ha
 }
 
 // recordStrike increments the slow strike counter and potentially degrades the cluster.
+// Must be called with state.mu unlocked.
 func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
-	state.fastStrikes.Store(0) // Reset fast counter
-
-	strikes := state.slowStrikes.Add(1)
-	if strikes >= a.strikeThreshold {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.fastStrikes = 0
+	state.slowStrikes++
+	if state.slowStrikes >= a.strikeThreshold {
 		state.isDegraded.Store(true)
 	}
 }
 
-// recordFast increments the fast counter and potentially recovers the cluster.
+// recordFast resets the slow-strike counter and, if the cluster is currently
+// degraded, increments the fast counter toward recovery.
+//
+// slowStrikes is always cleared — even on a healthy cluster — so that a
+// slow→fast→slow sequence does not let stale strikes accumulate across the
+// gap. The isDegraded check is performed inside the lock so that a concurrent
+// ForceRecover or Reset cannot change the degraded state between the check
+// and the fastStrikes increment.
+//
+// Must be called with state.mu unlocked.
 func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
-	state.slowStrikes.Store(0) // Reset slow counter
-
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.slowStrikes = 0 // Always clear, regardless of degraded state.
 	if !state.isDegraded.Load() {
-		return // Already healthy, nothing to do
+		return // Healthy — no recovery credit needed.
 	}
-
-	fast := state.fastStrikes.Add(1)
-	if fast >= a.recoveryThreshold {
+	state.fastStrikes++
+	if state.fastStrikes >= a.recoveryThreshold {
 		state.isDegraded.Store(false)
-		state.fastStrikes.Store(0)
+		state.fastStrikes = 0
 	}
 }
 
@@ -497,13 +531,17 @@ func (a *AdaptiveDualWrite) IsDegraded(cluster types.ClusterID) bool {
 //
 // This is useful for testing or manual intervention.
 func (a *AdaptiveDualWrite) Reset() {
-	a.stateA.slowStrikes.Store(0)
-	a.stateA.fastStrikes.Store(0)
+	a.stateA.mu.Lock()
+	a.stateA.slowStrikes = 0
+	a.stateA.fastStrikes = 0
 	a.stateA.isDegraded.Store(false)
+	a.stateA.mu.Unlock()
 
-	a.stateB.slowStrikes.Store(0)
-	a.stateB.fastStrikes.Store(0)
+	a.stateB.mu.Lock()
+	a.stateB.slowStrikes = 0
+	a.stateB.fastStrikes = 0
 	a.stateB.isDegraded.Store(false)
+	a.stateB.mu.Unlock()
 }
 
 // ForceDegrade manually marks a cluster as degraded.
@@ -529,13 +567,17 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 //   - cluster: The cluster to recover
 func (a *AdaptiveDualWrite) ForceRecover(cluster types.ClusterID) {
 	if cluster == types.ClusterA {
+		a.stateA.mu.Lock()
 		a.stateA.isDegraded.Store(false)
-		a.stateA.slowStrikes.Store(0)
-		a.stateA.fastStrikes.Store(0)
+		a.stateA.slowStrikes = 0
+		a.stateA.fastStrikes = 0
+		a.stateA.mu.Unlock()
 	} else {
+		a.stateB.mu.Lock()
 		a.stateB.isDegraded.Store(false)
-		a.stateB.slowStrikes.Store(0)
-		a.stateB.fastStrikes.Store(0)
+		a.stateB.slowStrikes = 0
+		a.stateB.fastStrikes = 0
+		a.stateB.mu.Unlock()
 	}
 }
 

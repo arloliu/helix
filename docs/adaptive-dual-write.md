@@ -223,7 +223,8 @@ When a cluster is DEGRADED, writes are executed asynchronously:
 
 ### Handling ErrWriteAsync
 
-The client automatically handles `ErrWriteAsync` as a partial success:
+The client automatically handles `ErrWriteAsync` as a partial success and
+eagerly enqueues replay as a safety net:
 
 ```go
 // This is handled internally by CQLClient
@@ -231,9 +232,15 @@ resultA, resultB := strategy.Execute(ctx, writeA, writeB)
 
 if errors.Is(resultB, types.ErrWriteAsync) {
     // B is degraded, write is running in background
-    // Enqueue to replayer as backup
+    // CQLClient immediately enqueues replay as backup
 }
 ```
+
+This eager replay means the write may be attempted twice if the background
+goroutine also succeeds. For normal CQL writes, Helix uses a client-generated
+timestamp so the duplicate attempt is idempotent under Cassandra's
+last-write-wins rules. Counter updates are the exception: `CounterBatch`
+operations are additive and can double-count.
 
 ### Concurrency Limit (fireForgetLimit)
 
@@ -285,12 +292,12 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 )
 ```
 
-When a fire-and-forget write fails:
-1. Background goroutine detects failure
-2. CQLClient enqueues the write to Replayer
-3. ReplayWorker retries the write later
+When AdaptiveDualWrite returns `ErrWriteAsync` or `ErrWriteDropped`:
+1. CQLClient immediately enqueues the write to Replayer as a safety net
+2. The background goroutine may still succeed if the write was async
+3. ReplayWorker retries later if reconciliation is still needed
 
-**Without a Replayer**, fire-and-forget failures are lost permanently.
+**Without a Replayer**, dropped writes and later fire-and-forget failures are lost permanently.
 
 ## Decision Flowchart
 

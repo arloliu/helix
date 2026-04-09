@@ -43,6 +43,12 @@ func (m *NopMetrics) IncWriteTotal(_ types.ClusterID) {}
 // IncWriteError discards the metric.
 func (m *NopMetrics) IncWriteError(_ types.ClusterID) {}
 
+// IncWriteAsync discards the metric.
+func (m *NopMetrics) IncWriteAsync(_ types.ClusterID) {}
+
+// IncWriteDropped discards the metric.
+func (m *NopMetrics) IncWriteDropped(_ types.ClusterID) {}
+
 // ObserveWriteDuration discards the metric.
 func (m *NopMetrics) ObserveWriteDuration(_ types.ClusterID, _ float64) {}
 

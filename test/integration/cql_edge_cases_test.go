@@ -798,6 +798,73 @@ func TestCQLAdaptiveDualWriteRecoveryIntegration(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestCQLAdaptiveDualWriteBothDegradedIntegration is a regression test for the P0 bug
+// where executeDualWrite returned DualClusterError (and enqueued no replay) when both
+// clusters were in degraded (fire-and-forget) state. The correct behaviour is:
+//   - caller receives nil (both async writes are in flight)
+//   - replay is enqueued for each degraded cluster as a safety net
+//   - IncWriteAsync is incremented for each cluster
+//   - IncWriteError is NOT incremented for either cluster
+func TestCQLAdaptiveDualWriteBothDegradedIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	sessionA, sessionB := getSharedSessions(t)
+	ctx := t.Context()
+
+	ordersTable := createTestTableOnBoth(t, "orders_both_degraded", ordersTableCQLSchema)
+
+	memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
+	metricsCollector := testutil.NewTestMetricsCollector()
+
+	adaptiveWrite := policy.NewAdaptiveDualWrite(
+		policy.WithAdaptiveFireForgetTimeout(5 * time.Second),
+	)
+
+	client, err := helix.NewCQLClient(
+		cqlv1.WrapSession(sessionA),
+		cqlv1.WrapSession(sessionB),
+		helix.WithWriteStrategy(adaptiveWrite),
+		helix.WithReplayer(memReplayer),
+		helix.WithMetrics(metricsCollector),
+	)
+	require.NoError(t, err)
+
+	// Degrade both clusters.
+	adaptiveWrite.ForceDegrade(types.ClusterA)
+	adaptiveWrite.ForceDegrade(types.ClusterB)
+	require.True(t, adaptiveWrite.IsDegraded(types.ClusterA))
+	require.True(t, adaptiveWrite.IsDegraded(types.ClusterB))
+
+	// Execute a write. Before the fix this returned DualClusterError; after the fix
+	// it must return nil because both writes are dispatched asynchronously.
+	orderID := gocql.TimeUUID()
+	writeErr := client.Query(
+		"INSERT INTO "+ordersTable+" (id, user_id, total, status) VALUES (?, ?, ?, ?)",
+		orderID, gocql.TimeUUID(), 42.0, "both_degraded_test",
+	).ExecContext(ctx)
+
+	require.NoError(t, writeErr,
+		"write must succeed (return nil) when both clusters are in degraded fire-and-forget mode")
+
+	// Replay must be enqueued for both clusters as a safety net.
+	assert.Equal(t, int64(1), metricsCollector.GetReplayEnqueued(types.ClusterA),
+		"replay must be enqueued for degraded cluster A")
+	assert.Equal(t, int64(1), metricsCollector.GetReplayEnqueued(types.ClusterB),
+		"replay must be enqueued for degraded cluster B")
+
+	// IncWriteAsync must be incremented for both; IncWriteError must not be touched.
+	assert.Equal(t, int64(1), metricsCollector.GetWriteAsync(types.ClusterA),
+		"IncWriteAsync must be called for degraded cluster A")
+	assert.Equal(t, int64(1), metricsCollector.GetWriteAsync(types.ClusterB),
+		"IncWriteAsync must be called for degraded cluster B")
+	assert.Equal(t, int64(0), metricsCollector.GetWriteErrors(types.ClusterA),
+		"IncWriteError must NOT be called for async sentinel")
+	assert.Equal(t, int64(0), metricsCollector.GetWriteErrors(types.ClusterB),
+		"IncWriteError must NOT be called for async sentinel")
+}
+
 // =============================================================================
 // LatencyCircuitBreaker Integration Tests
 // =============================================================================
@@ -969,6 +1036,16 @@ func TestCQLAdaptiveDualWriteNaturalDegradationIntegration(t *testing.T) {
 
 	// Cluster A should still be healthy
 	assert.False(t, adaptiveWrite.IsDegraded(types.ClusterA))
+
+	// Regression: IncWriteAsync must be incremented for the degraded-cluster write,
+	// and IncWriteError must NOT be incremented. Before the fix, ErrWriteAsync was
+	// classified as a real error, inflating write_error metrics and masking operational state.
+	assert.Greater(t, metricsCollector.GetWriteAsync(types.ClusterB), int64(0),
+		"WriteAsync must be incremented for degraded-cluster (fire-and-forget) writes")
+	assert.Equal(t, int64(0), metricsCollector.GetWriteErrors(types.ClusterB),
+		"WriteErrors must NOT be incremented for async sentinel writes")
+	assert.Equal(t, int64(0), metricsCollector.GetWriteErrors(types.ClusterA),
+		"WriteErrors must NOT be incremented for healthy cluster A writes")
 
 	t.Log("AdaptiveDualWrite natural degradation test passed: B degraded after slow writes")
 }

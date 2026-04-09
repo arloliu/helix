@@ -40,6 +40,16 @@ type MetricsCollector interface {
 	// IncWriteError increments the write error counter.
 	IncWriteError(cluster ClusterID)
 
+	// IncWriteAsync increments the counter when a write is dispatched asynchronously
+	// to a degraded cluster via fire-and-forget (AdaptiveDualWrite only).
+	// This is an operational state, not a cluster error.
+	IncWriteAsync(cluster ClusterID)
+
+	// IncWriteDropped increments the counter when a fire-and-forget write is dropped
+	// because the concurrency limit (semaphore) is full (AdaptiveDualWrite only).
+	// The replay system handles reconciliation for dropped writes.
+	IncWriteDropped(cluster ClusterID)
+
 	// ObserveWriteDuration records a write operation duration in seconds.
 	ObserveWriteDuration(cluster ClusterID, seconds float64)
 

@@ -20,6 +20,8 @@ type TestMetricsCollector struct {
 	// Write operations
 	WriteTotal    map[types.ClusterID]int64
 	WriteErrors   map[types.ClusterID]int64
+	WriteAsync    map[types.ClusterID]int64
+	WriteDropped  map[types.ClusterID]int64
 	WriteDuration map[types.ClusterID][]float64
 
 	// Failover
@@ -59,6 +61,8 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		ReadDuration:        make(map[types.ClusterID][]float64),
 		WriteTotal:          make(map[types.ClusterID]int64),
 		WriteErrors:         make(map[types.ClusterID]int64),
+		WriteAsync:          make(map[types.ClusterID]int64),
+		WriteDropped:        make(map[types.ClusterID]int64),
 		WriteDuration:       make(map[types.ClusterID][]float64),
 		FailoverTotal:       make(map[string]int64),
 		CircuitBreakerState: make(map[types.ClusterID]int),
@@ -111,6 +115,18 @@ func (m *TestMetricsCollector) IncWriteError(cluster types.ClusterID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.WriteErrors[cluster]++
+}
+
+func (m *TestMetricsCollector) IncWriteAsync(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.WriteAsync[cluster]++
+}
+
+func (m *TestMetricsCollector) IncWriteDropped(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.WriteDropped[cluster]++
 }
 
 func (m *TestMetricsCollector) ObserveWriteDuration(cluster types.ClusterID, seconds float64) {
@@ -259,6 +275,20 @@ func (m *TestMetricsCollector) GetWriteErrors(cluster types.ClusterID) int64 {
 	return m.WriteErrors[cluster]
 }
 
+// GetWriteAsync returns the async write count for a cluster.
+func (m *TestMetricsCollector) GetWriteAsync(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.WriteAsync[cluster]
+}
+
+// GetWriteDropped returns the dropped write count for a cluster.
+func (m *TestMetricsCollector) GetWriteDropped(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.WriteDropped[cluster]
+}
+
 // GetReadErrors returns the total read error count for a cluster.
 func (m *TestMetricsCollector) GetReadErrors(cluster types.ClusterID) int64 {
 	m.mu.RLock()
@@ -276,6 +306,8 @@ func (m *TestMetricsCollector) Reset() {
 	m.ReadDuration = make(map[types.ClusterID][]float64)
 	m.WriteTotal = make(map[types.ClusterID]int64)
 	m.WriteErrors = make(map[types.ClusterID]int64)
+	m.WriteAsync = make(map[types.ClusterID]int64)
+	m.WriteDropped = make(map[types.ClusterID]int64)
 	m.WriteDuration = make(map[types.ClusterID][]float64)
 	m.FailoverTotal = make(map[string]int64)
 	m.CircuitBreakerState = make(map[types.ClusterID]int)

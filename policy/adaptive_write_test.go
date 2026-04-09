@@ -549,3 +549,271 @@ func TestAdaptiveDualWrite_RecoveryWhenBothDegraded(t *testing.T) {
 	assert.False(t, a.IsDegraded(types.ClusterB),
 		"Cluster B should recover when both degraded - using absoluteMax-only check")
 }
+
+// TestAdaptiveDualWrite_NoDoubleStrike verifies that a cluster which violates BOTH
+// the absolute cap AND the delta threshold in a single execution receives exactly
+// one strike — not two. This ensures strikeThreshold behaves as documented.
+func TestAdaptiveDualWrite_NoDoubleStrike(t *testing.T) {
+	// Configure so that strikeThreshold=2 is the only way to degrade.
+	// Without the fix, a single execution with cap+delta violation gives 2 strikes,
+	// degrading the cluster after just 1 round (2 >= 2).
+	// With the fix, it takes 2 rounds (1 strike each).
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveAbsoluteMax(50*time.Millisecond),    // cap threshold
+		WithAdaptiveDeltaThreshold(30*time.Millisecond), // delta threshold
+		WithAdaptiveMinFloor(10*time.Millisecond),
+		WithAdaptiveStrikeThreshold(2),
+	)
+	ctx := t.Context()
+
+	// Single execution: A takes 80ms (>50ms cap), B takes 10ms.
+	// Delta = 70ms > 30ms threshold → both conditions fire for A.
+	// With the fix: A gets exactly 1 strike, NOT 2.
+	_, _ = a.Execute(ctx,
+		func(ctx context.Context) error {
+			time.Sleep(80 * time.Millisecond) // exceeds absoluteMax AND deltaThreshold
+			return nil
+		},
+		func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond) // fast
+			return nil
+		},
+	)
+
+	// After 1 execution, A must NOT be degraded yet (strikeThreshold=2).
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"cluster A must not degrade after 1 execution when strikeThreshold=2 (no double-strike)")
+	assert.False(t, a.IsDegraded(types.ClusterB))
+
+	// Second execution with same pattern → 2nd strike → now degraded.
+	_, _ = a.Execute(ctx,
+		func(ctx context.Context) error {
+			time.Sleep(80 * time.Millisecond)
+			return nil
+		},
+		func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		},
+	)
+
+	assert.True(t, a.IsDegraded(types.ClusterA),
+		"cluster A must be degraded after 2 slow executions with strikeThreshold=2")
+}
+
+// TestAdaptiveDualWrite_HandleErrors_ExcludesDropped verifies that ErrWriteDropped
+// does NOT record a strike. Only genuine write errors should move the strike counter.
+func TestAdaptiveDualWrite_HandleErrors_ExcludesDropped(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(2),
+	)
+
+	// Force-degrade A so fireAndForget returns ErrWriteDropped when semaphore is full.
+	a.ForceDegrade(types.ClusterA)
+
+	// Directly invoke handleErrors with ErrWriteDropped for A.
+	// If it were recorded as a strike, the slow counter would advance.
+	// We verify this does not happen by checking that B (which gets a nil)
+	// also stays unaffected and that A remains at 0 slow strikes.
+	a.handleErrors(types.ErrWriteDropped, nil)
+	a.handleErrors(types.ErrWriteDropped, nil)
+
+	// A was already degraded; verify it did not accumulate slow strikes from dropped errors.
+	// We use ForceRecover to reset degraded status and then check that strikes
+	// don't immediately re-degrade it (which would happen if slowStrikes were > 0).
+	a.ForceRecover(types.ClusterA)
+	require.False(t, a.IsDegraded(types.ClusterA), "after ForceRecover, cluster A must be healthy")
+
+	// One more dropped call — must not degrade with strikeThreshold=2.
+	a.handleErrors(types.ErrWriteDropped, nil)
+	assert.False(t, a.IsDegraded(types.ClusterA), "ErrWriteDropped must not count as a slow strike")
+}
+
+// TestAdaptiveDualWrite_RecordFast_ClearsSlowStrikesOnHealthyCluster is a regression
+// test for the bug where recordFast returned early on a healthy cluster without clearing
+// slowStrikes. A slow→fast→slow sequence would accumulate stale strikes across the fast
+// gap and degrade prematurely — the slow writes were not truly consecutive.
+func TestAdaptiveDualWrite_RecordFast_ClearsSlowStrikesOnHealthyCluster(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(5),
+	)
+
+	// Accumulate 2 slow strikes on A — one below the degrade threshold of 3.
+	a.recordStrike(&a.stateA)
+	a.recordStrike(&a.stateA)
+	require.False(t, a.IsDegraded(types.ClusterA), "precondition: 2 strikes should not degrade at threshold=3")
+
+	// A fast write should clear the accumulated slow strikes.
+	a.recordFast(&a.stateA)
+	require.False(t, a.IsDegraded(types.ClusterA), "still healthy after fast write")
+
+	// Without the fix: the 2 stale strikes survive recordFast, so this 3rd slow
+	// strike (the first after a fast gap) would tip the total to 3 and degrade A.
+	// With the fix: slowStrikes was reset to 0 by recordFast, so this is strike 1.
+	a.recordStrike(&a.stateA)
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"first slow strike after a fast gap must not degrade the cluster (stale strikes must have been cleared)")
+}
+
+// TestAdaptiveDualWrite_RecordFast_RaceWithForceRecover verifies that a concurrent
+// ForceRecover cannot cause a stale fire-and-forget completion to apply recovery
+// credit after the cluster has been intentionally reset. The isDegraded check inside
+// the lock prevents the TOCTOU window that existed when the check was outside the lock.
+func TestAdaptiveDualWrite_RecordFast_RaceWithForceRecover(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(2),
+	)
+
+	// Degrade A.
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	// ForceRecover runs first, resetting the cluster to healthy with fastStrikes=0.
+	a.ForceRecover(types.ClusterA)
+	require.False(t, a.IsDegraded(types.ClusterA))
+
+	// Now a stale fire-and-forget goroutine calls recordFast.
+	// Before the fix: isDegraded check was outside the lock; by the time the lock
+	// was acquired, isDegraded was already false. The goroutine then incremented
+	// fastStrikes (from 0 to 1) on a now-healthy cluster — harmless on its own,
+	// but the counter was left dirty, meaning the next genuine recovery would
+	// need only 1 more fast write instead of recoveryThreshold.
+	// After the fix: isDegraded is checked inside the lock, so the goroutine sees
+	// false and exits without touching fastStrikes.
+	a.recordFast(&a.stateA)
+
+	// fastStrikes must still be 0 — the stale goroutine must not have incremented it.
+	// Re-degrade A and verify it still requires a full recoveryThreshold=2 fast writes.
+	a.ForceDegrade(types.ClusterA)
+	a.recordFast(&a.stateA) // fast write 1 of 2
+	assert.True(t, a.IsDegraded(types.ClusterA),
+		"cluster must still need recoveryThreshold=2 fast writes to recover; stale credit must not have been applied")
+	a.recordFast(&a.stateA) // fast write 2 of 2
+	assert.False(t, a.IsDegraded(types.ClusterA), "cluster must recover after full recoveryThreshold")
+}
+
+// TestAdaptiveDualWrite_Concurrent_RecoveryThreshold stress-tests the state machine
+// under concurrent writes to verify that mutex-protected compound transitions
+// (slowStrikes→degraded, fastStrikes→recovered) are data-race free and produce
+// consistent final state.
+//
+// Scenario: 50 goroutines simultaneously fire recoveries against a pre-degraded
+// cluster. With recoveryThreshold=5, the cluster must recover exactly once —
+// and the final isDegraded state must be false regardless of interleaving.
+func TestAdaptiveDualWrite_Concurrent_RecoveryThreshold(t *testing.T) {
+	const goroutines = 50
+
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(5),
+	)
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			a.recordFast(&a.stateA)
+		}()
+	}
+	wg.Wait()
+
+	// After 50 concurrent fast recordings against threshold=5,
+	// the cluster must have recovered (isDegraded==false).
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"cluster A must be recovered after sufficient concurrent fast recordings")
+}
+
+// TestAdaptiveDualWrite_Concurrent_StrikeAndRecover stress-tests interleaved
+// strikes and recoveries from many goroutines to verify no data race is detected
+// by the race detector (-race). The exact final state is non-deterministic, but
+// the test must complete without crashing or deadlocking.
+func TestAdaptiveDualWrite_Concurrent_StrikeAndRecover(t *testing.T) {
+	const goroutines = 100
+
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(5),
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+
+	// Half the goroutines record strikes on A; half record fast recoveries on B.
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			a.recordStrike(&a.stateA)
+		}()
+		go func() {
+			defer wg.Done()
+			a.recordFast(&a.stateB)
+		}()
+	}
+	wg.Wait()
+
+	// State is non-deterministic but must be internally consistent:
+	// isDegraded must match whether slowStrikes reached the threshold.
+	// We just verify no panic/deadlock occurred (the -race detector catches races).
+}
+
+// TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget verifies that a successful
+// fire-and-forget write updates state.lastLatency so that subsequent delta comparisons
+// use a fresh observation rather than a stale pre-degradation value.
+//
+// The bug (before the fix): recordFast was called but lastLatency was never stored,
+// so the sibling's delta check would always compare against the old latency snapshot
+// taken when the cluster was last written synchronously — potentially hours stale.
+func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(1),
+		WithAdaptiveRecoveryThreshold(1),
+		WithAdaptiveFireForgetTimeout(5*time.Second),
+		// Use a wide delta so the write definitely passes the delta check.
+		WithAdaptiveDeltaThreshold(10*time.Second),
+		// absoluteMax must be large enough to not reject our fast write.
+		WithAdaptiveAbsoluteMax(10*time.Second),
+	)
+
+	// Pre-seed sibling (B) with a known latency so the delta path is exercised.
+	a.stateB.lastLatency.Store((50 * time.Millisecond).Nanoseconds())
+
+	// Degrade cluster A so the next Execute call takes the fireAndForget path.
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	// Capture the old latency — should be 0 (never written).
+	require.Equal(t, int64(0), a.stateA.lastLatency.Load(),
+		"precondition: stateA.lastLatency must be 0 before fire-and-forget")
+
+	ctx := t.Context()
+	var writeDone sync.WaitGroup
+	writeDone.Add(1)
+
+	errA, _ := a.Execute(ctx,
+		func(context.Context) error {
+			// Simulate a fast write (~1ms) — well within absoluteMax and delta.
+			time.Sleep(1 * time.Millisecond)
+			writeDone.Done()
+			return nil
+		},
+		func(context.Context) error { return nil },
+	)
+
+	// Execute must return ErrWriteAsync for the degraded cluster.
+	require.ErrorIs(t, errA, types.ErrWriteAsync,
+		"cluster A (degraded) must return ErrWriteAsync")
+
+	// Wait for the goroutine to complete before checking lastLatency.
+	writeDone.Wait()
+	// Give the goroutine a brief moment to store latency after writeDone.Done().
+	time.Sleep(5 * time.Millisecond)
+
+	latency := a.stateA.lastLatency.Load()
+	assert.Greater(t, latency, int64(0),
+		"stateA.lastLatency must be updated after a successful fire-and-forget write")
+}
