@@ -1174,3 +1174,145 @@ func TestCQLQueryConfigPropagation(t *testing.T) {
 		}
 	})
 }
+
+// TestCQLAdapterScanCASDirectIntegration tests the v1 adapter ScanCAS and
+// ScanCASContext methods directly (non-map variants, previously untested).
+func TestCQLAdapterScanCASDirectIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	sessionA, _ := getSharedSessions(t)
+	adapter := cqlv1.NewSession(sessionA)
+
+	table := createTestTableOnBoth(t, "scancas_direct", usersTableSchema)
+
+	userID := gocql.TimeUUID()
+
+	// ScanCAS: first insert succeeds (applied=true). Only [applied] in result — no dest needed.
+	applied, err := adapter.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		userID, "ScanCASUser", "scancas@example.com", time.Now(),
+	).ScanCAS()
+	require.NoError(t, err)
+	require.True(t, applied, "first INSERT IF NOT EXISTS should be applied")
+
+	// ScanCAS: duplicate insert fails (applied=false). Result includes all 4 table columns —
+	// dest vars must be provided so gocql can scan the existing row.
+	// Cassandra LWT returns columns in: partition key first, then non-key columns alphabetically.
+	// For usersTableSchema: id, created_at, email, name.
+	var existingID gocql.UUID
+	var existingCreatedAt time.Time
+	var existingEmail, existingName string
+	applied, err = adapter.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		userID, "ScanCASUser2", "scancas2@example.com", time.Now(),
+	).ScanCAS(&existingID, &existingCreatedAt, &existingEmail, &existingName)
+	require.NoError(t, err)
+	require.False(t, applied, "duplicate INSERT IF NOT EXISTS should not be applied")
+	require.Equal(t, "ScanCASUser", existingName, "existing row name returned on conflict")
+
+	// ScanCASContext: new row succeeds
+	newID := gocql.TimeUUID()
+	applied, err = adapter.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		newID, "ScanCASCtxUser", "scancasctx@example.com", time.Now(),
+	).ScanCASContext(ctx)
+	require.NoError(t, err)
+	require.True(t, applied, "ScanCASContext with new row should be applied")
+
+	// ScanCASContext: duplicate fails — same dest requirement (id, created_at, email, name).
+	applied, err = adapter.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		newID, "ScanCASCtxUser2", "scancasctx2@example.com", time.Now(),
+	).ScanCASContext(ctx, &existingID, &existingCreatedAt, &existingEmail, &existingName)
+	require.NoError(t, err)
+	require.False(t, applied, "duplicate ScanCASContext should not be applied")
+	require.Equal(t, "ScanCASCtxUser", existingName, "existing row name returned on conflict")
+}
+
+// TestCQLAdapterBatchExecCASIntegration tests the v1 adapter Batch.ExecCAS
+// (non-map variant) which was previously untested.
+func TestCQLAdapterBatchExecCASIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	sessionA, _ := getSharedSessions(t)
+	adapter := cqlv1.NewSession(sessionA)
+
+	table := createTestTableOnBoth(t, "batchexeccas", usersTableSchema)
+
+	userID := gocql.TimeUUID()
+
+	// ExecCAS: first insert applied
+	batch := adapter.Batch(cql.UnloggedBatch)
+	batch.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		userID, "BatchExecCASUser", "batchexeccas@example.com", time.Now(),
+	)
+	applied, iter, err := batch.ExecCAS()
+	require.NoError(t, err)
+	require.True(t, applied, "first batch ExecCAS should be applied")
+	require.NoError(t, iter.Close())
+
+	// ExecCAS: duplicate not applied — result includes all 4 table columns so dest vars are required.
+	// Column order (Cassandra LWT): id, created_at, email, name (PK first, non-key alphabetical).
+	var existingID gocql.UUID
+	var existingCreatedAt time.Time
+	var existingEmail, existingName string
+	batch2 := adapter.Batch(cql.UnloggedBatch)
+	batch2.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		userID, "BatchExecCASUser2", "batchexeccas2@example.com", time.Now(),
+	)
+	applied, iter, err = batch2.ExecCAS(&existingID, &existingCreatedAt, &existingEmail, &existingName)
+	require.NoError(t, err)
+	require.False(t, applied, "duplicate batch ExecCAS should not be applied")
+	require.Equal(t, "BatchExecCASUser", existingName, "existing row name returned on conflict")
+	require.NoError(t, iter.Close())
+}
+
+// TestCQLAdapterBatchExecCASContextIntegration tests the v1 adapter
+// Batch.ExecCASContext — exercising Fix #1's success path with a live context.
+func TestCQLAdapterBatchExecCASContextIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	sessionA, _ := getSharedSessions(t)
+	adapter := cqlv1.NewSession(sessionA)
+
+	table := createTestTableOnBoth(t, "batchexeccas_ctx", usersTableSchema)
+
+	userID := gocql.TimeUUID()
+
+	// ExecCASContext with live context: first insert applied
+	batch := adapter.Batch(cql.UnloggedBatch)
+	batch.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		userID, "BatchCASCtxUser", "batchcasctx@example.com", time.Now(),
+	)
+	applied, iter, err := batch.ExecCASContext(ctx)
+	require.NoError(t, err)
+	require.True(t, applied, "first ExecCASContext should be applied")
+	require.NoError(t, iter.Close())
+
+	// ExecCASContext: duplicate not applied — dest vars required for the 4 table columns.
+	// Column order (Cassandra LWT): id, created_at, email, name (PK first, non-key alphabetical).
+	var existingID gocql.UUID
+	var existingCreatedAt time.Time
+	var existingEmail, existingName string
+	batch2 := adapter.Batch(cql.UnloggedBatch)
+	batch2.Query(
+		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+		userID, "BatchCASCtxUser2", "batchcasctx2@example.com", time.Now(),
+	)
+	applied, iter, err = batch2.ExecCASContext(ctx, &existingID, &existingCreatedAt, &existingEmail, &existingName)
+	require.NoError(t, err)
+	require.False(t, applied, "duplicate ExecCASContext should not be applied")
+	require.Equal(t, "BatchCASCtxUser", existingName, "existing row name returned on conflict")
+	require.NoError(t, iter.Close())
+}
