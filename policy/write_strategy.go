@@ -127,8 +127,10 @@ func NewSyncDualWrite(opts ...SyncDualWriteOption) *SyncDualWrite {
 
 // Execute performs sequential writes to both clusters.
 //
-// Writes to the first cluster, then to the second, regardless of
-// whether the first succeeds or fails.
+// Writes to the first cluster, then to the second. If the context is already
+// canceled or deadline-exceeded after the first write returns, the second write
+// is skipped and ctx.Err() is returned for it — avoiding wasted work and an
+// immediate predictable error that the caller would have to handle anyway.
 //
 // Parameters:
 //   - ctx: Context for the operation
@@ -145,9 +147,15 @@ func (s *SyncDualWrite) Execute(
 ) (resultA, resultB error) {
 	if s.primaryFirst {
 		resultA = writeA(ctx)
+		if ctx.Err() != nil {
+			return resultA, ctx.Err()
+		}
 		resultB = writeB(ctx)
 	} else {
 		resultB = writeB(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err(), resultB
+		}
 		resultA = writeA(ctx)
 	}
 

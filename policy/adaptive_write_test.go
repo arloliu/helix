@@ -254,6 +254,44 @@ func TestAdaptiveDualWrite_RecoveryViaFastWrites(t *testing.T) {
 	assert.False(t, a.IsDegraded(types.ClusterB))
 }
 
+// TestAdaptiveDualWrite_ForceDegrade_ResetsFastStrikes verifies that ForceDegrade
+// resets fastStrikes atomically, preventing a cluster with accumulated fast-strike
+// credit from recovering immediately after a forced degradation.
+func TestAdaptiveDualWrite_ForceDegrade_ResetsFastStrikes(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(5),
+	)
+
+	// Degrade cluster A.
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	// Accumulate 4 of 5 fast strikes needed for recovery.
+	for range 4 {
+		a.recordFast(&a.stateA)
+	}
+	require.True(t, a.IsDegraded(types.ClusterA), "still degraded after 4/5 fast strikes")
+	require.Equal(t, int32(4), a.stateA.fastStrikes)
+
+	// ForceDegrade again — must reset fastStrikes to 0.
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.Equal(t, int32(0), a.stateA.fastStrikes, "ForceDegrade must zero fastStrikes")
+
+	// 4 more fast strikes must not recover the cluster (needs full 5).
+	for range 4 {
+		a.recordFast(&a.stateA)
+	}
+	assert.True(t, a.IsDegraded(types.ClusterA),
+		"cluster must stay degraded when fastStrikes < recoveryThreshold after ForceDegrade")
+
+	// 5th fast strike completes the threshold.
+	a.recordFast(&a.stateA)
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"cluster must recover after a full recoveryThreshold=5 run from zero")
+}
+
 func TestAdaptiveDualWrite_Reset(t *testing.T) {
 	a := NewAdaptiveDualWrite()
 

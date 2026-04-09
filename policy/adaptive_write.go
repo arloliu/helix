@@ -546,15 +546,24 @@ func (a *AdaptiveDualWrite) Reset() {
 
 // ForceDegrade manually marks a cluster as degraded.
 //
-// This is useful for testing or manual intervention.
+// This is useful for testing or manual intervention. The call acquires the
+// cluster's mutex so that fastStrikes is reset atomically with the degraded
+// transition — preventing a stale fast-strike accumulation from immediately
+// recovering the cluster on the very next recordFast call.
 //
 // Parameters:
 //   - cluster: The cluster to degrade
 func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 	if cluster == types.ClusterA {
+		a.stateA.mu.Lock()
+		a.stateA.fastStrikes = 0
 		a.stateA.isDegraded.Store(true)
+		a.stateA.mu.Unlock()
 	} else {
+		a.stateB.mu.Lock()
+		a.stateB.fastStrikes = 0
 		a.stateB.isDegraded.Store(true)
+		a.stateB.mu.Unlock()
 	}
 }
 

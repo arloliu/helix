@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,6 +92,57 @@ func TestSyncDualWritePrimaryFirst(t *testing.T) {
 	require.NoError(t, errA)
 	require.NoError(t, errB)
 	require.Equal(t, []string{"A", "B"}, order)
+}
+
+// TestSyncDualWrite_CanceledContext_SkipsSecondWrite verifies that if the context
+// is canceled after the first write returns, the second write is not called and
+// ctx.Err() is returned for the skipped cluster.
+func TestSyncDualWrite_CanceledContext_SkipsSecondWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	strategy := NewSyncDualWrite(WithPrimaryFirst())
+
+	var calledB atomic.Bool
+
+	errA, errB := strategy.Execute(ctx,
+		func(_ context.Context) error {
+			cancel() // cancel context during the first write
+			return nil
+		},
+		func(_ context.Context) error {
+			calledB.Store(true)
+			return nil
+		},
+	)
+
+	assert.NoError(t, errA, "cluster A write succeeded")
+	assert.ErrorIs(t, errB, context.Canceled, "cluster B must get context.Canceled when context is canceled")
+	assert.False(t, calledB.Load(), "cluster B write must not be called after context cancellation")
+}
+
+// TestSyncDualWrite_CanceledContext_SecondaryFirst verifies the same skip behavior
+// when the secondary cluster writes first.
+func TestSyncDualWrite_CanceledContext_SecondaryFirst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	strategy := NewSyncDualWrite(WithSecondaryFirst())
+
+	var calledA atomic.Bool
+
+	errA, errB := strategy.Execute(ctx,
+		func(_ context.Context) error {
+			calledA.Store(true)
+			return nil
+		},
+		func(_ context.Context) error {
+			cancel() // cancel context during the first write (B goes first)
+			return nil
+		},
+	)
+
+	assert.ErrorIs(t, errA, context.Canceled, "cluster A must get context.Canceled when context is canceled")
+	assert.NoError(t, errB, "cluster B write succeeded")
+	assert.False(t, calledA.Load(), "cluster A write must not be called after context cancellation")
 }
 
 func TestSyncDualWriteSecondaryFirst(t *testing.T) {

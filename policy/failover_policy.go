@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,16 +51,35 @@ func (a *ActiveFailover) RecordSuccess(_ types.ClusterID) {}
 //
 // Tracks consecutive failures and only triggers failover after a threshold
 // is reached. This prevents flapping on transient errors.
+//
+// Concurrency model:
+//   - muA / muB serialize all compound operations on cluster A / B state
+//     (load lastFailure → decide reset-or-add → store failures → store timestamp).
+//     Without this serialization the three atomic ops form a TOCTOU sequence
+//     that can lose counts or emit duplicate metrics under concurrent callers.
+//   - failuresA / failuresB remain atomic.Int32 so ShouldFailover can read
+//     them lock-free on the hot path; a one-call lag on a transition is fine.
+//   - trippedA / trippedB track whether the circuit has already tripped to
+//     open; they are plain bools guarded by muA / muB respectively, ensuring
+//     the "circuit opened" metric fires exactly once per trip.
+//   - clusterNames is stored in an atomic.Pointer so SetClusterNames is safe
+//     to call concurrently with RecordFailure / RecordSuccess.
 type CircuitBreaker struct {
 	threshold    int
 	resetTimeout time.Duration
 	metrics      types.MetricsCollector
 	logger       types.Logger
-	clusterNames types.ClusterNames
-	failuresA    atomic.Int32
-	failuresB    atomic.Int32
-	lastFailureA atomic.Int64 // Unix nano
-	lastFailureB atomic.Int64 // Unix nano
+	clusterNames atomic.Pointer[types.ClusterNames]
+
+	muA          sync.Mutex   // serializes compound ops for cluster A
+	trippedA     bool         // circuit open for A; guarded by muA
+	failuresA    atomic.Int32 // lock-free for ShouldFailover; written under muA
+	lastFailureA atomic.Int64 // Unix nano; written under muA
+
+	muB          sync.Mutex   // serializes compound ops for cluster B
+	trippedB     bool         // circuit open for B; guarded by muB
+	failuresB    atomic.Int32 // lock-free for ShouldFailover; written under muB
+	lastFailureB atomic.Int64 // Unix nano; written under muB
 }
 
 // CircuitBreakerOption configures a CircuitBreaker policy.
@@ -126,7 +146,7 @@ func WithCircuitBreakerLogger(l types.Logger) CircuitBreakerOption {
 //   - CircuitBreakerOption: Configuration option
 func WithCircuitBreakerClusterNames(names types.ClusterNames) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
-		c.clusterNames = names
+		c.clusterNames.Store(&names)
 	}
 }
 
@@ -143,8 +163,9 @@ func NewCircuitBreaker(opts ...CircuitBreakerOption) *CircuitBreaker {
 	c := &CircuitBreaker{
 		threshold:    3,
 		resetTimeout: 30 * time.Second,
-		clusterNames: types.DefaultClusterNames(),
 	}
+	defaultNames := types.DefaultClusterNames()
+	c.clusterNames.Store(&defaultNames)
 
 	for _, opt := range opts {
 		opt(c)
@@ -184,15 +205,20 @@ func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
 // RecordFailure increments the failure counter for a cluster.
 //
 // If the reset timeout has passed since the last failure, the counter
-// is reset to 1 instead of incrementing.
+// is reset to 1 instead of incrementing. The compound load-check-store
+// sequence is serialized by a per-cluster mutex to prevent TOCTOU races
+// under concurrent callers. The "circuit opened" metric is emitted at most
+// once per trip (guarded by the tripped flag inside the mutex).
 //
 // Parameters:
 //   - cluster: The cluster that failed
 func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 	now := time.Now().UnixNano()
 	var newFailures int32
+	var justTripped bool
 
 	if cluster == types.ClusterA {
+		c.muA.Lock()
 		lastFailure := c.lastFailureA.Load()
 		if lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
 			c.failuresA.Store(1)
@@ -201,7 +227,13 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 			newFailures = c.failuresA.Add(1)
 		}
 		c.lastFailureA.Store(now)
+		if int(newFailures) >= c.threshold && !c.trippedA {
+			c.trippedA = true
+			justTripped = true
+		}
+		c.muA.Unlock()
 	} else {
+		c.muB.Lock()
 		lastFailure := c.lastFailureB.Load()
 		if lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
 			c.failuresB.Store(1)
@@ -210,14 +242,18 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 			newFailures = c.failuresB.Add(1)
 		}
 		c.lastFailureB.Store(now)
+		if int(newFailures) >= c.threshold && !c.trippedB {
+			c.trippedB = true
+			justTripped = true
+		}
+		c.muB.Unlock()
 	}
 
-	// Record metrics when circuit trips to open
-	if int(newFailures) == c.threshold {
+	if justTripped {
 		c.metrics.IncCircuitBreakerTrip(cluster)
 		c.metrics.SetCircuitBreakerState(cluster, 2) // 2 = open
 		c.logger.Warn("circuit breaker tripped",
-			"cluster", c.clusterNames.Name(cluster),
+			"cluster", c.clusterNames.Load().Name(cluster),
 			"threshold", c.threshold,
 		)
 	}
@@ -231,20 +267,26 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 	var wasOpen bool
 
 	if cluster == types.ClusterA {
-		wasOpen = int(c.failuresA.Load()) >= c.threshold
+		c.muA.Lock()
+		wasOpen = c.trippedA
 		c.failuresA.Store(0)
 		c.lastFailureA.Store(0)
+		c.trippedA = false
+		c.muA.Unlock()
 	} else {
-		wasOpen = int(c.failuresB.Load()) >= c.threshold
+		c.muB.Lock()
+		wasOpen = c.trippedB
 		c.failuresB.Store(0)
 		c.lastFailureB.Store(0)
+		c.trippedB = false
+		c.muB.Unlock()
 	}
 
 	// Record metrics when circuit closes
 	if wasOpen {
 		c.metrics.SetCircuitBreakerState(cluster, 0) // 0 = closed
 		c.logger.Info("circuit breaker closed",
-			"cluster", c.clusterNames.Name(cluster),
+			"cluster", c.clusterNames.Load().Name(cluster),
 		)
 	}
 }
@@ -266,10 +308,11 @@ func (c *CircuitBreaker) Failures(cluster types.ClusterID) int {
 // SetClusterNames sets custom display names for clusters in log messages.
 //
 // This method is called by the client during initialization to propagate
-// cluster names configured via WithClusterNames.
+// cluster names configured via WithClusterNames. It is safe to call
+// concurrently with RecordFailure and RecordSuccess.
 //
 // Parameters:
 //   - names: The cluster names to use in log messages
 func (c *CircuitBreaker) SetClusterNames(names types.ClusterNames) {
-	c.clusterNames = names
+	c.clusterNames.Store(&names)
 }

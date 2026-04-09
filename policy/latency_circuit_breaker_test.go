@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -125,6 +126,61 @@ func TestLatencyCircuitBreaker_IndependentClusters(t *testing.T) {
 	assert.True(t, lcb.ShouldFailover(types.ClusterA, nil))
 	assert.False(t, lcb.ShouldFailover(types.ClusterB, nil))
 }
+
+// TestLatencyCircuitBreaker_WithMetrics verifies that WithLatencyMetrics wires a
+// real collector so circuit trip and state-change events are recorded.
+func TestLatencyCircuitBreaker_WithMetrics(t *testing.T) {
+	m := testutil.NewTestMetricsCollector()
+	lcb := NewLatencyCircuitBreaker(
+		WithLatencyAbsoluteMax(100*time.Millisecond),
+		WithLatencyThreshold(2),
+		WithLatencyMetrics(m),
+	)
+
+	// Two slow latencies trip the circuit.
+	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond)
+	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond)
+
+	assert.Equal(t, int64(1), m.CircuitBreakerTrips[types.ClusterA],
+		"circuit trip metric must be recorded when threshold is reached")
+	assert.Equal(t, 2, m.CircuitBreakerState[types.ClusterA],
+		"circuit breaker state must be 2 (open) after tripping")
+
+	// A fast latency closes the circuit.
+	lcb.RecordLatency(types.ClusterA, 50*time.Millisecond)
+	assert.Equal(t, 0, m.CircuitBreakerState[types.ClusterA],
+		"circuit breaker state must be 0 (closed) after recovery")
+}
+
+// TestLatencyCircuitBreaker_WithLogger verifies that WithLatencyLogger wires a
+// logger so circuit events produce log output. We verify indirectly: if the
+// logger were nil the call would panic; not panicking confirms the logger is used.
+func TestLatencyCircuitBreaker_WithLogger(t *testing.T) {
+	logged := make([]string, 0)
+	lcb := NewLatencyCircuitBreaker(
+		WithLatencyAbsoluteMax(100*time.Millisecond),
+		WithLatencyThreshold(1),
+		WithLatencyLogger(&captureLogger{messages: &logged}),
+	)
+
+	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond) // trips circuit
+
+	require.Len(t, logged, 1, "expected one log message for circuit trip")
+	assert.Contains(t, logged[0], "circuit breaker tripped")
+}
+
+// captureLogger records Warn messages for test assertions.
+type captureLogger struct {
+	messages *[]string
+}
+
+func (l *captureLogger) Debug(_ string, _ ...any) {}
+func (l *captureLogger) Info(_ string, _ ...any)  {}
+func (l *captureLogger) Warn(msg string, _ ...any) {
+	*l.messages = append(*l.messages, msg)
+}
+func (l *captureLogger) Error(_ string, _ ...any) {}
+func (l *captureLogger) Fatal(_ string, _ ...any) {}
 
 func TestLatencyCircuitBreaker_ImplementsFailoverPolicy(t *testing.T) {
 	// Verify LatencyCircuitBreaker can be used where FailoverPolicy is expected

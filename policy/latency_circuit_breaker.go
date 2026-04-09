@@ -86,6 +86,39 @@ func WithLatencyResetTimeout(d time.Duration) LatencyCircuitBreakerOption {
 	}
 }
 
+// WithLatencyMetrics sets the metrics collector for the latency circuit breaker.
+//
+// Without this option the circuit breaker uses a no-op collector, so circuit
+// trip events are never recorded. Provide a real collector in production to
+// observe open/close transitions.
+//
+// Parameters:
+//   - m: The metrics collector
+//
+// Returns:
+//   - LatencyCircuitBreakerOption: Configuration option
+func WithLatencyMetrics(m types.MetricsCollector) LatencyCircuitBreakerOption {
+	return func(l *LatencyCircuitBreaker) {
+		l.metrics = m
+	}
+}
+
+// WithLatencyLogger sets the logger for the latency circuit breaker.
+//
+// Without this option the circuit breaker uses a no-op logger, so circuit
+// trip/close events are never logged. Provide a real logger in production.
+//
+// Parameters:
+//   - log: The logger
+//
+// Returns:
+//   - LatencyCircuitBreakerOption: Configuration option
+func WithLatencyLogger(log types.Logger) LatencyCircuitBreakerOption {
+	return func(l *LatencyCircuitBreaker) {
+		l.logger = log
+	}
+}
+
 // NewLatencyCircuitBreaker creates a new LatencyCircuitBreaker policy.
 //
 // Defaults:
