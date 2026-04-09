@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -90,6 +91,7 @@ func TestCQLWithAutoMemoryWorkerReplayOnPartialFailure(t *testing.T) {
 
 	// Track execution via custom success callback
 	var replayedCount atomic.Int32
+	var replayedMu sync.Mutex
 	var replayedPayloads []types.ReplayPayload
 
 	// Use failing session for B to trigger replay
@@ -106,8 +108,10 @@ func TestCQLWithAutoMemoryWorkerReplayOnPartialFailure(t *testing.T) {
 		helix.WithAutoMemoryWorker(100,
 			replay.WithPollInterval(10*time.Millisecond),
 			replay.WithOnSuccess(func(p types.ReplayPayload) {
-				replayedCount.Add(1)
+				replayedMu.Lock()
 				replayedPayloads = append(replayedPayloads, p)
+				replayedMu.Unlock()
+				replayedCount.Add(1)
 			}),
 		),
 	)
@@ -133,7 +137,10 @@ func TestCQLWithAutoMemoryWorkerReplayOnPartialFailure(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond, "replay should process enqueued messages")
 
 	// Verify replayed payloads target cluster B
-	for _, payload := range replayedPayloads {
+	replayedMu.Lock()
+	payloadsCopy := append([]types.ReplayPayload(nil), replayedPayloads...)
+	replayedMu.Unlock()
+	for _, payload := range payloadsCopy {
 		assert.Equal(t, types.ClusterB, payload.TargetCluster)
 		assert.Contains(t, payload.Query, "INSERT INTO")
 	}
