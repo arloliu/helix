@@ -8,7 +8,7 @@
 // Import this package along with the Apache gocql driver:
 //
 //	import (
-//	    "github.com/apache/cassandra-gocql-driver/gocql"
+//	    gocql "github.com/apache/cassandra-gocql-driver/v2"
 //	    v2 "github.com/arloliu/helix/adapter/cql/v2"
 //	)
 //

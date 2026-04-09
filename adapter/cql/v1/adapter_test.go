@@ -34,18 +34,18 @@ func TestIterImplementsInterface(t *testing.T) {
 	var _ cql.Iter = (*v1.Iter)(nil)
 }
 
-// TestNewSessionNil tests that NewSession handles nil gracefully.
-func TestNewSessionNil(t *testing.T) {
-	// Note: This will create a Session with nil underlying gocql.Session.
-	// In production, this would panic on use, but we verify the constructor works.
-	session := v1.NewSession(nil)
-	require.NotNil(t, session)
+// TestNewSessionNilPanics verifies that NewSession panics on nil input.
+func TestNewSessionNilPanics(t *testing.T) {
+	require.PanicsWithValue(t, "cql/v1: NewSession called with nil gocql.Session", func() {
+		v1.NewSession(nil)
+	})
 }
 
-// TestWrapSessionNil tests that WrapSession handles nil gracefully.
-func TestWrapSessionNil(t *testing.T) {
-	session := v1.WrapSession(nil)
-	require.NotNil(t, session)
+// TestWrapSessionNilPanics verifies that WrapSession panics on nil input.
+func TestWrapSessionNilPanics(t *testing.T) {
+	require.PanicsWithValue(t, "cql/v1: NewSession called with nil gocql.Session", func() {
+		v1.WrapSession(nil)
+	})
 }
 
 // The following tests require a real gocql.Session and are run as integration tests.

@@ -15,12 +15,18 @@ type Session struct {
 
 // NewSession creates a new v1 adapter from a gocql session.
 //
+// NewSession panics if session is nil. Always pass a fully initialized
+// [gocql.Session] obtained from [gocql.ClusterConfig.CreateSession].
+//
 // Parameters:
-//   - session: A gocql.Session instance
+//   - session: A gocql.Session instance (must not be nil)
 //
 // Returns:
 //   - *Session: An adapter implementing cql.Session
 func NewSession(session *gocql.Session) *Session {
+	if session == nil {
+		panic("cql/v1: NewSession called with nil gocql.Session")
+	}
 	return &Session{session: session}
 }
 
@@ -284,11 +290,13 @@ func (b *Batch) ExecContext(ctx context.Context) error {
 }
 
 // IterContext executes the batch with context and returns an iterator.
-// Note: gocql v1 doesn't have a direct IterContext for batches,
-// so we execute and return a nil-safe iterator.
+//
+// WARNING: gocql v1 does not return an iterator from batch execution.
+// The batch is executed, but the execution error is silently discarded
+// and the returned iterator is always empty (nil-backed). Callers that
+// need error visibility should use [Batch.ExecContext] instead.
+// This method exists only for interface compatibility with v2.
 func (b *Batch) IterContext(ctx context.Context) cql.Iter {
-	// v1 doesn't return an iterator from ExecuteBatch, return empty iter
-	// This is mainly for API compatibility with v2
 	_ = b.session.ExecuteBatch(b.batch.WithContext(ctx))
 	return &Iter{iter: nil}
 }
@@ -304,8 +312,11 @@ func (b *Batch) ExecCAS(dest ...any) (applied bool, iter cql.Iter, err error) {
 
 // ExecCASContext executes a batch lightweight transaction with context.
 func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, iter cql.Iter, err error) {
-	b.batch.WithContext(ctx)
-	return b.ExecCAS(dest...)
+	applied, gocqlIter, err := b.session.ExecuteBatchCAS(b.batch.WithContext(ctx), dest...)
+	if gocqlIter != nil {
+		return applied, &Iter{iter: gocqlIter}, err
+	}
+	return applied, &Iter{iter: nil}, err
 }
 
 // MapExecCAS executes a batch lightweight transaction and scans into a map.
@@ -319,8 +330,11 @@ func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, er
 
 // MapExecCASContext executes a batch lightweight transaction with context.
 func (b *Batch) MapExecCASContext(ctx context.Context, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	b.batch.WithContext(ctx)
-	return b.MapExecCAS(dest)
+	applied, gocqlIter, err := b.session.MapExecuteBatchCAS(b.batch.WithContext(ctx), dest)
+	if gocqlIter != nil {
+		return applied, &Iter{iter: gocqlIter}, err
+	}
+	return applied, &Iter{iter: nil}, err
 }
 
 // Statements returns all statements in the batch.

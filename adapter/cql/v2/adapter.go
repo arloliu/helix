@@ -16,12 +16,18 @@ type Session struct {
 
 // NewSession creates a new v2 adapter from a gocql session.
 //
+// NewSession panics if session is nil. Always pass a fully initialized
+// [gocql.Session] obtained from [gocql.ClusterConfig.CreateSession].
+//
 // Parameters:
-//   - session: A gocql.Session instance from the Apache driver
+//   - session: A gocql.Session instance from the Apache driver (must not be nil)
 //
 // Returns:
 //   - *Session: An adapter implementing cql.Session
 func NewSession(session *gocql.Session) *Session {
+	if session == nil {
+		panic("cql/v2: NewSession called with nil gocql.Session")
+	}
 	return &Session{session: session}
 }
 
@@ -116,11 +122,10 @@ type Query struct {
 
 // WithContext associates a context with the query.
 //
-// Note: This method is deprecated in gocql v2. Consider using
-// ExecContext or IterContext instead for context-aware operations.
+// Deprecated: Use the *Context variants (ExecContext, ScanContext, IterContext,
+// ScanCASContext, MapScanCASContext) instead. Those methods are safe for
+// concurrent use; WithContext mutates internal state without synchronization.
 func (q *Query) WithContext(ctx context.Context) cql.Query {
-	// Store context for use in Exec/Iter methods
-	// v2 driver deprecates WithContext, but we need to maintain compatibility
 	q.ctx = ctx
 
 	return q
@@ -230,6 +235,9 @@ func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
 
 // ScanCAS executes a lightweight transaction and scans the result.
 func (q *Query) ScanCAS(dest ...any) (applied bool, err error) {
+	if q.ctx != nil {
+		return q.query.ScanCASContext(q.ctx, dest...)
+	}
 	return q.query.ScanCAS(dest...)
 }
 
@@ -240,6 +248,9 @@ func (q *Query) ScanCASContext(ctx context.Context, dest ...any) (applied bool, 
 
 // MapScanCAS executes a lightweight transaction and scans into a map.
 func (q *Query) MapScanCAS(dest map[string]any) (applied bool, err error) {
+	if q.ctx != nil {
+		return q.query.MapScanCASContext(q.ctx, dest)
+	}
 	return q.query.MapScanCAS(dest)
 }
 
@@ -289,8 +300,9 @@ func (b *Batch) SetConsistency(c cql.Consistency) {
 
 // WithContext associates a context with the batch.
 //
-// Note: This method is deprecated in gocql v2. Consider using
-// ExecContext instead for context-aware operations.
+// Deprecated: Use the *Context variants (ExecContext, ExecCASContext,
+// MapExecCASContext, IterContext) instead. Those methods are safe for
+// concurrent use; WithContext mutates internal state without synchronization.
 func (b *Batch) WithContext(ctx context.Context) cql.Batch {
 	b.ctx = ctx
 
@@ -324,6 +336,9 @@ func (b *Batch) IterContext(ctx context.Context) cql.Iter {
 
 // ExecCAS executes a batch lightweight transaction.
 func (b *Batch) ExecCAS(dest ...any) (applied bool, iter cql.Iter, err error) {
+	if b.ctx != nil {
+		return b.ExecCASContext(b.ctx, dest...)
+	}
 	applied, gocqlIter, err := b.batch.ExecCAS(dest...)
 	return applied, &Iter{iter: gocqlIter}, err
 }
@@ -336,6 +351,9 @@ func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, 
 
 // MapExecCAS executes a batch lightweight transaction and scans into a map.
 func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, err error) {
+	if b.ctx != nil {
+		return b.MapExecCASContext(b.ctx, dest)
+	}
 	applied, gocqlIter, err := b.batch.MapExecCAS(dest)
 	return applied, &Iter{iter: gocqlIter}, err
 }

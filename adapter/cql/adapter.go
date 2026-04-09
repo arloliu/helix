@@ -197,6 +197,10 @@ type Batch interface {
 	ExecContext(ctx context.Context) error
 
 	// IterContext executes the batch with context and returns an iterator.
+	//
+	// Note: gocql v1 does not support returning an iterator from batch execution.
+	// The v1 adapter executes the batch but discards the error and returns an
+	// empty iterator. Use [Batch.ExecContext] if error visibility is required.
 	IterContext(ctx context.Context) Iter
 
 	// ExecCAS executes a batch lightweight transaction.

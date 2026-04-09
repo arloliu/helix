@@ -1449,6 +1449,7 @@ func (l *captureLogger) Info(msg string, _ ...any) {
 	defer l.Unlock()
 	l.infoMsgs = append(l.infoMsgs, msg)
 }
+
 func (l *captureLogger) Warn(msg string, _ ...any) {
 	l.Lock()
 	defer l.Unlock()
