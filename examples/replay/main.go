@@ -378,7 +378,7 @@ func demoWithRealClusters() {
 	err = client.Query(
 		"INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
 		userID, "Alice", "alice@example.com",
-	).WithContext(ctx).Exec()
+	).ExecContext(ctx)
 
 	if err != nil {
 		// Both clusters failed

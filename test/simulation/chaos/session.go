@@ -56,30 +56,6 @@ func (s *Session) Batch(kind cql.BatchType) cql.Batch {
 	}
 }
 
-// NewBatch creates a new batch of the given type.
-// Deprecated: Use Batch() instead.
-func (s *Session) NewBatch(kind cql.BatchType) cql.Batch {
-	return s.Batch(kind)
-}
-
-// ExecuteBatch executes a batch.
-// Deprecated: Use Batch().Exec() instead.
-func (s *Session) ExecuteBatch(batch cql.Batch) error {
-	return batch.Exec()
-}
-
-// ExecuteBatchCAS executes a batch lightweight transaction.
-// Deprecated: Use Batch().ExecCAS() instead.
-func (s *Session) ExecuteBatchCAS(batch cql.Batch, dest ...any) (applied bool, iter cql.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-// MapExecuteBatchCAS executes a batch lightweight transaction and scans into a map.
-// Deprecated: Use Batch().MapExecCAS() instead.
-func (s *Session) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 // Close terminates the session.
 func (s *Session) Close() {
 	s.wrapped.Close()
@@ -117,18 +93,9 @@ func (q *Query) injectChaos() error {
 	return nil
 }
 
-func (q *Query) WithContext(ctx context.Context) cql.Query {
-	q.wrapped = q.wrapped.WithContext(ctx)
-	return q
-}
-
 func (q *Query) Consistency(c cql.Consistency) cql.Query {
 	q.wrapped = q.wrapped.Consistency(c)
 	return q
-}
-
-func (q *Query) SetConsistency(c cql.Consistency) {
-	q.wrapped.SetConsistency(c) //nolint:staticcheck // deprecated but required by interface
 }
 
 func (q *Query) PageSize(n int) cql.Query {
@@ -297,15 +264,6 @@ func (b *Batch) Query(stmt string, args ...any) cql.Batch {
 
 func (b *Batch) Consistency(c cql.Consistency) cql.Batch {
 	b.wrapped = b.wrapped.Consistency(c)
-	return b
-}
-
-func (b *Batch) SetConsistency(c cql.Consistency) {
-	b.wrapped.SetConsistency(c) //nolint:staticcheck // deprecated but required by interface
-}
-
-func (b *Batch) WithContext(ctx context.Context) cql.Batch {
-	b.wrapped = b.wrapped.WithContext(ctx)
 	return b
 }
 

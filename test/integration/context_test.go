@@ -137,8 +137,8 @@ func TestV2QueryScanCASWithCanceledContext(t *testing.T) {
 	_, err := helixSession.Query(
 		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 		gocqlv2.TimeUUID(), "V2CASCtx", "v2cas@example.com", time.Now(),
-	).WithContext(ctx).ScanCAS()
-	require.Error(t, err, "ScanCAS after WithContext(canceled) must return an error")
+	).ScanCASContext(ctx)
+	require.Error(t, err, "ScanCASContext with canceled context must return an error")
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -159,8 +159,8 @@ func TestV2QueryMapScanCASWithCanceledContext(t *testing.T) {
 	_, err := helixSession.Query(
 		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 		gocqlv2.TimeUUID(), "V2MapCASCtx", "v2mapcas@example.com", time.Now(),
-	).WithContext(ctx).MapScanCAS(dest)
-	require.Error(t, err, "MapScanCAS after WithContext(canceled) must return an error")
+	).MapScanCASContext(ctx, dest)
+	require.Error(t, err, "MapScanCASContext with canceled context must return an error")
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -182,10 +182,9 @@ func TestV2BatchExecCASWithCanceledContext(t *testing.T) {
 		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 		gocqlv2.TimeUUID(), "V2BatchCASCtx", "v2batchcas@example.com", time.Now(),
 	)
-	batch.WithContext(ctx)
 
-	_, iter, err := batch.ExecCAS()
-	require.Error(t, err, "ExecCAS after WithContext(canceled) must return an error")
+	_, iter, err := batch.ExecCASContext(ctx)
+	require.Error(t, err, "ExecCASContext with canceled context must return an error")
 	require.ErrorIs(t, err, context.Canceled)
 	require.NoError(t, iter.Close())
 }
@@ -208,11 +207,10 @@ func TestV2BatchMapExecCASWithCanceledContext(t *testing.T) {
 		"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 		gocqlv2.TimeUUID(), "V2BatchMapCASCtx", "v2batchmapcas@example.com", time.Now(),
 	)
-	batch.WithContext(ctx)
 
 	dest := make(map[string]any)
-	_, iter, err := batch.MapExecCAS(dest)
-	require.Error(t, err, "MapExecCAS after WithContext(canceled) must return an error")
+	_, iter, err := batch.MapExecCASContext(ctx, dest)
+	require.Error(t, err, "MapExecCASContext with canceled context must return an error")
 	require.ErrorIs(t, err, context.Canceled)
 	require.NoError(t, iter.Close())
 }

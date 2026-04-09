@@ -45,22 +45,6 @@ func (m *mockSession) Batch(kind cql.BatchType) cql.Batch {
 	return &mockBatch{session: m}
 }
 
-func (m *mockSession) NewBatch(kind cql.BatchType) cql.Batch {
-	return m.Batch(kind)
-}
-
-func (m *mockSession) ExecuteBatch(batch cql.Batch) error {
-	return batch.Exec()
-}
-
-func (m *mockSession) ExecuteBatchCAS(batch cql.Batch, dest ...any) (applied bool, iter cql.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-func (m *mockSession) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 func (m *mockSession) Close() {
 	m.closed.Store(true)
 }
@@ -78,16 +62,10 @@ type mockQuery struct {
 	ctx               context.Context // Track context
 }
 
-func (q *mockQuery) WithContext(ctx context.Context) cql.Query {
-	q.ctx = ctx
-	return q
-}
-
 func (q *mockQuery) Consistency(c cql.Consistency) cql.Query {
 	q.consistency = &c
 	return q
 }
-func (q *mockQuery) SetConsistency(c cql.Consistency) { q.Consistency(c) }
 func (q *mockQuery) SerialConsistency(c cql.Consistency) cql.Query {
 	q.serialConsistency = &c
 	return q
@@ -196,15 +174,10 @@ func (b *mockBatch) Query(stmt string, args ...any) cql.Batch {
 }
 
 func (b *mockBatch) Consistency(_ cql.Consistency) cql.Batch       { return b }
-func (b *mockBatch) SetConsistency(c cql.Consistency)              { b.Consistency(c) }
 func (b *mockBatch) SerialConsistency(_ cql.Consistency) cql.Batch { return b }
-func (b *mockBatch) WithContext(ctx context.Context) cql.Batch {
-	b.ctx = ctx
-	return b
-}
-func (b *mockBatch) WithTimestamp(_ int64) cql.Batch { return b }
-func (b *mockBatch) Size() int                       { return len(b.entries) }
-func (b *mockBatch) Statements() []cql.BatchEntry    { return b.entries }
+func (b *mockBatch) WithTimestamp(_ int64) cql.Batch               { return b }
+func (b *mockBatch) Size() int                                     { return len(b.entries) }
+func (b *mockBatch) Statements() []cql.BatchEntry                  { return b.entries }
 
 func (b *mockBatch) Exec() error {
 	return b.session.execErr
@@ -383,8 +356,7 @@ func TestCQLClientImplementsCQLSession(t *testing.T) {
 	batch := session.Batch(LoggedBatch)
 	require.NotNil(t, batch)
 
-	// Verify deprecated methods also work
-	batch2 := session.NewBatch(UnloggedBatch)
+	batch2 := session.Batch(UnloggedBatch)
 	require.NotNil(t, batch2)
 }
 
@@ -1511,20 +1483,18 @@ func (r *mockReplayer) Enqueue(_ context.Context, p types.ReplayPayload) error {
 	return nil
 }
 
-// Example_contextUsage demonstrates two patterns for context handling in queries.
+// Example_contextUsage demonstrates context handling in queries.
 func Example_contextUsage() {
 	var client *CQLClient
 	ctx := context.Background()
 
-	// Pattern 1: Direct context method (simple cases)
+	// Use *Context methods to pass context directly.
 	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").
 		ExecContext(ctx)
 	_ = err
 
-	// Pattern 2: Method chaining (multiple options)
 	err = client.Query("SELECT name FROM users WHERE id = ?", "user-1").
 		Consistency(Quorum).
-		WithContext(ctx).
-		Exec()
+		ScanContext(ctx)
 	_ = err
 }

@@ -37,16 +37,7 @@ type mockSession struct{}
 
 func (m *mockSession) Query(stmt string, values ...any) cql.Query { return &mockQuery{} }
 func (m *mockSession) Batch(kind cql.BatchType) cql.Batch         { return &mockBatch{} }
-func (m *mockSession) NewBatch(kind cql.BatchType) cql.Batch      { return &mockBatch{} }
-func (m *mockSession) ExecuteBatch(batch cql.Batch) error         { return nil }
-func (m *mockSession) ExecuteBatchCAS(batch cql.Batch, dest ...any) (bool, cql.Iter, error) {
-	return true, nil, nil
-}
-
-func (m *mockSession) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (bool, cql.Iter, error) {
-	return true, nil, nil
-}
-func (m *mockSession) Close() {}
+func (m *mockSession) Close()                                     {}
 
 type mockQuery struct{}
 
@@ -64,9 +55,7 @@ func (q *mockQuery) MapScanCAS(dest map[string]any) (bool, error)               
 func (q *mockQuery) MapScanCASContext(ctx context.Context, dest map[string]any) (bool, error) {
 	return true, nil
 }
-func (q *mockQuery) WithContext(ctx context.Context) cql.Query     { return q }
 func (q *mockQuery) Consistency(c cql.Consistency) cql.Query       { return q }
-func (q *mockQuery) SetConsistency(c cql.Consistency)              {}
 func (q *mockQuery) SerialConsistency(c cql.Consistency) cql.Query { return q }
 func (q *mockQuery) PageSize(n int) cql.Query                      { return q }
 func (q *mockQuery) PageState(state []byte) cql.Query              { return q }
@@ -78,10 +67,8 @@ func (q *mockQuery) Release()                                      {}
 type mockBatch struct{}
 
 func (b *mockBatch) Query(stmt string, args ...any) cql.Batch      { return b }
-func (b *mockBatch) WithContext(ctx context.Context) cql.Batch     { return b }
 func (b *mockBatch) WithTimestamp(ts int64) cql.Batch              { return b }
 func (b *mockBatch) Consistency(c cql.Consistency) cql.Batch       { return b }
-func (b *mockBatch) SetConsistency(c cql.Consistency)              {}
 func (b *mockBatch) SerialConsistency(c cql.Consistency) cql.Batch { return b }
 func (b *mockBatch) Exec() error                                   { return nil }
 func (b *mockBatch) ExecContext(ctx context.Context) error         { return nil }

@@ -69,34 +69,6 @@ func (m *MockCQLSession) Batch(kind helix.BatchType) helix.Batch {
 	return b
 }
 
-// NewBatch creates a new Batch.
-//
-// Deprecated: Use Batch() instead for the modern fluent API.
-func (m *MockCQLSession) NewBatch(kind helix.BatchType) helix.Batch {
-	return m.Batch(kind)
-}
-
-// ExecuteBatch executes a batch.
-//
-// Deprecated: Use batch.Exec() instead for the modern fluent API.
-func (m *MockCQLSession) ExecuteBatch(batch helix.Batch) error {
-	return batch.Exec()
-}
-
-// ExecuteBatchCAS executes a batch with CAS semantics.
-//
-// Deprecated: Use batch.ExecCAS() instead for the modern fluent API.
-func (m *MockCQLSession) ExecuteBatchCAS(batch helix.Batch, dest ...any) (applied bool, iter helix.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-// MapExecuteBatchCAS executes a batch CAS operation with map result.
-//
-// Deprecated: Use batch.MapExecCAS() instead for the modern fluent API.
-func (m *MockCQLSession) MapExecuteBatchCAS(batch helix.Batch, dest map[string]any) (applied bool, iter helix.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 // Close marks the session as closed.
 func (m *MockCQLSession) Close() {
 	m.mu.Lock()
@@ -180,16 +152,6 @@ func (m *MockQuery) Values() []any {
 	return m.values
 }
 
-// WithContext sets the context.
-func (m *MockQuery) WithContext(ctx context.Context) helix.Query {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ctx = ctx
-
-	return m
-}
-
 // Consistency sets the consistency level.
 func (m *MockQuery) Consistency(c helix.Consistency) helix.Query {
 	m.mu.Lock()
@@ -198,13 +160,6 @@ func (m *MockQuery) Consistency(c helix.Consistency) helix.Query {
 	m.consistency = c
 
 	return m
-}
-
-// SetConsistency sets the consistency level.
-//
-// Deprecated: Use Consistency() instead for the modern fluent API.
-func (m *MockQuery) SetConsistency(c helix.Consistency) {
-	m.Consistency(c)
 }
 
 // PageSize sets the page size.
@@ -442,23 +397,6 @@ func (m *MockBatch) Consistency(c helix.Consistency) helix.Batch {
 	defer m.mu.Unlock()
 
 	m.consistency = c
-
-	return m
-}
-
-// SetConsistency sets the consistency level.
-//
-// Deprecated: Use Consistency() instead for the modern fluent API.
-func (m *MockBatch) SetConsistency(c helix.Consistency) {
-	m.Consistency(c)
-}
-
-// WithContext sets the context.
-func (m *MockBatch) WithContext(ctx context.Context) helix.Batch {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ctx = ctx
 
 	return m
 }

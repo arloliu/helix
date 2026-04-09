@@ -31,26 +31,6 @@ func (s *SlowCQLSession) Batch(kind cql.BatchType) cql.Batch {
 	return s.Session.Batch(kind)
 }
 
-// NewBatch creates a new Batch.
-func (s *SlowCQLSession) NewBatch(kind cql.BatchType) cql.Batch {
-	return s.Batch(kind)
-}
-
-// ExecuteBatch executes a batch.
-func (s *SlowCQLSession) ExecuteBatch(batch cql.Batch) error {
-	return batch.Exec()
-}
-
-// ExecuteBatchCAS executes a batch with CAS semantics.
-func (s *SlowCQLSession) ExecuteBatchCAS(batch cql.Batch, dest ...any) (applied bool, iter cql.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-// MapExecuteBatchCAS executes a batch CAS operation with map result.
-func (s *SlowCQLSession) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 // Close is intentionally a no-op because SlowCQLSession wraps shared sessions
 // that are managed by TestMain's teardown. Calling Close() on the wrapper
 // should not close the underlying shared session.
@@ -67,21 +47,10 @@ type SlowCQLQuery struct {
 // Compile-time assertion that SlowCQLQuery implements cql.Query.
 var _ cql.Query = (*SlowCQLQuery)(nil)
 
-// WithContext sets the context for the query.
-func (q *SlowCQLQuery) WithContext(ctx context.Context) cql.Query {
-	q.Query = q.Query.WithContext(ctx)
-	return q
-}
-
 // Consistency sets the consistency level.
 func (q *SlowCQLQuery) Consistency(c cql.Consistency) cql.Query {
 	q.Query = q.Query.Consistency(c)
 	return q
-}
-
-// SetConsistency sets the consistency level (deprecated API).
-func (q *SlowCQLQuery) SetConsistency(c cql.Consistency) {
-	q.Consistency(c)
 }
 
 // SerialConsistency sets the serial consistency level.

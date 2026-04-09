@@ -846,22 +846,6 @@ func (m *mockCQLSession) Batch(kind cql.BatchType) cql.Batch {
 	}
 }
 
-func (m *mockCQLSession) NewBatch(kind cql.BatchType) cql.Batch {
-	return m.Batch(kind)
-}
-
-func (m *mockCQLSession) ExecuteBatch(batch cql.Batch) error {
-	return batch.Exec()
-}
-
-func (m *mockCQLSession) ExecuteBatchCAS(batch cql.Batch, dest ...any) (applied bool, iter cql.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-func (m *mockCQLSession) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 func (m *mockCQLSession) Close() {}
 
 // mockCQLQuery provides a zero-overhead mock CQL query.
@@ -871,9 +855,7 @@ type mockCQLQuery struct {
 	values    []any
 }
 
-func (q *mockCQLQuery) WithContext(_ context.Context) cql.Query       { return q }
 func (q *mockCQLQuery) Consistency(_ cql.Consistency) cql.Query       { return q }
-func (q *mockCQLQuery) SetConsistency(c cql.Consistency)              { q.Consistency(c) }
 func (q *mockCQLQuery) SerialConsistency(_ cql.Consistency) cql.Query { return q }
 func (q *mockCQLQuery) PageSize(_ int) cql.Query                      { return q }
 func (q *mockCQLQuery) PageState(_ []byte) cql.Query                  { return q }
@@ -943,9 +925,7 @@ func (b *mockCQLBatch) Query(stmt string, args ...any) cql.Batch {
 }
 
 func (b *mockCQLBatch) Consistency(_ cql.Consistency) cql.Batch       { return b }
-func (b *mockCQLBatch) SetConsistency(c cql.Consistency)              { b.Consistency(c) }
 func (b *mockCQLBatch) SerialConsistency(_ cql.Consistency) cql.Batch { return b }
-func (b *mockCQLBatch) WithContext(_ context.Context) cql.Batch       { return b }
 func (b *mockCQLBatch) WithTimestamp(_ int64) cql.Batch               { return b }
 func (b *mockCQLBatch) Size() int                                     { return len(b.entries) }
 
@@ -1020,22 +1000,6 @@ func (m *failingMockCQLSession) Batch(kind cql.BatchType) cql.Batch {
 	return &failingMockCQLBatch{kind: kind}
 }
 
-func (m *failingMockCQLSession) NewBatch(kind cql.BatchType) cql.Batch {
-	return m.Batch(kind)
-}
-
-func (m *failingMockCQLSession) ExecuteBatch(batch cql.Batch) error {
-	return batch.Exec()
-}
-
-func (m *failingMockCQLSession) ExecuteBatchCAS(batch cql.Batch, dest ...any) (applied bool, iter cql.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-func (m *failingMockCQLSession) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 func (m *failingMockCQLSession) Close() {}
 
 type failingMockCQLQuery struct {
@@ -1043,9 +1007,7 @@ type failingMockCQLQuery struct {
 	values    []any
 }
 
-func (q *failingMockCQLQuery) WithContext(_ context.Context) cql.Query       { return q }
 func (q *failingMockCQLQuery) Consistency(_ cql.Consistency) cql.Query       { return q }
-func (q *failingMockCQLQuery) SetConsistency(c cql.Consistency)              { q.Consistency(c) }
 func (q *failingMockCQLQuery) SerialConsistency(_ cql.Consistency) cql.Query { return q }
 func (q *failingMockCQLQuery) PageSize(_ int) cql.Query                      { return q }
 func (q *failingMockCQLQuery) PageState(_ []byte) cql.Query                  { return q }
@@ -1096,9 +1058,7 @@ func (b *failingMockCQLBatch) Query(stmt string, args ...any) cql.Batch {
 }
 
 func (b *failingMockCQLBatch) Consistency(_ cql.Consistency) cql.Batch       { return b }
-func (b *failingMockCQLBatch) SetConsistency(c cql.Consistency)              { b.Consistency(c) }
 func (b *failingMockCQLBatch) SerialConsistency(_ cql.Consistency) cql.Batch { return b }
-func (b *failingMockCQLBatch) WithContext(_ context.Context) cql.Batch       { return b }
 func (b *failingMockCQLBatch) WithTimestamp(_ int64) cql.Batch               { return b }
 func (b *failingMockCQLBatch) Size() int                                     { return len(b.entries) }
 func (b *failingMockCQLBatch) Exec() error                                   { return errMockFailure }

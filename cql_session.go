@@ -33,56 +33,6 @@ type CQLSession interface {
 	//   - Batch: A batch builder for adding statements
 	Batch(kind BatchType) Batch
 
-	// NewBatch creates a new Batch instance for grouping multiple mutations.
-	//
-	// Deprecated: Use Batch() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - kind: Type of batch (Logged, Unlogged, or Counter)
-	//
-	// Returns:
-	//   - Batch: A batch builder for adding statements
-	NewBatch(kind BatchType) Batch
-
-	// ExecuteBatch executes a batch of statements.
-	//
-	// Deprecated: Use Batch().Exec() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - batch: The batch to execute
-	//
-	// Returns:
-	//   - error: nil on success, error if execution fails
-	ExecuteBatch(batch Batch) error
-
-	// ExecuteBatchCAS executes a batch lightweight transaction.
-	//
-	// Deprecated: Use Batch().ExecCAS() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - batch: The batch to execute
-	//   - dest: Pointers to variables to receive previous values if not applied
-	//
-	// Returns:
-	//   - applied: true if the CAS operation was applied
-	//   - iter: Iterator for scanning additional CAS result rows
-	//   - err: error if the operation failed
-	ExecuteBatchCAS(batch Batch, dest ...any) (applied bool, iter Iter, err error)
-
-	// MapExecuteBatchCAS executes a batch lightweight transaction and scans into a map.
-	//
-	// Deprecated: Use Batch().MapExecCAS() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - batch: The batch to execute
-	//   - dest: Map to receive previous values if not applied
-	//
-	// Returns:
-	//   - applied: true if the CAS operation was applied
-	//   - iter: Iterator for scanning additional CAS result rows
-	//   - err: error if the operation failed
-	MapExecuteBatchCAS(batch Batch, dest map[string]any) (applied bool, iter Iter, err error)
-
 	// Close terminates connections to both clusters.
 	//
 	// After Close is called, the session cannot be reused.
@@ -95,30 +45,14 @@ type CQLSession interface {
 //   - Exec/ExecContext → Write Strategy (Dual Write)
 //   - Scan/Iter/MapScan → Read Strategy (Sticky Read)
 //
-// # Context Usage Patterns
+// # Context Usage
 //
-// Two equivalent patterns are supported for context handling:
+// Pass context directly to the *Context method variants:
 //
-//	// Pattern 1: Direct context method (recommended for simple cases)
 //	err := query.ExecContext(ctx)
-//	result := query.ScanContext(ctx, &dest)
-//
-//	// Pattern 2: Method chaining (useful with multiple options)
-//	err := query.Consistency(helix.Quorum).WithContext(ctx).Exec()
-//
-// Both patterns respect context cancellation and timeouts. Choose Pattern 1
-// when you only need to set a context. Choose Pattern 2 when chaining multiple
-// configuration calls (consistency, page size, timestamps, etc.).
+//	err = query.ScanContext(ctx, &dest)
+//	iter := query.IterContext(ctx)
 type Query interface {
-	// WithContext associates a context with the query.
-	//
-	// Parameters:
-	//   - ctx: Context for cancellation and timeout
-	//
-	// Returns:
-	//   - Query: The same query for chaining
-	WithContext(ctx context.Context) Query
-
 	// Consistency sets the consistency level for the query.
 	//
 	// Parameters:
@@ -127,14 +61,6 @@ type Query interface {
 	// Returns:
 	//   - Query: The same query for chaining
 	Consistency(c Consistency) Query
-
-	// SetConsistency sets the consistency level for the query.
-	//
-	// Deprecated: Use Consistency() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - c: Consistency level
-	SetConsistency(c Consistency)
 
 	// PageSize sets the number of rows to fetch per page.
 	//
@@ -344,23 +270,6 @@ type Batch interface {
 	// Returns:
 	//   - Batch: The same batch for chaining
 	Consistency(c Consistency) Batch
-
-	// SetConsistency sets the consistency level for the batch.
-	//
-	// Deprecated: Use Consistency() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - c: Consistency level
-	SetConsistency(c Consistency)
-
-	// WithContext associates a context with the batch.
-	//
-	// Parameters:
-	//   - ctx: Context for cancellation and timeout
-	//
-	// Returns:
-	//   - Batch: The same batch for chaining
-	WithContext(ctx context.Context) Batch
 
 	// WithTimestamp sets a specific timestamp for all statements in the batch.
 	//

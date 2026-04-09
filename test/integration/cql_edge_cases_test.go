@@ -527,22 +527,6 @@ func (p *partialFailureCQLSession) Batch(kind cql.BatchType) cql.Batch {
 	return p.session.Batch(kind)
 }
 
-func (p *partialFailureCQLSession) NewBatch(kind cql.BatchType) cql.Batch {
-	return p.Batch(kind)
-}
-
-func (p *partialFailureCQLSession) ExecuteBatch(batch cql.Batch) error {
-	return batch.Exec()
-}
-
-func (p *partialFailureCQLSession) ExecuteBatchCAS(batch cql.Batch, dest ...any) (applied bool, iter cql.Iter, err error) {
-	return batch.ExecCAS(dest...)
-}
-
-func (p *partialFailureCQLSession) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	return batch.MapExecCAS(dest)
-}
-
 func (p *partialFailureCQLSession) Close() {
 	// Note: We intentionally don't close the underlying session because
 	// it may be wrapping a shared gocql session used across tests.
@@ -555,20 +539,10 @@ type partialFailureCQLQuery struct {
 	failNextWrite *atomic.Int32
 }
 
-func (p *partialFailureCQLQuery) WithContext(ctx context.Context) cql.Query {
-	p.Query = p.Query.WithContext(ctx)
-
-	return p
-}
-
 func (p *partialFailureCQLQuery) Consistency(c cql.Consistency) cql.Query {
 	p.Query = p.Query.Consistency(c)
 
 	return p
-}
-
-func (p *partialFailureCQLQuery) SetConsistency(c cql.Consistency) {
-	p.Consistency(c)
 }
 
 func (p *partialFailureCQLQuery) PageSize(n int) cql.Query {

@@ -59,55 +59,14 @@ type Session interface {
 	//   - Batch: A batch builder
 	Batch(kind BatchType) Batch
 
-	// NewBatch creates a new batch of the given type.
-	//
-	// Deprecated: Use Batch() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - kind: Type of batch
-	//
-	// Returns:
-	//   - Batch: A batch builder
-	NewBatch(kind BatchType) Batch
-
-	// ExecuteBatch executes a batch.
-	//
-	// Deprecated: Use Batch().Exec() instead. This method exists for gocql v1 compatibility.
-	//
-	// Parameters:
-	//   - batch: The batch to execute
-	//
-	// Returns:
-	//   - error: nil on success, error if execution fails
-	ExecuteBatch(batch Batch) error
-
-	// ExecuteBatchCAS executes a batch lightweight transaction.
-	//
-	// Deprecated: Use Batch().ExecCAS() instead. This method exists for gocql v1 compatibility.
-	ExecuteBatchCAS(batch Batch, dest ...any) (applied bool, iter Iter, err error)
-
-	// MapExecuteBatchCAS executes a batch lightweight transaction and scans into a map.
-	//
-	// Deprecated: Use Batch().MapExecCAS() instead. This method exists for gocql v1 compatibility.
-	MapExecuteBatchCAS(batch Batch, dest map[string]any) (applied bool, iter Iter, err error)
-
 	// Close terminates the session.
 	Close()
 }
 
 // Query represents a raw CQL query from the underlying driver.
 type Query interface {
-	// WithContext associates a context with the query.
-	// Deprecated: Use ExecContext, ScanContext, IterContext, or MapScanContext instead.
-	WithContext(ctx context.Context) Query
-
 	// Consistency sets the consistency level.
 	Consistency(c Consistency) Query
-
-	// SetConsistency sets the consistency level.
-	//
-	// Deprecated: Use Consistency() instead. This method exists for gocql v1 compatibility.
-	SetConsistency(c Consistency)
 
 	// PageSize sets the page size.
 	PageSize(n int) Query
@@ -177,15 +136,6 @@ type Batch interface {
 
 	// Consistency sets the consistency level.
 	Consistency(c Consistency) Batch
-
-	// SetConsistency sets the consistency level.
-	//
-	// Deprecated: Use Consistency() instead. This method exists for gocql v1 compatibility.
-	SetConsistency(c Consistency)
-
-	// WithContext associates a context with the batch.
-	// Deprecated: Use ExecContext or IterContext instead.
-	WithContext(ctx context.Context) Batch
 
 	// WithTimestamp sets the write timestamp for all statements.
 	WithTimestamp(ts int64) Batch

@@ -527,7 +527,7 @@ func TestCQLMapScanIntegration(t *testing.T) {
 	result := make(map[string]any)
 	err = client.Query(
 		"SELECT name, email FROM "+usersTable+" WHERE id = ?", userID,
-	).WithContext(ctx).MapScan(result)
+	).MapScanContext(ctx, result)
 	require.NoError(t, err)
 
 	require.Equal(t, "MapScanUser", result["name"])
