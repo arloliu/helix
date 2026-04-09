@@ -204,19 +204,22 @@ func TestCQLV2AdapterScanCASIntegration(t *testing.T) {
 	t.Run("ScanCAS applied and not-applied", func(t *testing.T) {
 		userID := gocqlv2.TimeUUID()
 
-		// applied=true: result has only [applied], no dest needed.
-		applied, err := adapter.Query(
-			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
-			userID, "V2ScanCAS", "v2scancas@example.com", time.Now(),
-		).ScanCAS()
-		require.NoError(t, err)
-		require.True(t, applied, "first INSERT IF NOT EXISTS should be applied")
-
-		// applied=false: result has [applied] + 4 table columns — dest vars required.
-		// Column order (Cassandra LWT): id, created_at, email, name (PK first, non-key alphabetical).
+		// Dest vars for LWT scan results. ScyllaDB returns all columns even when applied=true,
+		// so dest vars must always be provided to avoid "not enough columns to scan" errors.
+		// Column order (Cassandra/ScyllaDB LWT): id, created_at, email, name (PK first, non-key alphabetical).
 		var existingID gocqlv2.UUID
 		var existingCreatedAt time.Time
 		var existingEmail, existingName string
+
+		// applied=true: first insert.
+		applied, err := adapter.Query(
+			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
+			userID, "V2ScanCAS", "v2scancas@example.com", time.Now(),
+		).ScanCAS(&existingID, &existingCreatedAt, &existingEmail, &existingName)
+		require.NoError(t, err)
+		require.True(t, applied, "first INSERT IF NOT EXISTS should be applied")
+
+		// applied=false: result has [applied] + 4 table columns.
 		applied, err = adapter.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 			userID, "V2ScanCAS2", "v2scancas2@example.com", time.Now(),
@@ -229,18 +232,21 @@ func TestCQLV2AdapterScanCASIntegration(t *testing.T) {
 	t.Run("ScanCASContext applied and not-applied", func(t *testing.T) {
 		userID := gocqlv2.TimeUUID()
 
-		// applied=true: no dest needed.
+		// Dest vars for LWT scan results. ScyllaDB returns all columns even when applied=true,
+		// so dest vars must always be provided to avoid "not enough columns to scan" errors.
+		var existingID gocqlv2.UUID
+		var existingCreatedAt time.Time
+		var existingEmail, existingName string
+
+		// applied=true: first insert.
 		applied, err := adapter.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 			userID, "V2ScanCASCtx", "v2scancasctx@example.com", time.Now(),
-		).ScanCASContext(ctx)
+		).ScanCASContext(ctx, &existingID, &existingCreatedAt, &existingEmail, &existingName)
 		require.NoError(t, err)
 		require.True(t, applied)
 
 		// applied=false: dest vars required for the 4 table columns (id, created_at, email, name).
-		var existingID gocqlv2.UUID
-		var existingCreatedAt time.Time
-		var existingEmail, existingName string
 		applied, err = adapter.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 			userID, "V2ScanCASCtx2", "v2scancasctx2@example.com", time.Now(),
@@ -318,22 +324,25 @@ func TestCQLV2AdapterBatchCASIntegration(t *testing.T) {
 	t.Run("ExecCAS applied and not-applied", func(t *testing.T) {
 		userID := gocqlv2.TimeUUID()
 
-		// applied=true: result has only [applied], no dest needed.
+		// Dest vars for LWT scan results. ScyllaDB returns all columns even when applied=true,
+		// so dest vars must always be provided to avoid "not enough columns to scan" errors.
+		// Column order (Cassandra/ScyllaDB LWT): id, created_at, email, name (PK first, non-key alphabetical).
+		var existingID gocqlv2.UUID
+		var existingCreatedAt time.Time
+		var existingEmail, existingName string
+
+		// applied=true: first insert.
 		batch := adapter.Batch(helix.UnloggedBatch)
 		batch.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 			userID, "V2ExecCAS", "v2execcas@example.com", time.Now(),
 		)
-		applied, iter, err := batch.ExecCAS()
+		applied, iter, err := batch.ExecCAS(&existingID, &existingCreatedAt, &existingEmail, &existingName)
 		require.NoError(t, err)
 		require.True(t, applied)
 		require.NoError(t, iter.Close())
 
-		// applied=false: result has [applied] + 4 table columns — dest vars required.
-		// Column order (Cassandra LWT): id, created_at, email, name (PK first, non-key alphabetical).
-		var existingID gocqlv2.UUID
-		var existingCreatedAt time.Time
-		var existingEmail, existingName string
+		// applied=false: result has [applied] + 4 table columns.
 		batch2 := adapter.Batch(helix.UnloggedBatch)
 		batch2.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
@@ -349,21 +358,24 @@ func TestCQLV2AdapterBatchCASIntegration(t *testing.T) {
 	t.Run("ExecCASContext applied and not-applied", func(t *testing.T) {
 		userID := gocqlv2.TimeUUID()
 
-		// applied=true: no dest needed.
+		// Dest vars for LWT scan results. ScyllaDB returns all columns even when applied=true,
+		// so dest vars must always be provided to avoid "not enough columns to scan" errors.
+		var existingID gocqlv2.UUID
+		var existingCreatedAt time.Time
+		var existingEmail, existingName string
+
+		// applied=true: first insert.
 		batch := adapter.Batch(helix.UnloggedBatch)
 		batch.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
 			userID, "V2ExecCASCtx", "v2execcasctx@example.com", time.Now(),
 		)
-		applied, iter, err := batch.ExecCASContext(ctx)
+		applied, iter, err := batch.ExecCASContext(ctx, &existingID, &existingCreatedAt, &existingEmail, &existingName)
 		require.NoError(t, err)
 		require.True(t, applied)
 		require.NoError(t, iter.Close())
 
 		// applied=false: dest vars required for the 4 table columns (id, created_at, email, name).
-		var existingID gocqlv2.UUID
-		var existingCreatedAt time.Time
-		var existingEmail, existingName string
 		batch2 := adapter.Batch(helix.UnloggedBatch)
 		batch2.Query(
 			"INSERT INTO "+table+" (id, name, email, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS",
