@@ -267,6 +267,8 @@ Time →
 └─────────────────────────────────┴──────────────────────────────────┘
 ```
 
+> **Oscillation risk.** If both clusters are intermittently failing, `StickyRead` can flip-flop between them — once the cooldown expires, a failure on cluster B causes a switch back to A, and vice versa. The cooldown is the only brake. Set it long enough that a single blip does not trigger rapid back-and-forth switching; 2–10 minutes is typical. Pairing `StickyRead` with `CircuitBreaker` instead of `ActiveFailover` provides an additional layer of protection: the circuit breaker absorbs transient errors and only allows failover after repeated failures.
+
 **When to use:** The default choice for most workloads. Sticking to one cluster maximizes row-cache and OS page-cache hit rates.
 
 **Trade-off:** One cluster handles all reads by default; the other is idle for reads. If read load must be distributed, use `RoundRobinRead` instead.
@@ -296,26 +298,37 @@ No configuration options.
 
 ### PrimaryOnlyRead
 
-Always reads from cluster A. Fails over to cluster B once on error, then continues preferring A.
+Always reads from cluster A. Fails over to cluster B on error. Without a recovery timeout, failover persists until `Reset()` is called manually; with one, the strategy automatically probes cluster A after the timeout elapses.
 
 ```go
+// Default: permanent failover until Reset() is called
 strategy := policy.NewPrimaryOnlyRead()
 
-// After cluster A recovers, reset to prefer A again
+// Auto-recovery: probe cluster A again after 2 minutes of being failed-over
+strategy := policy.NewPrimaryOnlyRead(
+    policy.WithPrimaryOnlyRecoveryTimeout(2 * time.Minute),
+)
+
+// Manual reset — use when you observe cluster A recovery externally
 strategy.Reset()
 ```
 
-No configuration options.
+**Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithPrimaryOnlyRecoveryTimeout` | disabled | After this duration in failed-over state, `Select` returns cluster A as a probe |
 
 **Behavior:**
 - All reads go to cluster A
-- First failure on A: fails over to B for that request only; sets a `failedOver` flag
-- While `failedOver`: subsequent reads still attempt A first (reads do not permanently stay on B)
-- `Reset()`: clears the `failedOver` flag — call this after observing cluster A recovery
+- On cluster A failure: sets `failedOver`, returns cluster B for failover
+- While `failedOver` (no recovery timeout): all reads route to cluster B permanently
+- While `failedOver` (with recovery timeout): after the timeout elapses, `Select` returns cluster A as a probe; if that read succeeds (`OnSuccess`), the strategy resets to cluster A; if it fails again (`OnFailure`), the timer restarts
+- `Reset()`: clears the `failedOver` flag immediately regardless of timeout
 
 **When to use:** Read-after-write consistency requirements where writes always go to cluster A and you need to read your own writes. Also suitable for primary-secondary setups where cluster B is a warm standby.
 
-**Trade-off:** Cluster B is idle for reads until A fails. Does not distribute load.
+**Trade-off:** Cluster B is idle for reads until A fails. Does not distribute load. Without `WithPrimaryOnlyRecoveryTimeout`, if cluster A recovers the client stays on cluster B indefinitely unless `Reset()` is called externally.
 
 ---
 
@@ -331,22 +344,35 @@ fp := policy.NewActiveFailover()
 
 No configuration options. All methods are no-ops except `ShouldFailover`, which always returns `true`.
 
-**When to use:** Read-heavy workloads where availability is more important than stability. Suitable when transient errors are common and each retry is cheap (e.g., simple key lookups).
+**When to use:** Read-heavy workloads where availability is more important than stability. Suitable when transient errors are rare, short-lived, and each retry is cheap (e.g., simple key lookups against a stable cluster pair).
 
-**Trade-off:** No circuit breaker logic. If both clusters are degraded simultaneously, the client will attempt failover on every request, doubling latency without benefit.
+**Trade-off — Oscillation risk:** `ActiveFailover` has no circuit breaker, no threshold, and no cooldown of its own. If both clusters are intermittently failing, the client will flip-flop between them on every request:
+
+```
+Request 1: read A → fails → failover to B → B returns error
+Request 2: next Select() picks A again (StickyRead switched back after prior success on B)
+           read A → fails → failover to B → B errors again
+Request 3: … same cycle repeats
+```
+
+In this scenario failover doubles latency on every request while providing no benefit. The effect is amplified when the `ReadStrategy` has no cooldown (e.g., `RoundRobinRead`) — then every alternating request hits a different cluster, generating a constant stream of failover attempts.
+
+**Mitigations:**
+- Pair with `StickyRead` and a long cooldown (≥ 2 minutes) so that even if both clusters are degraded, the client at least stays on one cluster for the duration of the cooldown.
+- Prefer `CircuitBreaker` in production — it absorbs transient errors silently and only gates failover after repeated failures, which prevents thrashing at the cost of surfacing the first `threshold - 1` errors directly to the caller.
 
 ---
 
 ### CircuitBreaker
 
-Tracks consecutive failures per cluster. Blocks failover until the failure count reaches a threshold (CLOSED state), then allows failover (OPEN state).
+Tracks consecutive failures **per cluster independently**. Blocks failover until the failure count reaches a threshold (CLOSED state), then allows failover (OPEN state). Cluster A's circuit state has no effect on cluster B's counter and vice versa.
 
 ```go
 breaker := policy.NewCircuitBreaker(
-    policy.WithThreshold(3),                    // failures before opening (default: 3)
-    policy.WithResetTimeout(30*time.Second),    // reset counter after idle (default: 30s)
-    policy.WithCircuitBreakerLogger(logger),    // optional structured logging
-    policy.WithCircuitBreakerMetrics(metrics),  // optional metrics
+    policy.WithThreshold(3),                      // failures before opening (default: 3)
+    policy.WithResetTimeout(30*time.Second),      // stale-failure window (default: 30s)
+    policy.WithCircuitBreakerLogger(logger),      // optional structured logging
+    policy.WithCircuitBreakerMetrics(metrics),    // optional metrics
     policy.WithCircuitBreakerClusterNames(names), // cluster labels for logs/metrics
 )
 ```
@@ -356,37 +382,52 @@ breaker := policy.NewCircuitBreaker(
 | Option | Default | Description |
 |--------|---------|-------------|
 | `WithThreshold` | 3 | Consecutive failures before circuit opens |
-| `WithResetTimeout` | 30s | Reset failure counter after this idle period |
+| `WithResetTimeout` | 30s | If the gap between two consecutive failures exceeds this, the counter resets to 1 on the next failure rather than incrementing — stale failures are discarded, not the live counter |
 | `WithCircuitBreakerLogger` | no-op | Structured logger for open/close events |
 | `WithCircuitBreakerMetrics` | no-op | Metrics collector for trip events and state changes |
 | `WithCircuitBreakerClusterNames` | "A"/"B" | Display names used in log and metric labels |
 
-**State machine:**
+> **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence." The counter does not reset automatically over time — it resets to 1 only when the *next* failure arrives after a `resetTimeout`-long gap. If a cluster stays broken, the counter keeps incrementing; `resetTimeout` only protects against counting a failure from *last week* against today's blip. The only way to close an open circuit is a successful read (`RecordSuccess`).
+
+**What triggers `RecordFailure` vs `RecordSuccess`:**
+- `RecordFailure`: every hard error returned by the driver (network failure, timeout, unavailable) — all errors except Helix-internal sentinels (`ErrWriteAsync`, `ErrWriteDropped`) which never appear on the read path
+- `RecordSuccess`: every successful read response, regardless of latency
+
+**State machine (per cluster):**
 
 ```
 CLOSED (failures < threshold)
-  └─ ShouldFailover() → false   ← absorbs transient errors
+  └─ ShouldFailover() → false   ← absorbs transient errors; error returned to caller
   └─ On RecordFailure():
-       - Increment counter; if counter < threshold: stay CLOSED
-       - If counter >= threshold: transition to OPEN, emit metric once
+       ├─ Gap since last failure > resetTimeout → reset counter to 1 (stale)
+       └─ Otherwise → increment; if counter >= threshold: transition to OPEN, emit metric
 
 OPEN (failures >= threshold)
   └─ ShouldFailover() → true    ← permits failover to alternative cluster
   └─ On RecordSuccess():
-       - Reset counter to 0, transition to CLOSED, emit metric
-  └─ On RecordFailure() after resetTimeout idle:
-       - Reset counter to 1 (stale failures discarded), stay OPEN
+       └─ Reset counter to 0, transition to CLOSED, emit metric
+  └─ On RecordFailure():
+       ├─ Gap since last failure > resetTimeout → reset counter to 1 (stale, stay OPEN)
+       └─ Otherwise → increment (stay OPEN)
 ```
+
+**When OPEN: what the caller observes:**
+- `ShouldFailover(A) = true` → `ReadStrategy.OnFailure(A)` is called → returns cluster B
+- Read is retried on cluster B
+- If B succeeds → caller gets result; B's `RecordSuccess` is called (B's counter resets)
+- If B also fails → **both circuits now track failures independently; caller gets the B error** — there is no further retry. If B's circuit was already OPEN, the caller immediately receives the error without attempting A; Helix does not return `DualClusterError` for reads (only writes).
 
 **Example timeline** (threshold = 3, resetTimeout = 30s):
 
 ```
- t=0s   Failure 1 → failures=1, ShouldFailover()=false
- t=5s   Failure 2 → failures=2, ShouldFailover()=false
- t=10s  Failure 3 → failures=3, ShouldFailover()=true  (circuit OPENS)
- t=15s  Failure 4 → failures=4, ShouldFailover()=true
- t=20s  Success   → failures=0, circuit CLOSES
- t=25s  Failure 1 → failures=1, ShouldFailover()=false  (fresh start)
+ t=0s   Failure 1 on A → A.failures=1, ShouldFailover(A)=false  (error returned to caller)
+ t=5s   Failure 2 on A → A.failures=2, ShouldFailover(A)=false  (error returned)
+ t=10s  Failure 3 on A → A.failures=3, ShouldFailover(A)=true   (circuit OPENS; failover to B)
+           B read succeeds → B.failures=0, A stays OPEN
+ t=15s  Next read → ShouldFailover(A)=true → retry on B → B succeeds
+ t=20s  A read attempted directly (ShouldFailover still true) → success → A.failures=0 (CLOSES)
+ t=25s  Failure 1 on A → A.failures=1, ShouldFailover(A)=false  (fresh start)
+ t=90s  Failure 1 on A → gap > 30s → A.failures reset to 1 (stale failure discarded)
 ```
 
 **When to use:** Workloads that can tolerate a few transient errors per cluster without failing over. The threshold absorbs brief blips (single-node restarts, brief GC pauses) without switching clusters unnecessarily.
@@ -419,14 +460,33 @@ breaker := policy.NewLatencyCircuitBreaker(
 | `WithLatencyLogger` | no-op | Structured logger |
 | `WithLatencyMetrics` | no-op | Metrics collector |
 
-**Behavior beyond CircuitBreaker:**
-- The client automatically detects that the configured policy implements `LatencyRecorder` and calls `RecordLatency(cluster, elapsed)` after each successful read — no manual wiring required
-- `RecordLatency`: if `elapsed > absoluteMax` → internally calls `RecordFailure()` (soft failure); otherwise calls `RecordSuccess()` (resets counter)
-- Hard errors (network failures) still call `RecordFailure()` directly, as in `CircuitBreaker`
+**What triggers `RecordFailure` vs `RecordSuccess`:**
+- Hard error from driver → `RecordFailure()` directly (same as `CircuitBreaker`)
+- Successful read, `elapsed ≤ absoluteMax` → `RecordSuccess()` (resets counter)
+- Successful read, `elapsed > absoluteMax` → `RecordLatency()` → internally calls `RecordFailure()` (soft failure counted toward threshold)
+
+The client calls `RecordLatency()` automatically after each successful read if the configured policy implements `LatencyRecorder` — no manual wiring required.
+
+**Example timeline** (absoluteMax = 2s, threshold = 3, resetTimeout = 30s):
+
+```
+ t=0s   Read A in 800ms  → RecordSuccess(A) → A.failures=0
+ t=1s   Read A in 2.3s   → RecordLatency(A, 2.3s) → soft failure → A.failures=1, ShouldFailover(A)=false
+ t=2s   Read A in 2.1s   → soft failure → A.failures=2, ShouldFailover(A)=false
+ t=3s   Read A in 2.5s   → soft failure → A.failures=3, ShouldFailover(A)=true  (circuit OPENS)
+           failover to B → B succeeds in 900ms → RecordSuccess(B)
+ t=4s   Read A → circuit still OPEN → failover to B → B in 600ms → RecordSuccess(B)
+ t=5s   Read A → hard error → RecordFailure(A) directly → A.failures=4 (stays OPEN)
+ t=10s  Read A → circuit OPEN → failover to B → B succeeds → RecordSuccess(B)
+           Meanwhile: A must receive a RecordSuccess call to CLOSE
+           (typically happens when A is directly selected and responds fast again)
+```
+
+> **Note:** Because every fast successful read calls `RecordSuccess()`, the `resetTimeout` is less significant in `LatencyCircuitBreaker` than in `CircuitBreaker` — successful reads continuously reset the counter, so stale failure accumulation is rare. The dominant closure mechanism is fast responses, not idle timeouts.
 
 **When to use:** Latency-sensitive production environments where a technically-healthy but slow cluster (e.g., compaction, GC pressure) should be treated as degraded. Combines hard-failure and latency-based degradation in one policy.
 
-**Trade-off:** Adds per-read overhead of a latency measurement and policy call. Tune `absoluteMax` carefully: too low and healthy clusters trip on normal jitter; too high and degraded clusters stay open too long.
+**Trade-off:** Adds per-read overhead of a latency measurement and policy call. Tune `absoluteMax` carefully: too low and healthy clusters trip on normal jitter; too high and degraded clusters stay open too long. A useful starting point is your p99 read SLA measured at the driver level — not at the application level, since Helix overhead adds a small constant.
 
 ---
 
@@ -506,9 +566,16 @@ Do you need cache locality (same rows read from the same cluster)?
 ```
 Can the workload tolerate a few errors without failover?
 │
-├─ No  → ActiveFailover
-│        Failover on every error; maximum availability;
-│        use with StickyRead cooldown to prevent flapping.
+├─ No  → Are both clusters guaranteed stable (rarely fail simultaneously)?
+│        │
+│        ├─ Yes → ActiveFailover
+│        │        Failover on every error; maximum availability;
+│        │        MUST pair with StickyRead + long cooldown (≥ 2m)
+│        │        to prevent oscillation if both clusters degrade.
+│        │
+│        └─ No  → CircuitBreaker (lower threshold, e.g. 2)
+│                 Absorbs single blips; opens fast enough that
+│                 first-error failover happens within 2 requests.
 │
 └─ Yes → Do slow (but successful) reads cause SLA violations?
          │
@@ -523,11 +590,11 @@ Can the workload tolerate a few errors without failover?
 
 **Summary table:**
 
-| Policy | Failover trigger | Circuit break | Latency-aware | Best for |
-|--------|-----------------|---------------|---------------|----------|
-| `ActiveFailover` | Every error | No | No | Max availability, simple |
-| `CircuitBreaker` | After N errors | Yes | No | Tolerate transient errors |
-| `LatencyCircuitBreaker` | After N errors or N slow reads | Yes | Yes | Latency-SLA production |
+| Policy | Failover trigger | Circuit break | Latency-aware | Oscillation risk | Best for |
+|--------|-----------------|---------------|---------------|-----------------|----------|
+| `ActiveFailover` | Every error | No | No | **High** — no damping | Stable clusters, max availability |
+| `CircuitBreaker` | After N errors | Yes | No | Low | General production use |
+| `LatencyCircuitBreaker` | After N errors or N slow reads | Yes | Yes | Low | Latency-SLA production |
 
 ---
 
@@ -565,9 +632,13 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 
 **Maximum availability (failover on every error):**
 ```go
+// NOTE: ActiveFailover with StickyRead requires a long cooldown.
+// Without it, both-cluster degradation causes rapid oscillation —
+// every request flips between A and B. The cooldown ensures the client
+// stays on one cluster for at least the duration of a blip.
 client, _ := helix.NewCQLClient(sessionA, sessionB,
     helix.WithReadStrategy(policy.NewStickyRead(
-        policy.WithStickyReadCooldown(5*time.Minute),
+        policy.WithStickyReadCooldown(5*time.Minute), // essential damping
     )),
     helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
     helix.WithFailoverPolicy(policy.NewActiveFailover()),
@@ -576,17 +647,27 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 
 **Even load distribution:**
 ```go
+// RoundRobinRead has no cooldown, so pair it with CircuitBreaker — not
+// ActiveFailover. Without a circuit breaker, every alternating request hitting
+// a degraded cluster triggers a failover attempt, generating constant noise.
 client, _ := helix.NewCQLClient(sessionA, sessionB,
     helix.WithReadStrategy(policy.NewRoundRobinRead()),
     helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
-    helix.WithFailoverPolicy(policy.NewActiveFailover()),
+    helix.WithFailoverPolicy(policy.NewCircuitBreaker(
+        policy.WithThreshold(3),
+        policy.WithResetTimeout(30*time.Second),
+    )),
 )
 ```
 
 **Read-after-write consistency:**
 ```go
 client, _ := helix.NewCQLClient(sessionA, sessionB,
-    helix.WithReadStrategy(policy.NewPrimaryOnlyRead()),
+    helix.WithReadStrategy(policy.NewPrimaryOnlyRead(
+        // Auto-probe cluster A after 2 minutes of being failed-over,
+        // so the client self-heals when cluster A recovers.
+        policy.WithPrimaryOnlyRecoveryTimeout(2*time.Minute),
+    )),
     helix.WithWriteStrategy(policy.NewSyncDualWrite(
         policy.WithPrimaryFirst(), // ensure A is durable before B
     )),
@@ -627,6 +708,17 @@ Driver-level timeouts apply uniformly to all query types (reads, writes, batches
 
 4. **Use LatencyCircuitBreaker's `absoluteMax` conservatively.** Set it to your p99 read SLA, not your p50. Cassandra/ScyllaDB p99 can be 2–5× p50 under compaction; a too-tight threshold will cause spurious failovers.
 
-5. **Call `PrimaryOnlyRead.Reset()` after cluster A recovers.** Without it, the `failedOver` flag persists across process restarts (if you reuse the same instance) and the primary cluster remains unused.
+5. **Configure `PrimaryOnlyRead` with a recovery timeout in production.** Without `WithPrimaryOnlyRecoveryTimeout`, a single cluster-A failure leaves the client permanently on cluster B until `Reset()` is called externally. Use the timeout to auto-probe cluster A after a reasonable recovery window (e.g., 2–5 minutes), so the client self-heals without operator intervention.
 
 6. **Add metrics and logging to CircuitBreaker in production.** The policy emits trip/close events that are the primary signal for cluster health degradation. Without a `MetricsCollector`, these events are silent.
+
+7. **Do not use `ActiveFailover` when both clusters can fail simultaneously.** `ActiveFailover` has no threshold, no cooldown of its own, and no circuit-breaking. When both clusters are degraded it causes request-level oscillation — each request flips to the other cluster, doubling latency with no benefit. Preferred alternatives:
+   - Use `CircuitBreaker` (or `LatencyCircuitBreaker`) in all production environments. The circuit breaker absorbs transient errors and dampens oscillation by requiring repeated failures before allowing failover.
+   - If you require first-error failover semantics, keep `ActiveFailover` but mandate `StickyRead` with a cooldown of at least 2 minutes. The cooldown prevents the read strategy from switching clusters again until the blip has passed.
+   - Never pair `ActiveFailover` with `RoundRobinRead`. `RoundRobinRead` has no cooldown at all; combined with `ActiveFailover`, every other request will hit a different cluster, generating constant failover noise during any dual-cluster degradation.
+
+8. **Understand the two layers of failover damping.** Oscillation protection requires both layers working together:
+   - `FailoverPolicy` (`CircuitBreaker`) decides **whether** to failover. Without a threshold it cannot absorb blips.
+   - `ReadStrategy` (`StickyRead` + cooldown) decides **where** to failover and **how long to stay there**. Without a cooldown the strategy can switch back immediately.
+   
+   Using `ActiveFailover` removes the first layer entirely. Using `RoundRobinRead` removes the second. Removing both is the worst-case combination for oscillation.
