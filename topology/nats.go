@@ -38,6 +38,7 @@ type NATS struct {
 	closed       bool
 	watchStarted bool
 	closeOnce    sync.Once
+	senderWG     sync.WaitGroup // tracks in-flight overflow-send goroutines
 }
 
 var _ helix.TopologyWatcher = (*NATS)(nil)
@@ -180,7 +181,10 @@ func (n *NATS) GetDrainReason() string {
 
 // watchLoop is the main watch loop that monitors the NATS KV key.
 func (n *NATS) watchLoop(ctx context.Context) {
-	defer n.closeOnce.Do(func() { close(n.updates) })
+	defer func() {
+		n.senderWG.Wait()
+		n.closeOnce.Do(func() { close(n.updates) })
+	}()
 
 	// Initial fetch
 	n.fetchAndEmit(ctx)
@@ -307,14 +311,9 @@ func (n *NATS) updateDrainState(cluster types.ClusterID, draining bool) {
 
 	*current = draining
 
-	// Emit update (non-blocking)
-	select {
-	case n.updates <- helix.TopologyUpdate{
+	sendUpdate(n.updates, &n.senderWG, n.done, helix.TopologyUpdate{
 		Cluster:   cluster,
 		Available: !draining,
 		DrainMode: draining,
-	}:
-	default:
-		// Channel full, skip update (older updates are stale anyway)
-	}
+	})
 }

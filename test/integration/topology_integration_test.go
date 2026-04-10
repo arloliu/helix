@@ -497,6 +497,39 @@ func TestLocalMultipleWatchCallsIntegration(t *testing.T) {
 	}
 }
 
+func TestLocalMultipleWatchDifferentContextsIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	watcher := topology.NewLocal()
+	defer watcher.Close()
+
+	ctx := t.Context()
+
+	// First Watch call with the main context
+	updates := watcher.Watch(ctx)
+
+	// Second Watch call with a context that is cancelled immediately.
+	// The short-lived context must not close the shared updates channel.
+	shortCtx, cancel := context.WithCancel(ctx)
+	updates2 := watcher.Watch(shortCtx)
+	cancel()
+
+	assert.Equal(t, updates, updates2)
+
+	// The shared channel must still be open: SetDrain must deliver updates.
+	_ = watcher.SetDrain(ctx, types.ClusterB, true, "short-ctx-test")
+
+	select {
+	case update := <-updates:
+		assert.Equal(t, types.ClusterB, update.Cluster)
+		assert.True(t, update.DrainMode)
+	case <-time.After(time.Second):
+		t.Fatal("shared updates channel was closed prematurely by short-lived context")
+	}
+}
+
 // =============================================================================
 // NATS TopologyWatcher + CQLClient Integration Tests
 // =============================================================================

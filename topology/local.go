@@ -22,8 +22,10 @@ type Local struct {
 
 	updates       chan helix.TopologyUpdate
 	done          chan struct{}
+	watchOnce     sync.Once
 	closed        bool
 	updatesClosed bool
+	senderWG      sync.WaitGroup // tracks in-flight overflow-send goroutines
 }
 
 var (
@@ -56,7 +58,9 @@ func NewLocal() *Local {
 // Returns:
 //   - <-chan helix.TopologyUpdate: Channel of topology changes
 func (l *Local) Watch(ctx context.Context) <-chan helix.TopologyUpdate {
-	go l.waitForClose(ctx)
+	l.watchOnce.Do(func() {
+		go l.waitForClose(ctx)
+	})
 	return l.updates
 }
 
@@ -104,16 +108,11 @@ func (l *Local) SetDrain(_ context.Context, cluster types.ClusterID, draining bo
 		l.drainReason = ""
 	}
 
-	// Emit update (non-blocking)
-	select {
-	case l.updates <- helix.TopologyUpdate{
+	sendUpdate(l.updates, &l.senderWG, l.done, helix.TopologyUpdate{
 		Cluster:   cluster,
 		Available: !draining,
 		DrainMode: draining,
-	}:
-	default:
-		// Channel full, skip update
-	}
+	})
 
 	return nil
 }
@@ -165,12 +164,33 @@ func (l *Local) Close() error {
 	return nil
 }
 
+// sendUpdate delivers update to ch. If ch is full it falls back to a background
+// goroutine so the caller is never blocked and the consumer still receives the
+// transition. The goroutine is tracked in wg; callers must call wg.Wait() before
+// closing ch to prevent "send on closed channel" panics.
+func sendUpdate(ch chan<- helix.TopologyUpdate, wg *sync.WaitGroup, done <-chan struct{}, update helix.TopologyUpdate) {
+	select {
+	case ch <- update:
+	default:
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case ch <- update:
+			case <-done:
+			}
+		}()
+	}
+}
+
 // waitForClose waits for context cancellation or close signal.
 func (l *Local) waitForClose(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 	case <-l.done:
 	}
+
+	l.senderWG.Wait()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()

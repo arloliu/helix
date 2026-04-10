@@ -70,6 +70,12 @@ type NATSReplayerConfig struct {
 	// The OnDrop callback will be called when this occurs.
 	// Default: 5
 	MaxDeliver int
+
+	// OnCorruptMessage is called when a message cannot be decoded and is
+	// permanently terminated from the queue. Use it for alerting or metrics.
+	// Unlike MaxDeliver exhaustion, corrupt messages are terminated immediately
+	// on the first decode attempt — retrying would never succeed.
+	OnCorruptMessage func(err error)
 }
 
 // DefaultNATSReplayerConfig returns the default configuration.
@@ -264,6 +270,23 @@ func WithMaxDeliver(n int) NATSReplayerOption {
 	}
 }
 
+// WithOnCorruptMessage sets a callback invoked when a message cannot be decoded
+// and is permanently terminated from the queue.
+//
+// Corrupt messages are terminated immediately on the first decode failure —
+// retrying would never succeed since the payload bytes are irrecoverably malformed.
+//
+// Parameters:
+//   - fn: Callback receiving the decode error
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithOnCorruptMessage(fn func(err error)) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.OnCorruptMessage = fn
+	}
+}
+
 // NewNATSReplayer creates a new NATS JetStream replayer.
 //
 // This function creates or updates a JetStream stream for storing replay messages.
@@ -454,6 +477,7 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 
 	maxDeliver := n.config.MaxDeliver
 	result := make([]ReplayMessage, 0, batchSize)
+msgLoop:
 	for msg := range msgs.Messages() {
 		// Extract delivery metadata
 		meta, metaErr := msg.Metadata()
@@ -464,8 +488,8 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 
 		var natsMsg natsReplayMessage
 		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
-			// Skip malformed messages but nak them for retry
-			_ = msg.Nak()
+			// Permanently corrupt — Term immediately; no retry will fix bad bytes.
+			n.handleCorrupt(msg, err)
 
 			continue
 		}
@@ -473,7 +497,7 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 		// Decode Args from msgp.Raw
 		args, err := decodeArgs(natsMsg.Args)
 		if err != nil {
-			_ = msg.Nak()
+			n.handleCorrupt(msg, err)
 
 			continue
 		}
@@ -485,9 +509,9 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 			for i, stmt := range natsMsg.BatchStatements {
 				stmtArgs, err := decodeArgs(stmt.Args)
 				if err != nil {
-					_ = msg.Nak()
+					n.handleCorrupt(msg, err)
 
-					continue
+					continue msgLoop
 				}
 				batchStmts[i] = types.BatchStatement{
 					Query: stmt.Query,
@@ -589,6 +613,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 
 	maxDeliver := n.config.MaxDeliver
 	result := make([]ReplayMessage, 0, batchSize)
+msgLoop:
 	for msg := range msgs.Messages() {
 		// Extract delivery metadata
 		meta, metaErr := msg.Metadata()
@@ -599,8 +624,8 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 
 		var natsMsg natsReplayMessage
 		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
-			// Skip malformed messages but nak them for retry
-			_ = msg.Nak()
+			// Permanently corrupt — Term immediately; no retry will fix bad bytes.
+			n.handleCorrupt(msg, err)
 
 			continue
 		}
@@ -608,7 +633,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		// Decode Args from msgp.Raw
 		args, err := decodeArgs(natsMsg.Args)
 		if err != nil {
-			_ = msg.Nak()
+			n.handleCorrupt(msg, err)
 
 			continue
 		}
@@ -620,9 +645,9 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 			for i, stmt := range natsMsg.BatchStatements {
 				stmtArgs, err := decodeArgs(stmt.Args)
 				if err != nil {
-					_ = msg.Nak()
+					n.handleCorrupt(msg, err)
 
-					continue
+					continue msgLoop
 				}
 				batchStmts[i] = types.BatchStatement{
 					Query: stmt.Query,
@@ -901,6 +926,20 @@ func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 
 	//nolint:gosec // overflow is handled by the cap above
 	return int(msgs), nil
+}
+
+// handleCorrupt terminates a message that cannot be decoded and invokes the
+// OnCorruptMessage callback if configured.
+//
+// Corrupt messages are terminated immediately rather than Nak'd: since the
+// payload bytes are irrecoverably malformed, no number of redeliveries would
+// allow the message to be processed successfully. Calling Term() removes the
+// message from the queue without waiting for MaxDeliver exhaustion.
+func (n *NATSReplayer) handleCorrupt(msg jetstream.Msg, err error) {
+	_ = msg.Term()
+	if n.config.OnCorruptMessage != nil {
+		n.config.OnCorruptMessage(err)
+	}
 }
 
 // Close closes the replayer.

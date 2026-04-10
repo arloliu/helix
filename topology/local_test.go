@@ -209,6 +209,47 @@ func TestLocalImplementsInterfaces(t *testing.T) {
 	var _ helix.TopologyOperator = (*Local)(nil)
 }
 
+// TestLocalUpdatesDeliveredWhenChannelFull verifies the goroutine-fallback send
+// path: if the updates channel buffer is full, the overflow update is still
+// delivered (not silently dropped) once the consumer starts reading.
+func TestLocalUpdatesDeliveredWhenChannelFull(t *testing.T) {
+	const bufferCap = 10 // must match the capacity used in NewLocal
+
+	local := NewLocal()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	defer local.Close()
+
+	updates := local.Watch(ctx)
+
+	// Alternate drain states without consuming any updates, filling the buffer.
+	// i=0 → true, i=1 → false, ..., i=9 → false. That is bufferCap state changes.
+	for i := range bufferCap {
+		_ = local.SetDrain(ctx, types.ClusterA, i%2 == 0, "fill")
+	}
+	// Channel buffer is now at capacity (10 items). Current state: drainA=false (i=9).
+
+	// This (bufferCap+1)th state change would previously be silently dropped.
+	_ = local.SetDrain(ctx, types.ClusterA, true, "must-deliver")
+
+	// Now drain the channel. All bufferCap+1 updates must arrive.
+	want := bufferCap + 1
+	got := make([]helix.TopologyUpdate, 0, want)
+	deadline := time.After(2 * time.Second)
+
+	for len(got) < want {
+		select {
+		case u := <-updates:
+			got = append(got, u)
+		case <-deadline:
+			t.Fatalf("timed out after receiving %d/%d updates; goroutine-fallback send was dropped",
+				len(got), want)
+		}
+	}
+
+	assert.Len(t, got, want, "all %d updates must be delivered, including the overflow via goroutine fallback", want)
+}
+
 func TestNATSImplementsInterface(t *testing.T) {
 	// Compile-time check that NATS implements TopologyWatcher
 	var _ helix.TopologyWatcher = (*NATS)(nil)
