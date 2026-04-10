@@ -855,3 +855,106 @@ func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
 	assert.Greater(t, latency, int64(0),
 		"stateA.lastLatency must be updated after a successful fire-and-forget write")
 }
+
+// TestAdaptiveDualWrite_HealthyClusterClearsStrikesWhileSiblingDegraded verifies
+// that a healthy cluster's stale slowStrikes are cleared while its sibling is
+// degraded. Previously, updateHealthState returned early when only one cluster
+// had valid latency, leaving the healthy cluster's slowStrikes frozen.
+func TestAdaptiveDualWrite_HealthyClusterClearsStrikesWhileSiblingDegraded(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveAbsoluteMax(50*time.Millisecond),
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(3),
+	)
+	ctx := t.Context()
+
+	// Accumulate 2 slow strikes on cluster A (one short of degradation).
+	for range 2 {
+		_, _ = a.Execute(ctx,
+			func(ctx context.Context) error {
+				time.Sleep(60 * time.Millisecond) // Exceeds absoluteMax
+				return nil
+			},
+			func(ctx context.Context) error {
+				time.Sleep(10 * time.Millisecond)
+				return nil
+			},
+		)
+	}
+	require.False(t, a.IsDegraded(types.ClusterA), "A not yet degraded (2/3 strikes)")
+	require.Equal(t, int32(2), a.stateA.slowStrikes, "A should have 2 slow strikes")
+
+	// Now degrade cluster B so that updateHealthState has only one valid latency.
+	a.ForceDegrade(types.ClusterB)
+	require.True(t, a.IsDegraded(types.ClusterB))
+
+	// Execute a fast write where only A returns latency. With the fix,
+	// A's slowStrikes should be cleared by recordFastIfNoViolation.
+	_, _ = a.Execute(ctx,
+		func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond) // Fast, no cap violation
+			return nil
+		},
+		func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		},
+	)
+
+	assert.Equal(t, int32(0), a.stateA.slowStrikes,
+		"A's slowStrikes must be cleared while sibling is degraded and A is healthy")
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"A must remain healthy after fast writes while sibling is degraded")
+}
+
+// TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded verifies
+// that when a cluster still exceeds absoluteMax while its sibling is degraded,
+// recordFastIfNoViolation does NOT reset slowStrikes — the cap-violation
+// strike from checkAbsoluteCap must be preserved.
+func TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveAbsoluteMax(50*time.Millisecond),
+		WithAdaptiveStrikeThreshold(3),
+		WithAdaptiveRecoveryThreshold(3),
+	)
+	ctx := t.Context()
+
+	// Accumulate 2 slow strikes on cluster A (one short of degradation).
+	for range 2 {
+		_, _ = a.Execute(ctx,
+			func(ctx context.Context) error {
+				time.Sleep(60 * time.Millisecond) // Exceeds absoluteMax
+				return nil
+			},
+			func(ctx context.Context) error {
+				time.Sleep(10 * time.Millisecond)
+				return nil
+			},
+		)
+	}
+	require.False(t, a.IsDegraded(types.ClusterA), "A not yet degraded (2/3 strikes)")
+	require.Equal(t, int32(2), a.stateA.slowStrikes, "A should have 2 slow strikes")
+
+	// Degrade cluster B so that updateHealthState enters the early-return path.
+	a.ForceDegrade(types.ClusterB)
+	require.True(t, a.IsDegraded(types.ClusterB))
+
+	// Execute a SLOW write on A (still exceeding absoluteMax). The
+	// cap-violation strike must be preserved — recordFastIfNoViolation
+	// must NOT clear it.
+	_, _ = a.Execute(ctx,
+		func(ctx context.Context) error {
+			time.Sleep(60 * time.Millisecond) // Still exceeds absoluteMax
+			return nil
+		},
+		func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		},
+	)
+
+	assert.True(t, a.IsDegraded(types.ClusterA),
+		"A must degrade: 3rd cap-violation strike should not be cleared by the early-return path")
+	assert.GreaterOrEqual(t, a.stateA.slowStrikes, int32(3),
+		"A's slowStrikes must reach the threshold when cap violation persists")
+}

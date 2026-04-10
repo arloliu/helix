@@ -354,3 +354,95 @@ func TestNATSWorkerParallelProcessing(t *testing.T) {
 	assert.Equal(t, int32(3), processedA.Load())
 	assert.Equal(t, int32(3), processedB.Load())
 }
+
+// TestMemoryWorkerOnDropCalledDuringShutdown verifies that the OnDrop callback
+// is invoked when a payload is dropped because the worker is stopped while
+// waiting for a retry backoff.
+func TestMemoryWorkerOnDropCalledDuringShutdown(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
+	defer replayer.Close()
+
+	var dropped atomic.Int32
+
+	worker := replay.NewMemoryWorker(replayer,
+		// Always fail so that the worker enters the retry backoff path.
+		func(_ context.Context, _ types.ReplayPayload) error {
+			return errors.New("always fail")
+		},
+		replay.WithPollInterval(10*time.Millisecond),
+		replay.WithRetryDelay(5*time.Second), // Long backoff to guarantee stopCh fires first
+		replay.WithOnDrop(func(_ types.ReplayPayload, _ error) {
+			dropped.Add(1)
+		}),
+	)
+
+	// Enqueue one payload
+	ctx := t.Context()
+	err := replayer.Enqueue(ctx, types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT INTO test (id) VALUES (?)",
+		Timestamp:     time.Now().UnixNano(),
+		Priority:      types.PriorityHigh,
+	})
+	require.NoError(t, err)
+
+	err = worker.Start()
+	require.NoError(t, err)
+
+	// Wait for the execute to fail and enter the backoff select.
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop the worker while it's waiting in the backoff select.
+	worker.Stop()
+
+	assert.GreaterOrEqual(t, dropped.Load(), int32(1),
+		"OnDrop must be called for payloads dropped during shutdown")
+}
+
+// TestMemoryWorkerQueueDrainedOnShutdown verifies that items remaining in the
+// in-memory queue when the worker stops also trigger OnDrop, not only the item
+// currently sitting in retry backoff. Previously, queue items were silently
+// abandoned because start() exited without draining.
+func TestMemoryWorkerQueueDrainedOnShutdown(t *testing.T) {
+	const total = 3
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
+	defer replayer.Close()
+
+	var dropped atomic.Int32
+
+	worker := replay.NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error {
+			return errors.New("always fail")
+		},
+		replay.WithPollInterval(10*time.Millisecond),
+		replay.WithRetryDelay(10*time.Second), // Long backoff so item 1 stays in backoff
+		replay.WithOnDrop(func(_ types.ReplayPayload, _ error) {
+			dropped.Add(1)
+		}),
+	)
+
+	ctx := t.Context()
+	for i := range total {
+		err := replayer.Enqueue(ctx, types.ReplayPayload{
+			TargetCluster: types.ClusterA,
+			Query:         "INSERT INTO test (id) VALUES (?)",
+			Timestamp:     int64(i),
+			Priority:      types.PriorityLow,
+		})
+		require.NoError(t, err)
+	}
+
+	err := worker.Start()
+	require.NoError(t, err)
+
+	// Wait for item 1 to fail and enter the 10s backoff.
+	// Items 2 and 3 remain in the queue during this window.
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop: item 1 is dropped via the backoff-stopCh path;
+	// items 2 and 3 are dropped by drainAndDrop on goroutine exit.
+	worker.Stop()
+
+	assert.Equal(t, int32(total), dropped.Load(),
+		"OnDrop must be called for every payload: backoff item + remaining queue items")
+}

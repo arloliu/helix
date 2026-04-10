@@ -27,6 +27,8 @@ If one strand snaps, the other keeps the organism alive. It's 4 billion years of
 - **Drop-in Replacement** - Interface-based design mirrors `gocql` API for minimal migration effort
 - **SQL Support** - Simple wrapper for `database/sql` with dual-write semantics
 
+> **CAS/LWT Warning:** Lightweight Transactions (`INSERT ... IF NOT EXISTS`, `ScanCAS`, etc.) are **not safe** in a shared-nothing dual-cluster architecture. Each cluster has an independent Paxos state, so CAS conditions cannot be coordinated across clusters. Do not use Helix for CAS/LWT operations.
+
 ## Installation
 
 ```bash

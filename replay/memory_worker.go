@@ -34,6 +34,7 @@ func (b *memoryBackend) backendType() string {
 // The cluster parameter is ignored since memory backend uses a single worker.
 func (b *memoryBackend) start(_ types.ClusterID) {
 	defer b.wg.Done()
+	defer b.drainAndDrop() // Drain remaining queue items and notify OnDrop on exit.
 
 	for {
 		select {
@@ -56,6 +57,26 @@ func (b *memoryBackend) start(_ types.ClusterID) {
 
 		// Execute the replay
 		b.executeWithRetry(payload, 1)
+	}
+}
+
+// drainAndDrop dequeues all remaining items from the queue and calls OnDrop
+// for each. Invoked when the worker exits to ensure no payload is silently lost.
+func (b *memoryBackend) drainAndDrop() {
+	for {
+		payload, ok := b.replayer.TryDequeue()
+		if !ok {
+			return
+		}
+
+		b.config.Metrics.IncReplayDropped(payload.TargetCluster)
+		b.config.Logger.Warn("replay message dropped during shutdown",
+			"cluster", b.clusterName(payload.TargetCluster),
+		)
+
+		if b.config.OnDrop != nil {
+			b.config.OnDrop(payload, nil)
+		}
 	}
 }
 
@@ -91,10 +112,22 @@ func (b *memoryBackend) executeWithRetry(payload types.ReplayPayload, attempt in
 	// (since we can't put it back at front of queue, we just re-enqueue)
 	delay := calculateBackoff(attempt, b.config.RetryDelay, b.config.MaxRetryDelay)
 
+	timer := time.NewTimer(delay)
 	select {
 	case <-b.stopCh:
+		timer.Stop()
+		// Payload dropped during shutdown — notify callback so the user
+		// has visibility into what was lost.
+		b.config.Metrics.IncReplayDropped(payload.TargetCluster)
+		b.config.Logger.Warn("replay message dropped during shutdown",
+			"cluster", b.clusterName(payload.TargetCluster),
+		)
+		if b.config.OnDrop != nil {
+			b.config.OnDrop(payload, err)
+		}
+
 		return
-	case <-time.After(delay):
+	case <-timer.C:
 	}
 
 	// Re-enqueue for retry

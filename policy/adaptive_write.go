@@ -252,6 +252,9 @@ func NewAdaptiveDualWrite(opts ...AdaptiveDualWriteOption) *AdaptiveDualWrite {
 //
 // For healthy clusters, writes are executed concurrently and waited upon.
 // For degraded clusters, writes are fire-and-forget (background goroutine).
+// Fire-and-forget writes use a dedicated context.Background() with fireForgetTimeout,
+// independent of the caller's ctx — the caller's context cancellation does not
+// cancel in-flight background writes.
 //
 // After execution, latencies are compared to update cluster health state.
 //
@@ -397,8 +400,17 @@ func (a *AdaptiveDualWrite) updateHealthState(
 	// Check absolute cap for clusters with valid latency
 	capViolationA, capViolationB := a.checkAbsoluteCap(hasLatencyA, hasLatencyB, latencyA, latencyB)
 
-	// Skip relative delta comparison if we don't have both latencies
+	// Skip relative delta comparison if we don't have both latencies.
+	// Still record fast-write credit for any healthy cluster that has valid
+	// latency and no cap violation, so that stale slowStrikes accumulated
+	// before the sibling degraded are cleared.
 	if !hasLatencyA || !hasLatencyB {
+		if hasLatencyA {
+			a.recordFastIfNoViolation(&a.stateA, capViolationA)
+		}
+		if hasLatencyB {
+			a.recordFastIfNoViolation(&a.stateB, capViolationB)
+		}
 		return
 	}
 
