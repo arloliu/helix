@@ -59,7 +59,6 @@
 //
 //   - types.ErrSessionClosed: Operation attempted on closed client
 //   - types.ErrReplayQueueFull: Replay queue at capacity, cannot enqueue failed write
-//   - types.ErrNoAvailableCluster: No cluster available for reads (both down/draining)
 //   - types.ErrBothClustersDraining: Both clusters in drain mode, writes rejected
 //   - types.ErrWriteAsync: Write sent async to degraded cluster (AdaptiveDualWrite only)
 //   - types.ErrWriteDropped: Write dropped due to concurrency limit (AdaptiveDualWrite only)

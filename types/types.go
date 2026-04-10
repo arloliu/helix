@@ -209,10 +209,6 @@ var (
 	// This is returned to the caller as a hard failure.
 	ErrBothClustersFailed = errors.New("helix: write failed on both clusters")
 
-	// ErrNoAvailableCluster indicates that no cluster is available for reads.
-	// Both clusters are either down or in drain mode.
-	ErrNoAvailableCluster = errors.New("helix: no cluster available for read")
-
 	// ErrBothClustersDraining indicates both clusters are in drain mode.
 	// No writes can be performed until at least one cluster exits drain mode.
 	ErrBothClustersDraining = errors.New("helix: both clusters are draining")
@@ -223,9 +219,6 @@ var (
 	// ErrReplayQueueFull indicates the in-memory replay queue is at capacity.
 	// The failed write could not be enqueued for later reconciliation.
 	ErrReplayQueueFull = errors.New("helix: replay queue is full")
-
-	// ErrInvalidBatchType indicates an unsupported batch type was specified.
-	ErrInvalidBatchType = errors.New("helix: invalid batch type")
 
 	// ErrNilSession indicates that a nil session was provided.
 	ErrNilSession = errors.New("helix: session cannot be nil")
@@ -241,33 +234,6 @@ var (
 	// when a degraded cluster is slow. The replay system handles reconciliation.
 	ErrWriteDropped = errors.New("helix: write dropped due to fire-and-forget concurrency limit")
 )
-
-// PartialWriteError represents a write that succeeded on one cluster but failed on another.
-//
-// This error is NOT returned to the caller. Partial writes are considered successful
-// from the caller's perspective, and the failed write is enqueued for replay.
-// This type is used internally for logging and metrics.
-type PartialWriteError struct {
-	// SucceededCluster is the cluster where the write succeeded.
-	SucceededCluster string
-
-	// FailedCluster is the cluster where the write failed.
-	FailedCluster string
-
-	// Cause is the underlying error from the failed cluster.
-	Cause error
-}
-
-// Error implements the error interface.
-func (e *PartialWriteError) Error() string {
-	return "helix: partial write - succeeded on " + e.SucceededCluster +
-		", failed on " + e.FailedCluster + ": " + e.Cause.Error()
-}
-
-// Unwrap returns the underlying cause for errors.Is/As compatibility.
-func (e *PartialWriteError) Unwrap() error {
-	return e.Cause
-}
 
 // ClusterError wraps an error from a specific cluster.
 type ClusterError struct {
@@ -301,12 +267,36 @@ type DualClusterError struct {
 }
 
 // Error implements the error interface.
+//
+// If either ErrorA or ErrorB is nil, the corresponding part is omitted from
+// the message rather than panicking.
 func (e *DualClusterError) Error() string {
-	return "helix: both clusters failed - A: " + e.ErrorA.Error() + ", B: " + e.ErrorB.Error()
+	var msgA, msgB string
+	if e.ErrorA != nil {
+		msgA = e.ErrorA.Error()
+	} else {
+		msgA = "<nil>"
+	}
+	if e.ErrorB != nil {
+		msgB = e.ErrorB.Error()
+	} else {
+		msgB = "<nil>"
+	}
+
+	return "helix: both clusters failed - A: " + msgA + ", B: " + msgB
 }
 
 // Unwrap returns the wrapped errors for errors.Is/As compatibility.
 // This allows checking for specific error types in either cluster's error.
+// Nil cluster errors are excluded from the returned slice.
 func (e *DualClusterError) Unwrap() []error {
-	return []error{ErrBothClustersFailed, e.ErrorA, e.ErrorB}
+	errs := []error{ErrBothClustersFailed}
+	if e.ErrorA != nil {
+		errs = append(errs, e.ErrorA)
+	}
+	if e.ErrorB != nil {
+		errs = append(errs, e.ErrorB)
+	}
+
+	return errs
 }
