@@ -173,20 +173,63 @@ func (s *StickyRead) Preferred() types.ClusterID {
 
 // PrimaryOnlyRead implements a read strategy that always reads from Cluster A.
 //
-// Cluster B is only used for writes and as a failover target.
+// Cluster B is only used for writes and as a failover target. Once Cluster A
+// fails, reads are permanently redirected to Cluster B until either:
+//   - [PrimaryOnlyRead.Reset] is called manually, or
+//   - The optional recovery timeout (set via [WithPrimaryOnlyRecoveryTimeout])
+//     elapses, after which Select will probe ClusterA again on the next call.
+//
+// Without a recovery timeout, failover is permanent until Reset is called —
+// if ClusterA recovers, the client stays on ClusterB indefinitely.
 type PrimaryOnlyRead struct {
-	failedOver atomic.Bool
+	failedOver      atomic.Bool
+	failoverTime    atomic.Int64 // Unix nano of last failover; 0 = not failed over
+	recoveryTimeout time.Duration
+}
+
+// PrimaryOnlyReadOption configures a PrimaryOnlyRead strategy.
+type PrimaryOnlyReadOption func(*PrimaryOnlyRead)
+
+// WithPrimaryOnlyRecoveryTimeout sets the duration after which a failed-over
+// PrimaryOnlyRead will automatically attempt to return reads to ClusterA.
+//
+// When the timeout elapses, the next Select call returns ClusterA as a probe.
+// If that read succeeds (OnSuccess called), the strategy remains on ClusterA.
+// If it fails again (OnFailure called), the failover timer resets.
+//
+// A zero or negative value disables auto-recovery (default: disabled).
+//
+// Parameters:
+//   - d: Recovery timeout duration
+//
+// Returns:
+//   - PrimaryOnlyReadOption: Configuration option
+func WithPrimaryOnlyRecoveryTimeout(d time.Duration) PrimaryOnlyReadOption {
+	return func(p *PrimaryOnlyRead) {
+		p.recoveryTimeout = d
+	}
 }
 
 // NewPrimaryOnlyRead creates a new PrimaryOnlyRead strategy.
 //
+// Parameters:
+//   - opts: Optional configuration options
+//
 // Returns:
 //   - *PrimaryOnlyRead: A new primary-only read strategy
-func NewPrimaryOnlyRead() *PrimaryOnlyRead {
-	return &PrimaryOnlyRead{}
+func NewPrimaryOnlyRead(opts ...PrimaryOnlyReadOption) *PrimaryOnlyRead {
+	p := &PrimaryOnlyRead{}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Select returns ClusterA unless it has failed over.
+//
+// If a recovery timeout is configured and has elapsed since the last failover,
+// ClusterA is returned as a probe — allowing the caller to re-evaluate whether
+// ClusterA has recovered.
 //
 // Parameters:
 //   - ctx: Context (unused)
@@ -194,21 +237,39 @@ func NewPrimaryOnlyRead() *PrimaryOnlyRead {
 // Returns:
 //   - types.ClusterID: ClusterA or ClusterB if failed over
 func (p *PrimaryOnlyRead) Select(_ context.Context) types.ClusterID {
-	if p.failedOver.Load() {
-		return types.ClusterB
+	if !p.failedOver.Load() {
+		return types.ClusterA
 	}
-	return types.ClusterA
+	// Auto-recovery: if recovery timeout is set and has elapsed, probe ClusterA.
+	if p.recoveryTimeout > 0 {
+		failoverAt := p.failoverTime.Load()
+		if failoverAt > 0 && time.Duration(time.Now().UnixNano()-failoverAt) >= p.recoveryTimeout {
+			return types.ClusterA
+		}
+	}
+
+	return types.ClusterB
 }
 
 // OnSuccess is called when a read succeeds.
 //
+// If ClusterA succeeds while in failed-over state, the strategy resets back
+// to ClusterA — completing auto-recovery.
+//
 // Parameters:
-//   - cluster: The cluster that succeeded (unused)
-func (p *PrimaryOnlyRead) OnSuccess(_ types.ClusterID) {
-	// Nothing to do
+//   - cluster: The cluster that succeeded
+func (p *PrimaryOnlyRead) OnSuccess(cluster types.ClusterID) {
+	if cluster == types.ClusterA && p.failedOver.Load() {
+		p.failedOver.Store(false)
+		p.failoverTime.Store(0)
+	}
 }
 
 // OnFailure handles read failures.
+//
+// If ClusterA fails and has not yet failed over, routes to ClusterB.
+// If ClusterA fails during an auto-recovery probe, resets the recovery timer
+// so another probe will only occur after another full recovery timeout.
 //
 // Parameters:
 //   - cluster: The cluster that failed
@@ -218,16 +279,18 @@ func (p *PrimaryOnlyRead) OnSuccess(_ types.ClusterID) {
 //   - types.ClusterID: ClusterB for failover
 //   - bool: true if failover should be attempted
 func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterID, bool) {
-	if cluster == types.ClusterA && !p.failedOver.Load() {
+	if cluster == types.ClusterA {
 		p.failedOver.Store(true)
+		p.failoverTime.Store(time.Now().UnixNano())
 		return types.ClusterB, true
 	}
 	return "", false
 }
 
-// Reset resets the failover state back to primary.
+// Reset resets the failover state back to primary immediately.
 func (p *PrimaryOnlyRead) Reset() {
 	p.failedOver.Store(false)
+	p.failoverTime.Store(0)
 }
 
 // RoundRobinRead implements a read strategy that alternates between clusters.
