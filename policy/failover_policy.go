@@ -13,6 +13,14 @@ import (
 // ActiveFailover implements an aggressive failover policy.
 //
 // On any failure, immediately attempts failover to the secondary cluster.
+// ShouldFailover always returns true — every error triggers a failover attempt,
+// with no delay, threshold, or backoff.
+//
+// WARNING: Oscillation risk. If both clusters are intermittently failing,
+// ActiveFailover will flip-flop between them on every request, producing
+// rapid and noisy failover transitions. In flaky dual-cluster scenarios,
+// prefer [CircuitBreaker] or [LatencyCircuitBreaker] which require a
+// threshold of consecutive failures before opening, dampening oscillation.
 type ActiveFailover struct{}
 
 // NewActiveFailover creates a new ActiveFailover policy.
@@ -24,6 +32,10 @@ func NewActiveFailover() *ActiveFailover {
 }
 
 // ShouldFailover always returns true for active failover.
+//
+// Every error triggers an immediate failover attempt regardless of cause or
+// frequency. See the [ActiveFailover] type documentation for the oscillation
+// risk this implies when both clusters are degraded.
 //
 // Parameters:
 //   - cluster: The cluster that failed (unused)
