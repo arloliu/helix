@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -61,11 +62,11 @@ func (c *ConcurrentDualWrite) Execute(
 	var wg sync.WaitGroup
 
 	wg.Go(func() {
-		resultA = writeA(ctx)
+		resultA = safeWrite(ctx, writeA, "A")
 	})
 
 	wg.Go(func() {
-		resultB = writeB(ctx)
+		resultB = safeWrite(ctx, writeB, "B")
 	})
 
 	wg.Wait()
@@ -146,18 +147,29 @@ func (s *SyncDualWrite) Execute(
 	writeB func(context.Context) error,
 ) (resultA, resultB error) {
 	if s.primaryFirst {
-		resultA = writeA(ctx)
+		resultA = safeWrite(ctx, writeA, "A")
 		if ctx.Err() != nil {
 			return resultA, ctx.Err()
 		}
-		resultB = writeB(ctx)
+		resultB = safeWrite(ctx, writeB, "B")
 	} else {
-		resultB = writeB(ctx)
+		resultB = safeWrite(ctx, writeB, "B")
 		if ctx.Err() != nil {
 			return ctx.Err(), resultB
 		}
-		resultA = writeA(ctx)
+		resultA = safeWrite(ctx, writeA, "A")
 	}
 
 	return resultA, resultB
+}
+
+// safeWrite calls write and recovers from panics, converting them to errors.
+func safeWrite(ctx context.Context, write func(context.Context) error, cluster string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("helix: panic in cluster %s write: %v", cluster, r)
+		}
+	}()
+
+	return write(ctx)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -165,4 +166,96 @@ func TestSyncDualWriteSecondaryFirst(t *testing.T) {
 	require.NoError(t, errA)
 	require.NoError(t, errB)
 	require.Equal(t, []string{"B", "A"}, order)
+}
+
+// TestConcurrentDualWrite_PanicInA verifies that a panic in cluster A's write
+// is recovered and returned as an error rather than deadlocking wg.Wait().
+func TestConcurrentDualWrite_PanicInA(t *testing.T) {
+	strategy := NewConcurrentDualWrite()
+
+	errA, errB := strategy.Execute(
+		context.Background(),
+		func(_ context.Context) error {
+			panic("driver exploded")
+		},
+		func(_ context.Context) error {
+			return nil
+		},
+	)
+
+	require.Error(t, errA)
+	assert.Contains(t, errA.Error(), "panic")
+	assert.Contains(t, errA.Error(), "driver exploded")
+	require.NoError(t, errB)
+}
+
+// TestConcurrentDualWrite_PanicInBoth verifies both goroutines recover independently.
+func TestConcurrentDualWrite_PanicInBoth(t *testing.T) {
+	strategy := NewConcurrentDualWrite()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		errA, errB := strategy.Execute(
+			context.Background(),
+			func(_ context.Context) error { panic("A exploded") },
+			func(_ context.Context) error { panic("B exploded") },
+		)
+		assert.Error(t, errA)
+		assert.Error(t, errB)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Execute deadlocked after panic in both write functions")
+	}
+}
+
+// TestSyncDualWrite_PanicInA verifies that a panic in the first write (A) is
+// recovered and returned as an error; the second write is not called.
+func TestSyncDualWrite_PanicInA(t *testing.T) {
+	strategy := NewSyncDualWrite(WithPrimaryFirst())
+
+	var calledB atomic.Bool
+
+	errA, errB := strategy.Execute(
+		context.Background(),
+		func(_ context.Context) error {
+			panic("A panicked")
+		},
+		func(_ context.Context) error {
+			calledB.Store(true)
+			return nil
+		},
+	)
+
+	require.Error(t, errA)
+	assert.Contains(t, errA.Error(), "panic")
+	assert.Contains(t, errA.Error(), "A panicked")
+	// Second write skipped because context is not canceled — but A returned error
+	// (not nil), so B still runs. Verify B was called and succeeded.
+	require.NoError(t, errB)
+	assert.True(t, calledB.Load(), "B should still be called when A panics (context not canceled)")
+}
+
+// TestSyncDualWrite_PanicInB verifies that a panic in the second write (B) is
+// recovered and returned as an error without affecting the first write result.
+func TestSyncDualWrite_PanicInB(t *testing.T) {
+	strategy := NewSyncDualWrite(WithPrimaryFirst())
+
+	errA, errB := strategy.Execute(
+		context.Background(),
+		func(_ context.Context) error {
+			return nil
+		},
+		func(_ context.Context) error {
+			panic("B panicked")
+		},
+	)
+
+	require.NoError(t, errA)
+	require.Error(t, errB)
+	assert.Contains(t, errB.Error(), "panic")
+	assert.Contains(t, errB.Error(), "B panicked")
 }
