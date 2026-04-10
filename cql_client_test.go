@@ -231,6 +231,34 @@ func (s *mockScanner) Next() bool          { return false }
 func (s *mockScanner) Scan(_ ...any) error { return nil }
 func (s *mockScanner) Err() error          { return nil }
 
+// mockReplayWorker implements ReplayWorker for testing.
+type mockReplayWorker struct {
+	startErr  error
+	running   atomic.Bool
+	stopCalls atomic.Int32
+}
+
+func newMockReplayWorker(startErr error) *mockReplayWorker {
+	return &mockReplayWorker{startErr: startErr}
+}
+
+func (w *mockReplayWorker) Start() error {
+	if w.startErr != nil {
+		return w.startErr
+	}
+	w.running.Store(true)
+	return nil
+}
+
+func (w *mockReplayWorker) Stop() {
+	w.running.Store(false)
+	w.stopCalls.Add(1)
+}
+
+func (w *mockReplayWorker) IsRunning() bool {
+	return w.running.Load()
+}
+
 // mockTopologyWatcher implements TopologyWatcher for testing.
 type mockTopologyWatcher struct {
 	mu      sync.RWMutex
@@ -1497,4 +1525,28 @@ func Example_contextUsage() {
 		Consistency(Quorum).
 		ScanContext(ctx)
 	_ = err
+}
+
+// TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure verifies that the
+// watchTopology goroutine is stopped when ReplayWorker.Start() fails during
+// initialization — i.e., no goroutine is leaked.
+func TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure(t *testing.T) {
+	sessionA := newMockSession()
+	watcher := newMockTopologyWatcher()
+	workerErr := errors.New("worker already running")
+	worker := newMockReplayWorker(workerErr)
+
+	_, err := NewCQLClient(sessionA, nil,
+		WithTopologyWatcher(watcher),
+		WithReplayWorker(worker),
+	)
+	require.ErrorIs(t, err, workerErr)
+
+	// The topology watcher's Watch goroutine should have been unblocked by the
+	// context cancellation. Give it a moment to propagate.
+	require.Eventually(t, func() bool {
+		watcher.mu.RLock()
+		defer watcher.mu.RUnlock()
+		return watcher.closed
+	}, time.Second, 10*time.Millisecond, "topology watcher context should be canceled on init failure")
 }

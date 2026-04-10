@@ -143,19 +143,25 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		)
 	}
 
-	// Start replay worker if configured
-	if config.ReplayWorker != nil {
-		if err := config.ReplayWorker.Start(); err != nil {
-			return nil, err
-		}
-	}
-
-	// Start topology watcher if configured
+	// Start topology watcher if configured. The cancel function is stashed so
+	// that it is called on any subsequent initialization error, preventing the
+	// watchTopology goroutine from leaking.
 	if config.TopologyWatcher != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		client.topologyCtx = ctx
 		client.topologyClose = cancel
 		go client.watchTopology()
+	}
+
+	// Start replay worker if configured. On failure, clean up the topology
+	// watcher goroutine that may already be running.
+	if config.ReplayWorker != nil {
+		if err := config.ReplayWorker.Start(); err != nil {
+			if client.topologyClose != nil {
+				client.topologyClose()
+			}
+			return nil, err
+		}
 	}
 
 	return client, nil
