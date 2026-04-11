@@ -21,7 +21,7 @@ helix:
 
   replay:
     type: memory
-    queue_size: 1000
+    queue_size: 10000
 
 workload:
   workers: 1

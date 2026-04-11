@@ -159,11 +159,11 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 	if profile == "comprehensive" || profile == "soak" {
 		sim.RegisterScenario(&scenarios.ReplaySaturation{})
 		sim.RegisterScenario(&scenarios.DrainMode{})
-		sim.RegisterScenario(&scenarios.CircuitBreakerTrip{})
 		sim.RegisterScenario(&scenarios.FireForgetLimit{})
 		sim.RegisterScenario(&scenarios.PartialDegradation{})
 
 		// Strategy groups for untested policy combinations
+		sim.RegisterStrategyGroup(circuitBreakerGroup())
 		sim.RegisterStrategyGroup(latencyCircuitBreakerGroup())
 		sim.RegisterStrategyGroup(primaryOnlyReadGroup())
 		sim.RegisterStrategyGroup(roundRobinReadGroup())
@@ -172,6 +172,18 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 
 	if profile == "soak" {
 		sim.RegisterScenario(&scenarios.DualClusterDegradation{})
+	}
+}
+
+// makeStrategyGroupClientWithMetrics creates a StrategyGroupSetupFunc where the
+// policy factory receives the metrics collector, allowing policies (e.g.
+// CircuitBreaker) to record metrics to the same collector the scenario asserts on.
+func makeStrategyGroupClientWithMetrics(
+	policyFactory func(mc *testutil.TestMetricsCollector) (helix.WriteStrategy, helix.ReadStrategy, helix.FailoverPolicy),
+) simulation.StrategyGroupSetupFunc {
+	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
+		writeStrategy, readStrategy, failoverPolicy := policyFactory(mc)
+		return makeStrategyGroupClient(writeStrategy, readStrategy, failoverPolicy)(sessionA, sessionB, mc)
 	}
 }
 
@@ -196,7 +208,9 @@ func makeStrategyGroupClient(
 			return nil, nil, fmt.Errorf("failed to create client: %w", err)
 		}
 
-		worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc())
+		worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
+			replay.WithWorkerMetrics(mc),
+		)
 		if err := worker.Start(); err != nil {
 			client.Close()
 			return nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
@@ -204,6 +218,34 @@ func makeStrategyGroupClient(
 		client.Config().ReplayWorker = worker
 
 		return client, memReplayer, nil
+	}
+}
+
+func circuitBreakerGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "circuit-breaker",
+		SetupFunc: makeStrategyGroupClientWithMetrics(
+			func(mc *testutil.TestMetricsCollector) (helix.WriteStrategy, helix.ReadStrategy, helix.FailoverPolicy) {
+				return policy.NewAdaptiveDualWrite(
+						policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+						policy.WithAdaptiveStrikeThreshold(3),
+					),
+					// PrimaryOnlyRead ensures reads start on ClusterA (so the CB
+					// observes A's failures) and automatically probes A after the
+					// recovery timeout, calling RecordSuccess to close the CB.
+					policy.NewPrimaryOnlyRead(
+						policy.WithPrimaryOnlyRecoveryTimeout(10 * time.Second),
+					),
+					policy.NewCircuitBreaker(
+						policy.WithThreshold(3),
+						policy.WithResetTimeout(15*time.Second),
+						policy.WithCircuitBreakerMetrics(mc),
+					)
+			},
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.CircuitBreakerTrip{},
+		},
 	}
 }
 

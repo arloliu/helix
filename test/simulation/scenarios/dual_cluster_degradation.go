@@ -25,16 +25,18 @@ func (s *DualClusterDegradation) Description() string {
 
 func (s *DualClusterDegradation) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting DualClusterDegradation scenario")
-	startCount := env.Tracker.Count()
 
-	// 1. Degrade both clusters with different partial drop rates
+	// 1. Degrade both clusters with different partial error rates
 	env.Logger.Info("Degrading both clusters simultaneously", "cluster_a_rate", 0.3, "cluster_b_rate", 0.5)
 	env.ChaosA.SetErrorRate(0.3)
 	env.ChaosB.SetErrorRate(0.5)
 
-	// 2. Run for 15s under dual degradation
+	// 2. Run under dual degradation. Use a fresh baseline so the wait gate
+	//    measures writes that flow through the error-injected sessions, not
+	//    pre-injection writes already accumulated.
+	injectCount := env.Tracker.Count()
 	_ = waitUntil(ctx, 15*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+50
+		return env.Tracker.Count() >= injectCount+200
 	})
 
 	dualErrors := env.Stats.DualClusterErr.Load()
@@ -47,9 +49,10 @@ func (s *DualClusterDegradation) Run(ctx context.Context, env *types.Environment
 		"replay_queued", env.MemReplayer.Len(),
 	)
 
-	// With 30% and 50% drop rates on A and B simultaneously, the both-async path
-	// must have triggered at least once. Fail fast if it didn't — it means the
-	// AdaptiveDualWrite DualClusterError path was never exercised.
+	// With 30% and 50% drop rates on A and B simultaneously, the both-sync-fail
+	// path must have triggered at least once (both clusters healthy, both writes
+	// fail). Fail fast if it didn't — it means the DualClusterError path was
+	// never exercised.
 	if dualErrors == 0 {
 		return errors.New("expected DualClusterError > 0 with both clusters degraded simultaneously")
 	}

@@ -206,7 +206,11 @@ func (s *Simulation) setupEnvironment() error {
 		}
 
 		// Configure Replayer
-		memReplayer = replay.NewMemoryReplayer()
+		var replayerOpts []replay.MemoryReplayerOption
+		if s.config.Settings.Helix.Replay.QueueSize > 0 {
+			replayerOpts = append(replayerOpts, replay.WithQueueCapacity(s.config.Settings.Helix.Replay.QueueSize))
+		}
+		memReplayer = replay.NewMemoryReplayer(replayerOpts...)
 		replayer = memReplayer
 	} else {
 		// Default configuration
@@ -236,7 +240,9 @@ func (s *Simulation) setupEnvironment() error {
 	}
 
 	// Wire replay worker to the client's default executor so it honors batch payloads.
-	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc())
+	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
+		replay.WithWorkerMetrics(mc),
+	)
 	if err := worker.Start(); err != nil {
 		client.Close()
 		return err
@@ -537,6 +543,12 @@ func (s *Simulation) resetBetweenScenarios(ctx context.Context) {
 	s.env.ChaosA.ResetCounters()
 	s.env.ChaosB.ResetCounters()
 	s.env.Metrics.Reset()
+
+	// Reset write strategy state so degraded flags from a previous scenario
+	// don't bleed into the next one.
+	if adw, ok := s.env.Client.Config().WriteStrategy.(*policy.AdaptiveDualWrite); ok {
+		adw.Reset()
+	}
 
 	// Stability gate: wait until 5 consecutive writes succeed, up to 10 seconds.
 	consecutive := 0

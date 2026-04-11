@@ -3,6 +3,7 @@ package chaos
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"math/big"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,12 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/types"
 )
+
+// ErrChaosSimulated is returned by SetErrorRate to simulate real cluster failures.
+// Unlike types.ErrWriteDropped (which Helix treats as an operational state),
+// this error is treated as a genuine write failure by AdaptiveDualWrite and
+// the CQL client's DualClusterError path.
+var ErrChaosSimulated = errors.New("chaos: simulated failure")
 
 // SessionConfig holds the chaos configuration for a session.
 type SessionConfig struct {
@@ -519,12 +526,17 @@ func (s *Session) SetLatency(d time.Duration) {
 }
 
 // SetErrorRate sets a probability of error for operations.
-// Note: This overwrites any previous configuration.
+// The injected error is ErrChaosSimulated (a real error), not types.ErrWriteDropped.
+// This ensures AdaptiveDualWrite treats chaos failures as genuine write errors
+// and accumulates strikes for degradation detection.
 func (s *Session) SetErrorRate(rate float64) {
-	// We use DropRate for "complete failure" (1.0) which simulates network partition/timeout.
-	// For partial errors, we could use ErrorFunc.
-	// The scenarios use SetErrorRate(1.0) to kill a cluster.
 	s.SetConfig(SessionConfig{
-		DropRate: rate,
+		ErrorFunc: func() error {
+			n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
+			if float64(n.Int64())/1000000.0 < rate {
+				return ErrChaosSimulated
+			}
+			return nil
+		},
 	})
 }

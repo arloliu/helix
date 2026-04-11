@@ -8,7 +8,6 @@ import (
 
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/test/simulation/chaos"
-	"github.com/arloliu/helix/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -185,17 +184,17 @@ func TestSession_ResetCounters(t *testing.T) {
 	}
 }
 
-// SetErrorRate(1.0) must always return ErrWriteDropped and increment dropCount.
-func TestSession_DropRate_100Percent(t *testing.T) {
+// SetErrorRate(1.0) must always return ErrChaosSimulated and increment dropCount.
+func TestSession_ErrorRate_100Percent(t *testing.T) {
 	s := chaos.NewSession(&stubSession{})
 	s.SetErrorRate(1.0)
 
 	err := s.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
 	if err == nil {
-		t.Fatal("expected error from 100% drop rate, got nil")
+		t.Fatal("expected error from 100% error rate, got nil")
 	}
-	if !errors.Is(err, types.ErrWriteDropped) {
-		t.Errorf("expected ErrWriteDropped, got %v", err)
+	if !errors.Is(err, chaos.ErrChaosSimulated) {
+		t.Errorf("expected ErrChaosSimulated, got %v", err)
 	}
 
 	exec, _, drop := s.Counters()
@@ -203,7 +202,7 @@ func TestSession_DropRate_100Percent(t *testing.T) {
 		t.Errorf("drop = %d, want 1", drop)
 	}
 	if exec != 0 {
-		t.Errorf("exec = %d, want 0 (drop must not count as exec)", exec)
+		t.Errorf("exec = %d, want 0 (error must not count as exec)", exec)
 	}
 }
 

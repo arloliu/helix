@@ -34,14 +34,18 @@ func (s *DegradedCluster) Run(ctx context.Context, env *types.Environment) error
 		return env.Tracker.Count() > startCount
 	})
 
-	// 2. Inject latency into Cluster A and snapshot counters
+	// 2. Inject latency into Cluster A and snapshot counters.
+	//    Use a fresh tracker baseline so the wait gate measures writes that
+	//    actually flow through the latency-injected session, not pre-injection
+	//    writes already accumulated during Phase 1 (critical under high write rates).
 	env.Logger.Info("Phase 2: Injecting latency into Cluster A")
 	env.ChaosA.SetLatency(500 * time.Millisecond)
 	beforeExecA, _, _ := env.ChaosA.Counters()
 	beforeExecB, _, _ := env.ChaosB.Counters()
 
+	injectCount := env.Tracker.Count()
 	if err := waitUntil(ctx, 15*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+100
+		return env.Tracker.Count() >= injectCount+100
 	}); err != nil {
 		return fmt.Errorf("write volume gate not reached before degradation check: %w", err)
 	}

@@ -25,9 +25,10 @@ func (s *FireForgetLimit) Run(ctx context.Context, env *types.Environment) error
 	env.Logger.Info("Starting FireForgetLimit scenario")
 	startCount := env.Tracker.Count()
 
-	// 1. Degrade Cluster A to trigger fire-and-forget mode (> delta threshold)
+	// 1. Degrade Cluster A to trigger fire-and-forget mode (> delta threshold).
+	//    500ms exceeds both 100ms (quick) and 300ms (soak) delta thresholds.
 	env.Logger.Info("Degrading Cluster A to trigger fire-and-forget")
-	env.ChaosA.SetLatency(200 * time.Millisecond)
+	env.ChaosA.SetLatency(500 * time.Millisecond)
 
 	// 2. Wait for adaptive write to switch A into fire-and-forget mode
 	_ = waitUntil(ctx, 10*time.Second, func() bool {

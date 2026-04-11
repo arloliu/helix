@@ -39,4 +39,4 @@ helix:
 
   replay:
     type: memory
-    queue_size: 5000
+    queue_size: 50000
