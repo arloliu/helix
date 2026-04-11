@@ -8,6 +8,8 @@ workload:
   workers: 4
   interval: 5ms
   payload_size: 256
+  read_ratio: 0.2
+  batch_ratio: 0.1
 
 clusters:
   type: scylladb

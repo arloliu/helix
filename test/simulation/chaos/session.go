@@ -20,8 +20,11 @@ type SessionConfig struct {
 
 // Session wraps a cql.Session to inject chaos.
 type Session struct {
-	wrapped cql.Session
-	config  *atomic.Pointer[SessionConfig]
+	wrapped   cql.Session
+	config    *atomic.Pointer[SessionConfig]
+	execCount atomic.Int64
+	scanCount atomic.Int64
+	dropCount atomic.Int64
 }
 
 // Compile-time assertion that Session implements cql.Session.
@@ -45,6 +48,7 @@ func (s *Session) Query(stmt string, values ...any) cql.Query {
 	return &Query{
 		wrapped: s.wrapped.Query(stmt, values...),
 		config:  s.config,
+		session: s,
 	}
 }
 
@@ -53,18 +57,21 @@ func (s *Session) Batch(kind cql.BatchType) cql.Batch {
 	return &Batch{
 		wrapped: s.wrapped.Batch(kind),
 		config:  s.config,
+		session: s,
 	}
 }
 
-// Close terminates the session.
-func (s *Session) Close() {
-	s.wrapped.Close()
-}
+// Close is a no-op for the chaos session. The underlying session lifecycle
+// is managed externally (e.g., by testutil.CQLCluster). This allows the
+// chaos session to be reused across multiple helix client instances in
+// simulation tests without prematurely closing the database connection.
+func (s *Session) Close() {}
 
 // Query wraps a cql.Query to inject chaos.
 type Query struct {
 	wrapped cql.Query
 	config  *atomic.Pointer[SessionConfig]
+	session *Session
 }
 
 // Compile-time assertion that Query implements cql.Query.
@@ -80,11 +87,13 @@ func (q *Query) injectChaos() error {
 			// Use crypto/rand for better randomness distribution
 			n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
 			if float64(n.Int64())/1000000.0 < cfg.DropRate {
+				q.session.dropCount.Add(1)
 				return types.ErrWriteDropped
 			}
 		}
 		if cfg.ErrorFunc != nil {
 			if err := cfg.ErrorFunc(); err != nil {
+				q.session.dropCount.Add(1)
 				return err
 			}
 		}
@@ -118,7 +127,12 @@ func (q *Query) Exec() error {
 		return err
 	}
 
-	return q.wrapped.Exec()
+	err := q.wrapped.Exec()
+	if err == nil {
+		q.session.execCount.Add(1)
+	}
+
+	return err
 }
 
 func (q *Query) ExecContext(ctx context.Context) error {
@@ -126,7 +140,12 @@ func (q *Query) ExecContext(ctx context.Context) error {
 		return err
 	}
 
-	return q.wrapped.ExecContext(ctx)
+	err := q.wrapped.ExecContext(ctx)
+	if err == nil {
+		q.session.execCount.Add(1)
+	}
+
+	return err
 }
 
 func (q *Query) Scan(dest ...any) error {
@@ -134,7 +153,12 @@ func (q *Query) Scan(dest ...any) error {
 		return err
 	}
 
-	return q.wrapped.Scan(dest...)
+	err := q.wrapped.Scan(dest...)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return err
 }
 
 func (q *Query) ScanContext(ctx context.Context, dest ...any) error {
@@ -142,13 +166,20 @@ func (q *Query) ScanContext(ctx context.Context, dest ...any) error {
 		return err
 	}
 
-	return q.wrapped.ScanContext(ctx, dest...)
+	err := q.wrapped.ScanContext(ctx, dest...)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return err
 }
 
 func (q *Query) Iter() cql.Iter {
 	if err := q.injectChaos(); err != nil {
 		return &ErrorIter{err: err}
 	}
+
+	q.session.scanCount.Add(1)
 
 	return q.wrapped.Iter()
 }
@@ -158,6 +189,8 @@ func (q *Query) IterContext(ctx context.Context) cql.Iter {
 		return &ErrorIter{err: err}
 	}
 
+	q.session.scanCount.Add(1)
+
 	return q.wrapped.IterContext(ctx)
 }
 
@@ -166,7 +199,12 @@ func (q *Query) MapScan(m map[string]any) error {
 		return err
 	}
 
-	return q.wrapped.MapScan(m)
+	err := q.wrapped.MapScan(m)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return err
 }
 
 func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
@@ -174,7 +212,12 @@ func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
 		return err
 	}
 
-	return q.wrapped.MapScanContext(ctx, m)
+	err := q.wrapped.MapScanContext(ctx, m)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return err
 }
 
 func (q *Query) ScanCAS(dest ...any) (applied bool, err error) {
@@ -182,7 +225,12 @@ func (q *Query) ScanCAS(dest ...any) (applied bool, err error) {
 		return false, err
 	}
 
-	return q.wrapped.ScanCAS(dest...)
+	applied, err = q.wrapped.ScanCAS(dest...)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return applied, err
 }
 
 func (q *Query) ScanCASContext(ctx context.Context, dest ...any) (applied bool, err error) {
@@ -190,7 +238,12 @@ func (q *Query) ScanCASContext(ctx context.Context, dest ...any) (applied bool, 
 		return false, err
 	}
 
-	return q.wrapped.ScanCASContext(ctx, dest...)
+	applied, err = q.wrapped.ScanCASContext(ctx, dest...)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return applied, err
 }
 
 func (q *Query) MapScanCAS(dest map[string]any) (applied bool, err error) {
@@ -198,7 +251,12 @@ func (q *Query) MapScanCAS(dest map[string]any) (applied bool, err error) {
 		return false, err
 	}
 
-	return q.wrapped.MapScanCAS(dest)
+	applied, err = q.wrapped.MapScanCAS(dest)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return applied, err
 }
 
 func (q *Query) MapScanCASContext(ctx context.Context, dest map[string]any) (applied bool, err error) {
@@ -206,7 +264,12 @@ func (q *Query) MapScanCASContext(ctx context.Context, dest map[string]any) (app
 		return false, err
 	}
 
-	return q.wrapped.MapScanCASContext(ctx, dest)
+	applied, err = q.wrapped.MapScanCASContext(ctx, dest)
+	if err == nil {
+		q.session.scanCount.Add(1)
+	}
+
+	return applied, err
 }
 
 func (q *Query) SerialConsistency(c cql.Consistency) cql.Query {
@@ -230,6 +293,7 @@ func (q *Query) Release() {
 type Batch struct {
 	wrapped cql.Batch
 	config  *atomic.Pointer[SessionConfig]
+	session *Session
 }
 
 // Compile-time assertion that Batch implements cql.Batch.
@@ -244,11 +308,13 @@ func (b *Batch) injectChaos() error {
 		if cfg.DropRate > 0 {
 			n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
 			if float64(n.Int64())/1000000.0 < cfg.DropRate {
+				b.session.dropCount.Add(1)
 				return types.ErrWriteDropped
 			}
 		}
 		if cfg.ErrorFunc != nil {
 			if err := cfg.ErrorFunc(); err != nil {
+				b.session.dropCount.Add(1)
 				return err
 			}
 		}
@@ -277,7 +343,12 @@ func (b *Batch) Exec() error {
 		return err
 	}
 
-	return b.wrapped.Exec()
+	err := b.wrapped.Exec()
+	if err == nil {
+		b.session.execCount.Add(1)
+	}
+
+	return err
 }
 
 func (b *Batch) ExecContext(ctx context.Context) error {
@@ -285,13 +356,20 @@ func (b *Batch) ExecContext(ctx context.Context) error {
 		return err
 	}
 
-	return b.wrapped.ExecContext(ctx)
+	err := b.wrapped.ExecContext(ctx)
+	if err == nil {
+		b.session.execCount.Add(1)
+	}
+
+	return err
 }
 
 func (b *Batch) IterContext(ctx context.Context) cql.Iter {
 	if err := b.injectChaos(); err != nil {
 		return &ErrorIter{err: err}
 	}
+
+	b.session.scanCount.Add(1)
 
 	return b.wrapped.IterContext(ctx)
 }
@@ -301,7 +379,12 @@ func (b *Batch) ExecCAS(dest ...any) (applied bool, iter cql.Iter, err error) {
 		return false, nil, err
 	}
 
-	return b.wrapped.ExecCAS(dest...)
+	applied, iter, err = b.wrapped.ExecCAS(dest...)
+	if err == nil {
+		b.session.execCount.Add(1)
+	}
+
+	return applied, iter, err
 }
 
 func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, iter cql.Iter, err error) {
@@ -309,7 +392,12 @@ func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, 
 		return false, nil, err
 	}
 
-	return b.wrapped.ExecCASContext(ctx, dest...)
+	applied, iter, err = b.wrapped.ExecCASContext(ctx, dest...)
+	if err == nil {
+		b.session.execCount.Add(1)
+	}
+
+	return applied, iter, err
 }
 
 func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, err error) {
@@ -317,7 +405,12 @@ func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, er
 		return false, nil, err
 	}
 
-	return b.wrapped.MapExecCAS(dest)
+	applied, iter, err = b.wrapped.MapExecCAS(dest)
+	if err == nil {
+		b.session.execCount.Add(1)
+	}
+
+	return applied, iter, err
 }
 
 func (b *Batch) MapExecCASContext(ctx context.Context, dest map[string]any) (applied bool, iter cql.Iter, err error) {
@@ -325,7 +418,12 @@ func (b *Batch) MapExecCASContext(ctx context.Context, dest map[string]any) (app
 		return false, nil, err
 	}
 
-	return b.wrapped.MapExecCASContext(ctx, dest)
+	applied, iter, err = b.wrapped.MapExecCASContext(ctx, dest)
+	if err == nil {
+		b.session.execCount.Add(1)
+	}
+
+	return applied, iter, err
 }
 
 func (b *Batch) SerialConsistency(c cql.Consistency) cql.Batch {
@@ -397,6 +495,20 @@ func (s *ErrorScanner) Scan(dest ...any) error {
 
 func (s *ErrorScanner) Err() error {
 	return s.err
+}
+
+// Counters returns the cumulative operation counts since creation or last ResetCounters call.
+// exec is the number of successful Exec/ExecCAS calls, scan is the number of successful
+// Scan/Iter/MapScan calls, and drop is the number of operations rejected by chaos injection.
+func (s *Session) Counters() (exec, scan, drop int64) {
+	return s.execCount.Load(), s.scanCount.Load(), s.dropCount.Load()
+}
+
+// ResetCounters zeroes all operation counters.
+func (s *Session) ResetCounters() {
+	s.execCount.Store(0)
+	s.scanCount.Store(0)
+	s.dropCount.Store(0)
 }
 
 // SetLatency sets a fixed latency for all operations.

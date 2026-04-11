@@ -22,3 +22,10 @@ helix:
   replay:
     type: memory
     queue_size: 1000
+
+workload:
+  workers: 1
+  interval: 10ms
+  payload_size: 100
+  read_ratio: 0.2
+  batch_ratio: 0.1

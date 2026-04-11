@@ -2,6 +2,7 @@ package scenarios
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/arloliu/helix/test/simulation/types"
@@ -25,20 +26,37 @@ func (s *ReplaySaturation) Run(ctx context.Context, env *types.Environment) erro
 	env.Logger.Info("Disconnecting Cluster B")
 	env.ChaosB.SetErrorRate(1.0)
 
-	// 2. Wait for buffer to fill
-	_ = waitUntil(ctx, 30*time.Second, func() bool {
-		// Best-effort: ensure workload is still producing successful writes.
+	// 2. Wait for writes to accumulate and replay queue to grow
+	if err := waitUntil(ctx, 30*time.Second, func() bool {
 		return env.Tracker.Count() >= startCount+250
-	})
+	}); err != nil {
+		return fmt.Errorf("write volume gate not reached before replay check: %w", err)
+	}
 
-	// 3. Recover
+	queueDepth := env.MemReplayer.Len()
+	env.Logger.Info("Replay queue depth during outage", "depth", queueDepth)
+	if queueDepth == 0 {
+		env.Logger.Warn("Replay queue is empty during Cluster B outage — writes may not be failing as expected")
+	}
+
+	// 3. Recover Cluster B
 	env.Logger.Info("Recovering Cluster B")
 	env.ChaosB.SetErrorRate(0.0)
 
-	// 4. Wait for drain
-	_ = waitUntil(ctx, 30*time.Second, func() bool {
-		// After recovery, expect additional successful writes to resume.
-		return env.Tracker.Count() >= startCount+500
+	// 4. Wait for replay queue to drain fully
+	err := waitUntil(ctx, 30*time.Second, func() bool {
+		return env.MemReplayer.Len() == 0
+	})
+	if err != nil {
+		return fmt.Errorf("replay queue did not drain after recovery: pending=%d", env.MemReplayer.Len())
+	}
+
+	env.Logger.Info("Replay queue drained", "total_replayed", env.Metrics.GetTotalReplaySuccess())
+
+	// 5. Wait for additional writes to confirm throughput resumed
+	drainEnd := env.Tracker.Count()
+	_ = waitUntil(ctx, 15*time.Second, func() bool {
+		return env.Tracker.Count() >= drainEnd+50
 	})
 
 	env.Logger.Info("ReplaySaturation scenario completed")

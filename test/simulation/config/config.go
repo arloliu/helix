@@ -69,6 +69,8 @@ type WorkloadConfig struct {
 	Workers     int           `yaml:"workers"`
 	Interval    time.Duration `yaml:"interval"`
 	PayloadSize int           `yaml:"payload_size"`
+	ReadRatio   float64       `yaml:"read_ratio"`  // Fraction of ops that are reads (0.0-1.0, default 0.2)
+	BatchRatio  float64       `yaml:"batch_ratio"` // Fraction of writes that use LOGGED BATCH (0.0-1.0, default 0.1)
 }
 
 // Load reads configuration from a YAML file

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof" //nolint:gosec // pprof is intentional for simulation
@@ -11,10 +12,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/arloliu/helix"
+	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/policy"
+	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/test/simulation"
 	"github.com/arloliu/helix/test/simulation/config"
 	"github.com/arloliu/helix/test/simulation/scenarios"
+	simtypes "github.com/arloliu/helix/test/simulation/types"
 	"github.com/arloliu/helix/test/testutil"
+	"github.com/arloliu/helix/topology"
+	htypes "github.com/arloliu/helix/types"
 )
 
 func main() {
@@ -152,7 +160,132 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 		sim.RegisterScenario(&scenarios.ReplaySaturation{})
 		sim.RegisterScenario(&scenarios.DrainMode{})
 		sim.RegisterScenario(&scenarios.CircuitBreakerTrip{})
-		sim.RegisterScenario(&scenarios.StickyCooldown{})
 		sim.RegisterScenario(&scenarios.FireForgetLimit{})
+		sim.RegisterScenario(&scenarios.PartialDegradation{})
+
+		// Strategy groups for untested policy combinations
+		sim.RegisterStrategyGroup(latencyCircuitBreakerGroup())
+		sim.RegisterStrategyGroup(primaryOnlyReadGroup())
+		sim.RegisterStrategyGroup(roundRobinReadGroup())
+		sim.RegisterStrategyGroup(stickyCooldownGroup())
+	}
+
+	if profile == "soak" {
+		sim.RegisterScenario(&scenarios.DualClusterDegradation{})
+	}
+}
+
+func makeStrategyGroupClient(
+	writeStrategy helix.WriteStrategy,
+	readStrategy helix.ReadStrategy,
+	failoverPolicy helix.FailoverPolicy,
+) simulation.StrategyGroupSetupFunc {
+	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
+		memReplayer := replay.NewMemoryReplayer()
+		topo := topology.NewLocal()
+
+		client, err := helix.NewCQLClient(sessionA, sessionB,
+			helix.WithWriteStrategy(writeStrategy),
+			helix.WithReadStrategy(readStrategy),
+			helix.WithFailoverPolicy(failoverPolicy),
+			helix.WithReplayer(memReplayer),
+			helix.WithTopologyWatcher(topo),
+			helix.WithMetrics(mc),
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create client: %w", err)
+		}
+
+		worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc())
+		if err := worker.Start(); err != nil {
+			client.Close()
+			return nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
+		}
+		client.Config().ReplayWorker = worker
+
+		return client, memReplayer, nil
+	}
+}
+
+func latencyCircuitBreakerGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "latency-cb",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			// Pin to ClusterA so the scenario's latency injection on ClusterA
+			// is always observed via RecordLatency. StickyRead uses crypto/rand
+			// for its default selection, which would otherwise route reads to
+			// ClusterB 50% of the time, leaving ClusterA latency unobserved.
+			policy.NewStickyRead(policy.WithPreferredCluster(htypes.ClusterA)),
+			policy.NewLatencyCircuitBreaker(
+				policy.WithLatencyAbsoluteMax(500*time.Millisecond),
+				policy.WithLatencyThreshold(3),
+				policy.WithLatencyResetTimeout(15*time.Second),
+			),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.LatencyCircuitBreakerTrip{},
+		},
+	}
+}
+
+func primaryOnlyReadGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "primary-only",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			policy.NewPrimaryOnlyRead(
+				policy.WithPrimaryOnlyRecoveryTimeout(10*time.Second),
+			),
+			policy.NewActiveFailover(),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.PrimaryOnlyReadRecovery{},
+		},
+	}
+}
+
+func roundRobinReadGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "round-robin",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			policy.NewRoundRobinRead(),
+			policy.NewActiveFailover(),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.RoundRobinReadBalance{},
+		},
+	}
+}
+
+func stickyCooldownGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "sticky-cooldown",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			// Pin initial preferred to A so phases 1–3 are deterministic.
+			// Short cooldown so the test completes in reasonable time.
+			policy.NewStickyRead(
+				policy.WithPreferredCluster(htypes.ClusterA),
+				policy.WithStickyReadCooldown(10*time.Second),
+			),
+			policy.NewActiveFailover(),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.StickyCooldown{},
+		},
 	}
 }

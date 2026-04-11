@@ -1,15 +1,26 @@
-# Helix Simulation Guide
+# Helix Simulation Test Suite
 
-The Helix simulation suite is an end-to-end behavioral test harness that spins up two independent Cassandra/ScyllaDB containers via Testcontainers, drives live read/write traffic, injects controlled failures, and verifies that every write was eventually replicated to both clusters.
+End-to-end behavioral test harness for the Helix dual-cluster client. It spins up two independent Cassandra/ScyllaDB containers via Testcontainers, drives live read/write traffic, injects controlled failures, and verifies that every write was eventually replicated to both clusters.
 
-## Prerequisites
+## Directory structure
 
-- Go 1.25+
-- Docker (for Testcontainers)
+```
+test/simulation/
+├── cmd/main.go          # Entry point — flags, cluster startup, scenario registration
+├── simulation.go        # Orchestrator: environment setup, workload, scenario dispatch
+├── chaos/               # cql.Session wrapper that injects latency, drops, and errors
+├── config/              # YAML config loader with defaults
+├── scenarios/           # One file per scenario; shared wait.go utility
+├── types/               # Environment struct and Scenario interface
+├── workload/            # WriteTracker (consistency oracle) and WorkloadStats
+└── configs/
+    ├── quick.yaml       # 5-minute sanity run (1 worker)
+    └── soak.yaml        # 2-hour stability run (4 workers)
+```
 
 ## Running
 
-All profiles share the same entry point in `test/simulation/cmd/main.go`.
+Requires Docker. All profiles use the same entry point.
 
 ```bash
 # Quick sanity check (~5 min, basic scenarios only)
@@ -22,46 +33,21 @@ go run ./test/simulation/cmd/main.go -profile comprehensive -config test/simulat
 go run ./test/simulation/cmd/main.go -profile soak -config test/simulation/configs/soak.yaml
 ```
 
-Override individual settings without a config file:
+Override individual flags without a config file:
 
 ```bash
 go run ./test/simulation/cmd/main.go -profile quick -duration 2m -seed 123
 ```
 
-A pprof server starts automatically on `127.0.0.1:6060` during all runs.
+A pprof server starts automatically on `127.0.0.1:6060` for profiling during soak runs.
 
 ## Profiles
 
-| Profile | Scenarios | Strategy groups | Default duration |
-|---|---|---|---|
-| `quick` | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | — | 5 min |
-| `comprehensive` | All quick + 5 more | `latency-cb`, `primary-only`, `round-robin`, `sticky-cooldown` | config-driven |
-| `soak` | All comprehensive + `dual-cluster-degradation` | Same as comprehensive | 2 h |
-
-### Scenarios
-
-| Name | Profile | What it verifies |
+| Profile | Scenarios | Duration (default) |
 |---|---|---|
-| `degraded-cluster` | quick+ | Adaptive write degrades gracefully under sustained latency on one cluster |
-| `adaptive-recovery` | quick+ | Write strategy recovers after a flapping cluster stabilizes |
-| `complete-failure` | quick+ | Replay queue absorbs writes during a total cluster outage |
-| `replay-saturation` | comprehensive+ | Replay buffer handles prolonged outage without data loss |
-| `drain-mode` | comprehensive+ | Replay drains cleanly after cluster returns |
-| `circuit-breaker` | comprehensive+ | Circuit breaker trips and resets under consecutive failures |
-| `fire-forget-limit` | comprehensive+ | Fire-and-forget semaphore is exhausted and writes are dropped with correct metrics |
-| `partial-degradation` | comprehensive+ | 30% partial drop rate on one cluster; replay compensates for intermittent failures |
-| `dual-cluster-degradation` | soak | Simultaneous degradation of both clusters produces `DualClusterError` |
-
-### Strategy groups
-
-A strategy group runs its scenarios against a fresh `CQLClient` with a specific combination of write strategy, read strategy, and failover policy. Groups share the container pair but get an isolated client and truncated table.
-
-| Group | Write strategy | Read strategy | Failover policy | Scenario |
-|---|---|---|---|---|
-| `latency-cb` | `AdaptiveDualWrite` | `StickyRead` (pinned to A) | `LatencyCircuitBreaker` (500 ms max, 3-strike) | `LatencyCircuitBreakerTrip` |
-| `primary-only` | `AdaptiveDualWrite` | `PrimaryOnlyRead` (10 s recovery) | `ActiveFailover` | `PrimaryOnlyReadRecovery` |
-| `round-robin` | `AdaptiveDualWrite` | `RoundRobinRead` | `ActiveFailover` | `RoundRobinReadBalance` |
-| `sticky-cooldown` | `AdaptiveDualWrite` | `StickyRead` (pinned to A, 10 s cooldown) | `ActiveFailover` | `StickyCooldown` |
+| `quick` | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | 5 min |
+| `comprehensive` | All of the above + 5 more + 4 strategy groups | config-driven |
+| `soak` | All comprehensive + `dual-cluster-degradation` | 2 h |
 
 ## Configuration reference
 
@@ -106,7 +92,7 @@ helix:
 
 ## Writing a new scenario
 
-Implement `types.Scenario` and register it in `cmd/main.go`.
+1. Create `scenarios/my_scenario.go` implementing `types.Scenario`:
 
 ```go
 package scenarios
@@ -128,12 +114,12 @@ func (s *MyScenario) Run(ctx context.Context, env *types.Environment) error {
     // Inject chaos
     env.ChaosA.SetErrorRate(1.0)
 
-    // Wait for an observable effect — always propagate gate errors
-    if err := waitUntil(ctx, 10*time.Second, func() bool {
+    // Wait for an observable effect
+    err := waitUntil(ctx, 10*time.Second, func() bool {
         _, _, drops := env.ChaosA.Counters()
         return drops > 50
-    }); err != nil {
-        env.ChaosA.SetErrorRate(0)
+    })
+    if err != nil {
         return fmt.Errorf("cluster A drops did not accumulate: %w", err)
     }
 
@@ -147,13 +133,13 @@ func (s *MyScenario) Run(ctx context.Context, env *types.Environment) error {
 }
 ```
 
-Register in `cmd/main.go`:
+2. Register in `cmd/main.go`:
 
 ```go
 sim.RegisterScenario(&scenarios.MyScenario{})
 ```
 
-Profile-gate scenarios that should not run in `quick`:
+Add it to a specific profile gate if it should not run in `quick`:
 
 ```go
 if profile == "comprehensive" || profile == "soak" {
@@ -161,7 +147,7 @@ if profile == "comprehensive" || profile == "soak" {
 }
 ```
 
-### Assertion guidelines
+**Assertion guidelines**
 
 - Prefer policy API methods (`IsDegraded`, `ShouldFailover`, `Select`) over counter deltas — they are the source of truth and don't have timing windows.
 - Use `waitUntil(ctx, timeout, condition)` for all polling; never `time.Sleep`.
@@ -170,9 +156,9 @@ if profile == "comprehensive" || profile == "soak" {
 - When spawning extra goroutines (e.g. flood workers), cancel them with a `context.CancelFunc` and then call `wg.Wait()` before returning. Relying on context cancellation alone can leave goroutines running after the scenario returns.
 - Chaos state is reset between scenarios by the orchestrator. Multi-phase scenarios that need to clear chaos mid-scenario to avoid interfering with later phases are an exception — clear it explicitly before returning on any error path.
 
-## Writing a new strategy group
+## Strategy groups
 
-A strategy group is appropriate when you need to verify behavior that depends on a specific combination of policies — for example, testing `StickyRead` cooldown semantics requires a client configured with a known initial preferred cluster and a known cooldown duration.
+A strategy group runs a set of scenarios against a client configured with a specific combination of write strategy, read strategy, and failover policy. Groups share the same underlying Cassandra containers but get a fresh `CQLClient` and truncated table.
 
 Register a group in `cmd/main.go`:
 
@@ -235,6 +221,8 @@ The simulation infrastructure components have focused unit tests that do not req
 | `config/config_test.go` | YAML parsing, default value injection, error handling |
 | `workload/tracker_test.go` | TrackWrite/Count/RandomKey, WorkloadStats.Reset, VerifyConsistency with mock sessions |
 | `scenarios/wait_test.go` | waitUntil: immediate-true, timeout, context cancellation |
+
+Run them with:
 
 ```bash
 go test ./test/simulation/...

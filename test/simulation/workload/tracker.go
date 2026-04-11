@@ -4,11 +4,39 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/gocql/gocql"
 )
+
+// WorkloadStats tracks error classifications from the traffic generator.
+type WorkloadStats struct {
+	WriteOK        atomic.Int64
+	WriteAsync     atomic.Int64 // errors.Is(err, types.ErrWriteAsync)
+	WriteDropped   atomic.Int64 // errors.Is(err, types.ErrWriteDropped)
+	WriteFailed    atomic.Int64 // all other write errors
+	DualClusterErr atomic.Int64 // errors.As(err, *types.DualClusterError)
+	ReadOK         atomic.Int64
+	ReadFailed     atomic.Int64
+}
+
+// NewWorkloadStats creates a new WorkloadStats.
+func NewWorkloadStats() *WorkloadStats {
+	return &WorkloadStats{}
+}
+
+// Reset zeroes all counters.
+func (s *WorkloadStats) Reset() {
+	s.WriteOK.Store(0)
+	s.WriteAsync.Store(0)
+	s.WriteDropped.Store(0)
+	s.WriteFailed.Store(0)
+	s.DualClusterErr.Store(0)
+	s.ReadOK.Store(0)
+	s.ReadFailed.Store(0)
+}
 
 // WriteTracker tracks successful writes for verification.
 type WriteTracker struct {
@@ -81,6 +109,24 @@ func (t *WriteTracker) VerifyAndPrune(sessionA, sessionB cql.Session, minAge tim
 	}
 
 	return pruned, nil
+}
+
+// RandomKey returns a random key from the tracked writes.
+// Returns a zero UUID if no writes are tracked.
+func (t *WriteTracker) RandomKey() gocql.UUID {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if len(t.writes) == 0 {
+		return gocql.UUID{}
+	}
+
+	// Iterate to a random position — map iteration order is random in Go.
+	for k := range t.writes {
+		return k
+	}
+
+	return gocql.UUID{}
 }
 
 // Count returns the number of currently tracked writes.
