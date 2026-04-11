@@ -5,6 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking Changes
+
+#### Interface additions (compile-time)
+
+The following methods were added to exported interfaces. **Custom implementations
+must be updated to compile.**
+
+| Interface | New method | Purpose |
+|---|---|---|
+| `helix.Query` / `adapter/cql.Query` | `FallbackRead() Query` | Enables best-effort read from both clusters |
+| `types.MetricsCollector` | `IncReadDivergence(cluster ClusterID)` | Tracks fallback-read divergence events |
+
+**Migration for `helix.Query` implementors**: Add a no-op `FallbackRead()` method
+that returns the receiver. The testutil `MockQuery` already implements this.
+
+**Migration for `MetricsCollector` implementors**: Add a no-op
+`IncReadDivergence` method. See `internal/metrics/NopMetrics` for reference.
+
+#### Not-found error contract change (silent behavior change)
+
+The v1 and v2 CQL adapters now map `gocql.ErrNotFound` to `types.ErrNotFound`
+in `Scan`, `ScanContext`, `MapScan`, and `MapScanContext`. This is a **silent
+breaking change** for callers that check `errors.Is(err, gocql.ErrNotFound)`
+directly — those checks will stop matching.
+
+**Migration**: Replace:
+
+```go
+// Before — stops working after this release
+if errors.Is(err, gocql.ErrNotFound) { ... }
+
+// After — works with both old and new releases
+if helix.IsNotFound(err) { ... }
+// or
+if errors.Is(err, helix.ErrNotFound) { ... }
+```
+
+### Added
+
+- **`FallbackRead`**: Best-effort read from both clusters for critical
+  read-after-write scenarios. When the selected cluster returns not-found,
+  Helix silently tries the other cluster before returning not-found to the
+  caller. Activated per-query (`.FallbackRead()`), per-context
+  (`helix.WithFallbackRead(ctx)`), or per-client
+  (`helix.WithDefaultFallbackRead(true)`). Precedence:
+  per-query > context > client default.
+- **`types.ErrNotFound`** / **`helix.IsNotFound`**: Canonical not-found
+  sentinel and helper. Adapters map driver-specific not-found errors to this
+  sentinel at the boundary.
+- **`IncReadDivergence` metric**: Fired when FallbackRead finds data on the
+  alternative cluster, labeled with the stale cluster for replay-lag
+  correlation.
+- **`helix.ErrNotFound`** / **`helix.IsNotFound`**: Root-package re-exports
+  for convenience.
+
+### Bug Fixes
+
+- **Not-found incorrectly treated as cluster failure**: `gocql.ErrNotFound`
+  was flowing through the read path as a real error, triggering
+  `IncReadError`, `RecordFailure`, and `OnFailure`. Not-found is now
+  classified as a successful cluster response with no data — it never
+  poisons health state or triggers failover.
+- **Failover not-found leaking into `DualClusterError`**: When the primary
+  cluster had a real error and the failover cluster returned not-found,
+  the combined `DualClusterError` satisfied `helix.IsNotFound()` — callers
+  would treat an inconclusive partial outage as "row definitively absent."
+  Now returns the healthy cluster's `ErrNotFound` directly (no
+  `DualClusterError`), preserving availability during single-cluster outages.
+- **Failover not-found poisoning healthy cluster**: In the same path,
+  `IncReadError` and `RecordFailure` were called on the failover cluster even
+  when it correctly returned not-found. Repeated reads for missing rows during
+  a partial outage could trip the healthy cluster's circuit breaker.
+- **FallbackRead returning error when alternative is unreachable**: When the
+  primary (healthy) cluster returned not-found and the alternative was down,
+  `executeFallbackRead` returned the alternative's connection error. This
+  made FallbackRead *decrease* availability versus not using it — the
+  primary's not-found would have been returned cleanly without FallbackRead.
+  Now returns `ErrNotFound` (the primary's healthy answer) while still
+  recording health metrics on the unreachable cluster.
+
+### Tests
+
+- 29 unit tests for FallbackRead behavior, error classification, metrics,
+  drain bypass, chaining, precedence, and single-cluster mode.
+- 16 integration tests against real Cassandra clusters:
+  - 4 adapter round-trip tests proving `gocql.ErrNotFound` → `types.ErrNotFound`
+    mapping through v1 and v2 adapters (Scan + MapScan).
+  - 5 FallbackRead end-to-end tests: write-to-one-cluster read-back, MapScan
+    variant, both-not-found, primary-has-data short-circuit, v2 adapter.
+  - 1 partial-write + replay convergence scenario.
+  - 1 primary-error + failover-not-found returns real error (not false
+    not-found).
+  - 3 metrics verification: divergence on stale cluster, not-found never trips
+    failover, ReadTotal accounting for both clusters.
+  - 2 activation-level tests: `WithDefaultFallbackRead(true)`,
+    `WithFallbackRead(ctx)`.
+
+---
+
 ## [1.0.0] — 2026-04-09
 
 This release stabilizes the public API for long-term support. All interfaces

@@ -3,6 +3,10 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/arloliu/helix.svg)](https://pkg.go.dev/github.com/arloliu/helix)
 [![Go Report Card](https://goreportcard.com/badge/github.com/arloliu/helix)](https://goreportcard.com/report/github.com/arloliu/helix)
 
+<div align="center">
+  <img src="docs/logo.png" alt="Helix Logo" height="150" />
+</div>
+
 **Helix** is a high-availability dual-database client library for Go, designed to support "Shared Nothing" architecture with active-active dual writes, sticky reads, and asynchronous reconciliation.
 
 ## Why "Helix"?
@@ -204,6 +208,27 @@ flowchart TD
 
 See [Strategy & Policy Documentation](docs/strategy-policy.md) for detailed configuration and interaction patterns.
 
+### FallbackRead
+
+When a dual-write partially fails and replay hasn't converged yet, a read may return "not found" on one cluster even though the data exists on the other. FallbackRead silently checks both clusters before returning not-found.
+
+```go
+// Per-query: critical data only
+err := client.Query("SELECT * FROM users WHERE id = ?", id).
+    FallbackRead().Scan(&name)
+
+// Per-context: all queries in a request handler
+ctx := helix.WithFallbackRead(r.Context())
+err = client.Query("SELECT ...").ScanContext(ctx, &dest)
+
+// Per-client: all queries on this client
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithDefaultFallbackRead(true),
+)
+```
+
+Use `helix.IsNotFound(err)` to check results. See [FallbackRead Guide](docs/fallback-read.md) for availability semantics, activation levels, and best practices.
+
 ## Replay System
 
 Helix provides two replay implementations for handling partial write failures:
@@ -280,6 +305,7 @@ See the [examples](examples/) directory:
 
 ## Documentation
 
+- [FallbackRead Guide](docs/fallback-read.md) - Best-effort dual-cluster reads for critical data
 - [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) - Latency-aware write strategy tuning
 - [Replay System](docs/replay-system.md) - Replay patterns and best practices
 - [Strategy & Policy](docs/strategy-policy.md) - Read/write strategies and failover policies

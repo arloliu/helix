@@ -202,6 +202,11 @@ func (m *MockQuery) WithPriority(_ helix.PriorityLevel) helix.Query {
 	return m
 }
 
+// FallbackRead enables best-effort fallback read for this query.
+func (m *MockQuery) FallbackRead() helix.Query {
+	return m
+}
+
 // Exec executes the query.
 func (m *MockQuery) Exec() error {
 	m.mu.RLock()

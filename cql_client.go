@@ -449,6 +449,15 @@ func (c *CQLClient) alternativeCluster(cluster ClusterID) ClusterID {
 	return ClusterA
 }
 
+// selectCluster returns the cluster to use for a read-path operation.
+// In single-cluster mode or when no ReadStrategy is configured, it always returns ClusterA.
+func (c *CQLClient) selectCluster(ctx context.Context) ClusterID {
+	if c.IsSingleCluster() || c.config.ReadStrategy == nil {
+		return ClusterA
+	}
+	return c.config.ReadStrategy.Select(ctx)
+}
+
 // clusterName returns the display name for the given cluster.
 func (c *CQLClient) clusterName(cluster ClusterID) string {
 	return c.config.ClusterNames.Name(cluster)
@@ -752,6 +761,22 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 	}
 }
 
+// readOptions holds per-read options resolved from the three-level hierarchy:
+// per-query FallbackRead() > context WithFallbackRead(ctx) > client DefaultFallbackRead.
+type readOptions struct {
+	fallbackRead bool
+}
+
+func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOptions {
+	if q.fallbackRead {
+		return readOptions{fallbackRead: true}
+	}
+	if hasFallbackRead(ctx) {
+		return readOptions{fallbackRead: true}
+	}
+	return readOptions{fallbackRead: c.config.DefaultFallbackRead}
+}
+
 // recordReadSuccess records a successful read, using latency-aware recording if supported.
 func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64) {
 	if c.config.ReadStrategy != nil {
@@ -772,7 +797,15 @@ func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64) {
 // In single-cluster mode, the read is executed directly on sessionA.
 // In dual-cluster mode, reads use sticky routing with failover to the alternative cluster.
 // Clusters in drain mode are skipped unless both clusters are draining.
-func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Context, cql.Session) error) error {
+//
+// Not-found results (types.ErrNotFound) are never recorded as cluster failures.
+// If opts.fallbackRead is true and the selected cluster returns not-found,
+// executeFallbackRead silently tries the other cluster before returning not-found.
+func (c *CQLClient) executeRead(
+	ctx context.Context,
+	opts readOptions,
+	readFunc func(context.Context, cql.Session) error,
+) error {
 	if c.closed.Load() {
 		return types.ErrSessionClosed
 	}
@@ -785,7 +818,9 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 
 		c.config.Metrics.IncReadTotal(ClusterA)
 		c.config.Metrics.ObserveReadDuration(ClusterA, elapsed)
-		if err != nil {
+		// Not-found is not a health signal; skip IncReadError for it.
+		// In single-cluster mode there is no alternative for FallbackRead.
+		if err != nil && !types.IsNotFound(err) {
 			c.config.Metrics.IncReadError(ClusterA)
 		}
 
@@ -815,13 +850,14 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 		// If both are draining, proceed with original selection (best effort)
 	}
 
-	// Try primary selection
+	// Try primary selection.
 	// Note: Timeouts should be configured on the underlying gocql session.
 	session := c.getSession(selectedCluster)
 	start := time.Now()
 	err := readFunc(ctx, session)
 	elapsed := time.Since(start).Seconds()
 
+	// A not-found read still consumed real cluster resources.
 	c.config.Metrics.IncReadTotal(selectedCluster)
 	c.config.Metrics.ObserveReadDuration(selectedCluster, elapsed)
 
@@ -831,36 +867,47 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 		return nil
 	}
 
-	// Primary failed - record error and failure
+	// Not-found is NOT a health signal — the cluster responded correctly.
+	// Do not call IncReadError, RecordFailure, or OnFailure.
+	if types.IsNotFound(err) {
+		if opts.fallbackRead {
+			// FallbackRead: try the other cluster once (bypasses drain state).
+			return c.executeFallbackRead(ctx, selectedCluster, readFunc)
+		}
+		// No fallback: return immediately with no health impact.
+		return err
+	}
+
+	// Real error path: record failure and potentially failover.
 	c.config.Metrics.IncReadError(selectedCluster)
 
 	if c.config.FailoverPolicy != nil {
 		c.config.FailoverPolicy.RecordFailure(selectedCluster)
 
 		// FailoverPolicy acts as a hard guardrail - if it says no, don't even
-		// consult ReadStrategy for alternatives
+		// consult ReadStrategy for alternatives.
 		if !c.config.FailoverPolicy.ShouldFailover(selectedCluster, err) {
 			return err
 		}
 	}
 
-	// Policy allows failover (or no policy configured) - ask strategy for alternative
+	// Policy allows failover (or no policy configured) - ask strategy for alternative.
 	var alternativeCluster ClusterID
 	var shouldFailover bool
 
 	if c.config.ReadStrategy != nil {
 		alternativeCluster, shouldFailover = c.config.ReadStrategy.OnFailure(selectedCluster, err)
 	} else {
-		// No read strategy - use simple failover logic
+		// No read strategy - use simple failover logic.
 		alternativeCluster = c.alternativeCluster(selectedCluster)
 		shouldFailover = true
 	}
 
 	// Don't failover to a draining cluster unless we came from a draining cluster too
-	// (both clusters draining = best effort)
+	// (both clusters draining = best effort).
 	if shouldFailover && c.clusterIsDraining(alternativeCluster, drainA, drainB) {
 		if !c.clusterIsDraining(selectedCluster, drainA, drainB) {
-			// Original wasn't draining but alternative is - don't failover
+			// Original wasn't draining but alternative is - don't failover.
 			shouldFailover = false
 		}
 	}
@@ -869,7 +916,7 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 		return err
 	}
 
-	// Record failover event
+	// Record failover event.
 	c.config.Metrics.IncFailoverTotal(selectedCluster, alternativeCluster)
 	c.config.Logger.Warn("read failed, failing over to alternative cluster",
 		"fromCluster", c.clusterName(selectedCluster),
@@ -877,7 +924,7 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 		"error", err.Error(),
 	)
 
-	// Try alternative cluster
+	// Try alternative cluster.
 	alternativeSession := c.getSession(alternativeCluster)
 	startSecondary := time.Now()
 	errSecondary := readFunc(ctx, alternativeSession)
@@ -892,14 +939,23 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 		return nil
 	}
 
-	// Record failure on alternative too
+	// Not-found on the failover cluster is NOT a health signal — same rule
+	// as the primary path. The healthy cluster responded correctly with "row
+	// absent." In an AP system, a healthy cluster's answer is authoritative;
+	// returning the primary's downtime error would fail the request for rows
+	// that genuinely do not exist.
+	if types.IsNotFound(errSecondary) {
+		return errSecondary
+	}
+
+	// Real error on alternative too — record failure.
 	c.config.Metrics.IncReadError(alternativeCluster)
 
 	if c.config.FailoverPolicy != nil {
 		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
 	}
 
-	// Both clusters failed - return combined error with both errors for diagnosis
+	// Both clusters had real failures - return combined error for diagnosis.
 	if selectedCluster == ClusterA {
 		return &types.DualClusterError{
 			ErrorA: err,
@@ -911,6 +967,76 @@ func (c *CQLClient) executeRead(ctx context.Context, readFunc func(context.Conte
 		ErrorA: errSecondary,
 		ErrorB: err,
 	}
+}
+
+// executeFallbackRead attempts a single silent read on the alternative cluster
+// after the selected cluster returned not-found.
+//
+// This is a one-shot check — it does NOT re-enter the main failover sequence.
+// Drain state is bypassed: the caller explicitly asked to check both clusters,
+// and a draining cluster may still hold the data.
+//
+// Returns:
+//   - nil when the alternative cluster has the data (divergence metric emitted)
+//   - types.ErrNotFound when both clusters confirm the row is absent, OR when
+//     the alternative cluster is unreachable (health metrics are still recorded
+//     on the unreachable cluster, but the caller receives the primary's healthy
+//     not-found to preserve availability)
+func (c *CQLClient) executeFallbackRead(
+	ctx context.Context,
+	selectedCluster ClusterID,
+	readFunc func(context.Context, cql.Session) error,
+) error {
+	alternativeCluster := c.alternativeCluster(selectedCluster)
+
+	c.config.Logger.Debug("fallback read: selected cluster returned not-found, trying alternative",
+		"fromCluster", c.clusterName(selectedCluster),
+		"toCluster", c.clusterName(alternativeCluster),
+	)
+
+	// Bypass drain state: the caller opted in with FallbackRead.
+	alternativeSession := c.getSession(alternativeCluster)
+	start := time.Now()
+	err := readFunc(ctx, alternativeSession)
+	elapsed := time.Since(start).Seconds()
+
+	c.config.Metrics.IncReadTotal(alternativeCluster)
+	c.config.Metrics.ObserveReadDuration(alternativeCluster, elapsed)
+
+	if err == nil {
+		// Found the data on the alternative cluster — divergence (replay lag).
+		c.recordReadSuccess(alternativeCluster, elapsed)
+		c.config.Metrics.IncReadDivergence(selectedCluster)
+		c.config.Logger.Debug("fallback read: found data on alternative cluster",
+			"staleCluster", c.clusterName(selectedCluster),
+		)
+		return nil
+	}
+
+	if types.IsNotFound(err) {
+		// Both clusters confirmed the row is absent — definitively not found.
+		c.config.Logger.Debug("fallback read: alternative cluster also returned not-found",
+			"cluster", c.clusterName(alternativeCluster),
+		)
+		return err
+	}
+
+	// Alternative returned a real error — record the health impact but return
+	// not-found to the caller. The primary (healthy) cluster already confirmed
+	// the row is absent. Returning the alternative's error would make FallbackRead
+	// decrease availability versus not using it: without FallbackRead, the
+	// primary's not-found would have been returned cleanly. A "try harder"
+	// feature must not make things worse.
+	c.config.Metrics.IncReadError(alternativeCluster)
+	if c.config.FailoverPolicy != nil {
+		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
+	}
+	c.config.Logger.Warn("fallback read: alternative cluster returned error, returning primary not-found",
+		"cluster", c.clusterName(alternativeCluster),
+		"error", err.Error(),
+	)
+
+	return types.ErrNotFound
 }
 
 // cqlQuery implements the Query interface for CQLClient.
@@ -925,6 +1051,7 @@ type cqlQuery struct {
 	pageState         []byte
 	timestamp         *int64
 	priority          *PriorityLevel
+	fallbackRead      bool
 }
 
 func (q *cqlQuery) WithContext(ctx context.Context) Query {
@@ -967,6 +1094,11 @@ func (q *cqlQuery) WithTimestamp(ts int64) Query {
 
 func (q *cqlQuery) WithPriority(p PriorityLevel) Query {
 	q.priority = &p
+	return q
+}
+
+func (q *cqlQuery) FallbackRead() Query {
+	q.fallbackRead = true
 	return q
 }
 
@@ -1053,7 +1185,8 @@ func (q *cqlQuery) Scan(dest ...any) error {
 }
 
 func (q *cqlQuery) ScanContext(ctx context.Context, dest ...any) error {
-	return q.client.executeRead(ctx, func(ctx context.Context, session cql.Session) error {
+	opts := q.client.resolveReadOptions(ctx, q)
+	return q.client.executeRead(ctx, opts, func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 
@@ -1071,14 +1204,7 @@ func (q *cqlQuery) Iter() Iter {
 // fails during iteration, the error is returned to the caller.
 // ReadStrategy.OnSuccess is only called if the iterator is closed successfully.
 func (q *cqlQuery) IterContext(ctx context.Context) Iter {
-	// For Iter, we need to handle failover differently since we return an iterator
-	// We'll attempt to get an iterator from the preferred cluster
-	var selectedCluster ClusterID
-	if q.client.config.ReadStrategy != nil {
-		selectedCluster = q.client.config.ReadStrategy.Select(ctx)
-	} else {
-		selectedCluster = ClusterA
-	}
+	selectedCluster := q.client.selectCluster(ctx)
 
 	session := q.client.getSession(selectedCluster)
 	query := session.Query(q.statement, q.values...)
@@ -1096,7 +1222,8 @@ func (q *cqlQuery) MapScan(m map[string]any) error {
 }
 
 func (q *cqlQuery) MapScanContext(ctx context.Context, m map[string]any) error {
-	return q.client.executeRead(ctx, func(ctx context.Context, session cql.Session) error {
+	opts := q.client.resolveReadOptions(ctx, q)
+	return q.client.executeRead(ctx, opts, func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 
@@ -1113,12 +1240,7 @@ func (q *cqlQuery) ScanCAS(dest ...any) (applied bool, err error) {
 // ScanCASContext executes a lightweight transaction with context and scans the result.
 // CAS operations are executed on a single cluster and are NOT replicated.
 func (q *cqlQuery) ScanCASContext(ctx context.Context, dest ...any) (applied bool, err error) {
-	var selectedCluster ClusterID
-	if q.client.config.ReadStrategy != nil {
-		selectedCluster = q.client.config.ReadStrategy.Select(ctx)
-	} else {
-		selectedCluster = ClusterA
-	}
+	selectedCluster := q.client.selectCluster(ctx)
 
 	session := q.client.getSession(selectedCluster)
 	query := session.Query(q.statement, q.values...)
@@ -1136,12 +1258,7 @@ func (q *cqlQuery) MapScanCAS(dest map[string]any) (applied bool, err error) {
 // MapScanCASContext executes a lightweight transaction with context and scans into a map.
 // CAS operations are executed on a single cluster and are NOT replicated.
 func (q *cqlQuery) MapScanCASContext(ctx context.Context, dest map[string]any) (applied bool, err error) {
-	var selectedCluster ClusterID
-	if q.client.config.ReadStrategy != nil {
-		selectedCluster = q.client.config.ReadStrategy.Select(ctx)
-	} else {
-		selectedCluster = ClusterA
-	}
+	selectedCluster := q.client.selectCluster(ctx)
 
 	session := q.client.getSession(selectedCluster)
 	query := session.Query(q.statement, q.values...)
@@ -1296,12 +1413,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 	ts := b.getTimestamp()
 
-	var selectedCluster ClusterID
-	if b.client.config.ReadStrategy != nil {
-		selectedCluster = b.client.config.ReadStrategy.Select(ctx)
-	} else {
-		selectedCluster = ClusterA
-	}
+	selectedCluster := b.client.selectCluster(ctx)
 
 	session := b.client.getSession(selectedCluster)
 	batch := session.Batch(b.kind)
@@ -1334,12 +1446,7 @@ func (b *cqlBatch) ExecCAS(dest ...any) (applied bool, iter Iter, err error) {
 func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, iter Iter, err error) {
 	ts := b.getTimestamp()
 
-	var selectedCluster ClusterID
-	if b.client.config.ReadStrategy != nil {
-		selectedCluster = b.client.config.ReadStrategy.Select(ctx)
-	} else {
-		selectedCluster = ClusterA
-	}
+	selectedCluster := b.client.selectCluster(ctx)
 
 	session := b.client.getSession(selectedCluster)
 	batch := session.Batch(b.kind)
@@ -1377,12 +1484,7 @@ func (b *cqlBatch) MapExecCAS(dest map[string]any) (applied bool, iter Iter, err
 func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (applied bool, iter Iter, err error) {
 	ts := b.getTimestamp()
 
-	var selectedCluster ClusterID
-	if b.client.config.ReadStrategy != nil {
-		selectedCluster = b.client.config.ReadStrategy.Select(ctx)
-	} else {
-		selectedCluster = ClusterA
-	}
+	selectedCluster := b.client.selectCluster(ctx)
 
 	session := b.client.getSession(selectedCluster)
 	batch := session.Batch(b.kind)

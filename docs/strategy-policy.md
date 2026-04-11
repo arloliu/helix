@@ -49,6 +49,8 @@ Each interface has a single responsibility. Compose them to express your exact r
 - **FailoverPolicy is a gatekeeper.** It must approve failover before `ReadStrategy.OnFailure` is even consulted. This enforces circuit breaker semantics uniformly.
 - **Both layers can deny failover.** `FailoverPolicy.ShouldFailover()` returning `false` stops immediately. `ReadStrategy.OnFailure()` returning `false` stops as well (e.g., cooldown active).
 - **Latency is recorded automatically.** If the configured `FailoverPolicy` implements `LatencyRecorder` (e.g., `LatencyCircuitBreaker`), the client calls `RecordLatency()` after each successful read with no extra wiring.
+- **Not-found is not a failure.** A cluster that responds with "row absent" is healthy. Not-found results never trigger `RecordFailure`, `OnFailure`, or `IncReadError`. This classification is independent of FallbackRead.
+- **FallbackRead is orthogonal to failover.** FallbackRead activates when a healthy cluster returns not-found; failover activates when a cluster returns a real error. They handle different failure modes and do not interfere with each other. See [FallbackRead Guide](fallback-read.md) for details.
 
 ---
 
@@ -676,6 +678,32 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
     )),
 )
 ```
+
+**Mixed workload — critical data with FallbackRead, bulk data without:**
+```go
+// Critical data client: FallbackRead on every query
+criticalClient, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReadStrategy(policy.NewStickyRead()),
+    helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
+    helix.WithFailoverPolicy(policy.NewCircuitBreaker(
+        policy.WithThreshold(3),
+    )),
+    helix.WithDefaultFallbackRead(true), // check both clusters on not-found
+    helix.WithReplayer(replayer),
+)
+
+// Bulk data client: no FallbackRead, accept eventual consistency
+bulkClient, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReadStrategy(policy.NewStickyRead()),
+    helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
+    helix.WithFailoverPolicy(policy.NewCircuitBreaker(
+        policy.WithThreshold(3),
+    )),
+    helix.WithReplayer(replayer),
+)
+```
+
+See [FallbackRead Guide](fallback-read.md) for detailed behavior, activation levels, and best practices.
 
 ---
 

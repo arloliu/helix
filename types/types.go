@@ -233,7 +233,25 @@ var (
 	// concurrency limit. This protects the application from resource exhaustion
 	// when a degraded cluster is slow. The replay system handles reconciliation.
 	ErrWriteDropped = errors.New("helix: write dropped due to fire-and-forget concurrency limit")
+
+	// ErrNotFound indicates that a query returned zero rows.
+	//
+	// This is the Helix sentinel for "not found" results, mapped from
+	// gocql.ErrNotFound at the adapter layer. It is NOT treated as a cluster
+	// health failure — Helix never records this as a read error or failover trigger.
+	//
+	// Use [IsNotFound] to check for this error, or errors.Is(err, ErrNotFound).
+	ErrNotFound = errors.New("helix: not found")
 )
+
+// IsNotFound reports whether err is a "not found" result.
+//
+// Returns true for [ErrNotFound] and any error wrapping it.
+// Use this instead of errors.Is(err, gocql.ErrNotFound) — the adapter layer
+// maps the driver-specific error to this sentinel.
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}
 
 // ClusterError wraps an error from a specific cluster.
 type ClusterError struct {

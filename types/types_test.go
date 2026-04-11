@@ -100,6 +100,7 @@ func TestSentinelErrors(t *testing.T) {
 		{"ErrNilSession", ErrNilSession, "session cannot be nil"},
 		{"ErrWriteAsync", ErrWriteAsync, "write sent asynchronously"},
 		{"ErrWriteDropped", ErrWriteDropped, "write dropped"},
+		{"ErrNotFound", ErrNotFound, "not found"},
 	}
 
 	for _, tt := range tests {
@@ -112,6 +113,22 @@ func TestSentinelErrors(t *testing.T) {
 			assert.True(t, errors.Is(wrapped, tt.err))
 		})
 	}
+}
+
+func TestIsNotFound(t *testing.T) {
+	// Sentinel itself
+	assert.True(t, IsNotFound(ErrNotFound))
+
+	// Wrapped sentinel
+	wrapped := fmt.Errorf("context: %w", ErrNotFound)
+	assert.True(t, IsNotFound(wrapped))
+
+	// Unrelated errors
+	assert.False(t, IsNotFound(errors.New("some other error")))
+	assert.False(t, IsNotFound(nil))
+
+	// errors.Is works directly too
+	assert.True(t, errors.Is(ErrNotFound, ErrNotFound))
 }
 
 func TestClusterIDConstants(t *testing.T) {

@@ -3,10 +3,20 @@ package v1
 
 import (
 	"context"
+	"errors"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/types"
 	"github.com/gocql/gocql"
 )
+
+// mapNotFound translates gocql.ErrNotFound to types.ErrNotFound at the adapter boundary.
+func mapNotFound(err error) error {
+	if errors.Is(err, gocql.ErrNotFound) {
+		return types.ErrNotFound
+	}
+	return err
+}
 
 // Session wraps a gocql v1 session.
 type Session struct {
@@ -163,7 +173,7 @@ func (q *Query) Exec() error {
 
 // Scan executes and scans a single row.
 func (q *Query) Scan(dest ...any) error {
-	return q.query.Scan(dest...)
+	return mapNotFound(q.query.Scan(dest...))
 }
 
 // Iter returns an iterator for results.
@@ -173,7 +183,7 @@ func (q *Query) Iter() cql.Iter {
 
 // MapScan executes and scans into a map.
 func (q *Query) MapScan(m map[string]any) error {
-	return q.query.MapScan(m)
+	return mapNotFound(q.query.MapScan(m))
 }
 
 // Statement returns the CQL statement.
@@ -198,7 +208,7 @@ func (q *Query) ExecContext(ctx context.Context) error {
 
 // ScanContext executes and scans a single row with context.
 func (q *Query) ScanContext(ctx context.Context, dest ...any) error {
-	return q.query.WithContext(ctx).Scan(dest...)
+	return mapNotFound(q.query.WithContext(ctx).Scan(dest...))
 }
 
 // IterContext returns an iterator for results with context.
@@ -208,7 +218,7 @@ func (q *Query) IterContext(ctx context.Context) cql.Iter {
 
 // MapScanContext executes and scans into a map with context.
 func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
-	return q.query.WithContext(ctx).MapScan(m)
+	return mapNotFound(q.query.WithContext(ctx).MapScan(m))
 }
 
 // ScanCAS executes a lightweight transaction and scans the result.

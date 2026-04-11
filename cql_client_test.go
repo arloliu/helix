@@ -1497,6 +1497,7 @@ func (m *mockMetricsCollector) ObserveReplayDuration(_ ClusterID, _ float64) {}
 func (m *mockMetricsCollector) SetClusterDraining(_ ClusterID, _ bool)       {}
 func (m *mockMetricsCollector) IncDrainModeEntered(_ ClusterID)              {}
 func (m *mockMetricsCollector) IncDrainModeExited(_ ClusterID)               {}
+func (m *mockMetricsCollector) IncReadDivergence(_ ClusterID)                {}
 
 // mockReplayer is a minimal inline replayer for write-classification tests.
 type mockReplayer struct {

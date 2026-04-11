@@ -1,6 +1,7 @@
 package v2_test
 
 import (
+	"errors"
 	"testing"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/arloliu/helix/adapter/cql"
 	v2 "github.com/arloliu/helix/adapter/cql/v2" //nolint:revive // required for v2_test package
+	"github.com/arloliu/helix/types"
 )
 
 // TestSessionImplementsInterface verifies that v2.Session implements cql.Session.
@@ -89,6 +91,26 @@ func TestQueryMethodsExist(t *testing.T) {
 		_ = q.MapScanCAS
 		_ = q.MapScanCASContext
 	}
+}
+
+// TestNotFoundMapping verifies the error mapping intent: gocql.ErrNotFound from
+// Scan/MapScan/ScanContext/MapScanContext is surfaced as types.ErrNotFound.
+//
+// Full round-trip testing (gocql query returning ErrNotFound) requires a live
+// Cassandra session — see test/integration/ for those tests.
+func TestNotFoundMapping(t *testing.T) {
+	// gocql.ErrNotFound is a real sentinel error
+	require.Error(t, gocql.ErrNotFound)
+
+	// types.ErrNotFound is the Helix sentinel we map to
+	require.True(t, types.IsNotFound(types.ErrNotFound))
+
+	// They must be distinct errors (not the same object)
+	require.False(t, errors.Is(types.ErrNotFound, gocql.ErrNotFound))
+
+	// types.ErrNotFound must be detectable via errors.Is
+	wrapped := errors.Join(types.ErrNotFound)
+	require.True(t, types.IsNotFound(wrapped))
 }
 
 // TestBatchMethodsExist verifies all Batch interface methods exist on v2.Batch.

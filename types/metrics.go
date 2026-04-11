@@ -33,6 +33,13 @@ type MetricsCollector interface {
 	// Metric: [prefix]_read_duration_seconds{cluster="..."}
 	ObserveReadDuration(cluster ClusterID, seconds float64)
 
+	// IncReadDivergence increments the counter when a FallbackRead finds data
+	// on the alternative cluster after the selected cluster returned not-found.
+	// The cluster parameter is the cluster that was missing the row, allowing
+	// operators to correlate divergence with replay lag on a specific cluster.
+	// Metric: [prefix]_read_divergence_total{cluster="..."}
+	IncReadDivergence(cluster ClusterID)
+
 	// ----------------------
 	// Write Operations
 	// ----------------------

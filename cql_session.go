@@ -117,6 +117,35 @@ type Query interface {
 	//   - Query: The same query for chaining
 	SerialConsistency(c Consistency) Query
 
+	// FallbackRead enables best-effort read from both clusters for this query.
+	//
+	// When the selected cluster returns not-found (zero rows), Helix silently
+	// tries the other cluster before returning not-found to the caller.
+	//
+	// This is a best-effort check, not a guaranteed dual-cluster read.
+	// If the alternative cluster is unreachable (timeout, connection refused,
+	// etc.), FallbackRead returns [ErrNotFound] from the healthy primary
+	// cluster — it does NOT propagate the alternative's network error to the
+	// caller. Health metrics ([MetricsCollector.IncReadError]) and failure
+	// tracking ([FailoverPolicy.RecordFailure]) are still recorded on the
+	// unreachable cluster, but the caller sees only a clean not-found result.
+	// This preserves availability: without this behavior, enabling FallbackRead
+	// would cause reads to fail during single-cluster outages for rows that
+	// genuinely do not exist.
+	//
+	// Not-found results are never recorded as cluster health failures regardless
+	// of whether FallbackRead is set. FallbackRead only controls whether
+	// a second cluster is attempted after a not-found.
+	//
+	// FallbackRead only applies to Scan, ScanContext, MapScan, and MapScanContext.
+	// It has no effect on Iter, Exec, or CAS operations. Iter returns a streaming
+	// cursor where "no rows" is an empty iteration with nil error — there is no
+	// not-found signal to trigger a fallback.
+	//
+	// Returns:
+	//   - Query: The same query for chaining
+	FallbackRead() Query
+
 	// Exec executes a write query using the Write Strategy.
 	//
 	// This triggers concurrent dual-write to both clusters.

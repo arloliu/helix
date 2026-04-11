@@ -13,9 +13,10 @@ type TestMetricsCollector struct {
 	mu sync.RWMutex
 
 	// Read operations
-	ReadTotal    map[types.ClusterID]int64
-	ReadErrors   map[types.ClusterID]int64
-	ReadDuration map[types.ClusterID][]float64
+	ReadTotal      map[types.ClusterID]int64
+	ReadErrors     map[types.ClusterID]int64
+	ReadDuration   map[types.ClusterID][]float64
+	ReadDivergence map[types.ClusterID]int64
 
 	// Write operations
 	WriteTotal    map[types.ClusterID]int64
@@ -59,6 +60,7 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		ReadTotal:           make(map[types.ClusterID]int64),
 		ReadErrors:          make(map[types.ClusterID]int64),
 		ReadDuration:        make(map[types.ClusterID][]float64),
+		ReadDivergence:      make(map[types.ClusterID]int64),
 		WriteTotal:          make(map[types.ClusterID]int64),
 		WriteErrors:         make(map[types.ClusterID]int64),
 		WriteAsync:          make(map[types.ClusterID]int64),
@@ -99,6 +101,12 @@ func (m *TestMetricsCollector) ObserveReadDuration(cluster types.ClusterID, seco
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ReadDuration[cluster] = append(m.ReadDuration[cluster], seconds)
+}
+
+func (m *TestMetricsCollector) IncReadDivergence(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReadDivergence[cluster]++
 }
 
 // ----------------------
@@ -296,6 +304,13 @@ func (m *TestMetricsCollector) GetReadErrors(cluster types.ClusterID) int64 {
 	return m.ReadErrors[cluster]
 }
 
+// GetReadDivergence returns the read divergence count for a cluster.
+func (m *TestMetricsCollector) GetReadDivergence(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ReadDivergence[cluster]
+}
+
 // Reset clears all collected metrics.
 func (m *TestMetricsCollector) Reset() {
 	m.mu.Lock()
@@ -304,6 +319,7 @@ func (m *TestMetricsCollector) Reset() {
 	m.ReadTotal = make(map[types.ClusterID]int64)
 	m.ReadErrors = make(map[types.ClusterID]int64)
 	m.ReadDuration = make(map[types.ClusterID][]float64)
+	m.ReadDivergence = make(map[types.ClusterID]int64)
 	m.WriteTotal = make(map[types.ClusterID]int64)
 	m.WriteErrors = make(map[types.ClusterID]int64)
 	m.WriteAsync = make(map[types.ClusterID]int64)

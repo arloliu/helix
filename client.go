@@ -1,6 +1,10 @@
 package helix
 
-import "github.com/arloliu/helix/types"
+import (
+	"context"
+
+	"github.com/arloliu/helix/types"
+)
 
 // Type aliases for convenience - re-export from types package.
 type (
@@ -48,3 +52,33 @@ const (
 	PriorityHigh = types.PriorityHigh
 	PriorityLow  = types.PriorityLow
 )
+
+var ErrNotFound = types.ErrNotFound
+
+// IsNotFound reports whether err represents a "not found" result.
+// See [types.IsNotFound] for details.
+func IsNotFound(err error) bool {
+	return types.IsNotFound(err)
+}
+
+type fallbackReadKey struct{}
+
+// WithFallbackRead returns a context that enables FallbackRead for all Scan
+// and MapScan queries executed with this context.
+//
+// Per-query FallbackRead() takes precedence over context-level enabling.
+// Client-level WithDefaultFallbackRead(true) is overridden by either.
+//
+// Parameters:
+//   - ctx: The parent context
+//
+// Returns:
+//   - context.Context: A new context with FallbackRead enabled
+func WithFallbackRead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, fallbackReadKey{}, true)
+}
+
+func hasFallbackRead(ctx context.Context) bool {
+	v, _ := ctx.Value(fallbackReadKey{}).(bool)
+	return v
+}

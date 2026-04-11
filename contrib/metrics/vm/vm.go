@@ -76,12 +76,14 @@ type Collector struct {
 	clusterNames types.ClusterNames
 
 	// Read metrics
-	readTotalA    *metrics.Counter
-	readTotalB    *metrics.Counter
-	readErrorsA   *metrics.Counter
-	readErrorsB   *metrics.Counter
-	readDurationA *metrics.Histogram
-	readDurationB *metrics.Histogram
+	readTotalA      *metrics.Counter
+	readTotalB      *metrics.Counter
+	readErrorsA     *metrics.Counter
+	readErrorsB     *metrics.Counter
+	readDurationA   *metrics.Histogram
+	readDurationB   *metrics.Histogram
+	readDivergenceA *metrics.Counter
+	readDivergenceB *metrics.Counter
 
 	// Write metrics
 	writeTotalA    *metrics.Counter
@@ -180,6 +182,8 @@ func (c *Collector) initMetrics() {
 	c.readErrorsB = c.set.NewCounter(fmt.Sprintf(`%s_read_errors_total{cluster="%s"}`, p, nB))
 	c.readDurationA = c.set.NewHistogram(fmt.Sprintf(`%s_read_duration_seconds{cluster="%s"}`, p, nA))
 	c.readDurationB = c.set.NewHistogram(fmt.Sprintf(`%s_read_duration_seconds{cluster="%s"}`, p, nB))
+	c.readDivergenceA = c.set.NewCounter(fmt.Sprintf(`%s_read_divergence_total{cluster="%s"}`, p, nA))
+	c.readDivergenceB = c.set.NewCounter(fmt.Sprintf(`%s_read_divergence_total{cluster="%s"}`, p, nB))
 
 	// Write metrics
 	c.writeTotalA = c.set.NewCounter(fmt.Sprintf(`%s_write_total{cluster="%s"}`, p, nA))
@@ -287,6 +291,16 @@ func (c *Collector) ObserveReadDuration(cluster types.ClusterID, seconds float64
 		c.readDurationA.Update(seconds)
 	} else {
 		c.readDurationB.Update(seconds)
+	}
+}
+
+// IncReadDivergence increments the counter when a FallbackRead finds data on
+// the alternative cluster after the selected cluster returned not-found.
+func (c *Collector) IncReadDivergence(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.readDivergenceA.Inc()
+	} else {
+		c.readDivergenceB.Inc()
 	}
 }
 

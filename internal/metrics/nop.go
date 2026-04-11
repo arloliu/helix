@@ -33,6 +33,9 @@ func (m *NopMetrics) IncReadError(_ types.ClusterID) {}
 // ObserveReadDuration discards the metric.
 func (m *NopMetrics) ObserveReadDuration(_ types.ClusterID, _ float64) {}
 
+// IncReadDivergence discards the metric.
+func (m *NopMetrics) IncReadDivergence(_ types.ClusterID) {}
+
 // ----------------------
 // Write Operations
 // ----------------------

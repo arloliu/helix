@@ -41,6 +41,17 @@ type ClientConfig struct {
 	ClusterNames      types.ClusterNames
 	OnReplayDropped   ReplayDroppedHandler
 
+	// DefaultFallbackRead enables FallbackRead for every Scan and MapScan query
+	// on this client when true. Equivalent to calling [Query.FallbackRead] on
+	// every query.
+	//
+	// FallbackRead is best-effort: if the alternative cluster is unreachable,
+	// callers receive [ErrNotFound] (not the network error). See
+	// [Query.FallbackRead] for full semantics.
+	//
+	// Default: false (opt-in per query or per context).
+	DefaultFallbackRead bool
+
 	// AutoMemoryWorker enables automatic in-process replay with MemoryReplayer.
 	// When true, a MemoryReplayer and Worker are created automatically.
 	AutoMemoryWorker bool
@@ -337,6 +348,36 @@ func WithLogger(logger types.Logger) Option {
 func WithClusterNames(nameA, nameB string) Option {
 	return func(c *ClientConfig) {
 		c.ClusterNames = types.ClusterNames{A: nameA, B: nameB}
+	}
+}
+
+// WithDefaultFallbackRead enables FallbackRead for all Scan and MapScan queries
+// on this client when enabled is true.
+//
+// When true, every query executed on this client behaves as if [Query.FallbackRead]
+// was called on it: a not-found result on the selected cluster triggers a silent
+// best-effort attempt on the other cluster.
+//
+// Important: FallbackRead is best-effort. If the alternative cluster is
+// unreachable, the caller receives [ErrNotFound] (the healthy cluster's answer),
+// not the network error. Health metrics and failure tracking are still recorded
+// on the unreachable cluster internally. See [Query.FallbackRead] for details.
+//
+// Use this when the majority of reads on this client are critical read-after-write
+// operations. For mixed workloads (e.g., critical user data + bulk time-series),
+// use per-query [Query.FallbackRead] or context-level [WithFallbackRead] instead,
+// or create separate clients with different configurations.
+//
+// Default: false (opt-in per query or per context).
+//
+// Parameters:
+//   - enabled: Whether to enable FallbackRead for all queries on this client
+//
+// Returns:
+//   - Option: Configuration option
+func WithDefaultFallbackRead(enabled bool) Option {
+	return func(c *ClientConfig) {
+		c.DefaultFallbackRead = enabled
 	}
 }
 
