@@ -372,6 +372,14 @@ func (a *AdaptiveDualWrite) fireAndForget(
 				// Still significantly slower than sibling - no recovery credit
 				return
 			}
+		} else if latency >= a.minFloor {
+			// Sibling has no baseline yet (also degraded or never written to).
+			// Use minFloor as a conservative substitute for the delta check:
+			// only grant recovery credit if this write was comfortably fast on
+			// its own. Without this guard, any sub-absoluteMax write would
+			// trigger recovery even when the sibling's true cost is unknown,
+			// potentially bouncing the cluster in/out of degradation.
+			return
 		}
 
 		// Write succeeded, was fast, and within delta of sibling - record for recovery.
