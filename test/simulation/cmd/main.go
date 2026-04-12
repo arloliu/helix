@@ -34,7 +34,7 @@ func main() {
 func run() error {
 	// Parse flags
 	configPath := flag.String("config", "", "Path to configuration file (optional)")
-	profile := flag.String("profile", "quick", "Simulation profile (quick, comprehensive, soak)")
+	profile := flag.String("profile", "quick", "Simulation profile (quick, comprehensive, soak, fallback)")
 	duration := flag.Duration("duration", 5*time.Minute, "Total simulation duration (for soak tests)")
 	seed := flag.Int64("seed", time.Now().UnixNano(), "Random seed")
 	flag.Parse()
@@ -154,6 +154,13 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 	sim.RegisterScenario(&scenarios.DegradedCluster{})
 	sim.RegisterScenario(&scenarios.AdaptiveRecovery{})
 	sim.RegisterScenario(&scenarios.CompleteFailure{})
+
+	// fallback profile: 3 baseline scenarios + fallback-read group only.
+	// Use this for quick, targeted verification of FallbackRead divergence detection.
+	if profile == "fallback" {
+		sim.RegisterStrategyGroup(fallbackReadGroup())
+		return
+	}
 
 	// Add more scenarios based on profile
 	if profile == "comprehensive" || profile == "soak" {

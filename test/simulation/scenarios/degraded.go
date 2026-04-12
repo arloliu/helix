@@ -2,7 +2,6 @@ package scenarios
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -34,39 +33,45 @@ func (s *DegradedCluster) Run(ctx context.Context, env *types.Environment) error
 		return env.Tracker.Count() > startCount
 	})
 
-	// 2. Inject latency into Cluster A and snapshot counters.
-	//    Use a fresh tracker baseline so the wait gate measures writes that
-	//    actually flow through the latency-injected session, not pre-injection
-	//    writes already accumulated during Phase 1 (critical under high write rates).
+	// 2. Inject latency into Cluster A and snapshot counters for later diagnostics.
 	env.Logger.Info("Phase 2: Injecting latency into Cluster A")
 	env.ChaosA.SetLatency(500 * time.Millisecond)
 	beforeExecA, _, _ := env.ChaosA.Counters()
 	beforeExecB, _, _ := env.ChaosB.Counters()
 
-	injectCount := env.Tracker.Count()
-	if err := waitUntil(ctx, 15*time.Second, func() bool {
-		return env.Tracker.Count() >= injectCount+100
-	}); err != nil {
-		return fmt.Errorf("write volume gate not reached before degradation check: %w", err)
-	}
-
-	// 3. Assert failover happened
-	env.Logger.Info("Phase 3: Verifying failover behavior")
-	afterExecA, _, _ := env.ChaosA.Counters()
-	afterExecB, _, _ := env.ChaosB.Counters()
-	deltaA := afterExecA - beforeExecA
-	deltaB := afterExecB - beforeExecB
-	env.Logger.Info("Exec delta during degradation", "cluster_a", deltaA, "cluster_b", deltaB)
-
-	// Use the canonical degradation API rather than exec-count comparison.
-	// Count-based checks are timing-sensitive: AdaptiveDualWrite fire-and-forget
-	// goroutines for Cluster A complete asynchronously, so A and B often accumulate
-	// similar counts within any fixed observation window.
+	// 3. Wait for AdaptiveDualWrite to detect and degrade Cluster A.
+	//
+	// Poll the degradation flag directly instead of waiting for a fixed write count.
+	// A write-volume gate is sensitive to Cassandra cold-start latency: on a fresh
+	// container, Cluster B writes can take 100–300ms (not the assumed ~10ms), which
+	// reduces post-degradation throughput to ~3–10 writes/sec and makes any fixed
+	// count threshold unreliable. The degradation flag is the authoritative signal.
+	env.Logger.Info("Phase 3: Waiting for AdaptiveDualWrite to degrade Cluster A")
 	if adw != nil {
-		if !adw.IsDegraded(htypes.ClusterA) {
-			return errors.New("AdaptiveDualWrite did not degrade Cluster A after sustained high latency")
+		if err := waitUntil(ctx, 30*time.Second, func() bool {
+			return adw.IsDegraded(htypes.ClusterA)
+		}); err != nil {
+			afterExecA, _, _ := env.ChaosA.Counters()
+			afterExecB, _, _ := env.ChaosB.Counters()
+			env.Logger.Error("Cluster A not degraded within timeout",
+				"delta_a", afterExecA-beforeExecA,
+				"delta_b", afterExecB-beforeExecB,
+			)
+			return fmt.Errorf("AdaptiveDualWrite did not degrade Cluster A after sustained high latency: %w", err)
 		}
-		env.Logger.Info("Cluster A marked degraded (fire-and-forget mode active)")
+		afterExecA, _, _ := env.ChaosA.Counters()
+		afterExecB, _, _ := env.ChaosB.Counters()
+		env.Logger.Info("Cluster A marked degraded (fire-and-forget mode active)",
+			"delta_a", afterExecA-beforeExecA,
+			"delta_b", afterExecB-beforeExecB,
+		)
+	} else {
+		afterExecA, _, _ := env.ChaosA.Counters()
+		afterExecB, _, _ := env.ChaosB.Counters()
+		env.Logger.Info("Exec delta during degradation window",
+			"cluster_a", afterExecA-beforeExecA,
+			"cluster_b", afterExecB-beforeExecB,
+		)
 	}
 
 	// 4. Recovery
