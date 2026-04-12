@@ -31,6 +31,9 @@ go run ./test/simulation/cmd/main.go -profile comprehensive -config test/simulat
 
 # Long-running stability run (2 h by default)
 go run ./test/simulation/cmd/main.go -profile soak -config test/simulation/configs/soak.yaml
+
+# Targeted FallbackRead verification (~5 min)
+go run ./test/simulation/cmd/main.go -profile fallback -config test/simulation/configs/quick.yaml
 ```
 
 Override individual flags without a config file:
@@ -46,8 +49,11 @@ A pprof server starts automatically on `127.0.0.1:6060` for profiling during soa
 | Profile | Scenarios | Duration (default) |
 |---|---|---|
 | `quick` | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | 5 min |
-| `comprehensive` | All of the above + 5 more + 4 strategy groups | config-driven |
+| `comprehensive` | All quick + 5 more + 6 strategy groups | config-driven |
 | `soak` | All comprehensive + `dual-cluster-degradation` | 2 h |
+| `fallback` | 3 baseline scenarios + `fallback-read` strategy group | 5 min |
+
+`fallback` is a targeted profile for verifying `FallbackRead` divergence detection in isolation. It runs the 3 baseline scenarios to warm up both clusters, then exercises `FallbackReadDivergence` via a dedicated strategy group configured with `WithDefaultFallbackRead(true)` and `StickyRead` pinned to Cluster B.
 
 ## Configuration reference
 
@@ -159,6 +165,15 @@ if profile == "comprehensive" || profile == "soak" {
 ## Strategy groups
 
 A strategy group runs a set of scenarios against a client configured with a specific combination of write strategy, read strategy, and failover policy. Groups share the same underlying Cassandra containers but get a fresh `CQLClient` and truncated table.
+
+| Group | Failover policy | Scenario | Profile |
+|---|---|---|---|
+| `circuit-breaker` | `CircuitBreaker` (3-strike, 15 s reset) | `circuit-breaker-trip` | comprehensive+ |
+| `latency-cb` | `LatencyCircuitBreaker` (500 ms max, 3-strike) | `latency-circuit-breaker-trip` | comprehensive+ |
+| `primary-only` | `ActiveFailover` | `primary-only-read-recovery` | comprehensive+ |
+| `round-robin` | `ActiveFailover` | `round-robin-read-balance` | comprehensive+ |
+| `sticky-cooldown` | `ActiveFailover` | `sticky-cooldown` | comprehensive+ |
+| `fallback-read` | `ActiveFailover` | `fallback-read-divergence` | comprehensive+, fallback |
 
 Register a group in `cmd/main.go`:
 
