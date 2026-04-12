@@ -74,15 +74,19 @@ func (s *DegradedCluster) Run(ctx context.Context, env *types.Environment) error
 		)
 	}
 
-	// 4. Recovery
+	// 4. Recovery: clear the injected latency and wait for AdaptiveDualWrite to
+	// confirm recovery via the degradation flag. A soft warn-only check is
+	// insufficient here — a still-degraded cluster means fire-and-forget mode
+	// persists unnecessarily, which would go undetected during soak runs.
 	env.Logger.Info("Phase 4: Recovering Cluster A")
 	env.ChaosA.SetLatency(0)
-	recoveryStart := env.Tracker.Count()
-	_ = waitUntil(ctx, 10*time.Second, func() bool {
-		return env.Tracker.Count() >= recoveryStart+50
-	})
-	if adw != nil && adw.IsDegraded(htypes.ClusterA) {
-		env.Logger.Warn("AdaptiveDualWrite: Cluster A still degraded after recovery")
+	if adw != nil {
+		if err := waitUntil(ctx, 20*time.Second, func() bool {
+			return !adw.IsDegraded(htypes.ClusterA)
+		}); err != nil {
+			return fmt.Errorf("cluster A did not recover after latency was cleared: %w", err)
+		}
+		env.Logger.Info("Cluster A recovered from degradation")
 	}
 
 	env.Logger.Info("DegradedCluster scenario completed")

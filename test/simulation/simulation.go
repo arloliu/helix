@@ -422,6 +422,11 @@ func (s *Simulation) classifyWriteError(err error, id gocql.UUID) {
 	default:
 		var dce *htypes.DualClusterError
 		if errors.As(err, &dce) {
+			// At least one cluster accepted the write; track so VerifyConsistency
+			// can assert the row is on both clusters after replay reconciliation.
+			if id != (gocql.UUID{}) {
+				s.env.Tracker.TrackWrite(id, time.Now().UnixNano())
+			}
 			s.env.Stats.DualClusterErr.Add(1)
 		} else {
 			s.env.Stats.WriteFailed.Add(1)

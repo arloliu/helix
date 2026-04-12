@@ -142,6 +142,13 @@ type Query interface {
 	// cursor where "no rows" is an empty iteration with nil error — there is no
 	// not-found signal to trigger a fallback.
 	//
+	// Circuit-breaker note: a cluster that consistently lags behind (replay
+	// backlog) will produce many not-found results that are silently recovered
+	// via FallbackRead. Not-found is not treated as a health failure, so the
+	// lagging cluster will NOT trip a [CircuitBreaker] or [LatencyCircuitBreaker]
+	// through FallbackRead reads alone. Monitor [MetricsCollector.IncReadDivergence]
+	// to detect persistent replay lag and alert before it becomes a write-path issue.
+	//
 	// Returns:
 	//   - Query: The same query for chaining
 	FallbackRead() Query
