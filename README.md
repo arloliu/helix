@@ -29,7 +29,6 @@ If one strand snaps, the other keeps the organism alive. It's 4 billion years of
 - **Active Failover** - Immediate failover to secondary cluster on read failures
 - **Replay System** - Asynchronous reconciliation via in-memory queue or NATS JetStream
 - **Drop-in Replacement** - Interface-based design mirrors `gocql` API for minimal migration effort
-- **SQL Support** - Simple wrapper for `database/sql` with dual-write semantics
 
 > **CAS/LWT Warning:** Lightweight Transactions (`INSERT ... IF NOT EXISTS`, `ScanCAS`, etc.) are **not safe** in a shared-nothing dual-cluster architecture. Each cluster has an independent Paxos state, so CAS conditions cannot be coordinated across clusters. Do not use Helix for CAS/LWT operations.
 
@@ -99,42 +98,6 @@ func main() {
         "SELECT name, email FROM users WHERE id = ?",
         userID,
     ).Scan(&name, &email)
-}
-```
-
-### SQL (PostgreSQL, MySQL, etc.)
-
-```go
-package main
-
-import (
-    "database/sql"
-    "log"
-
-    "github.com/arloliu/helix"
-    "github.com/arloliu/helix/replay"
-    _ "github.com/lib/pq"
-)
-
-func main() {
-    // Connect to both databases
-    primary, _ := sql.Open("postgres", "host=primary.example.com ...")
-    secondary, _ := sql.Open("postgres", "host=secondary.example.com ...")
-
-    // Create Helix SQL client
-    client, err := helix.NewSQLClientFromDB(primary, secondary,
-        helix.WithReplayer(replay.NewMemoryReplayer()),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer client.Close()
-
-    // Dual-write
-    _, err = client.Exec(
-        "INSERT INTO users (id, name) VALUES ($1, $2)",
-        "user-1", "Alice",
-    )
 }
 ```
 

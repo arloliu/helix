@@ -11,7 +11,7 @@ Helix is a high-availability dual-database client library designed for "Shared N
 
 ## Project Structure
 ```
-helix/                        # Root = main public package (CQLClient, SQLClient, options)
+helix/                        # Root = main public package (CQLClient, options)
 ├── adapter/                  # CQL adapter shims
 │   └── cql/
 │       ├── v1/               # gocql adapter (NewSession)

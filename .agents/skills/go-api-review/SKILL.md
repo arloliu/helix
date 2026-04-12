@@ -12,7 +12,7 @@ Please perform a critical review focused on **discoverability, clarity, and ease
 ## Scope
 
 When reviewing specific packages, specify them by name. The reviewable packages in Helix:
-- Root package (`helix`): Entry point — `CQLClient`, `SQLClient`, `NewCQLClient`, `NewSQLClientFromDB`, `WithXxx` options
+- Root package (`helix`): Entry point — `CQLClient`, `NewCQLClient`, `WithXxx` options
 - `adapter/cql/v1`: gocql adapter — `NewSession`
 - `adapter/cql/v2`: Apache driver adapter — `NewSession`
 - `policy/`: Strategies and policies — `NewStickyRead`, `NewPrimaryOnlyRead`, `NewRoundRobinRead`, `NewConcurrentDualWrite`, `NewSyncDualWrite`, `NewAdaptiveDualWrite`, `NewActiveFailover`, `NewCircuitBreaker`, `NewLatencyCircuitBreaker`

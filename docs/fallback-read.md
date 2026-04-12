@@ -65,7 +65,7 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
 
 **Key behaviors:**
 
-- FallbackRead is CQL-only. It is exposed on `helix.Query` returned by `helix.CQLClient`; raw adapter sessions and the SQL client do not support it.
+- FallbackRead is CQL-only. It is exposed on `helix.Query` returned by `helix.CQLClient`; raw adapter sessions do not support it.
 - FallbackRead only applies to `Scan`, `ScanContext`, `MapScan`, and `MapScanContext`. It has no effect on `Iter` (streaming cursors have no not-found signal) or `Exec` (write operations).
 - Not-found is never treated as a cluster failure. It never triggers `IncReadError`, `RecordFailure`, or failover — regardless of whether FallbackRead is enabled.
 - When the primary returns a real error (timeout, connection refused), the normal failover path handles it. FallbackRead only activates on not-found.

@@ -23,7 +23,6 @@ Helix is a high-availability dual-database client library designed to support "S
   ├── doc.go                    # Package documentation
   ├── client.go                 # Common definitions & interfaces
   ├── cql_client.go             # HelixCQLClient implementation
-  ├── sql_client.go             # HelixSQLClient implementation
   ├── *_test.go                 # Unit tests
   ├── types/                    # Shared types & errors (leaf package)
   │   └── types.go              # ClusterID, Consistency, BatchType, errors
@@ -38,10 +37,9 @@ Helix is a high-availability dual-database client library designed to support "S
   │   ├── nats.go               # NATS JetStream implementation (Phase N)
   │   └── *_test.go
   ├── adapter/                  # Driver adapters
-  │   ├── cql/                  # CQL adapter interfaces
-  │   │   ├── v1/               # gocql v1 adapter
-  │   │   └── v2/               # gocql v2 adapter
-  │   └── sql/                  # database/sql adapter
+  │   └── cql/                  # CQL adapter interfaces
+  │       ├── v1/               # gocql v1 adapter
+  │       └── v2/               # gocql v2 adapter
   ├── internal/                 # Private implementation
   │   ├── orchestrator/         # Dual-write orchestration logic
   │   └── circuit/              # Circuit breaker implementation
@@ -377,7 +375,6 @@ This project uses a comprehensive `golangci-lint` configuration with strict rule
 
 ### Security & Safety
 - **Type assertions**: Always use comma ok idiom: `val, ok := x.(Type)`
-- **SQL operations**: Always close `sql.Rows` and `sql.Stmt` (sqlclosecheck, rowserrcheck)
 - **HTTP responses**: Always close response bodies (bodyclose)
 - **Nil checks**: Avoid returning nil error with invalid value (nilnil)
 - **Unicode safety**: Check for dangerous unicode sequences (bidichk)
@@ -594,7 +591,6 @@ See `encoding/metric_names.go` for the canonical implementation of this format.
 - **Testing:**
   - `github.com/stretchr/testify` for assertions and mocking
   - `github.com/testcontainers/testcontainers-go` for CQL integration tests
-  - `github.com/mattn/go-sqlite3` for SQL integration tests (in-memory mode)
 - **Cassandra Drivers:**
   - `github.com/gocql/gocql` v1.7.0+ (v1 adapter)
   - `github.com/apache/cassandra-gocql-driver/v2` v2.0.0+ (v2 adapter)

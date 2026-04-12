@@ -14,7 +14,7 @@ When executing this skill, perform a critical review focused on **correctness, f
 ## Scope
 
 When reviewing specific packages, specify them by name. Default scope for Helix:
-- Root package (`helix`): `CQLClient`, `SQLClient`, `WithXxx` options
+- Root package (`helix`): `CQLClient`, `WithXxx` options
 - `adapter/cql/v1`, `adapter/cql/v2`: session adapters
 - `policy/`: `StickyRead`, `PrimaryOnlyRead`, `RoundRobinRead`, `ConcurrentDualWrite`, `SyncDualWrite`, `AdaptiveDualWrite`, `ActiveFailover`, `CircuitBreaker`, `LatencyCircuitBreaker`
 - `replay/`: `MemoryReplayer`, `NATSReplayer`, `Worker`

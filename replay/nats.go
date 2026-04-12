@@ -705,7 +705,7 @@ func encodeArgs(args []any) (msgp.Raw, error) {
 	}
 
 	// Encode as a MessagePack array
-	// Note: CQL/SQL queries typically have < 100 parameters, so overflow is not a concern
+	// Note: the queries typically have < 100 parameters, so overflow is not a concern
 	// in practice, but we add a check for safety.
 	if len(args) > int(^uint32(0)) {
 		return nil, errors.New("helix: too many arguments to encode")

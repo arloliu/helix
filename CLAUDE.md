@@ -5,7 +5,7 @@
 **Helix** (`github.com/arloliu/helix`) is a Go library for high-availability dual-database operations, designed for "Shared Nothing" architecture. It provides active-active dual writes, sticky read routing, and asynchronous reconciliation for independent Cassandra/ScyllaDB clusters.
 
 Key public packages:
-- **Root (`helix`)** — `CQLClient`, `SQLClient`, `NewCQLClient`, `NewSQLClientFromDB`, `WithXxx` options; entry point for all users
+- **Root (`helix`)** — `CQLClient`, `NewCQLClient`, `WithXxx` options; entry point for all users
 - **`adapter/cql/v1`** — gocql adapter (`NewSession`)
 - **`adapter/cql/v2`** — Apache cassandra-gocql-driver adapter (`NewSession`)
 - **`policy/`** — Read strategies (`StickyRead`, `PrimaryOnlyRead`, `RoundRobinRead`), write strategies (`ConcurrentDualWrite`, `SyncDualWrite`, `AdaptiveDualWrite`), failover policies (`ActiveFailover`, `CircuitBreaker`, `LatencyCircuitBreaker`)

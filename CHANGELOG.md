@@ -44,6 +44,12 @@ if helix.IsNotFound(err) { ... }
 if errors.Is(err, helix.ErrNotFound) { ... }
 ```
 
+### Removed
+
+- **SQL client**: `SQLClient`, `NewSQLClient`, `NewSQLClientFromDB`, and the
+  `adapter/sql` package have been deleted. The feature was incomplete and is not
+  being carried forward. Helix is CQL-only going forward.
+
 ### Added
 
 - **`FallbackRead`**: Best-effort read from both clusters for critical
