@@ -116,6 +116,11 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.Logger = logging.NewNopLogger()
 	}
 
+	// Ensure timestamp provider is never nil
+	if config.TimestampProvider == nil {
+		config.TimestampProvider = DefaultTimestampProvider
+	}
+
 	// Propagate cluster names to components that support it
 	propagateClusterNames(config)
 

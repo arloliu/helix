@@ -224,11 +224,28 @@ For production dual-cluster deployments, always configure:
 client, err := helix.NewCQLClient(
     v1.NewSession(sessionA),
     v1.NewSession(sessionB),
-    // REQUIRED for production: enables failure recovery
-    helix.WithReplayer(replay.NewNATSReplayer(nc, nats.JetStreamContext(nc))),
-    helix.WithReplayWorker(replay.NewWorker(replayer)),
+    // REQUIRED for production: enables failure recovery (in-memory, auto-started)
+    helix.WithAutoMemoryWorker(10000),
 
     // RECOMMENDED: optimizes read/write behavior
+    helix.WithReadStrategy(policy.NewStickyRead()),
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithFailoverPolicy(policy.NewActiveFailover()),
+)
+```
+
+For durable replay across restarts, use a NATS-backed replayer instead:
+
+```go
+natsReplayer, err := replay.NewNATSReplayer(js) // js is jetstream.JetStream
+if err != nil {
+    log.Fatal(err)
+}
+client, err := helix.NewCQLClient(
+    v1.NewSession(sessionA),
+    v1.NewSession(sessionB),
+    helix.WithReplayer(natsReplayer),
+    helix.WithReplayWorker(replay.NewNATSWorker(natsReplayer, executorFunc)),
     helix.WithReadStrategy(policy.NewStickyRead()),
     helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
     helix.WithFailoverPolicy(policy.NewActiveFailover()),

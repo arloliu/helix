@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] — 2026-04-12
 
 ### Breaking Changes
 
@@ -92,6 +92,25 @@ if errors.Is(err, helix.ErrNotFound) { ... }
   primary's not-found would have been returned cleanly without FallbackRead.
   Now returns `ErrNotFound` (the primary's healthy answer) while still
   recording health metrics on the unreachable cluster.
+- **`WithTimestampProvider(nil)` panics on first write**: Passing `nil` to
+  `WithTimestampProvider` stored a nil function pointer with no validation.
+  Any subsequent write calling `getTimestamp()` would panic with a nil
+  function dereference. `NewCQLClient` now resets a nil provider to
+  `DefaultTimestampProvider` after options are applied, matching the existing
+  nil-guard pattern for `Metrics` and `Logger`.
+- **`MemoryReplayer.Dequeue` blocks forever after `Close`**: After `Close()`
+  was called with both queues empty, `Dequeue` fell into a blocking `select`
+  with no escape path — the underlying channels are intentionally never
+  closed to prevent Enqueue panics. The documented contract ("returns false
+  when closed and empty") was not implemented. `Dequeue` now checks
+  `closed && Len() == 0` before entering the blocking select; remaining
+  queued items are still drained before returning false.
+- **Phantom `replay.NewWorker` / `WithExecutor` / `WithMaxRetries` in docs**:
+  The README "Minimal Production Example", `docs/adaptive-dual-write.md`, and
+  `replay/doc.go` all referenced a non-existent `replay.NewWorker` constructor
+  and phantom `WithExecutor` / `WithMaxRetries` options. The actual
+  constructors are `replay.NewMemoryWorker` and `replay.NewNATSWorker`.
+  All three files have been corrected to use real API symbols.
 
 ### Tests
 

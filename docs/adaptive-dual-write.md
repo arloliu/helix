@@ -285,10 +285,11 @@ AdaptiveDualWrite **requires** a Replayer for production use:
 
 ```go
 // REQUIRED: Configure replayer for fire-and-forget reliability
+natsReplayer, _ := replay.NewNATSReplayer(js) // js is jetstream.JetStream
 client, _ := helix.NewCQLClient(sessionA, sessionB,
     helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
-    helix.WithReplayer(replay.NewNATSReplayer(nc, js)),
-    helix.WithReplayWorker(replay.NewWorker(replayer)),
+    helix.WithReplayer(natsReplayer),
+    helix.WithReplayWorker(replay.NewNATSWorker(natsReplayer, executorFunc)),
 )
 ```
 

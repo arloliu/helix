@@ -195,7 +195,12 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 			return payload, true
 		}
 
-		// No messages available, wait for any message or context cancellation
+		// No messages available; if closed and drained, signal completion.
+		if m.closed.Load() && m.Len() == 0 {
+			return types.ReplayPayload{}, false
+		}
+
+		// Wait for any message or context cancellation
 		select {
 		case <-ctx.Done():
 			return types.ReplayPayload{}, false

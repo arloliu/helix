@@ -52,10 +52,8 @@
 // Configure it with [helix.WithReplayWorker] and it will be started/stopped
 // with the client lifecycle:
 //
-//	worker := replay.NewWorker(replayer,
-//	    replay.WithExecutor(executorFunc),
+//	worker := replay.NewMemoryWorker(replayer, executorFunc,
 //	    replay.WithRetryDelay(time.Second),
-//	    replay.WithMaxRetries(3),
 //	)
 //	client, _ := helix.NewCQLClient(sessionA, sessionB,
 //	    helix.WithReplayer(replayer),
