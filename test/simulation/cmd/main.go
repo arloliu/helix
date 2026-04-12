@@ -168,6 +168,7 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 		sim.RegisterStrategyGroup(primaryOnlyReadGroup())
 		sim.RegisterStrategyGroup(roundRobinReadGroup())
 		sim.RegisterStrategyGroup(stickyCooldownGroup())
+		sim.RegisterStrategyGroup(fallbackReadGroup())
 	}
 
 	if profile == "soak" {
@@ -328,6 +329,50 @@ func stickyCooldownGroup() simulation.StrategyGroup {
 		),
 		Scenarios: []simtypes.Scenario{
 			&scenarios.StickyCooldown{},
+		},
+	}
+}
+
+func fallbackReadGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "fallback-read",
+		SetupFunc: func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
+			memReplayer := replay.NewMemoryReplayer()
+			topo := topology.NewLocal()
+
+			client, err := helix.NewCQLClient(sessionA, sessionB,
+				helix.WithWriteStrategy(policy.NewAdaptiveDualWrite(
+					policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+					policy.WithAdaptiveStrikeThreshold(3),
+				)),
+				// Pin reads to B so FallbackRead is exercised deterministically:
+				// B returns not-found for A-only rows, then FallbackRead finds them on A.
+				helix.WithReadStrategy(policy.NewStickyRead(
+					policy.WithPreferredCluster(htypes.ClusterB),
+				)),
+				helix.WithFailoverPolicy(policy.NewActiveFailover()),
+				helix.WithReplayer(memReplayer),
+				helix.WithTopologyWatcher(topo),
+				helix.WithMetrics(mc),
+				helix.WithDefaultFallbackRead(true),
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create client: %w", err)
+			}
+
+			worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
+				replay.WithWorkerMetrics(mc),
+			)
+			if err := worker.Start(); err != nil {
+				client.Close()
+				return nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
+			}
+			client.Config().ReplayWorker = worker
+
+			return client, memReplayer, nil
+		},
+		Scenarios: []simtypes.Scenario{
+			&scenarios.FallbackReadDivergence{},
 		},
 	}
 }
