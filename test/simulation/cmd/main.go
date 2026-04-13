@@ -297,6 +297,7 @@ func primaryOnlyReadGroup() simulation.StrategyGroup {
 		),
 		Scenarios: []simtypes.Scenario{
 			&scenarios.PrimaryOnlyReadRecovery{},
+			&scenarios.PrimaryOnlyReadFailoverBack{},
 		},
 	}
 }
@@ -336,6 +337,7 @@ func stickyCooldownGroup() simulation.StrategyGroup {
 		),
 		Scenarios: []simtypes.Scenario{
 			&scenarios.StickyCooldown{},
+			&scenarios.StickyReadFailoverBack{},
 		},
 	}
 }

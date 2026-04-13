@@ -47,7 +47,7 @@ Each interface has a single responsibility. Compose them to express your exact r
 **Key design decisions:**
 
 - **FailoverPolicy is a gatekeeper.** It must approve failover before `ReadStrategy.OnFailure` is even consulted. This enforces circuit breaker semantics uniformly.
-- **Both layers can deny failover.** `FailoverPolicy.ShouldFailover()` returning `false` stops immediately. `ReadStrategy.OnFailure()` returning `false` stops as well (e.g., cooldown active).
+- **Both layers can deny failover.** `FailoverPolicy.ShouldFailover()` returning `false` stops immediately. `ReadStrategy.OnFailure()` returning `false` stops as well (e.g., failure on a non-preferred cluster in `StickyRead`). Note: `StickyRead` cooldown does **not** deny failover — it returns the alternative cluster for the current request without changing the preferred cluster, so the read can still succeed on the other cluster.
 - **Latency is recorded automatically.** If the configured `FailoverPolicy` implements `LatencyRecorder` (e.g., `LatencyCircuitBreaker`), the client calls `RecordLatency()` after each successful read with no extra wiring.
 - **Not-found is not a failure.** A cluster that responds with "row absent" is healthy. Not-found results never trigger `RecordFailure`, `OnFailure`, or `IncReadError`. This classification is independent of FallbackRead.
 - **FallbackRead is orthogonal to failover.** FallbackRead activates when a healthy cluster returns not-found; failover activates when a cluster returns a real error. They handle different failure modes and do not interfere with each other. See [FallbackRead Guide](fallback-read.md) for details.
@@ -262,12 +262,15 @@ Time →
 │                                 │                                  │
 │ Error occurs → failover to B ───┤ Cooldown starts (5 min)          │
 │                                 │                                  │
-│                                 │ Even if B errors: stays on B     │
-│                                 │ (cooldown prevents flapping)     │
+│                                 │ If B errors during cooldown:     │
+│                                 │   Preferred stays on B           │
+│                                 │   Read retries on A (per-request)│
 │                                 │                                  │
 │                                 │ After cooldown: can switch to A  │
 └─────────────────────────────────┴──────────────────────────────────┘
 ```
+
+During the cooldown window, if the current preferred cluster (B) fails, `OnFailure` returns the alternative (A) as a failover target for that individual request without changing preferred. Reads succeed via the retry, but each request during this window pays the cost of trying B first — resulting in elevated latency, error counts, and failover log entries until cooldown expires and preferred can switch.
 
 > **Oscillation risk.** If both clusters are intermittently failing, `StickyRead` can flip-flop between them — once the cooldown expires, a failure on cluster B causes a switch back to A, and vice versa. The cooldown is the only brake. Set it long enough that a single blip does not trigger rapid back-and-forth switching; 2–10 minutes is typical. Pairing `StickyRead` with `CircuitBreaker` instead of `ActiveFailover` provides an additional layer of protection: the circuit breaker absorbs transient errors and only allows failover after repeated failures.
 
@@ -300,7 +303,7 @@ No configuration options.
 
 ### PrimaryOnlyRead
 
-Always reads from cluster A. Fails over to cluster B on error. Without a recovery timeout, failover persists until `Reset()` is called manually; with one, the strategy automatically probes cluster A after the timeout elapses.
+Always reads from cluster A. Fails over to cluster B on error. Reads return to cluster A when one of three things happens: `Reset()` is called manually, the recovery timeout elapses and a probe succeeds, or cluster B itself fails while failed-over (triggering a probe back to A).
 
 ```go
 // Default: permanent failover until Reset() is called
@@ -324,13 +327,14 @@ strategy.Reset()
 **Behavior:**
 - All reads go to cluster A
 - On cluster A failure: sets `failedOver`, returns cluster B for failover
-- While `failedOver` (no recovery timeout): all reads route to cluster B permanently
+- On cluster B failure while `failedOver`: returns cluster A as a probe for that request without resetting state; if the probe succeeds, `OnSuccess` clears `failedOver` and reads return to A; if A is also down, the caller receives `DualClusterError` and subsequent reads stay on B
+- While `failedOver` (no recovery timeout): all reads route to cluster B permanently (unless B itself fails — see above)
 - While `failedOver` (with recovery timeout): after the timeout elapses, `Select` returns cluster A as a probe; if that read succeeds (`OnSuccess`), the strategy resets to cluster A; if it fails again (`OnFailure`), the timer restarts
 - `Reset()`: clears the `failedOver` flag immediately regardless of timeout
 
 **When to use:** Read-after-write consistency requirements where writes always go to cluster A and you need to read your own writes. Also suitable for primary-secondary setups where cluster B is a warm standby.
 
-**Trade-off:** Cluster B is idle for reads until A fails. Does not distribute load. Without `WithPrimaryOnlyRecoveryTimeout`, if cluster A recovers the client stays on cluster B indefinitely unless `Reset()` is called externally.
+**Trade-off:** Cluster B is idle for reads until A fails. Does not distribute load. Without `WithPrimaryOnlyRecoveryTimeout`, if cluster A recovers the client stays on cluster B indefinitely unless `Reset()` is called externally or cluster B also fails.
 
 ---
 

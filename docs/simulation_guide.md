@@ -35,42 +35,42 @@ A pprof server starts automatically on `127.0.0.1:6060` during all runs.
 
 ## Profiles
 
-| Profile | Scenarios | Strategy groups | Default duration |
-|---|---|---|---|
-| `quick` | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | — | 5 min |
-| `comprehensive` | All quick + 5 more | `circuit-breaker`, `latency-cb`, `primary-only`, `round-robin`, `sticky-cooldown`, `fallback-read` | config-driven |
-| `soak` | All comprehensive + `dual-cluster-degradation` | Same as comprehensive | 2 h |
-| `fallback` | 3 baseline scenarios | `fallback-read` | 5 min |
+| Profile         | Scenarios                                                   | Strategy groups                                                                                    | Default duration |
+|-----------------|-------------------------------------------------------------|----------------------------------------------------------------------------------------------------|------------------|
+| `quick`         | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | —                                                                                                  | 5 min            |
+| `comprehensive` | All quick + 5 more                                          | `circuit-breaker`, `latency-cb`, `primary-only`, `round-robin`, `sticky-cooldown`, `fallback-read` | config-driven    |
+| `soak`          | All comprehensive + `dual-cluster-degradation`              | Same as comprehensive                                                                              | 2 h              |
+| `fallback`      | 3 baseline scenarios                                        | `fallback-read`                                                                                    | 5 min            |
 
 `fallback` is a targeted profile for verifying `FallbackRead` divergence detection in isolation. It runs the 3 baseline scenarios to warm up both clusters, then exercises `FallbackReadDivergence` via a dedicated strategy group configured with `WithDefaultFallbackRead(true)` and `StickyRead` pinned to Cluster B.
 
 ### Scenarios
 
-| Name | Profile | What it verifies |
-|---|---|---|
-| `degraded-cluster` | quick+ | Adaptive write degrades gracefully under sustained latency on one cluster |
-| `adaptive-recovery` | quick+ | Write strategy recovers after a flapping cluster stabilizes |
-| `complete-failure` | quick+ | Replay queue absorbs writes during a total cluster outage |
-| `replay-saturation` | comprehensive+ | Replay buffer handles prolonged outage without data loss |
-| `drain-mode` | comprehensive+ | Replay drains cleanly after cluster returns |
-| `circuit-breaker-trip` | comprehensive+ | Circuit breaker opens after consecutive failures and resets after the timeout |
-| `fire-forget-limit` | comprehensive+ | Fire-and-forget semaphore is exhausted and writes are dropped with correct metrics |
-| `partial-degradation` | comprehensive+ | 30% partial drop rate on one cluster; replay compensates for intermittent failures |
+| Name                       | Profile                  | What it verifies                                                                                 |
+|----------------------------|--------------------------|--------------------------------------------------------------------------------------------------|
+| `degraded-cluster`         | quick+                   | Adaptive write degrades gracefully under sustained latency on one cluster                        |
+| `adaptive-recovery`        | quick+                   | Write strategy recovers after a flapping cluster stabilizes                                      |
+| `complete-failure`         | quick+                   | Replay queue absorbs writes during a total cluster outage                                        |
+| `replay-saturation`        | comprehensive+           | Replay buffer handles prolonged outage without data loss                                         |
+| `drain-mode`               | comprehensive+           | Replay drains cleanly after cluster returns                                                      |
+| `circuit-breaker-trip`     | comprehensive+           | Circuit breaker opens after consecutive failures and resets after the timeout                    |
+| `fire-forget-limit`        | comprehensive+           | Fire-and-forget semaphore is exhausted and writes are dropped with correct metrics               |
+| `partial-degradation`      | comprehensive+           | 30% partial drop rate on one cluster; replay compensates for intermittent failures               |
 | `fallback-read-divergence` | comprehensive+, fallback | FallbackRead recovers rows present only on Cluster A and records divergence metrics on Cluster B |
-| `dual-cluster-degradation` | soak | Simultaneous degradation of both clusters produces `DualClusterError` |
+| `dual-cluster-degradation` | soak                     | Simultaneous degradation of both clusters produces `DualClusterError`                            |
 
 ### Strategy groups
 
 A strategy group runs its scenarios against a fresh `CQLClient` with a specific combination of write strategy, read strategy, and failover policy. Groups share the container pair but get an isolated client and truncated table.
 
-| Group | Write strategy | Read strategy | Failover policy | Scenario |
-|---|---|---|---|---|
-| `circuit-breaker` | `AdaptiveDualWrite` | `PrimaryOnlyRead` (10 s recovery) | `CircuitBreaker` (3-strike, 15 s reset) | `CircuitBreakerTrip` |
-| `latency-cb` | `AdaptiveDualWrite` | `StickyRead` (pinned to A) | `LatencyCircuitBreaker` (500 ms max, 3-strike) | `LatencyCircuitBreakerTrip` |
-| `primary-only` | `AdaptiveDualWrite` | `PrimaryOnlyRead` (10 s recovery) | `ActiveFailover` | `PrimaryOnlyReadRecovery` |
-| `round-robin` | `AdaptiveDualWrite` | `RoundRobinRead` | `ActiveFailover` | `RoundRobinReadBalance` |
-| `sticky-cooldown` | `AdaptiveDualWrite` | `StickyRead` (pinned to A, 10 s cooldown) | `ActiveFailover` | `StickyCooldown` |
-| `fallback-read` | `AdaptiveDualWrite` | `StickyRead` (pinned to B) | `ActiveFailover` | `FallbackReadDivergence` |
+| Group             | Write strategy      | Read strategy                             | Failover policy                                | Scenario                                                 |
+|-------------------|---------------------|-------------------------------------------|------------------------------------------------|----------------------------------------------------------|
+| `circuit-breaker` | `AdaptiveDualWrite` | `PrimaryOnlyRead` (10 s recovery)         | `CircuitBreaker` (3-strike, 15 s reset)        | `CircuitBreakerTrip`                                     |
+| `latency-cb`      | `AdaptiveDualWrite` | `StickyRead` (pinned to A)                | `LatencyCircuitBreaker` (500 ms max, 3-strike) | `LatencyCircuitBreakerTrip`                              |
+| `primary-only`    | `AdaptiveDualWrite` | `PrimaryOnlyRead` (10 s recovery)         | `ActiveFailover`                               | `PrimaryOnlyReadRecovery`, `PrimaryOnlyReadFailoverBack` |
+| `round-robin`     | `AdaptiveDualWrite` | `RoundRobinRead`                          | `ActiveFailover`                               | `RoundRobinReadBalance`                                  |
+| `sticky-cooldown` | `AdaptiveDualWrite` | `StickyRead` (pinned to A, 10 s cooldown) | `ActiveFailover`                               | `StickyCooldown`, `StickyReadFailoverBack`               |
+| `fallback-read`   | `AdaptiveDualWrite` | `StickyRead` (pinned to B)                | `ActiveFailover`                               | `FallbackReadDivergence`                                 |
 
 ## Configuration reference
 
@@ -238,12 +238,12 @@ env.ChaosA.SetConfig(chaos.SessionConfig{})
 
 The simulation infrastructure components have focused unit tests that do not require Docker:
 
-| Test file | What it covers |
-|---|---|
-| `chaos/session_test.go` | Drop-rate sampling, latency injection, counter management, error propagation, no-op Close |
-| `config/config_test.go` | YAML parsing, default value injection, error handling |
-| `workload/tracker_test.go` | TrackWrite/Count/RandomKey, WorkloadStats.Reset, VerifyConsistency with mock sessions |
-| `scenarios/wait_test.go` | waitUntil: immediate-true, timeout, context cancellation |
+| Test file                  | What it covers                                                                            |
+|----------------------------|-------------------------------------------------------------------------------------------|
+| `chaos/session_test.go`    | Drop-rate sampling, latency injection, counter management, error propagation, no-op Close |
+| `config/config_test.go`    | YAML parsing, default value injection, error handling                                     |
+| `workload/tracker_test.go` | TrackWrite/Count/RandomKey, WorkloadStats.Reset, VerifyConsistency with mock sessions     |
+| `scenarios/wait_test.go`   | waitUntil: immediate-true, timeout, context cancellation                                  |
 
 ```bash
 go test ./test/simulation/...

@@ -45,13 +45,18 @@ func TestStickyReadFailoverCooldown(t *testing.T) {
 		WithStickyReadCooldown(1*time.Hour), // Long cooldown
 	)
 
-	// First failover should succeed
-	_, shouldFailover := strategy.OnFailure(types.ClusterA, nil)
+	// First failover should succeed and change preferred to B
+	alt, shouldFailover := strategy.OnFailure(types.ClusterA, nil)
 	require.True(t, shouldFailover)
+	require.Equal(t, types.ClusterB, alt)
+	require.Equal(t, types.ClusterB, strategy.Preferred())
 
-	// Second failover should be blocked by cooldown
-	_, shouldFailover = strategy.OnFailure(types.ClusterB, nil)
-	require.False(t, shouldFailover)
+	// Second failover within cooldown: should still return alternative for
+	// this request, but preferred must NOT change (cooldown gates state change)
+	alt, shouldFailover = strategy.OnFailure(types.ClusterB, nil)
+	require.True(t, shouldFailover, "should provide failover target even within cooldown")
+	require.Equal(t, types.ClusterA, alt, "alternative should be ClusterA")
+	require.Equal(t, types.ClusterB, strategy.Preferred(), "preferred must not change within cooldown")
 }
 
 func TestStickyReadNoFailoverOnSecondaryFailure(t *testing.T) {
@@ -170,6 +175,43 @@ func TestPrimaryOnlyRead_AutoRecovery_FailureResetsTimer(t *testing.T) {
 		"after second recovery timeout, should probe ClusterA again")
 }
 
+// TestPrimaryOnlyRead_RecoveryTimeout_BFailure_PreservesTimer verifies that
+// a transient B failure during the recovery-timeout window does not disrupt
+// the recovery timer. After OnFailure(B) probes A and the caller's retry
+// on A also fails, the recovery timeout still measures from the last
+// OnFailure(A) timestamp.
+func TestPrimaryOnlyRead_RecoveryTimeout_BFailure_PreservesTimer(t *testing.T) {
+	strategy := NewPrimaryOnlyRead(WithPrimaryOnlyRecoveryTimeout(50 * time.Millisecond))
+
+	// Failover to B
+	strategy.OnFailure(types.ClusterA, nil)
+	require.Equal(t, types.ClusterB, strategy.Select(t.Context()))
+
+	// B has a transient failure while failed-over — probe A
+	alt, ok := strategy.OnFailure(types.ClusterB, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterA, alt)
+
+	// A is also down — caller gets DualClusterError.
+	// Simulate: OnFailure(A) refreshes the failover timestamp.
+	strategy.OnFailure(types.ClusterA, nil)
+
+	// Immediately after, Select should return B (recovery timeout not yet elapsed)
+	require.Equal(t, types.ClusterB, strategy.Select(t.Context()))
+
+	// Wait for recovery timeout to elapse from the refreshed timestamp
+	time.Sleep(60 * time.Millisecond)
+
+	// Now Select should probe A again via the recovery-timeout path
+	require.Equal(t, types.ClusterA, strategy.Select(t.Context()),
+		"after recovery timeout, should probe ClusterA again")
+
+	// If the probe succeeds, recovery completes
+	strategy.OnSuccess(types.ClusterA)
+	require.False(t, strategy.failedOver.Load())
+	require.Equal(t, types.ClusterA, strategy.Select(t.Context()))
+}
+
 // TestPrimaryOnlyRead_NoRecoveryTimeout_StaysOnB verifies that without a
 // recovery timeout, failover is permanent until Reset is called.
 func TestPrimaryOnlyRead_NoRecoveryTimeout_StaysOnB(t *testing.T) {
@@ -183,4 +225,138 @@ func TestPrimaryOnlyRead_NoRecoveryTimeout_StaysOnB(t *testing.T) {
 
 	strategy.Reset()
 	require.Equal(t, types.ClusterA, strategy.Select(context.Background()))
+}
+
+// TestPrimaryOnlyRead_FailoverB_ProbesA verifies that when ClusterB fails
+// while in the failed-over state, the strategy returns ClusterA as a probe
+// but does NOT reset the failover state. State is only cleared when
+// OnSuccess(ClusterA) confirms A is healthy.
+func TestPrimaryOnlyRead_FailoverB_ProbesA(t *testing.T) {
+	strategy := NewPrimaryOnlyRead()
+
+	// Fail over to B
+	alt, ok := strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, alt)
+	require.True(t, strategy.failedOver.Load())
+
+	// B fails while in failed-over state — should probe A without resetting state
+	alt, ok = strategy.OnFailure(types.ClusterB, nil)
+	require.True(t, ok, "should provide failover target when B fails in failed-over state")
+	require.Equal(t, types.ClusterA, alt, "should probe ClusterA")
+	require.True(t, strategy.failedOver.Load(), "failedOver must stay true until A is proven healthy")
+	require.NotEqual(t, int64(0), strategy.failoverTime.Load(), "failoverTime must not be cleared")
+
+	// Select still returns B because failedOver is still set
+	require.Equal(t, types.ClusterB, strategy.Select(t.Context()))
+
+	// OnSuccess(A) completes the recovery — now state resets
+	strategy.OnSuccess(types.ClusterA)
+	require.False(t, strategy.failedOver.Load(), "failedOver should be cleared after OnSuccess(A)")
+	require.Equal(t, int64(0), strategy.failoverTime.Load(), "failoverTime should be reset after OnSuccess(A)")
+	require.Equal(t, types.ClusterA, strategy.Select(t.Context()))
+}
+
+// TestPrimaryOnlyRead_FailureBNotFailedOver_NoProbe verifies that when
+// ClusterB fails but we are NOT in the failed-over state (e.g., drain-state
+// override routed the read to B), no failover to A is suggested.
+func TestPrimaryOnlyRead_FailureBNotFailedOver_NoProbe(t *testing.T) {
+	strategy := NewPrimaryOnlyRead()
+
+	// Not failed over — B failure should not suggest A
+	alt, ok := strategy.OnFailure(types.ClusterB, nil)
+	require.False(t, ok, "should not failover when B fails outside failed-over state")
+	require.Empty(t, alt)
+}
+
+// TestPrimaryOnlyRead_FailoverBoth_DualFailure verifies the full scenario:
+// A fails → switch to B → B fails → probe A → A also fails = both down.
+// Because state is never eagerly reset, failedOver stays true throughout.
+func TestPrimaryOnlyRead_FailoverBoth_DualFailure(t *testing.T) {
+	strategy := NewPrimaryOnlyRead()
+
+	// A fails → failover to B
+	alt, ok := strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, alt)
+	require.True(t, strategy.failedOver.Load())
+	firstFailoverTime := strategy.failoverTime.Load()
+
+	// B fails → probe A (state stays failed-over)
+	alt, ok = strategy.OnFailure(types.ClusterB, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterA, alt)
+	require.True(t, strategy.failedOver.Load(), "failedOver must stay true — A not yet proven healthy")
+
+	// A fails again while still failed-over — refreshes the failover timestamp
+	alt, ok = strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, alt)
+	require.True(t, strategy.failedOver.Load())
+	require.GreaterOrEqual(t, strategy.failoverTime.Load(), firstFailoverTime,
+		"failoverTime should be refreshed on re-failover")
+}
+
+// TestStickyRead_CooldownStillFailsOver verifies that after A→B failover,
+// if B fails within the cooldown window, the alternative is still returned
+// for the current request — but preferred does not change.
+func TestStickyRead_CooldownStillFailsOver(t *testing.T) {
+	strategy := NewStickyRead(
+		WithPreferredCluster(types.ClusterA),
+		WithStickyReadCooldown(1*time.Hour),
+	)
+
+	// Failover from A to B
+	alt, ok := strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, alt)
+	require.Equal(t, types.ClusterB, strategy.Preferred())
+
+	// B fails within cooldown — should return A for this request
+	alt, ok = strategy.OnFailure(types.ClusterB, nil)
+	require.True(t, ok, "should provide failover target within cooldown")
+	require.Equal(t, types.ClusterA, alt, "alternative should be ClusterA")
+
+	// Preferred must not change — cooldown gates state changes
+	require.Equal(t, types.ClusterB, strategy.Preferred(),
+		"preferred should remain ClusterB (cooldown prevents state change)")
+}
+
+// TestStickyRead_CooldownExpired_SwitchesPreferred verifies that after
+// cooldown expires, a failure on the preferred cluster changes preferred.
+func TestStickyRead_CooldownExpired_SwitchesPreferred(t *testing.T) {
+	strategy := NewStickyRead(
+		WithPreferredCluster(types.ClusterA),
+		WithStickyReadCooldown(10*time.Millisecond),
+	)
+
+	// Failover A → B
+	_, ok := strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, strategy.Preferred())
+
+	// Wait for cooldown to expire
+	time.Sleep(15 * time.Millisecond)
+
+	// B fails after cooldown — should switch preferred back to A
+	alt, ok := strategy.OnFailure(types.ClusterB, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterA, alt)
+	require.Equal(t, types.ClusterA, strategy.Preferred(),
+		"preferred should switch to ClusterA after cooldown expires")
+}
+
+// TestStickyRead_NonPreferredFailure_NoCooldownBypass verifies that failure
+// on a non-preferred cluster does not trigger failover regardless of cooldown.
+func TestStickyRead_NonPreferredFailure_NoCooldownBypass(t *testing.T) {
+	strategy := NewStickyRead(
+		WithPreferredCluster(types.ClusterA),
+		WithStickyReadCooldown(0),
+	)
+
+	// B fails but A is preferred — no failover
+	alt, ok := strategy.OnFailure(types.ClusterB, nil)
+	require.False(t, ok)
+	require.Empty(t, alt)
+	require.Equal(t, types.ClusterA, strategy.Preferred())
 }

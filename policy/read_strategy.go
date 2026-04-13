@@ -108,8 +108,11 @@ func (s *StickyRead) OnSuccess(_ types.ClusterID) {
 
 // OnFailure handles read failures and determines failover.
 //
-// If the failed cluster is the preferred one and cooldown has passed,
-// returns the alternative cluster for failover.
+// If the failed cluster is the preferred one, returns the alternative cluster
+// for failover. When cooldown has passed, the preferred cluster is also
+// switched. When cooldown is still active, the alternative is returned for the
+// current request but preferred is not changed — this prevents reads from
+// failing entirely while still avoiding rapid preferred-cluster oscillation.
 //
 // Parameters:
 //   - cluster: The cluster that failed
@@ -129,14 +132,6 @@ func (s *StickyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterI
 		return "", false
 	}
 
-	// Check cooldown
-	s.mu.RLock()
-	if time.Since(s.lastFailoverTime) < s.failoverCooldown {
-		s.mu.RUnlock()
-		return "", false
-	}
-	s.mu.RUnlock()
-
 	// Determine alternative
 	var alternative types.ClusterID
 	if preferred == types.ClusterA {
@@ -145,12 +140,24 @@ func (s *StickyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterI
 		alternative = types.ClusterA
 	}
 
+	// Check cooldown — if still within cooldown, return the alternative for
+	// this request but do NOT change preferred. This prevents reads from
+	// failing entirely when the current preferred is down and cooldown blocks
+	// a state change (e.g., A failed → switched to B → B fails within cooldown).
+	s.mu.RLock()
+	if time.Since(s.lastFailoverTime) < s.failoverCooldown {
+		s.mu.RUnlock()
+		return alternative, true
+	}
+	s.mu.RUnlock()
+
 	// Update preferred cluster and record failover time
 	s.mu.Lock()
 	// Double-check cooldown under write lock
 	if time.Since(s.lastFailoverTime) < s.failoverCooldown {
 		s.mu.Unlock()
-		return "", false
+		// Still return alternative for this request even under the write-lock re-check
+		return alternative, true
 	}
 	s.preferred.Store(alternative)
 	s.lastFailoverTime = time.Now()
@@ -174,13 +181,17 @@ func (s *StickyRead) Preferred() types.ClusterID {
 // PrimaryOnlyRead implements a read strategy that always reads from Cluster A.
 //
 // Cluster B is only used for writes and as a failover target. Once Cluster A
-// fails, reads are permanently redirected to Cluster B until either:
+// fails, reads are redirected to Cluster B until one of:
 //   - [PrimaryOnlyRead.Reset] is called manually, or
 //   - The optional recovery timeout (set via [WithPrimaryOnlyRecoveryTimeout])
-//     elapses, after which Select will probe ClusterA again on the next call.
+//     elapses, after which Select will probe ClusterA again on the next call, or
+//   - Cluster B itself fails while in the failed-over state, at which point
+//     OnFailure returns ClusterA as a probe; if that probe succeeds,
+//     [PrimaryOnlyRead.OnSuccess] resets the failover state.
 //
-// Without a recovery timeout, failover is permanent until Reset is called —
-// if ClusterA recovers, the client stays on ClusterB indefinitely.
+// Without a recovery timeout, failover is permanent until Reset is called or
+// Cluster B also fails — if only ClusterA recovers while B stays healthy, the
+// client stays on ClusterB indefinitely.
 type PrimaryOnlyRead struct {
 	failedOver      atomic.Bool
 	failoverTime    atomic.Int64 // Unix nano of last failover; 0 = not failed over
@@ -270,13 +281,17 @@ func (p *PrimaryOnlyRead) OnSuccess(cluster types.ClusterID) {
 // If ClusterA fails and has not yet failed over, routes to ClusterB.
 // If ClusterA fails during an auto-recovery probe, resets the recovery timer
 // so another probe will only occur after another full recovery timeout.
+// If ClusterB fails while in the failed-over state, returns ClusterA as a
+// probe without resetting state. If the caller's retry on ClusterA succeeds,
+// OnSuccess clears the failover flag. If ClusterA is also down, the state
+// stays failed-over to B, avoiding request-level A/B flipping.
 //
 // Parameters:
 //   - cluster: The cluster that failed
 //   - err: The error
 //
 // Returns:
-//   - types.ClusterID: ClusterB for failover
+//   - types.ClusterID: Alternative cluster to try, or empty if no failover
 //   - bool: true if failover should be attempted
 func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterID, bool) {
 	if cluster == types.ClusterA {
@@ -284,6 +299,24 @@ func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.Clu
 		p.failoverTime.Store(time.Now().UnixNano())
 		return types.ClusterB, true
 	}
+
+	// ClusterB failed while in the failed-over state — probe ClusterA.
+	// This handles the scenario where A failed, we switched to B, A recovered,
+	// and now B fails. Without this, reads would fail entirely even though A
+	// may be available again.
+	//
+	// State is NOT reset here. If the probe succeeds, the caller invokes
+	// OnSuccess(ClusterA) which clears failedOver/failoverTime. If A is also
+	// down, both attempts fail (DualClusterError) and the next Select() still
+	// returns ClusterB — avoiding request-level A/B flipping.
+	//
+	// Guard: only probe A when genuinely failed-over. The caller may route to B
+	// due to drain-state override even when not failed over; in that case we
+	// must not suggest A (the drain-excluded cluster) as an alternative.
+	if cluster == types.ClusterB && p.failedOver.Load() {
+		return types.ClusterA, true
+	}
+
 	return "", false
 }
 
