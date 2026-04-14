@@ -422,11 +422,9 @@ func (s *Simulation) classifyWriteError(err error, id gocql.UUID) {
 	default:
 		var dce *htypes.DualClusterError
 		if errors.As(err, &dce) {
-			// At least one cluster accepted the write; track so VerifyConsistency
-			// can assert the row is on both clusters after replay reconciliation.
-			if id != (gocql.UUID{}) {
-				s.env.Tracker.TrackWrite(id, time.Now().UnixNano())
-			}
+			// Both clusters failed — neither accepted the write and no replay
+			// is enqueued (CQLClient returns DualClusterError before the replay
+			// path). Do NOT track: the key will never exist in either cluster.
 			s.env.Stats.DualClusterErr.Add(1)
 		} else {
 			s.env.Stats.WriteFailed.Add(1)
