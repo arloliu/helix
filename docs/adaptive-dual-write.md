@@ -427,5 +427,6 @@ policy.WithAdaptiveFireForgetTimeout(10 * time.Second)
 
 ## See Also
 
+- [Auto-Recovery Guide](auto-recovery.md) - End-to-end recovery lifecycle and operator workflow
 - [Strategy & Policy Overview](strategy-policy.md) - How read/write strategies interact
 - [Replay System](replay-system.md) - How failed writes are reconciled

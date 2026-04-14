@@ -23,23 +23,35 @@ Each interface has a single responsibility. Compose them to express your exact r
 │                        CQLClient.executeRead()                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  1. ReadStrategy.Select(ctx) → selectedCluster                      │
+│  0. resolveReadTarget(ctx) — resolved once, snapshot passed through │
+│     ├─ AllowedClusters func not set (or returns nil/[]) →           │
+│     │   normal path: ReadStrategy.Select(ctx) → selectedCluster     │
+│     └─ AllowedClusters func set and returns cluster list →          │
+│         override active: list[0] → selectedCluster (strategy FROZEN)│
+│         drain state intersected; fail-closed on conflict or panic   │
 │                                                                     │
-│  2. Execute read on selectedCluster                                 │
+│  1. Execute read on selectedCluster                                 │
 │                                                                     │
-│  3. On SUCCESS:                                                     │
-│     ├─ ReadStrategy.OnSuccess(cluster)                              │
+│  2. On SUCCESS:                                                     │
+│     ├─ [if !overrideActive] ReadStrategy.OnSuccess(cluster)         │
 │     ├─ FailoverPolicy.RecordSuccess(cluster)                        │
 │     └─ [If LatencyRecorder] FailoverPolicy.RecordLatency(cluster, d)│
 │                                                                     │
-│  4. On FAILURE:                                                     │
+│  3. On FAILURE (real error):                                        │
 │     ├─ FailoverPolicy.RecordFailure(cluster)                        │
 │     │                                                               │
 │     ├─ FailoverPolicy.ShouldFailover(cluster, err)  ← GATEKEEPER   │
 │     │   └─ If FALSE → return error immediately                      │
 │     │                                                               │
-│     └─ ReadStrategy.OnFailure(cluster, err) → alternative, ok      │
+│     ├─ [if overrideActive] → use snap.fallback (strategy NOT called)│
+│     └─ [if normal]  → ReadStrategy.OnFailure(cluster, err)         │
+│                          → alternative, ok                          │
 │         └─ If ok → retry on alternative cluster                     │
+│                                                                     │
+│  4. On NOT-FOUND:                                                   │
+│     └─ [if FallbackRead enabled]                                    │
+│         ├─ [if overrideActive && alt not in allowed set] → skip alt │
+│         └─ Otherwise → try alternative cluster once                  │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -51,6 +63,7 @@ Each interface has a single responsibility. Compose them to express your exact r
 - **Latency is recorded automatically.** If the configured `FailoverPolicy` implements `LatencyRecorder` (e.g., `LatencyCircuitBreaker`), the client calls `RecordLatency()` after each successful read with no extra wiring.
 - **Not-found is not a failure.** A cluster that responds with "row absent" is healthy. Not-found results never trigger `RecordFailure`, `OnFailure`, or `IncReadError`. This classification is independent of FallbackRead.
 - **FallbackRead is orthogonal to failover.** FallbackRead activates when a healthy cluster returns not-found; failover activates when a cluster returns a real error. They handle different failure modes and do not interfere with each other. See [FallbackRead Guide](fallback-read.md) for details.
+- **`WithAllowedClusters` overrides the read path at the resolution layer.** When active, it bypasses `ReadStrategy.Select()` and freezes strategy state. See [External Cluster Control](#external-cluster-control-withallowedclusters) for the full operational model.
 
 ---
 
@@ -496,6 +509,152 @@ The client calls `RecordLatency()` automatically after each successful read if t
 
 ---
 
+## External Cluster Control (`WithAllowedClusters`)
+
+### Problem: Stale Reads After Cluster Recovery
+
+When a cluster fails for an extended period, the replay queue accumulates writes destined for it. When the cluster comes back online, Helix's read strategies (`PrimaryOnlyRead` recovery timeout, `StickyRead` cooldown expiry) may automatically switch reads back — but the replay worker is still backfilling. The recovering cluster has incomplete data.
+
+```
++-- A fails --- failover to B --- A comes back ---  strategy auto-recovers to A --+
+|                                                                                  |
+|  Writes land on B only    Replay queue grows    Reads hit A BUT replay worker    |
+|                                                 is still backfilling             |
+|                                                 → stale or missing data          |
+```
+
+The read strategies have no visibility into the replay backlog. They see "A is responding" and switch back.
+
+### Solution: `WithAllowedClusters`
+
+`WithAllowedClusters` provides an operator-driven function that controls which clusters are eligible for reads. While the function returns a non-empty list, the read strategy is bypassed entirely and the override list directly controls routing.
+
+```go
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReadStrategy(policy.NewStickyRead(...)),
+    helix.WithAllowedClusters(func() []helix.ClusterID {
+        if featureFlag.IsClusterExcluded("A") {
+            return []helix.ClusterID{helix.ClusterB}
+        }
+        return nil // no override, normal strategy behavior
+    }),
+)
+```
+
+The function is called on every read operation. It must be non-blocking, goroutine-safe, and cheap to call.
+
+### List Ordering Is the Routing Decision
+
+When the override is active:
+
+| Return value | Behavior |
+|---|---|
+| `[]ClusterID{ClusterB}` | Only B; A excluded, no failover |
+| `[]ClusterID{ClusterB, ClusterA}` | B primary, A as failover |
+| `nil` or `[]ClusterID{}` | No override; normal strategy + drain behavior |
+
+The first element is the primary read target; subsequent elements are failover candidates in priority order. Duplicate entries are deduplicated while preserving order: `[B, B, A]` resolves to primary=B, fallback=A. `[B, B]` resolves to primary=B, no fallback.
+
+### Strategy State Is Frozen During Override
+
+When the override is active, the `ReadStrategy` is completely bypassed:
+
+- `Select()` is not called — the override list controls routing
+- `OnSuccess()` is not called — strategy internal state does not advance
+- `OnFailure()` is not called — strategy does not flip preferred cluster
+
+This is intentional. If `OnFailure(B)` were called during override, `StickyRead` might flip its preferred cluster to A — the cluster the operator excluded. When the override is later removed, reads would route to A (stale data).
+
+**When override is removed**, strategy state resumes from where it was frozen. For example:
+- `StickyRead`: preferred stays at its last value (likely B, from the original failover). Reads go to B, normal cooldown mechanics resume.
+- `PrimaryOnlyRead`: `failoverTime` stays at its last value. If the recovery timeout elapsed while frozen, the next `Select()` probes A — which is correct if the operator removed the override because A is now consistent.
+- If you need to force strategy state after removing the override, call `PrimaryOnlyRead.Reset()` or use `WithPreferredCluster`.
+
+**`FailoverPolicy` still receives health signals.** Even during override, `RecordSuccess`, `RecordFailure`, and `RecordLatency` are called so that circuit breaker state reflects real cluster health. The circuit breaker still gates failover: if it says no, the read fails even if the override list has a fallback entry.
+
+### Drain and Override Intersect
+
+Override and drain serve different purposes — neither supersedes the other. The valid candidate set for reads is the **intersection** of override-allowed and non-draining clusters.
+
+| Override | Drain state | Effective candidates | Behavior |
+|---|---|---|---|
+| `[B]` | neither draining | `[B]` | Reads go to B only |
+| `[B, A]` | A draining | `[B]` | A filtered by drain; reads go to B only |
+| `[A]` | A draining | `[]` — **conflict** | `ErrNoValidClusters` |
+| `[A, B]` | A draining | `[B]` | A filtered; B is the sole candidate |
+| `nil` | A draining | `[B]` | Normal drain behavior (unchanged) |
+
+When the intersection is empty the read **fails** with `ErrNoValidClusters`. This is fail-closed: conflicting constraints are an operator error that must be resolved.
+
+### FallbackRead Respects the Override Fence
+
+When the override is active and a cluster is excluded, FallbackRead will not probe it. If the alternative cluster is not in the allowed set, FallbackRead returns `ErrNotFound` immediately without probing.
+
+This is critical: the excluded cluster may have stale or missing rows. A FallbackRead that probed it could return old data or falsely confirm existence of a row that was deleted while the cluster was down.
+
+### Fail-Closed on Broken Provider Output
+
+| Provider output | Behavior |
+|---|---|
+| `nil` or empty slice | No override, normal behavior |
+| Valid cluster list | Override active |
+| Only unknown `ClusterID`s | `ErrInvalidClusterOverride` |
+| `ClusterB` in single-cluster mode | `ErrInvalidClusterOverride` |
+| Function panics | `ErrClusterOverridePanic` (panic recovered, stack logged) |
+
+### CAS Operations Are Not Overridden
+
+CAS operations (`ScanCAS`, `MapScanCAS`, batch `ExecCAS`, `MapExecCAS`) are single-cluster, non-replicated conditional writes. The override is a read-safety mechanism — it prevents reading stale data from a recovering cluster. CAS operations are write-like: they apply conditional mutations and are never replicated to the other cluster.
+
+If the override rerouted a CAS to a different cluster, it would silently move conditional writes, potentially increasing divergence. CAS paths continue using `ReadStrategy.Select()` directly. To control which cluster CAS operations target, use `ForceDegrade`/`ForceRecover` on the write side.
+
+### Iterator Paths Defer Errors to `Close()`
+
+`IterContext()` returns `Iter`, not `(Iter, error)`. If `resolveReadTarget` fails (e.g., all unknown cluster IDs, panic), an `errorIter` is returned that defers the error:
+
+- `Scan()` returns `false`
+- `Close()` returns the error
+- `SliceMap()` returns the error
+- All other methods return zero values
+
+**Always call `Close()` and check its error.** Callers that iterate with `for iter.Scan(&x) { ... }` and never call `Close()` will observe an empty result set with no error indication — this is a constraint of the `Iter` API shape.
+
+### Operator Workflow
+
+```
+1. Cluster A fails → automatic failover (read strategies handle this normally)
+
+2. Operator detects prolonged outage:
+   strategy.ForceDegrade(ClusterA)         → writes: fire-and-forget A, replay safety-net
+   featureFlag.Set("cluster_A_excluded")   → AllowedClusters returns [B]
+                                           → reads: only from B
+
+3. A comes back online
+   → Replay worker backfills A from queue
+   → Operator monitors replay queue depth
+   → Strategies would auto-recover, but override blocks them
+   → FallbackRead fence prevents probing A
+
+4. Operator confirms A's data is consistent:
+   featureFlag.Clear()                     → AllowedClusters returns nil
+                                           → reads: strategy resumes from frozen state
+   strategy.ForceRecover(ClusterA)         → writes: resume dual-write to A
+   strategy.Reset() (optional)             → force strategy to a known state
+```
+
+### Compose with `ForceDegrade`/`ForceRecover` for Full Control
+
+Reads and writes are controlled separately:
+
+| Concern | Read-side | Write-side |
+|---|---|---|
+| Exclude cluster | `WithAllowedClusters` returning `[B]` | `ForceDegrade(A)` |
+| Re-include cluster | Return `nil` from func | `ForceRecover(A)` |
+
+Composing separate primitives is cleaner than one mechanism that attempts to control both paths.
+
+---
+
 ## Decision Guide
 
 ### Choosing a Write Strategy
@@ -709,6 +868,38 @@ bulkClient, _ := helix.NewCQLClient(sessionA, sessionB,
 
 See [FallbackRead Guide](fallback-read.md) for detailed behavior, activation levels, and best practices.
 
+**Controlled recovery after prolonged cluster failure:**
+```go
+// Use a feature flag or atomic to control the override at runtime.
+// ForceDegrade/ForceRecover control the write side separately.
+var excludeA atomic.Bool
+
+writeStrategy := policy.NewAdaptiveDualWrite()
+
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReadStrategy(policy.NewStickyRead()),
+    helix.WithWriteStrategy(writeStrategy),
+    helix.WithFailoverPolicy(policy.NewCircuitBreaker(policy.WithThreshold(3))),
+    helix.WithReplayer(replayer),
+    helix.WithAllowedClusters(func() []helix.ClusterID {
+        if excludeA.Load() {
+            return []helix.ClusterID{helix.ClusterB}
+        }
+        return nil // normal strategy routing
+    }),
+)
+
+// When cluster A has an outage:
+writeStrategy.ForceDegrade(helix.ClusterA) // writes: fire-and-forget A, replay safety-net
+excludeA.Store(true)                        // reads: only from B
+
+// When A is back and replay queue is drained:
+excludeA.Store(false)                       // reads: strategy resumes (frozen state)
+writeStrategy.ForceRecover(helix.ClusterA) // writes: resume dual-write to A
+```
+
+See [External Cluster Control](#external-cluster-control-withallowedclusters) for full semantics, fail-closed behavior, and the operator workflow.
+
 ---
 
 ## Operation Timeouts
@@ -749,7 +940,9 @@ Driver-level timeouts apply uniformly to all query types (reads, writes, batches
    - If you require first-error failover semantics, keep `ActiveFailover` but mandate `StickyRead` with a cooldown of at least 2 minutes. The cooldown prevents the read strategy from switching clusters again until the blip has passed.
    - Never pair `ActiveFailover` with `RoundRobinRead`. `RoundRobinRead` has no cooldown at all; combined with `ActiveFailover`, every other request will hit a different cluster, generating constant failover noise during any dual-cluster degradation.
 
-8. **Understand the two layers of failover damping.** Oscillation protection requires both layers working together:
+8. **Use `WithAllowedClusters` to gate reads during replay backfill.** When a cluster recovers after prolonged downtime, read strategies may auto-recover before the replay worker has finished backfilling. Use `WithAllowedClusters` to hold reads on the healthy cluster until you confirm data consistency externally. Compose it with `ForceDegrade`/`ForceRecover` on the write side. Return `nil` (not an empty slice, though both work) to signal "no constraint" so the pattern is explicit in code review. See the [Auto-Recovery Guide](auto-recovery.md) for the full coordinated workflow.
+
+9. **Understand the two layers of failover damping.** Oscillation protection requires both layers working together:
    - `FailoverPolicy` (`CircuitBreaker`) decides **whether** to failover. Without a threshold it cannot absorb blips.
    - `ReadStrategy` (`StickyRead` + cooldown) decides **where** to failover and **how long to stay there**. Without a cooldown the strategy can switch back immediately.
    

@@ -689,6 +689,7 @@ The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `h
 
 ## See Also
 
+- [Auto-Recovery Guide](auto-recovery.md) - End-to-end recovery lifecycle and operator workflow
 - [High Level Design](high_level_design.md) - Overall Helix architecture
 - [Design Plan](design_plan.md) - Implementation phases
 - [NATS JetStream Documentation](https://docs.nats.io/nats-concepts/jetstream)

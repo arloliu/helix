@@ -285,6 +285,7 @@ See the [examples](examples/) directory:
 
 ## Documentation
 
+- [Auto-Recovery Guide](docs/auto-recovery.md) - Recovery lifecycle, operator workflow, and best practices
 - [FallbackRead Guide](docs/fallback-read.md) - Best-effort dual-cluster reads for critical data
 - [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) - Latency-aware write strategy tuning
 - [Replay System](docs/replay-system.md) - Replay patterns and best practices
