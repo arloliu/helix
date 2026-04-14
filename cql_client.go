@@ -1074,43 +1074,7 @@ func (c *CQLClient) executeOverrideFailover(
 		return primaryErr
 	}
 
-	fallbackCluster := rt.snap.fallback
-
-	c.config.Metrics.IncFailoverTotal(selected, fallbackCluster)
-	c.config.Logger.Warn("read failed, failing over to override fallback cluster",
-		"fromCluster", c.clusterName(selected),
-		"toCluster", c.clusterName(fallbackCluster),
-		"error", primaryErr.Error(),
-	)
-
-	session := c.getSession(fallbackCluster)
-	start := time.Now()
-	err := readFunc(ctx, session)
-	elapsed := time.Since(start).Seconds()
-
-	c.config.Metrics.IncReadTotal(fallbackCluster)
-	c.config.Metrics.ObserveReadDuration(fallbackCluster, elapsed)
-
-	if err == nil {
-		// NO ReadStrategy.OnSuccess call — strategy is frozen during override
-		c.recordReadSuccess(fallbackCluster, elapsed, true)
-		return nil
-	}
-
-	if types.IsNotFound(err) {
-		return err
-	}
-
-	c.config.Metrics.IncReadError(fallbackCluster)
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(fallbackCluster)
-	}
-
-	if selected == ClusterA {
-		return &types.DualClusterError{ErrorA: primaryErr, ErrorB: err}
-	}
-
-	return &types.DualClusterError{ErrorA: err, ErrorB: primaryErr}
+	return c.tryFallbackCluster(ctx, selected, rt.snap.fallback, primaryErr, true, readFunc)
 }
 
 // executeNormalFailover handles failover using the ReadStrategy (no override active).
@@ -1151,23 +1115,37 @@ func (c *CQLClient) executeNormalFailover(
 		return primaryErr
 	}
 
-	c.config.Metrics.IncFailoverTotal(selectedCluster, alternativeCluster)
+	return c.tryFallbackCluster(ctx, selectedCluster, alternativeCluster, primaryErr, false, readFunc)
+}
+
+// tryFallbackCluster executes a read on the fallback cluster after the primary
+// cluster failed. It records metrics, handles not-found, and returns a
+// DualClusterError when both clusters fail. Used by both override and normal
+// failover paths.
+func (c *CQLClient) tryFallbackCluster(
+	ctx context.Context,
+	selected, fallback ClusterID,
+	primaryErr error,
+	overrideActive bool,
+	readFunc func(context.Context, cql.Session) error,
+) error {
+	c.config.Metrics.IncFailoverTotal(selected, fallback)
 	c.config.Logger.Warn("read failed, failing over to alternative cluster",
-		"fromCluster", c.clusterName(selectedCluster),
-		"toCluster", c.clusterName(alternativeCluster),
+		"fromCluster", c.clusterName(selected),
+		"toCluster", c.clusterName(fallback),
 		"error", primaryErr.Error(),
 	)
 
-	session := c.getSession(alternativeCluster)
+	session := c.getSession(fallback)
 	start := time.Now()
 	err := readFunc(ctx, session)
 	elapsed := time.Since(start).Seconds()
 
-	c.config.Metrics.IncReadTotal(alternativeCluster)
-	c.config.Metrics.ObserveReadDuration(alternativeCluster, elapsed)
+	c.config.Metrics.IncReadTotal(fallback)
+	c.config.Metrics.ObserveReadDuration(fallback, elapsed)
 
 	if err == nil {
-		c.recordReadSuccess(alternativeCluster, elapsed, false)
+		c.recordReadSuccess(fallback, elapsed, overrideActive)
 		return nil
 	}
 
@@ -1175,12 +1153,12 @@ func (c *CQLClient) executeNormalFailover(
 		return err
 	}
 
-	c.config.Metrics.IncReadError(alternativeCluster)
+	c.config.Metrics.IncReadError(fallback)
 	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
+		c.config.FailoverPolicy.RecordFailure(fallback)
 	}
 
-	if selectedCluster == ClusterA {
+	if selected == ClusterA {
 		return &types.DualClusterError{ErrorA: primaryErr, ErrorB: err}
 	}
 
