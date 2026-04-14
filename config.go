@@ -41,6 +41,26 @@ type ClientConfig struct {
 	ClusterNames      types.ClusterNames
 	OnReplayDropped   ReplayDroppedHandler
 
+	// AllowedClusters, when set, overrides automatic read routing with an
+	// operator-controlled cluster list. This is the external control for
+	// preventing reads from a recovering cluster whose replay backfill has
+	// not yet completed.
+	//
+	// When the function returns a non-empty list, the read strategy's Select()
+	// is NOT called — the list directly controls routing. The strategy's
+	// internal state (OnSuccess/OnFailure) is frozen until the override is
+	// removed.
+	//
+	// Iterator paths defer override errors to Close(). Always call Close()
+	// and check its error.
+	//
+	// CAS operations (ScanCAS, MapScanCAS, batch ExecCAS) are not affected
+	// by this override — they are write-like operations controlled by
+	// ForceDegrade/ForceRecover.
+	//
+	// See [AllowedClustersFunc] for return-value semantics.
+	AllowedClusters AllowedClustersFunc
+
 	// DefaultFallbackRead enables FallbackRead for every Scan and MapScan query
 	// on this client when true. Equivalent to calling [Query.FallbackRead] on
 	// every query.
@@ -348,6 +368,53 @@ func WithLogger(logger types.Logger) Option {
 func WithClusterNames(nameA, nameB string) Option {
 	return func(c *ClientConfig) {
 		c.ClusterNames = types.ClusterNames{A: nameA, B: nameB}
+	}
+}
+
+// WithAllowedClusters sets an operator-driven function that controls which
+// clusters are eligible for reads.
+//
+// When the function returns a non-empty list, the read strategy is bypassed
+// and the list directly controls read routing. The first element is the
+// primary read target; subsequent elements are failover candidates in order.
+// The read strategy's internal state (OnSuccess/OnFailure) is frozen during
+// the override so it resumes cleanly when the override is removed.
+//
+// When the function returns nil or an empty slice, normal strategy + drain
+// behavior applies.
+//
+// Fail-closed: if the list contains only unknown cluster IDs, or all valid
+// clusters are draining, the read returns an error (ErrInvalidClusterOverride
+// or ErrNoValidClusters). A panicking function returns ErrClusterOverridePanic.
+// This prevents silent misrouting from stale or misconfigured flags.
+//
+// CAS operations (ScanCAS, MapScanCAS, batch ExecCAS/MapExecCAS) are NOT
+// affected by this override — they are single-cluster, write-like operations
+// controlled by ForceDegrade/ForceRecover on the write side.
+//
+// Iterator paths (IterContext) defer override errors to Close(). Always call
+// Close() and check its error.
+//
+// Parameters:
+//   - fn: Function returning the ordered list of allowed clusters for reads
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	client, _ := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithReadStrategy(policy.NewStickyRead(...)),
+//	    helix.WithAllowedClusters(func() []helix.ClusterID {
+//	        if featureFlag.IsClusterExcluded("A") {
+//	            return []helix.ClusterID{helix.ClusterB}
+//	        }
+//	        return nil // all allowed, normal strategy behavior
+//	    }),
+//	)
+func WithAllowedClusters(fn AllowedClustersFunc) Option {
+	return func(c *ClientConfig) {
+		c.AllowedClusters = fn
 	}
 }
 

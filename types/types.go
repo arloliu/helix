@@ -234,6 +234,20 @@ var (
 	// when a degraded cluster is slow. The replay system handles reconciliation.
 	ErrWriteDropped = errors.New("helix: write dropped due to fire-and-forget concurrency limit")
 
+	// ErrNoValidClusters indicates that the allowed-clusters override and
+	// drain state conflict, leaving no cluster available for reads.
+	// The operator must resolve the conflict (adjust the override or clear drain).
+	ErrNoValidClusters = errors.New("helix: no valid clusters for read — override and drain state conflict")
+
+	// ErrInvalidClusterOverride indicates that the AllowedClustersFunc returned
+	// only unknown ClusterIDs, or targeted an unconfigured cluster in
+	// single-cluster mode. This is a fail-closed condition.
+	ErrInvalidClusterOverride = errors.New("helix: invalid cluster override — no recognized clusters in returned list")
+
+	// ErrClusterOverridePanic indicates that the AllowedClustersFunc panicked.
+	// This is a fail-closed condition; the panic is recovered and the read fails.
+	ErrClusterOverridePanic = errors.New("helix: cluster override function panicked")
+
 	// ErrNotFound indicates that a query returned zero rows.
 	//
 	// This is the Helix sentinel for "not found" results, mapped from

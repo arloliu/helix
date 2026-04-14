@@ -5,6 +5,30 @@ import (
 	"time"
 )
 
+// AllowedClustersFunc returns the ordered list of clusters currently allowed
+// for reads. The first element is the primary read target; subsequent elements
+// are failover targets in priority order.
+//
+// Return values:
+//
+//   - []ClusterID{ClusterB}           — only B; A excluded, no failover
+//   - []ClusterID{ClusterB, ClusterA} — B primary, A as failover
+//   - nil or empty slice              — no override, normal strategy + drain behavior
+//
+// Duplicate entries are ignored (only the first occurrence counts).
+//
+// Fail-closed behavior: if the returned list contains only unknown cluster IDs
+// (not ClusterA or ClusterB), or if all valid clusters are currently draining,
+// the read fails with an error — it does NOT fall through to normal strategy
+// routing. A panicking function also fails the read. This ensures operator
+// intent is never silently ignored.
+//
+// The function must be non-blocking, safe for concurrent use from multiple
+// goroutines, and cheap to call — it runs on every read operation. A slow
+// function adds its latency to every read; if the function may block, cache
+// the result in an atomic and read from the atomic.
+type AllowedClustersFunc func() []ClusterID
+
 // Replayer handles asynchronous reconciliation of failed writes.
 //
 // When a dual-write partially fails (one cluster succeeds, one fails),

@@ -1551,3 +1551,811 @@ func TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure(t *testing.T)
 		return watcher.closed
 	}, time.Second, 10*time.Millisecond, "topology watcher context should be canceled on init failure")
 }
+
+// Compile-time assertion: errorIter implements Iter.
+var _ Iter = (*errorIter)(nil)
+
+// --- AllowedClusters override tests ---
+
+func TestAllowedClusters_SingleClusterRouting(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	// Reads should route to B, not strategy's A
+	assert.Equal(t, 1, len(sessionB.queries), "query should route to cluster B")
+	assert.Equal(t, 0, len(sessionA.queries), "query should NOT route to cluster A")
+	// Strategy should not have been called for OnSuccess (frozen)
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB], "OnSuccess should NOT be called during override")
+}
+
+func TestAllowedClusters_SingleClusterReadFails_NoFailover(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	sessionB.scanErr = errors.New("cluster B unavailable")
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cluster B unavailable")
+	// No failover — only B in the list
+	assert.Equal(t, 0, len(sessionA.queries))
+}
+
+func TestAllowedClusters_TwoClusters_PrimaryFails_FailoverToSecond(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	sessionB.scanErr = errors.New("cluster B down")
+	// A should succeed on failover
+	sessionA.scanErr = nil
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithFailoverPolicy(newMockFailoverPolicy(true)),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB, ClusterA}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(sessionB.queries), "should try B first")
+	assert.Equal(t, 1, len(sessionA.queries), "should failover to A")
+}
+
+func TestAllowedClusters_NilReturn_NormalBehavior(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	// Strategy selects A normally
+	assert.Equal(t, 1, len(sessionA.queries), "should use strategy's selection (A)")
+	assert.Equal(t, 1, strategy.onSuccessCalled[ClusterA], "OnSuccess should be called normally")
+}
+
+func TestAllowedClusters_EmptySlice_NormalBehavior(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionA.queries), "empty slice = no override, normal behavior")
+	assert.Equal(t, 1, strategy.onSuccessCalled[ClusterA])
+}
+
+func TestAllowedClusters_ToggleOverride(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	var overrideActive atomic.Bool
+	overrideActive.Store(true)
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			if overrideActive.Load() {
+				return []ClusterID{ClusterB}
+			}
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// First read: override active, routes to B
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionB.queries))
+	assert.Equal(t, 0, len(sessionA.queries))
+
+	// Remove override
+	overrideActive.Store(false)
+
+	// Second read: no override, strategy selects A
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionA.queries))
+}
+
+func TestAllowedClusters_FailoverPolicyDenies(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	sessionB.scanErr = errors.New("cluster B down")
+
+	policy := newMockFailoverPolicy(false) // deny failover
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithFailoverPolicy(policy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB, ClusterA}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Error(t, err)
+	// CB blocked failover even though A is in the override list
+	assert.Equal(t, 0, len(sessionA.queries), "failover policy should block failover to A")
+}
+
+func TestAllowedClusters_DrainOnAllowedCluster(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB, ClusterA}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Set A to draining
+	client.drainA.Store(true)
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	// B is primary (first non-draining), A is filtered by drain
+	assert.Equal(t, 1, len(sessionB.queries))
+	assert.Equal(t, 0, len(sessionA.queries))
+}
+
+func TestAllowedClusters_DrainConflict_NoValidClusters(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterA}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// A is draining but override says only A
+	client.drainA.Store(true)
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.ErrorIs(t, err, types.ErrNoValidClusters)
+}
+
+func TestAllowedClusters_StrategyStateFrozen(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Successful read — strategy.OnSuccess should NOT be called
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB], "OnSuccess must be frozen during override")
+}
+
+func TestAllowedClusters_OverrideRemoved_StrategyResumes(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	var overrideActive atomic.Bool
+	overrideActive.Store(true)
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			if overrideActive.Load() {
+				return []ClusterID{ClusterB}
+			}
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Override active: frozen
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB])
+
+	// Remove override
+	overrideActive.Store(false)
+
+	// Normal: strategy should be called again
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, strategy.onSuccessCalled[ClusterA])
+}
+
+func TestAllowedClusters_IterContext_OverrideApplied(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	iter := client.Query("SELECT name FROM users").Iter()
+	err = iter.Close()
+	assert.NoError(t, err)
+
+	// Should have gone to B
+	assert.Equal(t, 1, len(sessionB.queries))
+	assert.Equal(t, 0, len(sessionA.queries))
+
+	// Strategy.OnSuccess should NOT be called (frozen during override)
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB])
+}
+
+func TestAllowedClusters_CAS_NotOverridden(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	// Strategy selects A — CAS should follow strategy, not override
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB} // Override says B only
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// CAS uses selectClusterForCAS which follows strategy → A
+	_, _ = client.Query("INSERT INTO users (name) VALUES (?) IF NOT EXISTS", "test").ScanCAS()
+	assert.Equal(t, 1, len(sessionA.queries), "CAS should go to strategy-selected cluster, not override")
+	assert.Equal(t, 0, len(sessionB.queries), "CAS should NOT be affected by override")
+}
+
+func TestAllowedClusters_FallbackRead_Fenced(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	// B returns not-found
+	sessionB.scanErr = types.ErrNotFound
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB} // only B; A excluded
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").FallbackRead().Scan(&result)
+	assert.ErrorIs(t, err, types.ErrNotFound)
+	// A should NOT be probed — it's excluded by override
+	assert.Equal(t, 0, len(sessionA.queries), "fallback must NOT probe fenced cluster")
+}
+
+func TestAllowedClusters_FallbackRead_AllowedWhenBothInList(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	// B returns not-found, A has the data
+	sessionB.scanErr = types.ErrNotFound
+	sessionA.scanErr = nil
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB, ClusterA}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").FallbackRead().Scan(&result)
+	assert.NoError(t, err)
+	// A should be probed because it's in the allowed list
+	assert.Equal(t, 1, len(sessionA.queries), "fallback should probe A since it's in the allowed list")
+}
+
+func TestAllowedClusters_UnknownClusterID_FailClosed(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{"X", "Y"}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.ErrorIs(t, err, types.ErrInvalidClusterOverride)
+}
+
+func TestAllowedClusters_Panic_FailClosed(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			panic("provider crashed")
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.ErrorIs(t, err, types.ErrClusterOverridePanic)
+}
+
+func TestAllowedClusters_IteratorCloseDoesNotCallOnSuccessDuringOverride(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	iter := client.Query("SELECT name FROM users").Iter()
+	_ = iter.Close()
+
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB],
+		"iterator Close must not call OnSuccess during override")
+}
+
+func TestAllowedClusters_IteratorSnapshotConsistency(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	var overrideActive atomic.Bool
+	overrideActive.Store(true)
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			if overrideActive.Load() {
+				return []ClusterID{ClusterB}
+			}
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create iterator under override
+	iter := client.Query("SELECT name FROM users").Iter()
+
+	// Remove override AFTER iterator creation
+	overrideActive.Store(false)
+
+	// Close should still use the snapshot (override was active at creation)
+	_ = iter.Close()
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB],
+		"OnSuccess must not leak when override removed between creation and Close")
+}
+
+func TestAllowedClusters_SingleClusterMode_ClusterB_FailClosed(t *testing.T) {
+	sessionA := newMockSession()
+	// Single-cluster mode: no sessionB
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.ErrorIs(t, err, types.ErrInvalidClusterOverride)
+}
+
+func TestAllowedClusters_DuplicateEntries_Deduped(t *testing.T) {
+	t.Run("[B,B,A] resolves to primary=B fallback=A", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+		sessionB.scanErr = errors.New("cluster B down")
+
+		client, err := NewCQLClient(sessionA, sessionB,
+			WithFailoverPolicy(newMockFailoverPolicy(true)),
+			WithAllowedClusters(func() []ClusterID {
+				return []ClusterID{ClusterB, ClusterB, ClusterA}
+			}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		var result string
+		err = client.Query("SELECT name FROM users").Scan(&result)
+		// B fails, failover to A (deduped fallback)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(sessionA.queries), "should failover to A")
+	})
+
+	t.Run("[B,B] resolves to primary=B no fallback", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+		sessionB.scanErr = errors.New("cluster B down")
+
+		client, err := NewCQLClient(sessionA, sessionB,
+			WithAllowedClusters(func() []ClusterID {
+				return []ClusterID{ClusterB, ClusterB}
+			}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		var result string
+		err = client.Query("SELECT name FROM users").Scan(&result)
+		assert.Error(t, err)
+		// No fallback — deduped to just B
+		assert.Equal(t, 0, len(sessionA.queries), "no fallback should be attempted")
+	})
+}
+
+func TestAllowedClusters_IterContext_ErrorIter(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{"unknown"}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	iter := client.Query("SELECT name FROM users").Iter()
+
+	// Scan returns false
+	var result string
+	assert.False(t, iter.Scan(&result), "errorIter.Scan should return false")
+
+	// Close returns the error
+	err = iter.Close()
+	assert.ErrorIs(t, err, types.ErrInvalidClusterOverride)
+
+	// SliceMap returns the error
+	iter2 := client.Query("SELECT name FROM users").Iter()
+	_, sliceErr := iter2.SliceMap()
+	assert.ErrorIs(t, sliceErr, types.ErrInvalidClusterOverride)
+
+	// Metadata methods return zero values
+	iter3 := client.Query("SELECT name FROM users").Iter()
+	assert.Nil(t, iter3.PageState())
+	assert.Equal(t, 0, iter3.NumRows())
+	assert.Nil(t, iter3.Columns())
+	scanner := iter3.Scanner()
+	assert.NotNil(t, scanner, "errorIter.Scanner should return a non-nil errorScanner")
+	assert.False(t, scanner.Next(), "errorScanner.Next should return false")
+	assert.ErrorIs(t, scanner.Err(), types.ErrInvalidClusterOverride)
+	assert.Nil(t, iter3.Warnings())
+	_ = iter3.Close()
+}
+
+func TestAllowedClusters_DrainFiltersWithinOverride(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterA, ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// A is draining; override says [A, B]; effective = B only
+	client.drainA.Store(true)
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionB.queries), "drain should filter A within override")
+	assert.Equal(t, 0, len(sessionA.queries))
+}
+
+func TestAllowedClusters_BatchIterContext_OverrideApplied(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	batch := client.Batch(UnloggedBatch)
+	batch.Query("INSERT INTO t (id) VALUES (?)", 1)
+	iter := batch.IterContext(context.Background())
+	err = iter.Close()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, strategy.onSuccessCalled[ClusterB],
+		"batch IterContext should freeze strategy during override")
+}
+
+func TestAllowedClusters_BatchIterContext_ErrorIter(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{"unknown"}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	batch := client.Batch(UnloggedBatch)
+	batch.Query("INSERT INTO t (id) VALUES (?)", 1)
+	iter := batch.IterContext(context.Background())
+	err = iter.Close()
+	assert.ErrorIs(t, err, types.ErrInvalidClusterOverride)
+}
+
+func TestAllowedClusters_NoReadStrategy_OverrideStillApplies(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	// No ReadStrategy configured
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionB.queries), "override should apply even without ReadStrategy")
+	assert.Equal(t, 0, len(sessionA.queries))
+}
+
+func TestAllowedClusters_FallbackReadSnapshotConsistency(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	sessionB.scanErr = types.ErrNotFound
+
+	var overrideActive atomic.Bool
+	overrideActive.Store(true)
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			if overrideActive.Load() {
+				return []ClusterID{ClusterB} // only B; A excluded
+			}
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Override active: A is fenced. Even if override is removed mid-request,
+	// the snapshot ensures A stays fenced.
+	var result string
+	err = client.Query("SELECT name FROM users").FallbackRead().Scan(&result)
+	assert.ErrorIs(t, err, types.ErrNotFound)
+	assert.Equal(t, 0, len(sessionA.queries), "snapshot should prevent A probe even if override changes")
+}
+
+func TestAllowedClusters_SingleClusterMode_ClusterA_Works(t *testing.T) {
+	sessionA := newMockSession()
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterA}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionA.queries))
+}
+
+func TestAllowedClusters_SingleCluster_NilReturn_NoPhantomClusterB(t *testing.T) {
+	sessionA := newMockSession()
+
+	strategy := newMockReadStrategy(ClusterA, ClusterB, true)
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithReadStrategy(strategy),
+		WithAllowedClusters(func() []ClusterID {
+			return nil // opt-out
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	// Must route to A (single session) with exactly 1 query
+	assert.Equal(t, 1, len(sessionA.queries))
+	// In single-cluster mode the strategy is not consulted for OnSuccess
+	// since there is only one session — the fast path skips strategy calls.
+}
+
+func TestAllowedClusters_SingleCluster_EmptyReturn_NoPhantomClusterB(t *testing.T) {
+	sessionA := newMockSession()
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{}
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	_ = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Equal(t, 1, len(sessionA.queries))
+}
+
+func TestAllowedClusters_SingleCluster_NilReturn_ErrorDoesNotFailover(t *testing.T) {
+	sessionA := newMockSession()
+	sessionA.scanErr = errors.New("cluster A failed")
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithReadStrategy(newMockReadStrategy(ClusterA, ClusterB, true)),
+		WithFailoverPolicy(newMockFailoverPolicy(true)),
+		WithAllowedClusters(func() []ClusterID {
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").Scan(&result)
+	assert.Error(t, err)
+	// Must NOT attempt failover to ClusterB — there is only one session.
+	// The query count should be exactly 1: the single failed attempt on A.
+	assert.Equal(t, 1, len(sessionA.queries),
+		"single-cluster mode must not retry via failover when override returns nil")
+}
+
+func TestAllowedClusters_SingleCluster_NilReturn_FallbackReadSuppressed(t *testing.T) {
+	sessionA := newMockSession()
+	sessionA.scanErr = types.ErrNotFound
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithAllowedClusters(func() []ClusterID {
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	var result string
+	err = client.Query("SELECT name FROM users").FallbackRead().Scan(&result)
+	assert.ErrorIs(t, err, types.ErrNotFound)
+	// FallbackRead must be suppressed in single-cluster mode:
+	// only one query should execute (no phantom probe on ClusterB).
+	assert.Equal(t, 1, len(sessionA.queries),
+		"FallbackRead must not probe a phantom ClusterB in single-cluster mode")
+}
+
+func BenchmarkResolveReadTarget_OverrideActive(b *testing.B) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithAllowedClusters(func() []ClusterID {
+			return []ClusterID{ClusterB, ClusterA}
+		}),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		rt := client.resolveReadTarget(ctx)
+		if rt.err != nil {
+			b.Fatal(rt.err)
+		}
+	}
+}
+
+func BenchmarkResolveReadTarget_NoOverride(b *testing.B) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(newMockReadStrategy(ClusterA, ClusterB, true)),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		rt := client.resolveReadTarget(ctx)
+		if rt.err != nil {
+			b.Fatal(rt.err)
+		}
+	}
+}
