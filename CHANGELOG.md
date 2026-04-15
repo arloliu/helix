@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-04-15
+
+### Added
+
+- **`WithAllowedClusters`**: Operator-driven read routing override. When the
+  provided `AllowedClustersFunc` returns a non-empty cluster list, the read
+  strategy is bypassed and the list directly controls routing with optional
+  failover. Strategy state (OnSuccess/OnFailure) is frozen during the override
+  to prevent drift, and resumes cleanly when the override is removed. Key
+  behaviors:
+  - **Fail-closed**: unknown cluster IDs, drain conflicts, and panics all
+    return errors (`ErrInvalidClusterOverride`, `ErrNoValidClusters`,
+    `ErrClusterOverridePanic`) rather than falling through silently.
+  - **FallbackRead fencing**: FallbackRead only probes the alternative cluster
+    if it appears in the allowed list.
+  - **CAS bypass**: CAS operations (ScanCAS, MapScanCAS, batch ExecCAS) are
+    unaffected — they are write-like, single-cluster operations.
+  - **Power-of-2 log backoff**: misconfiguration errors log on the 1st, 2nd,
+    4th, 8th, … occurrence to prevent log storms at high QPS.
+  - **Iterator paths**: override errors are deferred to `Close()`. Always call
+    `Close()` and check its error.
+- **`AllowedClustersFunc`** type: function signature for the override provider.
+- **`ErrNoValidClusters`**, **`ErrInvalidClusterOverride`**,
+  **`ErrClusterOverridePanic`**: New sentinel errors in `types/` for
+  AllowedClusters fail-closed conditions.
+- **Auto-recovery guide** (`docs/auto-recovery.md`): End-to-end recovery
+  lifecycle documentation — when auto-recovery suffices, when operator
+  intervention is needed, the coordinated 4-phase workflow, and common mistakes.
+- **AllowedClusters section in `docs/strategy-policy.md`**: Override semantics,
+  strategy freezing, drain intersection, FallbackRead fencing, CAS bypass,
+  fail-closed behavior, and operator workflow.
+
+### Bug Fixes
+
+- **`PrimaryOnlyRead.OnFailure` drops reads when ClusterB fails in failed-over
+  state**: When ClusterA failed and reads moved to ClusterB, a subsequent
+  ClusterB failure returned `("", false)` — the read failed entirely even if
+  ClusterA had recovered. `OnFailure` now returns ClusterA as a probe target.
+  If the probe succeeds, `OnSuccess(ClusterA)` clears the failover state. If
+  ClusterA is also down, both attempts fail (DualClusterError) and the next
+  `Select()` still returns ClusterB — avoiding request-level A/B flipping.
+- **`StickyRead.OnFailure` drops reads during cooldown**: When the preferred
+  cluster failed and cooldown was still active, `OnFailure` returned
+  `("", false)` — the read failed entirely. Now returns the alternative cluster
+  for the current request without changing preferred. Reads succeed via retry,
+  but each request during the cooldown window pays the cost of trying the
+  preferred cluster first (elevated latency and error counts until cooldown
+  expires and preferred can switch).
+
+### Internal
+
+- **`tryFallbackCluster` extraction**: The ~35 lines of shared failover tail
+  logic (metrics, logging, session read, not-found handling, DualClusterError
+  construction) duplicated between `executeOverrideFailover` and
+  `executeNormalFailover` were extracted into a single helper.
+
+### Tests
+
+- 32 unit tests for AllowedClusters: single-cluster routing, failover within
+  override, nil/empty return (normal behavior), toggle on/off, failover policy
+  denial, drain filtering, drain conflict, strategy state freezing/resumption,
+  iterator paths, CAS bypass, FallbackRead fencing, unknown cluster IDs, panic
+  recovery, duplicate deduplication, single-cluster mode edge cases, snapshot
+  consistency, and batch iterator paths.
+- 17 integration tests for AllowedClusters against real Cassandra clusters:
+  override routing, failover within override, drain interaction, single-cluster
+  mode, CAS bypass, panic recovery, FallbackRead fencing, ForceDegrade
+  coordination, and DefaultFallbackRead fencing.
+- 7 unit tests for failover-back fixes: `PrimaryOnlyRead` ClusterB failure
+  probes ClusterA, non-failed-over B failure does not probe, dual failure
+  (both down), recovery timeout timer preservation; `StickyRead` cooldown
+  still fails over (per-request), cooldown expired switches preferred,
+  non-preferred failure with no cooldown bypass.
+- 3 integration tests for failover-back behavior against real Cassandra
+  clusters.
+- 8 simulation soak-loop tests covering duration-bounded randomized scenario
+  replay with inter-iteration queue drains and pre-verify drains.
+
+---
+
 ## [1.1.0] — 2026-04-12
 
 ### Breaking Changes
