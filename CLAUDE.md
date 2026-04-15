@@ -15,6 +15,13 @@ Key public packages:
 
 Internal packages under `internal/` are private implementation details — do not reference them in public API or docs.
 
+## Working Principles
+
+- **Surface uncertainty before coding.** State assumptions explicitly. If multiple interpretations exist, present them — don't pick silently. If something is unclear, stop and ask.
+- **Minimum change that solves the problem.** No speculative features, unnecessary abstractions, or unasked-for flexibility. Every changed line should trace directly to the request.
+- **Don't guess — verify with code.** When uncertain about behavior (API semantics, concurrency, edge cases), write a small test or prototype to confirm rather than assuming. For performance assumptions, benchmark before and after — don't refactor for speed based on intuition alone.
+- **Define verifiable success criteria before implementing.** Transform vague tasks ("fix the bug") into concrete checks ("write a test that reproduces it, then make it pass"). For multi-step tasks, state a brief plan with verification steps.
+
 ## Git Conventions
 
 **Never add `Co-Authored-By` or any other attribution trailers to git commit messages.**
