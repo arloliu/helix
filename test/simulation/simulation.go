@@ -654,6 +654,15 @@ func (s *Simulation) resetBetweenScenarios(ctx context.Context) {
 		adw.Reset()
 	}
 
+	// Drain the replay queue so the next scenario starts with a clean slate.
+	// Without this, residual entries from the previous scenario accumulate
+	// across soak iterations and cause false failures in drain/saturation checks.
+	if s.env.MemReplayer != nil {
+		_ = waitUntilCtx(ctx, 30*time.Second, func() bool {
+			return s.env.MemReplayer.Len() == 0
+		})
+	}
+
 	// Stability gate: wait until 5 consecutive writes succeed, up to 10 seconds.
 	consecutive := 0
 	deadline := time.Now().Add(10 * time.Second)
@@ -676,6 +685,15 @@ func (s *Simulation) verify() error {
 	resetConfig := chaos.SessionConfig{}
 	s.env.ChaosA.SetConfig(resetConfig)
 	s.env.ChaosB.SetConfig(resetConfig)
+
+	// Drain the replay queue before checking consistency. Without this,
+	// writes that were enqueued for replay during the last scenario may
+	// not have been applied yet, causing false consistency failures.
+	if s.env.MemReplayer != nil {
+		_ = waitUntilCtx(context.Background(), 60*time.Second, func() bool {
+			return s.env.MemReplayer.Len() == 0
+		})
+	}
 
 	// Wait for eventual consistency (replay to finish).
 	// Use condition-based waiting rather than a fixed sleep to reduce flakiness.
