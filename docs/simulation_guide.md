@@ -39,8 +39,10 @@ A pprof server starts automatically on `127.0.0.1:6060` during all runs.
 |-----------------|-------------------------------------------------------------|----------------------------------------------------------------------------------------------------|------------------|
 | `quick`         | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | —                                                                                                  | 5 min            |
 | `comprehensive` | All quick + 5 more                                          | `circuit-breaker`, `latency-cb`, `primary-only`, `round-robin`, `sticky-cooldown`, `fallback-read` | config-driven    |
-| `soak`          | All comprehensive + `dual-cluster-degradation`              | Same as comprehensive                                                                              | 2 h              |
+| `soak`          | All comprehensive + `dual-cluster-degradation` + randomized soak loop | Same as comprehensive                                                                    | 2 h              |
 | `fallback`      | 3 baseline scenarios                                        | `fallback-read`                                                                                    | 5 min            |
+
+`soak` is the endurance profile. After the initial sequential pass (which validates baseline correctness), it enters a **randomized soak loop** that randomly selects and executes standalone scenarios until the configured duration expires or a signal is received. This catches ordering-dependent bugs, state drift, memory leaks, and resource exhaustion under sustained load. Strategy groups run once after the soak loop as a final validation pass.
 
 `fallback` is a targeted profile for verifying `FallbackRead` divergence detection in isolation. It runs the 3 baseline scenarios to warm up both clusters, then exercises `FallbackReadDivergence` via a dedicated strategy group configured with `WithDefaultFallbackRead(true)` and `StickyRead` pinned to Cluster B.
 

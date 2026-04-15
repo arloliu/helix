@@ -83,7 +83,23 @@ func (s *Simulation) RegisterStrategyGroup(group StrategyGroup) {
 }
 
 // Run executes the simulation.
+//
+// For the "soak" profile, a duration-bounded context is applied and a
+// randomized soak loop runs after the initial sequential pass. All other
+// profiles run the registered scenarios once and exit.
 func (s *Simulation) Run(ctx context.Context) error {
+	// Keep the parent (signal-only) context for strategy groups, which run
+	// after the soak loop and must not be cancelled by the duration timeout.
+	parentCtx := ctx
+
+	// Apply duration bound for soak profile so traffic, pruner, and the
+	// soak loop all respect the configured duration.
+	if s.config.Profile == "soak" && s.config.Duration > 0 {
+		var durationCancel context.CancelFunc
+		ctx, durationCancel = context.WithTimeout(ctx, s.config.Duration)
+		defer durationCancel()
+	}
+
 	s.logger.Info("Initializing simulation environment...")
 
 	if err := s.setupEnvironment(); err != nil {
@@ -103,6 +119,7 @@ func (s *Simulation) Run(ctx context.Context) error {
 
 	var scenarioErrors []error
 
+	// Phase 1: Sequential pass — validates baseline correctness.
 	for _, scenario := range s.scenarios {
 		if ctx.Err() != nil {
 			break
@@ -122,6 +139,12 @@ func (s *Simulation) Run(ctx context.Context) error {
 		s.resetBetweenScenarios(ctx)
 	}
 
+	// Phase 2 (soak only): Randomized loop until duration expires.
+	if s.config.Profile == "soak" && ctx.Err() == nil && len(scenarioErrors) == 0 {
+		soakErrs := s.runSoakLoop(ctx)
+		scenarioErrors = append(scenarioErrors, soakErrs...)
+	}
+
 	s.logger.Info("Stopping workload...")
 	cancel()
 	time.Sleep(1 * time.Second)
@@ -130,12 +153,14 @@ func (s *Simulation) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Run strategy groups: each gets a fresh CQLClient sharing the same sessions.
+	// Run strategy groups using the parent context — the duration-bounded
+	// context may have expired after the soak loop, but strategy groups
+	// should still run as a final validation pass.
 	for i := range s.strategyGroups {
-		if ctx.Err() != nil {
+		if parentCtx.Err() != nil {
 			break
 		}
-		if errs := s.runStrategyGroup(ctx, &s.strategyGroups[i]); len(errs) > 0 {
+		if errs := s.runStrategyGroup(parentCtx, &s.strategyGroups[i]); len(errs) > 0 {
 			scenarioErrors = append(scenarioErrors, errs...)
 		}
 	}
@@ -145,6 +170,79 @@ func (s *Simulation) Run(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// runSoakLoop randomly selects and executes scenarios until the context
+// expires (duration timeout or signal). It runs after the sequential pass
+// has validated baseline correctness. Context cancellation during a scenario
+// is treated as a clean exit, not a failure.
+func (s *Simulation) runSoakLoop(ctx context.Context) []error {
+	if len(s.scenarios) == 0 {
+		return nil
+	}
+
+	s.logger.Info("==================================================")
+	s.logger.Info("Entering soak loop — randomly selecting scenarios",
+		"scenarioPool", len(s.scenarios),
+		"remaining", time.Until(s.soakDeadline(ctx)),
+	)
+	s.logger.Info("==================================================")
+
+	var soakErrors []error
+	iteration := 0
+
+	for ctx.Err() == nil {
+		iteration++
+
+		scenario := s.scenarios[s.randIntn(len(s.scenarios))]
+
+		s.logger.Info("--------------------------------------------------")
+		s.logger.Info("Soak iteration",
+			"iteration", iteration,
+			"scenario", scenario.Name(),
+			"remaining", time.Until(s.soakDeadline(ctx)),
+		)
+		s.logger.Info("--------------------------------------------------")
+
+		if err := scenario.Run(ctx, s.env); err != nil {
+			// Context cancellation is a clean exit, not a failure.
+			if ctx.Err() != nil {
+				break
+			}
+			s.logger.Error("Soak scenario failed",
+				"iteration", iteration,
+				"scenario", scenario.Name(),
+				"error", err,
+			)
+			soakErrors = append(soakErrors, fmt.Errorf("soak #%d %s: %w", iteration, scenario.Name(), err))
+		} else {
+			s.logger.Info("Soak scenario completed", "iteration", iteration)
+		}
+
+		s.resetBetweenScenarios(ctx)
+	}
+
+	s.logger.Info("Soak loop finished",
+		"totalIterations", iteration,
+		"failures", len(soakErrors),
+	)
+
+	return soakErrors
+}
+
+// soakDeadline returns the context deadline or a zero time if none is set.
+func (s *Simulation) soakDeadline(ctx context.Context) time.Time {
+	if dl, ok := ctx.Deadline(); ok {
+		return dl
+	}
+	return time.Time{}
+}
+
+// randIntn returns a random int in [0, n) using the simulation's shared RNG.
+func (s *Simulation) randIntn(n int) int {
+	s.rngMu.Lock()
+	defer s.rngMu.Unlock()
+	return s.rng.Intn(n)
 }
 
 func (s *Simulation) setupEnvironment() error {
@@ -541,6 +639,9 @@ func waitUntilCtx(ctx context.Context, timeout time.Duration, condition func() b
 // the metrics collector, then waits for 5 consecutive successful writes to prove
 // both clusters are healthy.
 func (s *Simulation) resetBetweenScenarios(ctx context.Context) {
+	if s.env == nil {
+		return
+	}
 	s.env.ChaosA.SetConfig(chaos.SessionConfig{})
 	s.env.ChaosB.SetConfig(chaos.SessionConfig{})
 	s.env.ChaosA.ResetCounters()
