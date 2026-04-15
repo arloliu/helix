@@ -8,6 +8,7 @@ Rules are loaded in numeric order before any work begins. See [`.agents/rules/AG
 
 | File | Topic |
 |------|-------|
+| [`050-principles.md`](.agents/rules/050-principles.md) | Working principles: surface uncertainty, minimize changes, verify with code, define success criteria |
 | [`100-overview.md`](.agents/rules/100-overview.md) | Project identity, structure, architecture, dependencies, prime directives |
 | [`200-coding-style.md`](.agents/rules/200-coding-style.md) | Go idioms, error handling, file layout, naming, loop patterns |
 | [`300-testing.md`](.agents/rules/300-testing.md) | Unit/integration/simulation organization, async testing rules, make targets |

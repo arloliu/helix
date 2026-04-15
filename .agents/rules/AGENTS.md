@@ -5,6 +5,10 @@
 
 ## Rule Index
 
+### 0. Working Principles
+- **[050-principles.md](050-principles.md)**
+  *Behavioral guidelines: surface uncertainty, minimize changes, verify with code, define success criteria.*
+
 ### 1. Core Directives
 - **[100-overview.md](100-overview.md)**
   *Identity, project structure, architecture notes, dependencies, and prime directives.*
