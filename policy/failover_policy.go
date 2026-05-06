@@ -196,22 +196,52 @@ func NewCircuitBreaker(opts ...CircuitBreakerOption) *CircuitBreaker {
 	return c
 }
 
-// ShouldFailover returns true if the failure threshold has been reached.
+// ShouldFailover returns true if the failure threshold has been reached
+// AND the reset timeout has not yet elapsed since the last failure.
+//
+// Once the reset timeout passes, ShouldFailover returns false to allow a
+// half-open probe attempt: the next operation will be routed to the failed
+// cluster, and its outcome (RecordSuccess closes the breaker; RecordFailure
+// resets the counter to 1 and accumulates again) determines what happens
+// next. Without this transition, a tripped breaker stays open indefinitely
+// for any caller that stops sending traffic to the failed cluster (e.g.
+// StickyRead routing all reads to the survivor) — there is no path to
+// closure because no probe ever fires.
+//
+// Note: this is "leaky" half-open — concurrent callers may all see false
+// during the probe window and all be routed to the failed cluster. This is
+// intentional: the per-cluster mutex in RecordFailure / RecordSuccess
+// serializes the outcome, and at most (threshold) operations can fail
+// against a still-broken cluster before the breaker re-trips.
 //
 // Parameters:
 //   - cluster: The cluster that failed
 //   - err: The error (unused)
 //
 // Returns:
-//   - bool: true if consecutive failures >= threshold
+//   - bool: true if failover should occur
 func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
 	var failures int32
+	var lastFailure int64
 	if cluster == types.ClusterA {
 		failures = c.failuresA.Load()
+		lastFailure = c.lastFailureA.Load()
 	} else {
 		failures = c.failuresB.Load()
+		lastFailure = c.lastFailureB.Load()
 	}
-	return int(failures) >= c.threshold
+	if int(failures) < c.threshold {
+		return false
+	}
+	// Half-open: allow a probe after resetTimeout elapses. resetTimeout=0
+	// disables the timed transition (breaker stays open until explicit
+	// RecordSuccess).
+	if c.resetTimeout > 0 && lastFailure > 0 &&
+		time.Duration(time.Now().UnixNano()-lastFailure) > c.resetTimeout {
+		return false
+	}
+
+	return true
 }
 
 // RecordFailure increments the failure counter for a cluster.
@@ -233,8 +263,13 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 		c.muA.Lock()
 		lastFailure := c.lastFailureA.Load()
 		if lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
+			// Half-open window expired without a recovery — counter resets
+			// to 1 AND the trip latch clears so a re-trip on this cycle
+			// fires IncCircuitBreakerTrip again. Without clearing trippedA,
+			// observability undercounts trips across multi-cycle outages.
 			c.failuresA.Store(1)
 			newFailures = 1
+			c.trippedA = false
 		} else {
 			newFailures = c.failuresA.Add(1)
 		}
@@ -250,6 +285,7 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 		if lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
 			c.failuresB.Store(1)
 			newFailures = 1
+			c.trippedB = false
 		} else {
 			newFailures = c.failuresB.Add(1)
 		}
