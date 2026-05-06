@@ -10,8 +10,10 @@ COVERAGE_HTML   := $(COVERAGE_DIR)/coverage.html
 
 # Source files
 ALL_GO_FILES    := $(shell find . -name "*.go" -not -path "./vendor/*")
-TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./vendor/*" -not -path "./test/integration/*")))
+TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./vendor/*" -not -path "./test/integration/*" -not -path "./test/e2e/*")))
 INTEGRATION_DIR := ./test/integration/...
+E2E_DIR         := ./test/e2e/...
+E2E_TIMEOUT     ?= 30m
 LATEST_GIT_TAG  := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
 
 # Linter configuration
@@ -21,7 +23,7 @@ GOLANGCI_LINT_VERSION := 2.5.0
 # Default target
 .DEFAULT_GOAL := help
 
-.PHONY: help test test-unit test-integration test-all test-quick clean-test-results
+.PHONY: help test test-unit test-integration test-all test-quick test-e2e clean-test-results
 .PHONY: coverage coverage-html
 .PHONY: lint linter-update linter-version fmt vet
 .PHONY: generate gomod-tidy clean ci
@@ -59,6 +61,15 @@ test-all: clean-test-results
 test-quick: clean-test-results
 	@echo "Running unit tests without race detection..."
 	@CGO_ENABLED=0 go test $(TEST_DIRS) -count=1 -short -timeout=$(TEST_TIMEOUT)
+
+## test-e2e: Run container-kill end-to-end tests (Docker required, build tag 'e2e')
+test-e2e: clean-test-results
+	@echo "Running e2e/cql container-lifecycle tests (Docker required)..."
+	@# -race is intentionally omitted: e2e tests run live containers and
+	@# the wall-clock cost (~3 min) is dominated by container I/O, not Go
+	@# code. Race detection adds significant overhead and the tests do not
+	@# exercise concurrency-sensitive paths beyond what unit/integration cover.
+	@CGO_ENABLED=1 go test -tags e2e $(E2E_DIR) -count=1 -v -timeout=$(E2E_TIMEOUT)
 
 ## coverage: Generate test coverage report (unit packages only)
 coverage: clean-test-results
