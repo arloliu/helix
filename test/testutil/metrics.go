@@ -253,6 +253,14 @@ func (m *TestMetricsCollector) GetReplaySuccess(cluster types.ClusterID) int64 {
 	return m.ReplaySuccess[cluster]
 }
 
+// GetReplayDropped returns the total replay dropped count for a cluster.
+func (m *TestMetricsCollector) GetReplayDropped(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.ReplayDropped[cluster]
+}
+
 // GetTotalReplayEnqueued returns the total replay enqueued count across all clusters.
 func (m *TestMetricsCollector) GetTotalReplayEnqueued() int64 {
 	return m.totalReplayEnqueued.Load()
