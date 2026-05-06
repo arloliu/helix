@@ -72,12 +72,12 @@ func TestS2_PauseA_ReadFailover(t *testing.T) {
 			factory: func() helix.ReadStrategy {
 				return policy.NewRoundRobinRead()
 			},
-			// RoundRobinRead has no "preferred" cluster, so a paused A is
-			// not observed as a failover by the policy — the next op simply
-			// rotates to B. This was confirmed by the e2e suite (see
-			// SPIKE_FINDINGS.md §6 for whether this is the desired
-			// observability contract).
-			expectsFailovers: false,
+			// RoundRobinRead alternates between clusters; ~half of reads
+			// will Select the paused cluster, fail, and trigger a failover.
+			// (The original "RR doesn't fire failovers" observation in
+			// SPIKE_FINDINGS §7 was a single-read test artifact — fixed by
+			// driving multiple reads below.)
+			expectsFailovers: true,
 			stateAssert:      func(t *testing.T, rs helix.ReadStrategy) {},
 		},
 	}
@@ -102,15 +102,22 @@ func TestS2_PauseA_ReadFailover(t *testing.T) {
 				require.NoError(t, a.Pause(ctx))
 				defer func() { _ = a.Unpause(context.Background()) }()
 
-				qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				defer cancel()
-
+				// Drive multiple reads — important for RoundRobinRead, which
+				// alternates: a single read could land on the healthy cluster
+				// by chance and skip the failover path entirely (the original
+				// SPIKE_FINDINGS §7 observation was caused by exactly this).
+				const reads = 4
 				var got string
-				err = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
-					ScanContext(qCtx, &got)
-				require.NoError(t, err,
-					"[%s/%s] read should succeed via cluster B", d.name, s.name)
-				assert.Equal(t, "v", got)
+				for i := 0; i < reads; i++ {
+					qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+					err = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
+						ScanContext(qCtx, &got)
+					cancel()
+					require.NoError(t, err,
+						"[%s/%s] read %d should succeed via the healthy cluster",
+						d.name, s.name, i)
+					assert.Equal(t, "v", got)
+				}
 
 				if s.expectsFailovers {
 					assert.GreaterOrEqual(t, mc.GetTotalFailovers(), int64(1),

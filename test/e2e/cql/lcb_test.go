@@ -85,23 +85,32 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 				"[%s] breaker took too many ops to open — strike accumulation may be misclassified",
 				d.name)
 
-			// Unpause; verify reads keep succeeding through B.
+			// Unpause A; reset timeout is 5s. The half-open transition
+			// (CircuitBreaker.ShouldFailover returns false after resetTimeout)
+			// allows the next read to probe A. If A's latency is healthy,
+			// RecordLatency → RecordSuccess closes the breaker.
 			require.NoError(t, a.Unpause(ctx))
-			qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			var got string
-			require.NoError(t,
-				client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").ScanContext(qCtx, &got),
-				"[%s] post-unpause read should still succeed via B", d.name)
-			cancel()
 
-			// Observation (not asserted): once the LCB has tripped on A,
-			// the StickyRead strategy routes all traffic to B. The LCB
-			// never observes A's latency again, so even after the reset
-			// timeout it stays open. This is a recovery-path question
-			// for Helix — the breaker has no built-in probe mechanism.
-			// Documented in SPIKE_FINDINGS.md §8.
-			t.Logf("[%s] post-unpause LCB ShouldFailover(A)=%v (expected true: no probe mechanism)",
-				d.name, lcb.ShouldFailover(htypes.ClusterA, nil))
+			closeDeadline := time.Now().Add(15 * time.Second)
+			closed := false
+			for time.Now().Before(closeDeadline) {
+				if !lcb.ShouldFailover(htypes.ClusterA, nil) {
+					closed = true
+					break
+				}
+				// Drive a read; whichever cluster the policy selects, the
+				// successful latency record will eventually close the breaker.
+				qCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				var got string
+				_ = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
+					ScanContext(qCtx, &got)
+				cancel()
+				time.Sleep(200 * time.Millisecond)
+			}
+			assert.True(t, closed,
+				"[%s] LatencyCircuitBreaker did not close after Unpause + reset timeout "+
+					"(half-open probe should re-route to A and observe healthy latency)",
+				d.name)
 		})
 	}
 }

@@ -46,33 +46,37 @@ v2 recovered after 1 attempts in 3.4ms
 So a Pause-based failure scenario can run a full cycle (pause → ops fail →
 unpause → ops succeed) inside a few seconds.
 
-## 3. **Helix bug candidate confirmed: v1 `gocql.ErrTimeoutNoResponse` does NOT match v2 errors**
+## 3. v1/v2 errors.Is sentinel mismatch — INVALIDATED, spike test artifact
 
-The most important spike finding. Both drivers emit a timeout error during
-Pause with **identical message text** ("gocql: no response received from
-cassandra within timeout period"), but `errors.Is(err, gocql.ErrTimeoutNoResponse)`:
+Original framing: "v1 `gocql.ErrTimeoutNoResponse` does NOT match v2 errors
+via `errors.Is`, even though message text is identical." Suspected adapter
+parity hazard.
 
-- **matches** the v1 error (sentinel from `github.com/gocql/gocql`),
-- **does NOT match** the v2 error (different package; sentinel value is
-  the same string but a different `*errors.errorString` instance).
+Verification:
 
-```
-v1-paused: errors.Is gocql: no response received from cassandra within timeout period ✓
-v2-paused: (no errors.Is hit logged)
-```
+- v1 adapter (`adapter/cql/v1/adapter.go:14`) uses `errors.Is(err,
+  gocql.ErrNotFound)` where `gocql` is `github.com/gocql/gocql`.
+- v2 adapter (`adapter/cql/v2/adapter.go:14`) uses `errors.Is(err,
+  gocql.ErrNotFound)` where `gocql` is `github.com/apache/cassandra-gocql-driver/v2`.
+- Each adapter only checks its **own** driver's sentinels. There is no
+  cross-package compare anywhere in Helix.
+- Both adapters normalize to the unified `types.ErrNotFound`. Callers use
+  `types.IsNotFound(err)` and don't need to know the driver.
 
-Verified with the audit step below. Helix today does NOT use
-`errors.Is(err, gocql.Err*)` anywhere in `internal/`, `policy/`, or `types/`
-— but **adapter v1 nor v2 normalize timeout errors at the adapter boundary**.
-Any future caller (or a feature like replay-eligibility classification
-based on timeout-vs-other-error) that uses `errors.Is(err, gocql.ErrTimeoutNoResponse)`
-would silently work on v1 and silently fail on v2.
+Integration tests already confirm parity end-to-end:
+`test/integration/cql_fallback_integration_test.go:36`
+`TestV1Adapter_Scan_ReturnsErrNotFound` and `TestV2Adapter_Scan_ReturnsErrNotFound`.
 
-The S6 (parity) test in this suite must explicitly probe this: drive the
-same Pause through both adapters, build an outcome fingerprint that
-includes `errors.Is(err, gocql.ErrTimeoutNoResponse)` and `errors.Is(err,
-gocqlv2.ErrTimeoutNoResponse)`, and assert the *Helix-observable*
-classification is symmetric — surfacing any divergence as a parity bug.
+The original spike finding came from a test that ran
+`errors.Is(v2err, gocqlv1.ErrTimeoutNoResponse)` — a cross-package compare
+that Helix never performs. The mismatch is real for that specific (and
+incorrect) usage, but does not affect Helix's contract. No code fix
+needed.
+
+Worth noting for *future* design: only `ErrNotFound` is normalized today.
+If callers ever need to distinguish e.g. timeouts from other errors at
+the Helix level, a normalized `types.ErrTimeout` would be a clean
+addition — but that is a feature, not a bug fix, and out of scope here.
 
 ## 4. v1 reconnect attempts during outage are **chatty and instant**
 
@@ -97,63 +101,104 @@ likely vary. The e2e suite should:
 
 ## Findings from running the suite (2026-05-06)
 
-### 6. Replay queue silently loses writes under sustained load
+### 6. Replay queue overflow under sustained load — INVALIDATED, observable via instrumentation
 
-When S1 was originally written to drive writes flat-out for 10s with cluster A
-paused, the result was:
+Original symptom: S1 driving 4898 writes flat-out against a paused A
+ended with `A=600` and `B=4898`. The "silent loss" framing was wrong.
 
-```
-[v1] writes: ok+async=4898 async=0 dropped=0 dualErr=0 other=0
-[v1] post-drain row counts: A=600 B=4898
-```
+Verification (`cql_client_replay_drop_test.go:TestReplayDrop_QueueOverflow_IsObservable`):
 
-The replay queue (capacity 1000) drained to zero, but only **600 of 4898**
-writes ended up applied to A — and Helix reported zero `ErrWriteDropped`
-errors to the caller. Either:
+- `WithQueueCapacity(10) + 100 writes against failing A`:
+  `enqueued=5  dropped(metric)=95  dropped(callback)=95`
+- Full accounting holds: `enqueued + dropped == writes` (5 + 95 = 100).
+- `OnReplayDropped` callback count == `IncReplayDropped` metric — symmetric.
 
-- the replayer is dropping items when the queue is full and not surfacing it
-  via the `OnReplayDropped` callback, or
-- the replay worker is marking items "done" even when the apply against A
-  fails (e.g., because A is still paused at apply time).
+So drops are **fully observable**, just opt-in. The original e2e test had
+neither subscribed to `OnReplayDropped` nor read `IncReplayDropped`, so
+the loss appeared silent from the test's perspective only.
 
-This is a candidate Helix bug worth investigating separately. The committed
-S1 test uses a slower workload (100 writes at 50ms each) so replay drain
-is the only thing being tested; a dedicated **S7: replay-overflow under
-sustained load** scenario should be added to specifically probe this.
+Two design observations worth noting:
 
-### 8. LatencyCircuitBreaker has no probe path; stays open indefinitely once tripped
+a) `WithQueueCapacity(N)` allocates N/2 per priority queue (high + low),
+   not N total slots. Documented at `replay/memory.go:122-125` but easy
+   to miss; the parameter name suggests N total.
+b) `client.Query().Exec()` returns nil on partial success even when the
+   replay was dropped (cql_client.go:860 — "partial success is still
+   success from the caller's perspective"). Users who care about
+   replay drops must subscribe to `OnReplayDropped` or watch
+   `IncReplayDropped`.
 
-S3 originally asserted that the LCB would close after the reset timeout
-elapsed. It does not, because:
+No code fix needed. The e2e S1 test was updated to demonstrate the
+visibility pattern (subscribe to OnReplayDropped, read the metric).
 
-- Once the LCB trips on A, `StickyRead` routes all traffic to B.
-- The LCB only updates state via `RecordLatency` / `RecordSuccess`, which
-  are triggered by reads against the recorded cluster.
-- A cluster that is no longer being read against will never accumulate
-  successful latency observations, so the breaker stays open.
+### 8. CircuitBreaker had no half-open probe path — FIXED
 
-`CircuitBreaker.RecordFailure` checks the reset timeout to decide whether
-to reset the failure counter to 1, but `ShouldFailover` does not consult
-the timeout — it just returns `failures >= threshold`. So even after the
-reset timeout elapses, `ShouldFailover` still returns true until something
-explicitly calls `RecordFailure` or `RecordSuccess`.
+Original symptom: LCB on A, once tripped, stayed open indefinitely under
+read-only workloads. Root cause: `CircuitBreaker.ShouldFailover` returned
+`failures >= threshold` without consulting the reset timeout — so once
+`StickyRead` routed traffic away from A, no `RecordLatency`/`RecordSuccess`
+ever fired against A, and the breaker had no path back to closed.
 
-This is a real Helix design question: should the LCB have a half-open
-probe state? Without one, manual intervention is required to recover.
-The S3 test now logs this as an observation rather than asserting on
-recovery.
+Verified with `policy/circuit_breaker_probe_test.go:
+TestCircuitBreaker_ShouldFailover_StaysTrueAfterResetTimeout` (failing
+before the fix; passing after).
 
-### 7. RoundRobinRead does not increment the failover metric
+Fix in two parts (`policy/failover_policy.go`):
 
-When cluster A is paused under `RoundRobinRead + ActiveFailover`, reads
-succeed (rotated to B), but `mc.GetTotalFailovers()` stays at 0. Other
-strategies (Sticky, PrimaryOnly) increment by ≥1 in the same scenario.
+1. `ShouldFailover` is now time-aware — after `resetTimeout` elapses
+   since the last failure, it returns false to allow a probe attempt.
+2. `RecordFailure` clears the `tripped*` latch on the timeout-reset
+   branch, so multi-cycle outages (trip → half-open → probe-fail →
+   re-trip) emit `IncCircuitBreakerTrip` once per cycle rather than
+   once per the entire outage. Without this, observability undercounts
+   trips across recurring failures. Verified by
+   `TestCircuitBreaker_TripMetric_FiresOncePerTripCycle`.
 
-This is an observability gap: an operator who relies on the failover
-metric to alert on a sick cluster will not be paged when the active
-strategy is RoundRobin. Whether this is a bug or documented behavior
-depends on Helix's contract. The S2 test now logs this as informational
-when `expectsFailovers=false` rather than asserting on it.
+This is "leaky" half-open: concurrent callers may all see `false` during
+the probe window and route to the failed cluster simultaneously. That is
+intentional and bounded — the per-cluster mutex serializes outcomes, and
+at most `threshold` operations can fail before the breaker re-trips. A
+strict single-probe variant would need an additional "probe in flight"
+atomic; the leaky version is adequate for Helix's failure-recovery
+purpose and avoids the extra synchronization.
+
+**Scope of the fix.** It corrects the `ShouldFailover` *API contract*
+and therefore the trip metric across multi-cycle outages. The fix is
+load-bearing for **external monitoring** that polls `ShouldFailover`
+directly (which is what the e2e LCB test does). It does **not** by
+itself restore read routing in a `StickyRead + LCB` scenario — read
+routing under StickyRead is governed by StickyRead's own preferred-
+cluster latch and cooldown, which are independent of the breaker
+state. Any caller using `ShouldFailover` as a health gate will now see
+correct half-open / re-trip semantics.
+
+Existing tests still pass (full `./policy/...` race-detected suite, plus
+`TestCircuitBreakerResetTimeout`, `TestCircuitBreaker_MetricEmittedOnce`
+single-trip dedup, and `TestLatencyCircuitBreaker_ResetTimeout`). The
+S3 e2e test now asserts the breaker closes after `Unpause + resetTimeout`
+rather than logging an observation.
+
+### 7. RoundRobinRead failover metric — INVALIDATED, test artifact
+
+Original symptom: under `RoundRobinRead + ActiveFailover` with cluster A
+paused, `mc.GetTotalFailovers()` stayed at 0 while other strategies
+incremented. Suspected observability gap.
+
+Verification (`cql_client_rr_failover_metric_test.go:
+TestRoundRobinRead_FailoverMetric_FiresOnFailedClusterRead`):
+
+- 20 reads against an always-failing A + always-healthy B → 10 failovers,
+  exactly half (RR alternation).
+
+The original e2e test only did ONE read. RoundRobinRead's first `Select`
+returns ClusterB (counter starts at 0, first call increments to 1, 1%2==1
+→ B). B was healthy, so the read succeeded immediately and no failover
+was needed — `IncFailoverTotal` correctly stayed at 0.
+
+The S2 test was updated to drive 4 reads per sub-test, ensuring at least
+one Select hits the paused cluster regardless of the initial counter
+parity. With multiple reads, RR fires `IncFailoverTotal` exactly as
+expected. No code fix needed.
 
 ---
 
