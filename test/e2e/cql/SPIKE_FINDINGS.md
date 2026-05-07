@@ -4,28 +4,38 @@ Run via `go test -tags spike -v -run TestSpike ./test/e2e/cql/...` against
 Cassandra (test host has no AIO; ScyllaDB module fell back). Captured before
 implementing the e2e scenario suite.
 
-## 1. Stop / Start with the testcontainers Cassandra module is **not viable**
+## 1. Stop / Start with the testcontainers Cassandra module — root cause identified, still not viable
 
-Both `grace=1s` and `grace=30s` fail. The container shuts down cleanly
-(HintsService paused, MessagingService quiesces, system_schema flushes —
-all observed in logs), but on `Start()` the testcontainers wait hook reports
-`container exited with code 1`. The Cassandra JVM throws on `initServer`,
-likely because the node's persisted broadcast_address differs from its new
-container IP after restart.
+Verified after upgrading testcontainers-go `v0.40.0 → v0.42.0`. The exact
+JVM error captured from the restart logs:
 
-**Implication:** the e2e suite must not depend on `Stop`/`Start` against
-Cassandra. Two paths forward:
+```
+ERROR [main] CassandraDaemon.java:900 - Fatal configuration error
+org.apache.cassandra.exceptions.ConfigurationException:
+  Cannot change the number of tokens from 1 to 16
+```
 
-1. (Best long-term) Run on a host with `/proc/sys/fs/aio-nr` < `aio-max-nr`
-   so testutil picks ScyllaDB. Scylla does survive Stop/Start.
-2. (Universal) Use `Pause`/`Unpause` as the canonical "cluster down" failure
-   mode. Pause works on both backends and is the only mode that exercises
-   real hung-TCP semantics anyway — which is what makes it the most
-   chaos-uncovered axis.
+Root cause: the testcontainers Cassandra module writes
+`num_tokens=1` directly into `cassandra.yaml` during first-boot
+initialization. On restart, the image default `num_tokens=16` conflicts
+with the persisted `system` keyspace, and Cassandra refuses to boot.
+Setting `CASSANDRA_NUM_TOKENS=16` via env var does NOT override the
+module's direct yaml edit — the conflict persists either way (you'd
+just get the inverse mismatch).
 
-Decision: **Pause/Unpause is the primary failure mode for all e2e scenarios.**
-Stop/Start stays in the testutil API but tests do not rely on it. Suite
-docs note that Stop scenarios require ScyllaDB.
+This is a fundamental incompatibility between the testcontainers
+Cassandra module's first-boot config and Cassandra's restart
+requirements. Fixing it in our codebase would require either a
+custom container build or post-init yaml surgery — out of scope.
+
+**Implication for the e2e suite**: Stop/Start scenarios MUST run on
+Scylla, which survives the cycle cleanly. Pause/Unpause works on both
+backends. Decision unchanged:
+
+- Pause/Unpause is the primary failure mode for all e2e scenarios.
+- Stop/Start scenarios are gated on `cluster.Type == ScyllaDB`.
+- For real "process death" semantics that work on both backends, use
+  `docker kill -SIGKILL` (see §9 below).
 
 ## 2. Pause / Unpause works reliably on both v1 and v2
 
@@ -89,13 +99,48 @@ error. The control-conn chatter is logged but not raised to the API.
 
 ## 5. Container backend in CI / dev hosts
 
-`testutil.IsAIOAvailable()` returned false on this dev host (Linux Mint
-22.3, Docker 29.4). `StartCQLCluster` fell back to Cassandra. CI hosts
-likely vary. The e2e suite should:
+`testutil.IsAIOAvailable()` checks `aio-nr < aio-max-nr` and returns false
+if AIO slots are exhausted; `StartCQLCluster` then falls back to Cassandra.
 
-- print which backend it picked at TestMain startup,
-- gracefully skip Stop-only scenarios when backend is Cassandra,
-- run Pause-based scenarios unconditionally.
+**Common gotcha: a long-running peer Scylla without
+`--reactor-backend=epoll` consumes most of the AIO slots** (default
+1,048,576 system-wide). With `aio-nr == aio-max-nr`, no further Scylla
+container can register an AIO ring, so `IsAIOAvailable()` correctly
+declines. Verified by stopping a 3-week-old peer Scylla and seeing
+`aio-nr` drop from 1,048,576 to 0.
+
+Remediations (in order of preference):
+
+1. Stop or terminate any peer Scylla container hogging the AIO pool.
+2. Configure peers to use `--reactor-backend=epoll` (skips AIO entirely).
+3. Raise the system limit: `sudo sysctl -w fs.aio-max-nr=4194304`.
+
+The testutil-managed Scylla already passes `--reactor-backend=epoll`
+itself, so it doesn't perpetuate the problem — but it still needs a
+non-empty headroom of unused AIO slots at startup time on some Scylla
+versions.
+
+## 5a. Stop/Start on Scylla — supported, but with port reassignment
+
+Verified directly via the spike (`TestSpike_StopStartPortPreserved`):
+
+- Scylla survives a clean Stop/Start cycle (Cassandra in this
+  testcontainers configuration does not — see §1).
+- **Docker reassigns the host port**: `localhost:32849 → localhost:32851`
+  across one cycle. The original gocql session cannot auto-recover
+  because its connect string points at the dead port.
+- `cluster.Reconnect(ctx)` rebuilds both v1 and v2 sessions against
+  the new mapping; queries succeed immediately on both drivers.
+
+So real Stop/Start scenarios are viable on Scylla, but require the
+caller to call `Reconnect` after `Start`. The `withRestoredCluster`
+helper in setup_test.go already does this.
+
+Caveat for Helix client testing: the helix CQLClient holds the gocql
+sessions by value at construction time. After `Reconnect`, the cluster's
+new sessions are accessible via `cluster.Session` / `cluster.SessionV2`,
+but any helix.CQLClient built before Stop is still referencing the
+old (now-dead) sessions. Tests must rebuild the helix client too.
 
 ---
 
