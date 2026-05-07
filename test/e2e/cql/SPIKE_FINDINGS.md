@@ -201,10 +201,14 @@ This is **a real Helix usability gotcha** (not a correctness bug —
 the data and callbacks are right, just the metric path is bifurcated):
 
 - `replay.NewMemoryWorker(replayer, executeFn, replay.WithWorkerMetrics(mc), …)`
-  is the correct pattern.
-- A future improvement could detect `client.Config().Metrics` at the
-  point where `client.Config().ReplayWorker = worker` is assigned and
-  inject it if the worker doesn't already have one.
+  remains the safe pattern.
+- **Resolved**: `NewCQLClient` now auto-injects the client's metrics
+  collector into a worker that doesn't have one explicitly set, via
+  type-assertion on `MetricsConfigured() bool` + `SetMetrics(...)`
+  (added to `*replay.Worker`). Auto-memory worker gets the same
+  injection. Callers who explicitly pass `WithWorkerMetrics(otherMc)`
+  are NOT overwritten — their choice wins. See
+  `cql_client_worker_metrics_test.go` for the unit guards.
 
 Two design observations from the v1 doc retained:
 

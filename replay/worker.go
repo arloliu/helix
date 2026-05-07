@@ -56,6 +56,13 @@ type WorkerConfig struct {
 	// If nil, no metrics are recorded.
 	Metrics types.MetricsCollector
 
+	// metricsExplicit is true when WithWorkerMetrics was called by the
+	// caller. Used by [Worker.MetricsConfigured] so a parent (e.g. the
+	// helix CQLClient) can detect "user did NOT pass WithWorkerMetrics"
+	// and inject its own MetricsCollector to keep client+worker
+	// instrumentation unified.
+	metricsExplicit bool
+
 	// Logger is the structured logger for replay worker events.
 	// If nil, no logs are emitted.
 	Logger types.Logger
@@ -187,9 +194,14 @@ func WithOnDrop(fn func(types.ReplayPayload, error)) WorkerOption {
 }
 
 // WithWorkerMetrics sets the metrics collector for the worker.
+//
+// Marks the configuration as "metrics explicitly set" so a parent caller
+// (e.g. helix.NewCQLClient) does not auto-inject a different collector
+// later via [Worker.SetMetrics] / [Worker.MetricsConfigured].
 func WithWorkerMetrics(m types.MetricsCollector) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.Metrics = m
+		c.metricsExplicit = true
 	}
 }
 
@@ -292,6 +304,50 @@ func (w *Worker) IsRunning() bool {
 //   - names: The cluster names to use in log messages
 func (w *Worker) SetClusterNames(names types.ClusterNames) {
 	w.config.ClusterNames = names
+}
+
+// MetricsConfigured reports whether the worker's metrics collector was
+// explicitly set by the caller (via [WithWorkerMetrics]) at construction
+// time.
+//
+// The helix CQLClient uses this to detect a worker that has not been
+// given a metrics collector and inject its own (via [Worker.SetMetrics])
+// so client and worker metrics share the same collector — preventing
+// the surprise where worker-side IncReplaySuccess/Dropped/Error are
+// silently invisible because the worker is using its internal NopMetrics.
+//
+// Returns:
+//   - bool: true if WithWorkerMetrics was called at construction time
+func (w *Worker) MetricsConfigured() bool {
+	return w.config.metricsExplicit
+}
+
+// SetMetrics replaces the worker's metrics collector. No-op once
+// [Worker.MetricsConfigured] returns true (the caller's explicit choice
+// wins) or if m is nil. Successful injection marks the configuration
+// as explicit so subsequent SetMetrics calls are no-ops.
+//
+// Intended for parent callers like helix.CQLClient that want to ensure
+// client and worker metrics are unified without overwriting a deliberate
+// per-worker choice.
+//
+// Parameters:
+//   - m: The metrics collector to use
+func (w *Worker) SetMetrics(m types.MetricsCollector) {
+	if w.config.metricsExplicit {
+		return
+	}
+	if m == nil {
+		return
+	}
+	w.config.Metrics = m
+	w.config.metricsExplicit = true
+}
+
+// Metrics returns the worker's metrics collector. Useful for tests and
+// for parent callers verifying metrics propagation.
+func (w *Worker) Metrics() types.MetricsCollector {
+	return w.config.Metrics
 }
 
 // BackendType returns the type of backend being used ("memory" or "nats").

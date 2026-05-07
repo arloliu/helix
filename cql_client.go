@@ -425,17 +425,42 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// nil-pointer-deref-risk on the holder pointer itself.
 	client.storeSessionB(sessionB)
 
-	// Create auto memory worker if configured
+	// Create auto memory worker if configured. The auto-created worker
+	// inherits the client's metrics collector by default so client and
+	// worker metrics are unified — this prevents the gotcha where
+	// worker-side IncReplaySuccess/Dropped/Error go into a separate
+	// NopMetrics and are silently invisible to the client's collector.
+	// Caller-supplied AutoMemoryWorkerOpts that include WithWorkerMetrics
+	// override this default (last-option-wins).
 	if config.AutoMemoryWorker {
 		memReplayer := replay.NewMemoryReplayer(
 			replay.WithQueueCapacity(config.AutoMemoryCapacity),
 		)
 		config.Replayer = memReplayer
+		opts := append(
+			[]replay.WorkerOption{replay.WithWorkerMetrics(config.Metrics)},
+			config.AutoMemoryWorkerOpts...,
+		)
 		config.ReplayWorker = replay.NewMemoryWorker(
 			memReplayer,
 			client.DefaultExecuteFunc(),
-			config.AutoMemoryWorkerOpts...,
+			opts...,
 		)
+	}
+
+	// For caller-supplied workers (via WithReplayWorker), inject the
+	// client's metrics collector if the worker doesn't already have one
+	// explicitly set. Type-assertion-based so the public ReplayWorker
+	// interface is unchanged; workers that opt in (replay.Worker does)
+	// expose MetricsConfigured + SetMetrics; others are left alone.
+	if config.ReplayWorker != nil && config.Metrics != nil {
+		type metricsAware interface {
+			MetricsConfigured() bool
+			SetMetrics(types.MetricsCollector)
+		}
+		if mw, ok := config.ReplayWorker.(metricsAware); ok && !mw.MetricsConfigured() {
+			mw.SetMetrics(config.Metrics)
+		}
 	}
 
 	// Start topology watcher if configured. The cancel function is stashed so
