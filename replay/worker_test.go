@@ -559,6 +559,149 @@ func TestMemoryWorker_MaxAttemptsBoundsRetries(t *testing.T) {
 	worker.Stop()
 }
 
+// TestMemoryWorker_FailingPayloadDoesNotBlockHealthy is the head-of-line
+// blocking regression guard. Inline retry on the dequeue loop would stall
+// the entire backlog (including unrelated-cluster work) for the full
+// cumulative backoff window of a single permanently-failing payload.
+// Retries must run off the dequeue path so a healthy payload enqueued
+// after the failing one still progresses in bounded time.
+func TestMemoryWorker_FailingPayloadDoesNotBlockHealthy(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(10))
+	defer replayer.Close()
+
+	var processedHealthy atomic.Int32
+	var failingAttempts atomic.Int32
+
+	execute := func(_ context.Context, payload types.ReplayPayload) error {
+		// Cluster B = healthy; cluster A = always fails.
+		if payload.TargetCluster == types.ClusterB {
+			processedHealthy.Add(1)
+			return nil
+		}
+		failingAttempts.Add(1)
+
+		return errors.New("cluster A is broken")
+	}
+
+	worker := replay.NewMemoryWorker(replayer, execute,
+		replay.WithPollInterval(5*time.Millisecond),
+		// Long backoff to make any head-of-line blocking observable.
+		replay.WithRetryDelay(2*time.Second),
+		replay.WithMaxRetryDelay(2*time.Second),
+		replay.WithMaxAttempts(3),
+	)
+
+	// Enqueue the failing payload first so it occupies the worker before
+	// the healthy one arrives.
+	require.NoError(t, replayer.Enqueue(t.Context(), types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT A",
+		Timestamp:     1,
+		Priority:      types.PriorityHigh,
+	}))
+	require.NoError(t, replayer.Enqueue(t.Context(), types.ReplayPayload{
+		TargetCluster: types.ClusterB,
+		Query:         "INSERT B",
+		Timestamp:     2,
+		Priority:      types.PriorityHigh,
+	}))
+
+	require.NoError(t, worker.Start())
+	t.Cleanup(worker.Stop)
+
+	// Healthy payload must be processed within ~150ms — well under the
+	// 2s backoff that would block it under inline-retry semantics.
+	require.Eventually(t, func() bool {
+		return processedHealthy.Load() == 1
+	}, 500*time.Millisecond, 5*time.Millisecond,
+		"healthy payload must not be blocked behind a failing payload's retry backoff")
+
+	// Sanity: the failing payload's first attempt has run, but its
+	// retry attempts (which would take 2+ seconds with the backoff
+	// configured) have NOT yet run.
+	assert.Equal(t, int32(1), failingAttempts.Load(),
+		"failing payload should have attempted exactly once before healthy ran; "+
+			"if this is >1 the dequeue loop blocked on retry sleep")
+}
+
+// TestMemoryWorker_RetryPoolSaturationDropsImmediately verifies that
+// when the retry-goroutine pool is full, further failures drop
+// immediately instead of stalling the dequeue loop. This is the
+// safety valve that prevents a sustained-failure storm from using
+// dequeue concurrency as an unbounded retry queue.
+func TestMemoryWorker_RetryPoolSaturationDropsImmediately(t *testing.T) {
+	const enqueueCount = 200 // intentionally exceeds the 100-slot retry pool
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(enqueueCount))
+	defer replayer.Close()
+
+	var attempts atomic.Int32
+	var dropped atomic.Int32
+	var saturatedDrops atomic.Int32
+
+	execute := func(_ context.Context, _ types.ReplayPayload) error {
+		attempts.Add(1)
+		return errors.New("always fails")
+	}
+
+	worker := replay.NewMemoryWorker(replayer, execute,
+		replay.WithPollInterval(1*time.Millisecond),
+		// Long backoff so retries pile up in the goroutine pool rather
+		// than completing quickly.
+		replay.WithRetryDelay(10*time.Second),
+		replay.WithMaxRetryDelay(10*time.Second),
+		replay.WithMaxAttempts(5),
+		replay.WithOnDrop(func(_ types.ReplayPayload, err error) {
+			dropped.Add(1)
+			// Drops attributable to pool saturation see the original
+			// first-attempt error string ("always fails"); shutdown
+			// drops also see that. Both are valid for this assertion;
+			// what matters is that dropped count grows beyond what
+			// the 100-slot pool could absorb.
+			if err != nil {
+				saturatedDrops.Add(1)
+			}
+		}),
+	)
+
+	for range enqueueCount {
+		require.NoError(t, replayer.Enqueue(t.Context(), types.ReplayPayload{
+			TargetCluster: types.ClusterA,
+			Query:         "INSERT",
+			Timestamp:     1,
+			Priority:      types.PriorityHigh,
+		}))
+	}
+
+	require.NoError(t, worker.Start())
+
+	// Wait until the dequeue loop has processed all enqueued payloads
+	// (each gets one synchronous first attempt before either entering
+	// retry or being saturation-dropped).
+	require.Eventually(t, func() bool {
+		return attempts.Load() >= int32(enqueueCount)
+	}, 5*time.Second, 5*time.Millisecond,
+		"dequeue loop must keep processing first attempts even when retry pool fills")
+
+	// Saturation-drops should account for at least (enqueueCount - 100)
+	// of the dropped count: the first 100 fit in the retry pool, the
+	// remaining ~100 must drop immediately.
+	require.Eventually(t, func() bool {
+		return saturatedDrops.Load() >= int32(enqueueCount-defaultMemoryRetryConcurrencyForTest)
+	}, time.Second, 5*time.Millisecond,
+		"failures beyond the retry pool capacity must drop immediately rather than queue")
+
+	worker.Stop()
+
+	// After Stop, every payload should ultimately have been dropped
+	// (saturation drops + shutdown drops of the in-flight retries).
+	assert.Equal(t, int32(enqueueCount), dropped.Load(),
+		"every payload should drop exactly once across saturation + shutdown paths")
+}
+
+// defaultMemoryRetryConcurrencyForTest mirrors the unexported constant in
+// memory_worker.go. Update both when changing the cap.
+const defaultMemoryRetryConcurrencyForTest = 100
+
 // TestMemoryWorker_RecoveryBeforeMaxAttempts verifies that a transient failure
 // recovered before MaxAttempts is exhausted yields a successful replay and
 // no OnDrop call.
