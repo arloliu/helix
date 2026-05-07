@@ -93,6 +93,16 @@ type ClientConfig struct {
 	// Mirrors the [TimestampProvider] pattern above.
 	NowProvider NowProvider
 
+	// AutoRefresh configures the auto-refresh detector. When Enabled is
+	// true AND a SessionRefresher is registered, a background goroutine
+	// monitors per-cluster op outcomes and invokes [CQLClient.RefreshSession]
+	// when a cluster's session is observed to be permanently dead.
+	//
+	// Defaults are conservative — see [DefaultAutoRefreshConfig]. Use
+	// [WithAutoRefresh] to enable; tune individual knobs with the
+	// AutoRefresh*Option helpers.
+	AutoRefresh AutoRefreshConfig
+
 	// SessionRefresher is an optional caller-supplied factory used by
 	// [CQLClient.RefreshSession] to build a replacement [cql.Session] for a
 	// cluster whose live session is broken (e.g., the cluster restarted at a
@@ -539,4 +549,120 @@ func propagateClusterNames(c *ClientConfig) {
 	if namer, ok := c.ReadStrategy.(types.ClusterNamer); ok {
 		namer.SetClusterNames(names)
 	}
+}
+
+// AutoRefreshConfig configures the auto-refresh detector for the
+// [CQLClient]. Auto-refresh is opt-in via [WithAutoRefresh] and requires
+// a [SessionRefresher] registered via [WithSessionRefresher].
+//
+// The detector runs as a background goroutine that ticks every
+// CheckInterval and inspects per-cluster op-outcome stats. A cluster is
+// considered "session permanently dead" when ALL of:
+//
+//   - consecutiveFailures >= FailureThreshold
+//   - now - lastSuccess >= SustainedFailureWindow
+//   - now - lastRefresh >= MinRetryInterval (throttle)
+//
+// On match, the detector invokes [CQLClient.RefreshSession] with a
+// RefreshTimeout-bound context. RefreshTimeout caps the wall-clock
+// budget for a misbehaving refresher.
+//
+// Defaults are intentionally conservative: refresh storms (an aggressive
+// detector firing repeatedly) are operationally far worse than slow
+// recovery. Use [WithAutoRefresh] with no per-knob options to get them.
+type AutoRefreshConfig struct {
+	// Enabled gates the entire detector. False by default — auto-refresh
+	// is strictly opt-in. Set automatically by [WithAutoRefresh].
+	Enabled bool
+
+	// FailureThreshold is the consecutive-failures count that must be
+	// reached before the detector considers refresh. Default: 10.
+	FailureThreshold int
+
+	// SustainedFailureWindow is the minimum duration since the most
+	// recent successful op for the detector to fire. Punctuating
+	// failures with even one success resets this. Default: 5 minutes.
+	SustainedFailureWindow time.Duration
+
+	// MinRetryInterval is the minimum duration between successive
+	// refresh attempts on the same cluster. Bounds the rate at which
+	// auto-refresh can fire even under sustained failure with a
+	// failing refresher. Default: 1 minute.
+	MinRetryInterval time.Duration
+
+	// CheckInterval is the period at which the detector goroutine
+	// evaluates per-cluster state. Detector lag is bounded by this.
+	// Default: 30 seconds.
+	CheckInterval time.Duration
+
+	// RefreshTimeout is the per-call timeout context applied around
+	// [CQLClient.RefreshSession] when the detector fires. The refresher
+	// should respect this deadline. Default: 30 seconds.
+	RefreshTimeout time.Duration
+}
+
+// DefaultAutoRefreshConfig returns the production defaults applied by
+// [WithAutoRefresh] when called with no per-knob options. Exposed as a
+// symbol so callers can construct an AutoRefreshConfig literal with
+// these defaults and then mutate select fields.
+func DefaultAutoRefreshConfig() AutoRefreshConfig {
+	return AutoRefreshConfig{
+		Enabled:                true,
+		FailureThreshold:       10,
+		SustainedFailureWindow: 5 * time.Minute,
+		MinRetryInterval:       1 * time.Minute,
+		CheckInterval:          30 * time.Second,
+		RefreshTimeout:         30 * time.Second,
+	}
+}
+
+// AutoRefreshOption is a per-knob configurator for [WithAutoRefresh].
+type AutoRefreshOption func(*AutoRefreshConfig)
+
+// WithAutoRefresh enables the auto-refresh detector with conservative
+// defaults (see [DefaultAutoRefreshConfig]). A registered
+// [SessionRefresher] is required for the detector to do anything;
+// without one, the detector silently no-ops.
+//
+// Per-knob tuning:
+//
+//	helix.WithAutoRefresh(
+//	    helix.WithAutoRefreshFailureThreshold(20),
+//	    helix.WithAutoRefreshSustainedFailureWindow(2*time.Minute),
+//	)
+//
+// Returns:
+//   - Option: Configuration option
+func WithAutoRefresh(opts ...AutoRefreshOption) Option {
+	return func(c *ClientConfig) {
+		c.AutoRefresh = DefaultAutoRefreshConfig()
+		for _, opt := range opts {
+			opt(&c.AutoRefresh)
+		}
+	}
+}
+
+// WithAutoRefreshFailureThreshold overrides AutoRefreshConfig.FailureThreshold.
+func WithAutoRefreshFailureThreshold(n int) AutoRefreshOption {
+	return func(c *AutoRefreshConfig) { c.FailureThreshold = n }
+}
+
+// WithAutoRefreshSustainedFailureWindow overrides AutoRefreshConfig.SustainedFailureWindow.
+func WithAutoRefreshSustainedFailureWindow(d time.Duration) AutoRefreshOption {
+	return func(c *AutoRefreshConfig) { c.SustainedFailureWindow = d }
+}
+
+// WithAutoRefreshMinRetryInterval overrides AutoRefreshConfig.MinRetryInterval.
+func WithAutoRefreshMinRetryInterval(d time.Duration) AutoRefreshOption {
+	return func(c *AutoRefreshConfig) { c.MinRetryInterval = d }
+}
+
+// WithAutoRefreshCheckInterval overrides AutoRefreshConfig.CheckInterval.
+func WithAutoRefreshCheckInterval(d time.Duration) AutoRefreshOption {
+	return func(c *AutoRefreshConfig) { c.CheckInterval = d }
+}
+
+// WithAutoRefreshRefreshTimeout overrides AutoRefreshConfig.RefreshTimeout.
+func WithAutoRefreshRefreshTimeout(d time.Duration) AutoRefreshOption {
+	return func(c *AutoRefreshConfig) { c.RefreshTimeout = d }
 }

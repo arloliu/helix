@@ -105,6 +105,13 @@ type CQLClient struct {
 	// millisecond-scale time-based assertions don't depend on wall clock.
 	// Mirrors the TimestampProvider pattern in config.go.
 	nowFunc NowProvider
+
+	// autoRefreshCtx / autoRefreshClose control the auto-refresh
+	// background goroutine's lifetime. Nil if WithAutoRefresh was not
+	// configured (or if no SessionRefresher was registered, since the
+	// detector cannot do anything useful without a refresher).
+	autoRefreshCtx   context.Context
+	autoRefreshClose context.CancelFunc
 }
 
 // sessionHolder wraps a cql.Session so it can live in an atomic.Pointer.
@@ -116,12 +123,16 @@ type sessionHolder struct {
 // clusterStats holds per-cluster op-outcome counters. All fields are
 // atomics — no lock needed on the read or write side.
 //
-// The auto-refresh detector (commit 3) reads these fields to decide when
-// a cluster's session is permanently dead.
+// The auto-refresh detector (see [WithAutoRefresh]) reads these fields
+// to decide when a cluster's session is permanently dead and needs a
+// RefreshSession call. lastRefreshNanos is the throttle: stamped before
+// each refresh attempt so a hung refresher cannot cause re-entrant
+// double-fire on the next detector tick.
 type clusterStats struct {
 	consecutiveFailures atomic.Int32
 	lastSuccessNanos    atomic.Int64
 	lastFailureNanos    atomic.Int64
+	lastRefreshNanos    atomic.Int64
 }
 
 // NowProvider returns the current time as Unix nanoseconds.
@@ -179,6 +190,117 @@ func (c *CQLClient) statsForCluster(cluster ClusterID) *clusterStats {
 	}
 
 	return &c.statsA
+}
+
+// autoRefreshLoop runs in a background goroutine when WithAutoRefresh is
+// enabled and a SessionRefresher is registered. It ticks every
+// AutoRefresh.CheckInterval and asks maybeAutoRefresh to evaluate each
+// cluster.
+//
+// Started by NewCQLClient, stopped by Close.
+func (c *CQLClient) autoRefreshLoop() {
+	t := time.NewTicker(c.config.AutoRefresh.CheckInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-c.autoRefreshCtx.Done():
+			return
+		case <-t.C:
+			c.maybeAutoRefresh(ClusterA)
+			if !c.singleCluster {
+				c.maybeAutoRefresh(ClusterB)
+			}
+		}
+	}
+}
+
+// maybeAutoRefresh evaluates the trigger condition for the given cluster
+// and invokes RefreshSession if all three predicates hold:
+//
+//  1. consecutiveFailures >= AutoRefresh.FailureThreshold
+//  2. now - lastSuccess  >= AutoRefresh.SustainedFailureWindow
+//  3. now - lastRefresh  >= AutoRefresh.MinRetryInterval (throttle)
+//
+// Each predicate is evaluated against atomic loads — no lock. The
+// throttle stamp (lastRefreshNanos) is set BEFORE invoking the refresher
+// so a hung refresher cannot cause re-entrant double-fire on the next
+// tick. On successful refresh, consecutiveFailures is reset (so a
+// fresh-session-also-dead scenario must re-accumulate threshold-many
+// failures before re-triggering); lastSuccessNanos is left stale until
+// the next genuinely successful op proves the new session is healthy.
+//
+// Exported for tests via direct invocation; production callers should
+// not call this — the goroutine drives it.
+func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
+	if c.closed.Load() {
+		return
+	}
+	if c.config.SessionRefresher == nil {
+		return // can't refresh; the loop is moot for this cluster
+	}
+
+	s := c.statsForCluster(cluster)
+	now := c.nowFunc()
+	cfg := c.config.AutoRefresh
+
+	// Compare via int64 to dodge gosec's int → int32 conversion warning;
+	// FailureThreshold can in principle exceed int32 max but in practice
+	// is always single/double digits.
+	if int64(s.consecutiveFailures.Load()) < int64(cfg.FailureThreshold) {
+		return
+	}
+	if now-s.lastSuccessNanos.Load() < int64(cfg.SustainedFailureWindow) {
+		return
+	}
+	if now-s.lastRefreshNanos.Load() < int64(cfg.MinRetryInterval) {
+		return
+	}
+
+	// Throttle stamp first — any future tick within MinRetryInterval will
+	// see this and bail at the predicate above, even if RefreshSession
+	// hangs or panics.
+	s.lastRefreshNanos.Store(now)
+
+	if m, ok := c.config.Metrics.(types.SessionRefreshMetrics); ok {
+		m.IncSessionRefreshAttempt(cluster)
+	}
+	c.config.Logger.Info("auto-refresh: session believed dead, invoking refresher",
+		"cluster", c.clusterName(cluster),
+		"consecutiveFailures", s.consecutiveFailures.Load(),
+		"secondsSinceLastSuccess", (now-s.lastSuccessNanos.Load())/int64(time.Second),
+	)
+
+	ctx, cancel := context.WithTimeout(c.autoRefreshCtx, cfg.RefreshTimeout)
+	defer cancel()
+
+	if err := c.RefreshSession(ctx, cluster); err != nil {
+		if m, ok := c.config.Metrics.(types.SessionRefreshMetrics); ok {
+			m.IncSessionRefreshError(cluster)
+		}
+		c.config.Logger.Warn("auto-refresh: session refresh failed",
+			"cluster", c.clusterName(cluster),
+			"error", err.Error(),
+		)
+
+		return
+	}
+
+	if m, ok := c.config.Metrics.(types.SessionRefreshMetrics); ok {
+		m.IncSessionRefreshSuccess(cluster)
+	}
+	c.config.Logger.Info("auto-refresh: session refreshed",
+		"cluster", c.clusterName(cluster),
+	)
+
+	// Reset failure counters: the new session deserves a fresh start.
+	// Leave lastSuccessNanos stale — we want the detector to require a
+	// genuinely successful op against the new session before considering
+	// it healthy. Without this, an immediate re-tick would see threshold
+	// failures already met against a now-replaced session and could
+	// (modulo MinRetryInterval) re-fire spuriously.
+	s.consecutiveFailures.Store(0)
+	s.lastFailureNanos.Store(0)
 }
 
 // recordOpOutcome updates the per-cluster stats based on a single op's
@@ -335,6 +457,16 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 			}
 			return nil, err
 		}
+	}
+
+	// Start the auto-refresh detector if enabled AND a refresher is
+	// registered. Without a refresher the detector cannot do anything
+	// useful, so we skip the goroutine entirely.
+	if config.AutoRefresh.Enabled && config.SessionRefresher != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		client.autoRefreshCtx = ctx
+		client.autoRefreshClose = cancel
+		go client.autoRefreshLoop()
 	}
 
 	return client, nil
@@ -510,6 +642,14 @@ func (c *CQLClient) Close() {
 		// Stop topology watcher
 		if c.topologyClose != nil {
 			c.topologyClose()
+		}
+
+		// Stop the auto-refresh detector goroutine. Cancellation is
+		// observed at the goroutine's select; any RefreshSession call
+		// that's currently in flight will additionally see closed=true
+		// at its entry and return ErrSessionClosed.
+		if c.autoRefreshClose != nil {
+			c.autoRefreshClose()
 		}
 
 		// Stop replay worker
