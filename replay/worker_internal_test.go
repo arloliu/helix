@@ -1,11 +1,18 @@
 package replay
 
 import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/arloliu/helix/internal/logging"
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/types"
 )
 
@@ -58,4 +65,138 @@ func TestWorkerConfigOptions(t *testing.T) {
 	// Verify callback works
 	worker.config.OnSuccess(types.ReplayPayload{})
 	assert.True(t, called)
+}
+
+// TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown verifies the
+// shutdown contract: when stopCh fires mid-batch, every unprocessed
+// message in the batch is Nak'd so the broker re-delivers them
+// immediately rather than waiting for AckWait (default 30s) to expire.
+//
+// The test exercises processMessages directly with fabricated
+// ReplayMessage values so we can observe ack/nak/term invocation without
+// running an embedded NATS server.
+func TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown(t *testing.T) {
+	const batchSize = 5
+
+	stopCh := make(chan struct{})
+	cfg := DefaultWorkerConfig()
+	cfg.Metrics = metrics.NewNopMetrics()
+	cfg.Logger = logging.NewNopLogger()
+	cfg.ExecuteTimeout = time.Second
+
+	// Track per-message outcomes via injected ack/nak/term funcs.
+	var (
+		mu          sync.Mutex
+		ackCount    int
+		nakedIdxs   []int
+		termCount   int
+		executedIdx atomic.Int32
+	)
+
+	msgs := make([]ReplayMessage, batchSize)
+	for i := range batchSize {
+		msgs[i] = ReplayMessage{
+			Payload: types.ReplayPayload{
+				TargetCluster: types.ClusterA,
+				Query:         "INSERT test",
+				Timestamp:     int64(i),
+			},
+			ackFunc: func() error {
+				mu.Lock()
+				ackCount++
+				mu.Unlock()
+
+				return nil
+			},
+			nakFunc: func() error {
+				mu.Lock()
+				nakedIdxs = append(nakedIdxs, i)
+				mu.Unlock()
+
+				return nil
+			},
+			termFunc: func() error {
+				mu.Lock()
+				termCount++
+				mu.Unlock()
+
+				return nil
+			},
+			DeliveryCount: 1,
+			MaxDeliver:    5,
+		}
+	}
+
+	// Execute func: succeed on the first message, then signal stop and
+	// block briefly so processMessages observes stopCh on the next iteration.
+	execute := func(_ context.Context, _ types.ReplayPayload) error {
+		idx := executedIdx.Add(1)
+		if idx == 1 {
+			// Trigger shutdown after the first message acks.
+			close(stopCh)
+			// Brief pause to ensure the next loop iteration sees stopCh.
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		return nil
+	}
+
+	b := &natsBackend{
+		config:  &cfg,
+		execute: execute,
+		stopCh:  stopCh,
+	}
+
+	b.processMessages(msgs)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	assert.Equal(t, 1, ackCount, "exactly one message processed and ack'd before shutdown")
+	assert.Equal(t, 0, termCount, "no terms — no last-attempt drops")
+	require.Len(t, nakedIdxs, batchSize-1,
+		"every unprocessed message in the batch must be Nak'd; tail messages can no longer rely on AckWait timeout")
+	assert.Equal(t, []int{1, 2, 3, 4}, nakedIdxs,
+		"Nak must hit the contiguous tail starting at the message that observed stopCh")
+}
+
+// TestNATSBackend_ProcessMessages_NakErrorsAreNonBlocking verifies that an
+// error from one Nak does not prevent the rest of the batch from being
+// Nak'd. Each message's ack/nak is independent.
+func TestNATSBackend_ProcessMessages_NakErrorsAreNonBlocking(t *testing.T) {
+	stopCh := make(chan struct{})
+	close(stopCh) // already stopped
+
+	cfg := DefaultWorkerConfig()
+	cfg.Metrics = metrics.NewNopMetrics()
+	cfg.Logger = logging.NewNopLogger()
+
+	var nakedCount atomic.Int32
+	mkMsg := func(failNak bool) ReplayMessage {
+		return ReplayMessage{
+			Payload: types.ReplayPayload{TargetCluster: types.ClusterA},
+			nakFunc: func() error {
+				nakedCount.Add(1)
+				if failNak {
+					return errors.New("nak failed")
+				}
+
+				return nil
+			},
+			ackFunc:  func() error { return nil },
+			termFunc: func() error { return nil },
+		}
+	}
+
+	msgs := []ReplayMessage{mkMsg(true), mkMsg(false), mkMsg(true)}
+
+	b := &natsBackend{
+		config:  &cfg,
+		execute: func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		stopCh:  stopCh,
+	}
+	b.processMessages(msgs)
+
+	assert.Equal(t, int32(3), nakedCount.Load(),
+		"every message in the batch must have its Nak attempted, errors don't abort the loop")
 }

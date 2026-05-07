@@ -161,12 +161,22 @@ func (b *natsBackend) dequeueHighFirst(ctx context.Context, cluster types.Cluste
 }
 
 // processMessages processes a batch of NATS replay messages.
+//
+// On shutdown, the current message AND all remaining messages in the batch
+// are Nak'd so they redeliver immediately. Without naking the tail, those
+// messages would sit unacknowledged until AckWait expires (default 30s)
+// before a restarted worker could re-process them — a long visible delay
+// during graceful restarts.
 func (b *natsBackend) processMessages(msgs []ReplayMessage) {
-	for _, msg := range msgs {
+	for i, msg := range msgs {
 		select {
 		case <-b.stopCh:
-			// Nak remaining messages for redelivery
-			_ = msg.Nak()
+			// Nak the current message AND every unprocessed message left
+			// in the batch. Each Nak is independent; an error on one does
+			// not block the others.
+			for j := i; j < len(msgs); j++ {
+				_ = msgs[j].Nak()
+			}
 
 			return
 		default:
