@@ -13,9 +13,20 @@ import (
 //
 // # Priority Support
 //
-// The replayer uses separate channels for high and low priority messages, sharing
-// a total capacity. High-priority messages are preferred during dequeue operations,
-// with configurable ratio-based fair scheduling to prevent low-priority starvation.
+// The replayer uses separate channels for high and low priority messages,
+// sharing a total enforced capacity. Each priority channel is sized to the
+// full configured capacity so an all-high or all-low workload can use the
+// entire budget; a shared atomic counter caps the combined pending across
+// both queues. High-priority messages are preferred during dequeue operations,
+// with configurable ratio-based fair scheduling to prevent low-priority
+// starvation.
+//
+// # Memory Footprint
+//
+// Because both priority channels are sized to the full capacity, the replayer
+// reserves channel buffer slots for ~2× capacity ReplayPayload structs (the
+// enforced pending limit is still 1× capacity). Size WithQueueCapacity with
+// that overhead in mind for high-capacity deployments.
 //
 // # Durability Warning
 //
@@ -48,9 +59,11 @@ type MemoryReplayer struct {
 // MemoryReplayerOption configures a MemoryReplayer.
 type MemoryReplayerOption func(*MemoryReplayer)
 
-// WithQueueCapacity sets the maximum number of pending replays.
+// WithQueueCapacity sets the maximum number of pending replays across both
+// priority queues combined.
 //
-// The capacity is shared across both high and low priority queues.
+// Values <= 0 are clamped to 1; there is no way to disable the queue via
+// this option (callers who do not want a replayer should not configure one).
 //
 // Parameters:
 //   - n: Total queue capacity (default: 10000)
@@ -140,7 +153,10 @@ func NewMemoryReplayer(opts ...MemoryReplayerOption) *MemoryReplayer {
 //   - payload: The write operation to replay
 //
 // Returns:
-//   - error: nil on success, ErrReplayQueueFull if queue is at capacity
+//   - error: nil on success;
+//     [types.ErrSessionClosed] if Close has been called;
+//     ctx.Err() if ctx is already cancelled or is cancelled while waiting;
+//     [types.ErrReplayQueueFull] if the combined pending count is at capacity.
 func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload) error {
 	if m.closed.Load() {
 		return types.ErrSessionClosed
@@ -242,8 +258,20 @@ func (m *MemoryReplayer) tryReserveSlot() bool {
 	}
 }
 
+// releaseSlot decrements the pending counter by one. It is paired with
+// tryReserveSlot for capacity accounting. A defensive CAS loop refuses to
+// drive the counter below zero so a regression that releases more than it
+// reserved cannot inflate effective capacity on subsequent reservations.
 func (m *MemoryReplayer) releaseSlot() {
-	m.pending.Add(-1)
+	for {
+		current := m.pending.Load()
+		if current <= 0 {
+			return
+		}
+		if m.pending.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
 }
 
 // tryDequeueWithPriority attempts to dequeue based on priority settings.
@@ -349,10 +377,10 @@ func (m *MemoryReplayer) LowLen() int {
 	return len(m.lowQueue)
 }
 
-// Cap returns the total queue capacity.
+// Cap returns the total enforced queue capacity across both priority queues.
 //
 // Returns:
-//   - int: Maximum total queue size (sum of high and low queue capacities)
+//   - int: Maximum combined pending across high and low priority queues
 func (m *MemoryReplayer) Cap() int {
 	return m.capacity
 }
