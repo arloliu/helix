@@ -4,6 +4,7 @@ package v2
 import (
 	"context"
 	"errors"
+	"sync"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
@@ -20,8 +21,14 @@ func mapNotFound(err error) error {
 }
 
 // Session wraps a gocql v2 session.
+//
+// Close is idempotent: a sync.Once guards the underlying gocql.Session.Close
+// so the adapter remains safe to double-Close even if a future gocql release
+// drops its own internal idempotency guarantee. Helix relies on this contract
+// — the CQLClient docstring promises Close-on-bundled-adapter is safe.
 type Session struct {
-	session *gocql.Session
+	session   *gocql.Session
+	closeOnce sync.Once
 }
 
 // NewSession creates a new v2 adapter from a gocql session.
@@ -117,9 +124,10 @@ func (s *Session) MapExecuteBatchCAS(batch cql.Batch, dest map[string]any) (appl
 	return batch.MapExecCAS(dest)
 }
 
-// Close terminates the session.
+// Close terminates the session. Safe to call multiple times; the underlying
+// gocql.Session.Close is invoked at most once.
 func (s *Session) Close() {
-	s.session.Close()
+	s.closeOnce.Do(s.session.Close)
 }
 
 // Query wraps a gocql v2 query.
