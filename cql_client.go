@@ -404,8 +404,14 @@ func (c *CQLClient) MapExecuteBatchCAS(batch Batch, dest map[string]any) (applie
 
 // Close terminates connections to cluster(s) and stops the replay worker.
 //
-// The topology watcher and replay worker are stopped first.
-// After Close is called, the client cannot be reused.
+// The topology watcher and replay worker are stopped first. After Close is
+// called, the client cannot be reused; further public operations including
+// SwapSession and RefreshSession return [types.ErrSessionClosed].
+//
+// Calling Close concurrently with SwapSession or RefreshSession is undefined:
+// Close may end up closing either the old or the new session depending on
+// scheduling, and the caller of SwapSession still owns the session it
+// received. Synchronize externally if you need a deterministic order.
 func (c *CQLClient) Close() {
 	if c.closed.CompareAndSwap(false, true) {
 		// Stop topology watcher
@@ -423,6 +429,151 @@ func (c *CQLClient) Close() {
 			c.loadSessionB().Close()
 		}
 	}
+}
+
+// SwapSession atomically replaces the live session for the given cluster
+// with newSession and returns the previous session. The caller is
+// responsible for closing the returned session once any in-flight work
+// using it has drained.
+//
+// SwapSession is the lowest-level escape hatch for callers who have already
+// built a fresh [cql.Session] (typically because they detected the live one
+// is unrecoverable — e.g., the cluster restarted at a different endpoint).
+// For most callers, [CQLClient.RefreshSession] combined with
+// [WithSessionRefresher] is more ergonomic.
+//
+// Behavior:
+//   - The swap is lock-free on the read path; concurrent Query/Batch/Iter
+//     callers see either the old or the new session, never a partial state.
+//   - Operations that have already resolved their session (in-flight Iter
+//     or CAS, mid-execution synchronous calls, fire-and-forget writes
+//     captured into a goroutine) continue against the session they
+//     captured. Only operations that resolve the session after the swap
+//     observe the new one.
+//   - This method does NOT change cluster cardinality. Calling it with
+//     ClusterB on a single-cluster client returns [types.ErrInvalidCluster].
+//   - The returned old session is NOT closed by this method. The caller
+//     decides when in-flights are quiet and calls [cql.Session.Close]
+//     accordingly. Calling Close on the returned session before in-flights
+//     drain may abort them.
+//
+// Parameters:
+//   - cluster: The cluster whose session to replace.
+//   - newSession: The replacement session. Must not be nil.
+//
+// Returns:
+//   - cql.Session: The previous session for the given cluster.
+//   - error: [types.ErrSessionClosed] if the client has been closed,
+//     [types.ErrNilSession] if newSession is nil,
+//     [types.ErrInvalidCluster] for ClusterB on a single-cluster client
+//     or any unrecognized ClusterID.
+func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.Session, error) {
+	if c.closed.Load() {
+		return nil, types.ErrSessionClosed
+	}
+	if newSession == nil {
+		return nil, types.ErrNilSession
+	}
+
+	var slot *atomic.Pointer[sessionHolder]
+	switch cluster {
+	case ClusterA:
+		slot = &c.sessionA
+	case ClusterB:
+		if c.singleCluster {
+			return nil, types.ErrInvalidCluster
+		}
+		slot = &c.sessionB
+	default:
+		return nil, types.ErrInvalidCluster
+	}
+
+	old := slot.Swap(&sessionHolder{s: newSession})
+
+	return old.s, nil
+}
+
+// RefreshSession invokes the [SessionRefresher] registered via
+// [WithSessionRefresher], atomically installs the returned session in place
+// of the existing one for the given cluster, and closes the old session.
+//
+// This is the high-level recovery entry point for the case where the live
+// session is permanently unrecoverable (e.g., the cluster restarted at a
+// new endpoint and gocql cannot reconnect). The decoupling principle —
+// Helix does not know how to construct a [cql.Session] for any specific
+// driver version — is preserved by delegating session construction to the
+// caller-supplied refresher.
+//
+// Unlike [CQLClient.SwapSession], RefreshSession DOES close the old session
+// because the refresh contract implies the old one is dead. If the
+// refresher returns an error or a nil session, no swap occurs and the
+// existing session remains live.
+//
+// Behavior:
+//   - The refresher is invoked synchronously on the calling goroutine.
+//     A long-running rebuild (e.g., re-handshake against a slow cluster)
+//     blocks the caller; respect the passed context.
+//   - If the refresher succeeds but the swap subsequently fails (e.g., the
+//     client was closed between the refresher call and the swap), the
+//     newly-built session is closed before returning the error so no
+//     connection is leaked.
+//   - The "lastErr" passed to the refresher is currently nil. v2 will
+//     thread the most-recently-observed error per cluster through this
+//     argument so refreshers can tailor reconnection strategy to the
+//     observed failure mode.
+//
+// Parameters:
+//   - ctx: Context for the refresher and any timeouts the refresher honors.
+//   - cluster: The cluster to refresh.
+//
+// Returns:
+//   - error: [types.ErrSessionClosed] if the client has been closed,
+//     [types.ErrNoSessionRefresher] if no refresher was configured,
+//     [types.ErrInvalidCluster] for an unsupported cluster on this client,
+//     [types.ErrNilSession] if the refresher returned a nil session, or
+//     a wrapped error from the refresher.
+func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error {
+	if c.closed.Load() {
+		return types.ErrSessionClosed
+	}
+	if c.config.SessionRefresher == nil {
+		return types.ErrNoSessionRefresher
+	}
+
+	// Validate cluster before calling the (potentially expensive) refresher.
+	if cluster != ClusterA && cluster != ClusterB {
+		return types.ErrInvalidCluster
+	}
+	if cluster == ClusterB && c.singleCluster {
+		return types.ErrInvalidCluster
+	}
+
+	newSession, err := c.config.SessionRefresher(ctx, cluster, nil)
+	if err != nil {
+		return fmt.Errorf("session refresher: %w", err)
+	}
+	if newSession == nil {
+		return types.ErrNilSession
+	}
+
+	old, err := c.SwapSession(cluster, newSession)
+	if err != nil {
+		// Swap can only fail here if the client was closed between the
+		// refresher call and the swap. Don't leak the just-built session.
+		newSession.Close()
+
+		return err
+	}
+
+	// Refresh contract: the old session is dead, so close it on the
+	// caller's behalf. SwapSession's contract differs ("caller closes")
+	// because the caller may have other references they want to drain;
+	// RefreshSession owns the swap end-to-end so it owns the close too.
+	if old != nil {
+		old.Close()
+	}
+
+	return nil
 }
 
 // Session returns the CQLClient as a CQLSession interface.

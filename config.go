@@ -1,8 +1,10 @@
 package helix
 
 import (
+	"context"
 	"time"
 
+	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/replay"
@@ -82,7 +84,35 @@ type ClientConfig struct {
 
 	// AutoMemoryWorkerOpts are options passed to the auto-created Worker.
 	AutoMemoryWorkerOpts []replay.WorkerOption
+
+	// SessionRefresher is an optional caller-supplied factory used by
+	// [CQLClient.RefreshSession] to build a replacement [cql.Session] for a
+	// cluster whose live session is broken (e.g., the cluster restarted at a
+	// different endpoint and the existing session cannot reconnect).
+	//
+	// Helix is decoupled from any specific gocql driver version, so it cannot
+	// build a session itself — only the caller knows whether to wrap a
+	// gocql v1, gocql v2, chaos-injecting, or test-mock implementation. The
+	// refresher receives the target ClusterID and the most recently observed
+	// error (currently always nil in v1; reserved for future per-cluster
+	// last-error tracking) and returns a fresh session.
+	//
+	// If unset, [CQLClient.RefreshSession] returns [types.ErrNoSessionRefresher].
+	// The lower-level [CQLClient.SwapSession] does not require a refresher
+	// because the caller passes the new session directly.
+	SessionRefresher SessionRefresher
 }
+
+// SessionRefresher builds a fresh [cql.Session] for the given cluster.
+//
+// Implementations are caller-provided and are responsible for choosing the
+// concrete adapter (cqlv1.NewSession, cqlv2.NewSession, etc.) — Helix never
+// imports a specific gocql driver and so cannot construct a session itself.
+//
+// lastErr is currently always nil; reserved for v2 per-cluster last-error
+// tracking that will let refreshers tailor reconnection strategy to the
+// observed failure mode.
+type SessionRefresher func(ctx context.Context, cluster ClusterID, lastErr error) (cql.Session, error)
 
 // DefaultConfig returns a ClientConfig with sensible defaults.
 //
@@ -157,6 +187,28 @@ func WithWriteStrategy(strategy WriteStrategy) Option {
 func WithFailoverPolicy(policy FailoverPolicy) Option {
 	return func(c *ClientConfig) {
 		c.FailoverPolicy = policy
+	}
+}
+
+// WithSessionRefresher registers a factory used by [CQLClient.RefreshSession]
+// to build a replacement [cql.Session] for a cluster whose live session has
+// become permanently unrecoverable. Without this option, RefreshSession
+// returns [types.ErrNoSessionRefresher]; the lower-level [CQLClient.SwapSession]
+// remains available without it.
+//
+// The factory is invoked synchronously by RefreshSession on the calling
+// goroutine; long-running connection establishment should respect the passed
+// context.
+//
+// Parameters:
+//   - fn: The session factory; receives the target cluster and (in v1) a nil
+//     lastErr. Reserved for future per-cluster last-error threading.
+//
+// Returns:
+//   - Option: Configuration option
+func WithSessionRefresher(fn SessionRefresher) Option {
+	return func(c *ClientConfig) {
+		c.SessionRefresher = fn
 	}
 }
 
