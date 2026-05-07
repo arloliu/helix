@@ -5,6 +5,118 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Session refresh — manual API**: `*CQLClient.SwapSession(cluster, newSession)`
+  and `*CQLClient.RefreshSession(ctx, cluster)` recover from a permanently-dead
+  underlying `cql.Session` (cluster restart with port reassignment, DNS
+  rotation, host migration) without rebuilding the client. The topology
+  watcher, replay worker, and any application-side references stay alive
+  across the swap.
+  - `SwapSession`: lowest-level escape hatch. Caller passes a fresh session
+    they built; receives the old session back and decides when to close it.
+    Lock-free on the read path via `atomic.Pointer[sessionHolder]`.
+  - `RefreshSession`: high-level entry point. Invokes the registered
+    `SessionRefresher`, atomically swaps the result in, and closes the old
+    session.
+  - `WithSessionRefresher(fn SessionRefresher)`: caller-supplied factory.
+    Helix never imports a specific gocql driver — only the caller knows
+    how to construct a session. The refresher receives the most recently
+    observed failure error against this cluster (or nil if none) so it can
+    tailor reconnection strategy.
+  - New sentinels: `types.ErrInvalidCluster` (cluster B on a single-cluster
+    client; unknown ClusterID), `types.ErrNoSessionRefresher` (RefreshSession
+    called without a registered refresher).
+- **Session refresh — automatic detection (`WithAutoRefresh`)**: Helix
+  observes per-cluster op outcomes via a background goroutine and invokes
+  the registered `SessionRefresher` automatically when a cluster's session
+  is observed to be permanently dead. The decision is policy-independent
+  (works with any `FailoverPolicy`) and references no driver-specific
+  error types.
+  - Trigger condition (all three required): `consecutiveFailures >=
+    FailureThreshold` AND `time.Since(lastSuccess) >= SustainedFailureWindow`
+    AND `time.Since(lastRefresh) >= MinRetryInterval` (throttle).
+  - Conservative defaults (10 / 5 min / 1 min / 30 s / 30 s) — refresh
+    storms are operationally far worse than slow recovery. Tunable via
+    per-knob options: `WithAutoRefreshFailureThreshold`,
+    `WithAutoRefreshSustainedFailureWindow`,
+    `WithAutoRefreshMinRetryInterval`, `WithAutoRefreshCheckInterval`,
+    `WithAutoRefreshRefreshTimeout`.
+  - Throttle stamp set BEFORE invoking the refresher so a hung refresher
+    cannot cause re-entrant double-fire.
+  - Optional metrics interface `types.SessionRefreshMetrics` (Inc
+    SessionRefreshAttempt / Success / Error). Implementations that embed
+    `internal/metrics.NopMetrics` get the new methods for free; by-hand
+    implementations stay source-compatible across this release.
+- **`NowProvider`** abstraction in `config.go`, mirroring `TimestampProvider`.
+  Lets tests substitute a deterministic clock for the auto-refresh detector.
+- **Session Refresh Guide** (`docs/session-refresh.md`): when you need this,
+  quick start, decision logic, throttling, operational-state filtering,
+  manual SwapSession/RefreshSession semantics, concurrency rules,
+  observability, documented non-goals, production-shaped refresher example.
+- **e2e/cql test suite** (`test/e2e/cql/`, build tag `e2e`): real-container
+  failure-mode scenarios on Cassandra/ScyllaDB. Tests S1–S11 cover read/write
+  failover, the LCB half-open transition, container Pause/Unpause and
+  Stop/Start, hard SIGKILL, manual + auto session refresh, and the
+  replay-queue conservation law under deliberate sustained-load overflow.
+  Runs via `make test-e2e`; gated to opt-in via the build tag.
+- **`testutil.CQLCluster` lifecycle methods**: `Stop`, `Start`, `Pause`,
+  `Unpause`, `Kill`, `NetworkDisconnect`, `NetworkReconnect`, `Reconnect`,
+  `RefreshHost`. Supports the e2e suite's container-level chaos.
+
+### Bug Fixes
+
+- **`CircuitBreaker.ShouldFailover` had no half-open probe path**: once the
+  breaker tripped on a cluster, it stayed open indefinitely if traffic
+  routed away (e.g., `StickyRead` to the survivor) — no `RecordSuccess`
+  ever fired against the failed cluster, so the breaker had no path back
+  to closed. Fix is two-part: (a) `ShouldFailover` now returns false when
+  `time.Since(lastFailure) > resetTimeout`, allowing a probe; (b)
+  `RecordFailure` clears the trip latch on the timeout-reset branch so
+  multi-cycle outages emit `IncCircuitBreakerTrip` once per trip rather
+  than once per the entire outage. "Leaky" half-open semantics are
+  documented (concurrent callers may all probe the same cycle).
+- **Auto-injection of metrics into replay worker**: when `WithMetrics(mc)`
+  is set on the client but the worker is built without
+  `WithWorkerMetrics(mc)`, worker-side `IncReplaySuccess` / `IncReplayDropped`
+  / `IncReplayError` previously went into the worker's internal `NopMetrics`
+  and were silently invisible to the client's collector. `NewCQLClient`
+  now detects this via type-assertion (`MetricsConfigured() bool` +
+  `SetMetrics(types.MetricsCollector)` on `*replay.Worker`) and injects
+  the client's mc. Caller-supplied `WithWorkerMetrics(otherMc)` is NOT
+  overwritten. The auto-memory worker (created internally when
+  `WithAutoMemoryWorker` is set) inherits the client's mc by default.
+- **Integration test `TestAllowedClusters_Integration_CAS_NotOverridden`
+  fails on Scylla**: Scylla's `IF NOT EXISTS` returns 3 columns
+  (`[applied]`, key, value) regardless of applied=true vs false, while
+  Cassandra returns just `[applied]` when applied=true. gocql's `ScanCAS`
+  errors on column-count mismatch. Fixed by passing two destination
+  values to `ScanCAS` to match Scylla's wider response — works on both
+  backends.
+
+### Internal
+
+- **`*CQLClient.sessionA` / `sessionB`** migrated from `cql.Session` fields
+  to `atomic.Pointer[sessionHolder]`. Pure refactor; existing tests pass
+  unchanged. The wrapper struct is required because `cql.Session` is an
+  interface, `atomic.Pointer[T]` requires a concrete type, and
+  `atomic.Value` would panic when successive Stores have different
+  dynamic types — which the upcoming `SwapSession` feature explicitly
+  supports.
+- **Per-cluster op-outcome tracking** (`recordOpOutcome` helper) wired
+  into every hot-path success/failure site, including the dual-write
+  per-cluster paths. Operational/data states (`ErrWriteAsync`,
+  `ErrWriteDropped`, `ErrNotFound`) are filtered structurally — they
+  don't accumulate as failures. The dual-write wiring is per-cluster
+  (not gated on "all clusters succeeded") so a partial-success outage
+  on B doesn't starve A's `lastSuccess`, preventing false-positive
+  auto-refresh on the healthy cluster.
+- **testcontainers-go** upgraded `v0.40.0 → v0.42.0`. Docker SDK API
+  breakage in `ContainerPause` / `ContainerUnpause` (now require options
+  structs and return result values) absorbed in the testutil shim.
+
 ## [1.2.0] — 2026-04-15
 
 ### Added
