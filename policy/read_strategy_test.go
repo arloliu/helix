@@ -346,6 +346,28 @@ func TestStickyRead_CooldownExpired_SwitchesPreferred(t *testing.T) {
 		"preferred should switch to ClusterA after cooldown expires")
 }
 
+// TestStickyRead_CooldownExpiry_DoesNotProbePassively verifies that merely
+// waiting for cooldown to expire does not move preferred back to the original
+// cluster. StickyRead only changes preferred in response to a later failure on
+// the currently preferred cluster.
+func TestStickyRead_CooldownExpiry_DoesNotProbePassively(t *testing.T) {
+	strategy := NewStickyRead(
+		WithPreferredCluster(types.ClusterA),
+		WithStickyReadCooldown(10*time.Millisecond),
+	)
+
+	_, ok := strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, strategy.Preferred())
+
+	time.Sleep(15 * time.Millisecond)
+
+	require.Equal(t, types.ClusterB, strategy.Select(t.Context()),
+		"cooldown expiry alone must not change preferred cluster")
+	require.Equal(t, types.ClusterB, strategy.Preferred(),
+		"preferred should remain ClusterB until a later failure triggers a switch")
+}
+
 // TestStickyRead_NonPreferredFailure_NoCooldownBypass verifies that failure
 // on a non-preferred cluster does not trigger failover regardless of cooldown.
 func TestStickyRead_NonPreferredFailure_NoCooldownBypass(t *testing.T) {

@@ -16,11 +16,10 @@ import (
 	htypes "github.com/arloliu/helix/types"
 )
 
-// TestS5_LongOutageNoTraffic answers an open question about Helix:
-// after a cluster has been marked unavailable and there is NO read traffic
-// for some time, does the read strategy probe and recover automatically
-// when the cluster comes back, or does it only re-evaluate on the next
-// failed operation?
+// TestS5_LongOutageNoTraffic verifies StickyRead's no-passive-probe contract:
+// after failover, cooldown expiry alone does not move the preferred cluster
+// back. StickyRead only re-evaluates when the current preferred cluster fails
+// again on a later request.
 //
 // The test:
 //  1. Pause cluster A. Drive a small read burst so the strategy switches
@@ -28,12 +27,11 @@ import (
 //  2. Idle for 30s with no traffic.
 //  3. Unpause cluster A.
 //  4. Continue idling another 5s with no traffic.
-//  5. Resume reads. Assert the read succeeds and observe whether the
-//     strategy re-routed to A or stayed on B.
+//  5. Resume reads. Assert the read succeeds and that preferred still stays on B.
 //
-// This documents Helix's recovery semantics rather than enforcing one
-// specific behavior — the assertion is "the read still succeeds" plus
-// a logged observation of which cluster served it.
+// This locks in the current implementation contract so operators can rely on
+// the fact that a recovered non-preferred cluster will not be probed again
+// until the current preferred cluster produces another failure.
 func TestS5_LongOutageNoTraffic(t *testing.T) {
 	if testing.Short() {
 		t.Skip("S5 takes ~45s of wall-clock — skipped in short mode")
@@ -89,23 +87,18 @@ func TestS5_LongOutageNoTraffic(t *testing.T) {
 			require.NoError(t, a.Unpause(ctx))
 			time.Sleep(5 * time.Second)
 
-			// Phase 4: resume reads. Helix's StickyRead with cooldown
-			// expired SHOULD re-evaluate; the question is whether it
-			// re-evaluates passively or requires a triggering failure.
+			// Phase 4: resume reads. StickyRead should continue using B —
+			// cooldown expiry alone does not trigger a passive probe back to A.
 			qCtx, cancel = context.WithTimeout(ctx, 15*time.Second)
 			err = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
 				ScanContext(qCtx, &got)
 			cancel()
 			require.NoError(t, err,
-				"[%s] phase 4 read should succeed (either cluster)", d.name)
+				"[%s] phase 4 read should succeed via the current preferred cluster", d.name)
 			assert.Equal(t, "v", got)
-
-			// Observe (don't assert) recovery state — both behaviors are
-			// arguably correct depending on Helix's documented semantics.
-			t.Logf("[%s] phase 4 done: preferred=%s failovers=%d "+
-				"(documents whether StickyRead probes back to preferred=A "+
-				"after cooldown expiry without a triggering failure)",
-				d.name, rs.Preferred(), mc.GetTotalFailovers())
+			assert.Equal(t, htypes.ClusterB, rs.Preferred(),
+				"[%s] cooldown expiry alone must not switch StickyRead back to A", d.name)
+			t.Logf("[%s] phase 4 done: preferred=%s failovers=%d", d.name, rs.Preferred(), mc.GetTotalFailovers())
 		})
 	}
 }

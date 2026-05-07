@@ -53,11 +53,13 @@ import (
 //	defer client.Close()  // Always close to release resources
 //
 // After Close() is called:
-//   - All ongoing operations complete or are cancelled
+//   - New public operations return [types.ErrSessionClosed]
 //   - Replay worker is stopped (enqueued replays are lost if using MemoryReplayer)
-//   - Topology watcher is stopped
-//   - Underlying sessions are closed
-//   - The client cannot be reused (operations return ErrSessionClosed)
+//   - Topology watcher and auto-refresh detector are stopped
+//   - The currently installed underlying sessions are closed
+//   - Close does not wait for in-flight operations or fire-and-forget writes;
+//     work that already captured a session may race with shutdown and fail
+//   - The client cannot be reused
 type CQLClient struct {
 	// sessionA / sessionB hold the live cql.Session references behind an
 	// atomic.Pointer so they can be replaced at runtime via SwapSession or
@@ -683,11 +685,17 @@ func (c *CQLClient) MapExecuteBatchCAS(batch Batch, dest map[string]any) (applie
 	return batch.MapExecCAS(dest)
 }
 
-// Close terminates connections to cluster(s) and stops the replay worker.
+// Close marks the client closed, stops background components, and closes the
+// currently installed sessions.
 //
-// The topology watcher and replay worker are stopped first. After Close is
-// called, the client cannot be reused; further public operations including
-// SwapSession and RefreshSession return [types.ErrSessionClosed].
+// The topology watcher, auto-refresh detector, and replay worker are stopped
+// first. After Close is called, the client cannot be reused; new public
+// operations including SwapSession and RefreshSession return
+// [types.ErrSessionClosed].
+//
+// Close does not wait for in-flight synchronous operations or detached
+// fire-and-forget writes to finish. Work that already captured a session may
+// continue racing with shutdown and can fail when that session is closed.
 //
 // Calling Close concurrently with SwapSession or RefreshSession is undefined:
 // Close may end up closing either the old or the new session depending on

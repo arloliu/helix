@@ -50,36 +50,32 @@ func TestMemoryReplayerDequeue(t *testing.T) {
 }
 
 func TestMemoryReplayerQueueFull(t *testing.T) {
-	// Capacity 4 = 2 per priority queue
+	// Capacity is shared globally across both priority queues.
 	replayer := NewMemoryReplayer(WithQueueCapacity(4))
 	defer replayer.Close()
 
 	highPayload := types.ReplayPayload{Query: "SELECT 1", Priority: types.PriorityHigh}
 	lowPayload := types.ReplayPayload{Query: "SELECT 2", Priority: types.PriorityLow}
 
-	// Fill the high queue (capacity 2)
+	// Fill the shared capacity entirely with high-priority items.
+	require.NoError(t, replayer.Enqueue(context.Background(), highPayload))
+	require.NoError(t, replayer.Enqueue(context.Background(), highPayload))
 	require.NoError(t, replayer.Enqueue(context.Background(), highPayload))
 	require.NoError(t, replayer.Enqueue(context.Background(), highPayload))
 
-	// Third high-priority enqueue should fail
+	// Further enqueues fail regardless of priority.
 	err := replayer.Enqueue(context.Background(), highPayload)
 	require.ErrorIs(t, err, types.ErrReplayQueueFull)
 
-	// Low queue still has space
-	require.NoError(t, replayer.Enqueue(context.Background(), lowPayload))
-	require.NoError(t, replayer.Enqueue(context.Background(), lowPayload))
-
-	// Low queue now full
 	err = replayer.Enqueue(context.Background(), lowPayload)
 	require.ErrorIs(t, err, types.ErrReplayQueueFull)
 }
 
 func TestMemoryReplayerContextCancellation(t *testing.T) {
-	// Capacity 2 = 1 per priority queue
-	replayer := NewMemoryReplayer(WithQueueCapacity(2))
+	replayer := NewMemoryReplayer(WithQueueCapacity(1))
 	defer replayer.Close()
 
-	// Fill the high queue
+	// Fill the shared queue
 	payload := types.ReplayPayload{Query: "SELECT 1", Priority: types.PriorityHigh}
 	require.NoError(t, replayer.Enqueue(context.Background(), payload))
 
@@ -169,6 +165,20 @@ func TestMemoryReplayerCapacity(t *testing.T) {
 	defer replayer.Close()
 
 	require.Equal(t, 100, replayer.Cap())
+}
+
+func TestMemoryReplayerOddCapacityPreserved(t *testing.T) {
+	replayer := NewMemoryReplayer(WithQueueCapacity(3))
+	defer replayer.Close()
+
+	require.Equal(t, 3, replayer.Cap())
+
+	payload := types.ReplayPayload{Query: "SELECT 1", Priority: types.PriorityHigh}
+	require.NoError(t, replayer.Enqueue(context.Background(), payload))
+	require.NoError(t, replayer.Enqueue(context.Background(), payload))
+	require.NoError(t, replayer.Enqueue(context.Background(), payload))
+	require.Equal(t, 3, replayer.Len())
+	require.ErrorIs(t, replayer.Enqueue(context.Background(), payload), types.ErrReplayQueueFull)
 }
 
 func TestMemoryReplayerPriorityRouting(t *testing.T) {

@@ -192,7 +192,7 @@ No manual intervention needed — recovery is fully automatic.
 
 | Strategy | Auto-Recovery Behavior |
 |----------|----------------------|
-| **StickyRead** | After cooldown (default: 5m) expires, `Select()` returns the original preferred cluster. If that read succeeds, it stays. Within the cooldown window, if the current preferred cluster fails, the alternative is returned for that individual request without changing the global preferred state — this prevents reads from failing entirely while cooldown still gates state changes. |
+| **StickyRead** | Cooldown only controls when a later failure on the current preferred cluster is allowed to change preferred again. It does **not** cause `Select()` to probe the original cluster passively after expiry. Within the cooldown window, if the current preferred cluster fails, the alternative is returned for that individual request without changing the global preferred state. If the current preferred cluster stays healthy, reads stay there indefinitely even after the other cluster recovers. |
 | **PrimaryOnlyRead** | After recovery timeout (if configured), `Select()` probes cluster A. Success resets to A; failure restarts the timer. If cluster B fails while in the failed-over state, cluster A is returned as a probe even without an elapsed recovery timeout; if A succeeds, `OnSuccess` clears the failed-over flag and reads return to A. Without a timeout and without B failing, stays on B until `Reset()`. |
 | **RoundRobinRead** | No state to recover — alternates regardless. Failover policy governs whether to try the failed cluster. |
 

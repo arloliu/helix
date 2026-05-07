@@ -15,7 +15,9 @@ import (
 // StickyRead implements a sticky read strategy that routes reads to a preferred cluster.
 //
 // The preferred cluster is randomly selected at initialization and sticks to it
-// to maximize cache hits. On failure, it can failover to the secondary cluster.
+// to maximize cache hits. On failure, it can fail over to the secondary cluster.
+// Cooldown only gates future state changes; it does not trigger passive probing
+// back to a recovered cluster in the absence of another read failure.
 type StickyRead struct {
 	preferred        atomic.Value // types.ClusterID
 	mu               sync.RWMutex
@@ -113,6 +115,8 @@ func (s *StickyRead) OnSuccess(_ types.ClusterID) {
 // switched. When cooldown is still active, the alternative is returned for the
 // current request but preferred is not changed — this prevents reads from
 // failing entirely while still avoiding rapid preferred-cluster oscillation.
+// Cooldown expiry alone does not change the preferred cluster; a later failure
+// on the current preferred cluster is still required to switch back.
 //
 // Parameters:
 //   - cluster: The cluster that failed

@@ -36,6 +36,7 @@ type MemoryReplayer struct {
 	lowQueue  chan types.ReplayPayload
 	closed    atomic.Bool
 	capacity  int
+	pending   atomic.Int64
 
 	// For priority-aware dequeue tracking
 	mu                sync.Mutex
@@ -50,7 +51,6 @@ type MemoryReplayerOption func(*MemoryReplayer)
 // WithQueueCapacity sets the maximum number of pending replays.
 //
 // The capacity is shared across both high and low priority queues.
-// Each queue gets half the capacity.
 //
 // Parameters:
 //   - n: Total queue capacity (default: 10000)
@@ -101,7 +101,8 @@ func WithMemoryStrictPriority(strict bool) MemoryReplayerOption {
 // NewMemoryReplayer creates a new in-memory replayer.
 //
 // The replayer uses separate buffered channels for high and low priority messages,
-// sharing a total capacity. Default capacity is 10,000 items (5,000 per priority).
+// while a shared capacity counter enforces the total pending-item limit across
+// both queues. Default capacity is 10,000 items.
 //
 // Parameters:
 //   - opts: Optional configuration options
@@ -119,13 +120,11 @@ func NewMemoryReplayer(opts ...MemoryReplayerOption) *MemoryReplayer {
 		opt(m)
 	}
 
-	// Split capacity between high and low priority queues
-	halfCap := m.capacity / 2
-	if halfCap < 1 {
-		halfCap = 1
+	if m.capacity < 1 {
+		m.capacity = 1
 	}
-	m.highQueue = make(chan types.ReplayPayload, halfCap)
-	m.lowQueue = make(chan types.ReplayPayload, halfCap)
+	m.highQueue = make(chan types.ReplayPayload, m.capacity)
+	m.lowQueue = make(chan types.ReplayPayload, m.capacity)
 
 	return m
 }
@@ -146,6 +145,14 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 	if m.closed.Load() {
 		return types.ErrSessionClosed
 	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if !m.tryReserveSlot() {
+		return types.ErrReplayQueueFull
+	}
 
 	// Route to appropriate queue based on priority
 	var targetQueue chan types.ReplayPayload
@@ -157,10 +164,12 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 
 	select {
 	case <-ctx.Done():
+		m.releaseSlot()
 		return ctx.Err()
 	case targetQueue <- payload:
 		return nil
 	default:
+		m.releaseSlot()
 		return types.ErrReplayQueueFull
 	}
 }
@@ -192,6 +201,7 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 		// Determine which queue to try based on priority mode
 		payload, ok := m.tryDequeueWithPriority()
 		if ok {
+			m.releaseSlot()
 			return payload, true
 		}
 
@@ -208,14 +218,32 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 			m.mu.Lock()
 			m.highProcessed++
 			m.mu.Unlock()
+			m.releaseSlot()
 			return payload, true
 		case payload := <-m.lowQueue:
 			m.mu.Lock()
 			m.highProcessed = 0 // Reset counter after processing low
 			m.mu.Unlock()
+			m.releaseSlot()
 			return payload, true
 		}
 	}
+}
+
+func (m *MemoryReplayer) tryReserveSlot() bool {
+	for {
+		current := m.pending.Load()
+		if current >= int64(m.capacity) {
+			return false
+		}
+		if m.pending.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (m *MemoryReplayer) releaseSlot() {
+	m.pending.Add(-1)
 }
 
 // tryDequeueWithPriority attempts to dequeue based on priority settings.
@@ -297,7 +325,7 @@ func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
 // Returns:
 //   - int: Total number of items in high and low priority queues
 func (m *MemoryReplayer) Len() int {
-	return len(m.highQueue) + len(m.lowQueue)
+	return int(m.pending.Load())
 }
 
 // HighLen returns the current number of high-priority pending replays.
@@ -321,7 +349,7 @@ func (m *MemoryReplayer) LowLen() int {
 // Returns:
 //   - int: Maximum total queue size (sum of high and low queue capacities)
 func (m *MemoryReplayer) Cap() int {
-	return cap(m.highQueue) + cap(m.lowQueue)
+	return m.capacity
 }
 
 // Close marks the replay queue as closed.
@@ -358,6 +386,7 @@ func (m *MemoryReplayer) DrainAll() []types.ReplayPayload {
 	for {
 		select {
 		case payload := <-m.highQueue:
+			m.releaseSlot()
 			payloads = append(payloads, payload)
 		default:
 			goto drainLow
@@ -369,6 +398,7 @@ drainLow:
 	for {
 		select {
 		case payload := <-m.lowQueue:
+			m.releaseSlot()
 			payloads = append(payloads, payload)
 		default:
 			return payloads

@@ -103,11 +103,12 @@ func DefaultNATSReplayerConfig() NATSReplayerConfig {
 // Unlike MemoryReplayer, messages persisted to JetStream survive process crashes.
 // This is the recommended replayer for production use.
 type NATSReplayer struct {
-	js     jetstream.JetStream
-	stream jetstream.Stream
-	config NATSReplayerConfig
-	closed bool
-	mu     sync.RWMutex
+	js        jetstream.JetStream
+	stream    jetstream.Stream
+	config    NATSReplayerConfig
+	consumers map[string]jetstream.Consumer
+	closed    bool
+	mu        sync.RWMutex
 }
 
 // NATSReplayerOption configures a NATSReplayer.
@@ -338,9 +339,10 @@ func NewNATSReplayer(js jetstream.JetStream, opts ...NATSReplayerOption) (*NATSR
 	}
 
 	return &NATSReplayer{
-		js:     js,
-		stream: stream,
-		config: config,
+		js:        js,
+		stream:    stream,
+		config:    config,
+		consumers: make(map[string]jetstream.Consumer),
 	}, nil
 }
 
@@ -425,9 +427,9 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 
 // Dequeue retrieves a batch of replay messages for processing.
 //
-// This creates a pull consumer if it doesn't exist and fetches messages.
-// The returned messages must be acknowledged after successful processing
-// using the Ack method on each message.
+// The required pull consumer is created lazily on first use and reused for
+// subsequent fetches. The returned messages must be acknowledged after
+// successful processing using the Ack method on each message.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -446,113 +448,21 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 	}
 	n.mu.RUnlock()
 
-	// Create a consumer for this cluster (both high and low priority)
 	consumerName := fmt.Sprintf("helix-worker-%s", cluster)
 	filterSubject := fmt.Sprintf("%s.*.%s", n.config.SubjectPrefix, cluster)
 
-	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:            consumerName,
-		Durable:         consumerName,
-		FilterSubject:   filterSubject,
-		AckPolicy:       jetstream.AckExplicitPolicy,
-		DeliverPolicy:   jetstream.DeliverAllPolicy,
-		MaxDeliver:      n.config.MaxDeliver,
-		MaxAckPending:   n.config.MaxAckPending,
-		MaxRequestBatch: n.config.MaxRequestBatch,
-		AckWait:         n.config.AckWait,
-	})
+	consumer, err := n.getOrCreateConsumer(ctx, consumerName, filterSubject)
 	if err != nil {
-		return nil, fmt.Errorf("helix: failed to create consumer: %w", err)
+		return nil, err
 	}
 
-	// Fetch messages
-	msgs, err := consumer.Fetch(batchSize, jetstream.FetchMaxWait(time.Second))
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, jetstream.ErrNoMessages) {
-			return nil, nil // No messages available
-		}
-
-		return nil, fmt.Errorf("helix: failed to fetch messages: %w", err)
-	}
-
-	maxDeliver := n.config.MaxDeliver
-	result := make([]ReplayMessage, 0, batchSize)
-msgLoop:
-	for msg := range msgs.Messages() {
-		// Extract delivery metadata
-		meta, metaErr := msg.Metadata()
-		var deliveryCount uint64 = 1
-		if metaErr == nil {
-			deliveryCount = meta.NumDelivered
-		}
-
-		var natsMsg natsReplayMessage
-		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
-			// Permanently corrupt — Term immediately; no retry will fix bad bytes.
-			n.handleCorrupt(msg, err)
-
-			continue
-		}
-
-		// Decode Args from msgp.Raw
-		args, err := decodeArgs(natsMsg.Args)
-		if err != nil {
-			n.handleCorrupt(msg, err)
-
-			continue
-		}
-
-		// Decode batch statements if this is a batch
-		var batchStmts []types.BatchStatement
-		if natsMsg.IsBatch {
-			batchStmts = make([]types.BatchStatement, len(natsMsg.BatchStatements))
-			for i, stmt := range natsMsg.BatchStatements {
-				stmtArgs, err := decodeArgs(stmt.Args)
-				if err != nil {
-					n.handleCorrupt(msg, err)
-
-					continue msgLoop
-				}
-				batchStmts[i] = types.BatchStatement{
-					Query: stmt.Query,
-					Args:  stmtArgs,
-				}
-			}
-		}
-
-		result = append(result, ReplayMessage{
-			Payload: types.ReplayPayload{
-				TargetCluster:   types.ClusterID(natsMsg.TargetCluster),
-				Query:           natsMsg.Query,
-				Args:            args,
-				Timestamp:       natsMsg.Timestamp,
-				Priority:        types.PriorityLevel(natsMsg.Priority),
-				IsBatch:         natsMsg.IsBatch,
-				BatchType:       types.BatchType(natsMsg.BatchType),
-				BatchStatements: batchStmts,
-			},
-			ackFunc:       msg.Ack,
-			nakFunc:       msg.Nak,
-			termFunc:      msg.Term,
-			DeliveryCount: deliveryCount,
-			MaxDeliver:    maxDeliver,
-		})
-	}
-
-	// Check for errors during iteration
-	if err := msgs.Error(); err != nil {
-		if !errors.Is(err, jetstream.ErrNoMessages) {
-			return result, fmt.Errorf("helix: error during message fetch: %w", err)
-		}
-	}
-
-	return result, nil
+	return n.fetchReplayMessages(consumer, batchSize)
 }
 
 // DequeueByPriority retrieves a batch of replay messages for a specific priority.
 //
-// This creates a pull consumer for the specific priority/cluster combination
-// and fetches messages. The returned messages must be acknowledged after
+// The required pull consumer is created lazily on first use and reused for
+// subsequent fetches. The returned messages must be acknowledged after
 // successful processing using the Ack method on each message.
 //
 // Use this method for priority-aware processing where you want to control
@@ -582,9 +492,38 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		priorityStr = "high"
 	}
 
-	// Create a consumer for this specific priority/cluster combination
 	consumerName := fmt.Sprintf("helix-worker-%s-%s", priorityStr, cluster)
 	filterSubject := fmt.Sprintf("%s.%s.%s", n.config.SubjectPrefix, priorityStr, cluster)
+
+	consumer, err := n.getOrCreateConsumer(ctx, consumerName, filterSubject)
+	if err != nil {
+		return nil, err
+	}
+
+	return n.fetchReplayMessages(consumer, batchSize)
+}
+
+func (n *NATSReplayer) getOrCreateConsumer(
+	ctx context.Context,
+	consumerName string,
+	filterSubject string,
+) (jetstream.Consumer, error) {
+	n.mu.RLock()
+	consumer, ok := n.consumers[consumerName]
+	n.mu.RUnlock()
+	if ok {
+		return consumer, nil
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.closed {
+		return nil, types.ErrSessionClosed
+	}
+	if consumer, ok = n.consumers[consumerName]; ok {
+		return consumer, nil
+	}
 
 	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Name:            consumerName,
@@ -601,6 +540,15 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		return nil, fmt.Errorf("helix: failed to create consumer: %w", err)
 	}
 
+	n.consumers[consumerName] = consumer
+
+	return consumer, nil
+}
+
+func (n *NATSReplayer) fetchReplayMessages(
+	consumer jetstream.Consumer,
+	batchSize int,
+) ([]ReplayMessage, error) {
 	// Fetch messages
 	msgs, err := consumer.Fetch(batchSize, jetstream.FetchMaxWait(time.Second))
 	if err != nil {

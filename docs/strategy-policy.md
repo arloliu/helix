@@ -283,7 +283,9 @@ Time →
 └─────────────────────────────────┴──────────────────────────────────┘
 ```
 
-During the cooldown window, if the current preferred cluster (B) fails, `OnFailure` returns the alternative (A) as a failover target for that individual request without changing preferred. Reads succeed via the retry, but each request during this window pays the cost of trying B first — resulting in elevated latency, error counts, and failover log entries until cooldown expires and preferred can switch.
+During the cooldown window, if the current preferred cluster (B) fails, `OnFailure` returns the alternative (A) as a failover target for that individual request without changing preferred. Reads succeed via the retry, but each request during this window pays the cost of trying B first — resulting in elevated latency, error counts, and failover log entries until a later failure occurs after cooldown expiry and preferred can switch.
+
+Cooldown expiry by itself does **not** trigger a probe back to the original cluster. If B stays healthy after A recovers, reads continue on B indefinitely. StickyRead only changes preferred in response to a failure on the current preferred cluster.
 
 > **Oscillation risk.** If both clusters are intermittently failing, `StickyRead` can flip-flop between them — once the cooldown expires, a failure on cluster B causes a switch back to A, and vice versa. The cooldown is the only brake. Set it long enough that a single blip does not trigger rapid back-and-forth switching; 2–10 minutes is typical. Pairing `StickyRead` with `CircuitBreaker` instead of `ActiveFailover` provides an additional layer of protection: the circuit breaker absorbs transient errors and only allows failover after repeated failures.
 
@@ -945,5 +947,5 @@ Driver-level timeouts apply uniformly to all query types (reads, writes, batches
 9. **Understand the two layers of failover damping.** Oscillation protection requires both layers working together:
    - `FailoverPolicy` (`CircuitBreaker`) decides **whether** to failover. Without a threshold it cannot absorb blips.
    - `ReadStrategy` (`StickyRead` + cooldown) decides **where** to failover and **how long to stay there**. Without a cooldown the strategy can switch back immediately.
-   
+
    Using `ActiveFailover` removes the first layer entirely. Using `RoundRobinRead` removes the second. Removing both is the worst-case combination for oscillation.
