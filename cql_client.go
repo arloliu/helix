@@ -364,6 +364,44 @@ func (c *CQLClient) recordOpOutcomeAt(cluster ClusterID, err error, nowNano int6
 // Compile-time assertion that CQLClient implements CQLSession.
 var _ CQLSession = (*CQLClient)(nil)
 
+// autoInjectMetricsAndLogger threads the client-level metrics and logger
+// into components that opt into auto-injection via the metricsAware /
+// loggerAware interfaces.
+//
+// The replay worker auto-injects metrics so worker-side replay metrics
+// land in the same collector the client uses. Write strategies follow the
+// same pattern — AdaptiveDualWrite emits IncWriteError + Warn from its
+// fire-and-forget background goroutine, which would otherwise hit a
+// NopMetrics / NopLogger and be invisible.
+func autoInjectMetricsAndLogger(config *ClientConfig) {
+	type metricsAware interface {
+		MetricsConfigured() bool
+		SetMetrics(types.MetricsCollector)
+	}
+	type loggerAware interface {
+		SetLogger(types.Logger)
+	}
+
+	if config.Metrics != nil {
+		if config.ReplayWorker != nil {
+			if mw, ok := config.ReplayWorker.(metricsAware); ok && !mw.MetricsConfigured() {
+				mw.SetMetrics(config.Metrics)
+			}
+		}
+		if config.WriteStrategy != nil {
+			if ws, ok := config.WriteStrategy.(metricsAware); ok && !ws.MetricsConfigured() {
+				ws.SetMetrics(config.Metrics)
+			}
+		}
+	}
+
+	if config.Logger != nil && config.WriteStrategy != nil {
+		if ws, ok := config.WriteStrategy.(loggerAware); ok {
+			ws.SetLogger(config.Logger)
+		}
+	}
+}
+
 // shouldLogOverrideErr returns true on the first occurrence and on every
 // power-of-2 occurrence thereafter (1, 2, 4, 8, 16 …). This prevents a
 // misconfigured AllowedClusters provider from flooding the log at high QPS
@@ -481,20 +519,11 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		)
 	}
 
-	// For caller-supplied workers (via WithReplayWorker), inject the
-	// client's metrics collector if the worker doesn't already have one
-	// explicitly set. Type-assertion-based so the public ReplayWorker
-	// interface is unchanged; workers that opt in (replay.Worker does)
-	// expose MetricsConfigured + SetMetrics; others are left alone.
-	if config.ReplayWorker != nil && config.Metrics != nil {
-		type metricsAware interface {
-			MetricsConfigured() bool
-			SetMetrics(types.MetricsCollector)
-		}
-		if mw, ok := config.ReplayWorker.(metricsAware); ok && !mw.MetricsConfigured() {
-			mw.SetMetrics(config.Metrics)
-		}
-	}
+	// Auto-inject client metrics/logger into components that opt in via
+	// type-assertion-based interfaces (replay.Worker, AdaptiveDualWrite).
+	// This keeps client and component instrumentation unified without
+	// expanding the public ReplayWorker / WriteStrategy interfaces.
+	autoInjectMetricsAndLogger(config)
 
 	// Start topology watcher if configured. The cancel function is stashed so
 	// that it is called on any subsequent initialization error, preventing the

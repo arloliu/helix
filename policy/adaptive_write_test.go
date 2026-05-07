@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -185,6 +186,43 @@ func TestAdaptiveDualWrite_FireAndForget(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	assert.True(t, fireForgetCompleted.Load())
 	assert.Equal(t, int32(1), callsA.Load())
+}
+
+// TestAdaptiveDualWrite_FireAndForgetSurfacesError verifies that a real
+// error against a degraded cluster's background write is observable: the
+// metrics collector sees IncWriteError for that cluster. Without this the
+// foreground caller only saw ErrWriteAsync — the background error was
+// silently swallowed and operators couldn't tell a degraded cluster had
+// progressed to permanently broken.
+func TestAdaptiveDualWrite_FireAndForgetSurfacesError(t *testing.T) {
+	m := testutil.NewTestMetricsCollector()
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveFireForgetTimeout(100*time.Millisecond),
+		WithAdaptiveMetrics(m),
+	)
+	ctx := t.Context()
+
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	bgErr := errors.New("background failed")
+
+	errA, errB := a.Execute(ctx,
+		func(_ context.Context) error { return bgErr },
+		func(_ context.Context) error { return nil },
+	)
+	require.ErrorIs(t, errA, types.ErrWriteAsync,
+		"foreground sees ErrWriteAsync regardless of background outcome")
+	require.NoError(t, errB)
+
+	// Background goroutine has its own context — give it time to finish.
+	require.Eventually(t, func() bool {
+		return m.GetWriteErrors(types.ClusterA) == 1
+	}, time.Second, 10*time.Millisecond,
+		"IncWriteError must be emitted for the degraded cluster's background failure")
+
+	assert.Equal(t, int64(0), m.GetWriteErrors(types.ClusterB),
+		"healthy cluster must not see IncWriteError")
 }
 
 func TestAdaptiveDualWrite_Recovery(t *testing.T) {

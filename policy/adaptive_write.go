@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arloliu/helix/internal/logging"
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/types"
 )
 
@@ -46,6 +48,15 @@ type AdaptiveDualWrite struct {
 	fireForgetTimeout time.Duration // Timeout for fire-and-forget writes
 	fireForgetLimit   int32         // Max concurrent fire-and-forget writes
 	fireForgetSem     chan struct{} // Semaphore for limiting concurrent fire-and-forget
+
+	// Observability for fire-and-forget background writes. The
+	// foreground caller already records metrics for the synchronous
+	// path; without these, real errors against a degraded cluster are
+	// invisible because the goroutine returns silently.
+	metrics         types.MetricsCollector
+	logger          types.Logger
+	metricsExplicit bool
+	clusterNames    atomic.Pointer[types.ClusterNames]
 
 	// Per-cluster state
 	stateA clusterWriteState
@@ -188,6 +199,50 @@ func WithAdaptiveFireForgetTimeout(d time.Duration) AdaptiveDualWriteOption {
 	}
 }
 
+// WithAdaptiveMetrics sets the metrics collector for fire-and-forget background
+// writes. Without this option (or auto-injection by [helix.NewCQLClient]),
+// real errors against a degraded cluster's background write are not surfaced
+// to metrics — only the foreground ErrWriteAsync result is.
+//
+// Parameters:
+//   - m: The metrics collector
+//
+// Returns:
+//   - AdaptiveDualWriteOption: Configuration option
+func WithAdaptiveMetrics(m types.MetricsCollector) AdaptiveDualWriteOption {
+	return func(a *AdaptiveDualWrite) {
+		a.metrics = m
+		a.metricsExplicit = true
+	}
+}
+
+// WithAdaptiveLogger sets the logger for fire-and-forget background writes.
+//
+// Parameters:
+//   - l: The logger
+//
+// Returns:
+//   - AdaptiveDualWriteOption: Configuration option
+func WithAdaptiveLogger(l types.Logger) AdaptiveDualWriteOption {
+	return func(a *AdaptiveDualWrite) {
+		a.logger = l
+	}
+}
+
+// WithAdaptiveClusterNames sets the display names for clusters in log
+// messages emitted by the fire-and-forget background path.
+//
+// Parameters:
+//   - names: The cluster names
+//
+// Returns:
+//   - AdaptiveDualWriteOption: Configuration option
+func WithAdaptiveClusterNames(names types.ClusterNames) AdaptiveDualWriteOption {
+	return func(a *AdaptiveDualWrite) {
+		a.clusterNames.Store(&names)
+	}
+}
+
 // WithAdaptiveFireForgetLimit sets the maximum concurrent fire-and-forget writes.
 //
 // When a cluster is degraded and writes are sent via fire-and-forget, this limit
@@ -237,15 +292,73 @@ func NewAdaptiveDualWrite(opts ...AdaptiveDualWriteOption) *AdaptiveDualWrite {
 		fireForgetTimeout: 30 * time.Second,
 		fireForgetLimit:   100,
 	}
+	defaultNames := types.DefaultClusterNames()
+	a.clusterNames.Store(&defaultNames)
 
 	for _, opt := range opts {
 		opt(a)
+	}
+
+	// Ensure metrics and logger are never nil — fireAndForget calls them
+	// from a background goroutine and a nil deref there would crash the
+	// process under load.
+	if a.metrics == nil {
+		a.metrics = metrics.NewNopMetrics()
+	}
+	if a.logger == nil {
+		a.logger = logging.NewNopLogger()
 	}
 
 	// Initialize semaphore after options are applied
 	a.fireForgetSem = make(chan struct{}, a.fireForgetLimit)
 
 	return a
+}
+
+// SetClusterNames implements [types.ClusterNamer] so the helix client can
+// propagate cluster names configured via WithClusterNames into log messages.
+//
+// Safe to call concurrently with Execute.
+func (a *AdaptiveDualWrite) SetClusterNames(names types.ClusterNames) {
+	a.clusterNames.Store(&names)
+}
+
+// MetricsConfigured reports whether the metrics collector was explicitly
+// set via WithAdaptiveMetrics. The helix client uses this to detect a
+// caller-passed strategy without metrics and inject its own collector so
+// the strategy's fire-and-forget path participates in unified instrumentation.
+func (a *AdaptiveDualWrite) MetricsConfigured() bool {
+	return a.metricsExplicit
+}
+
+// SetMetrics replaces the metrics collector. No-op once MetricsConfigured
+// returns true (caller's explicit choice wins) or if m is nil.
+func (a *AdaptiveDualWrite) SetMetrics(m types.MetricsCollector) {
+	if a.metricsExplicit {
+		return
+	}
+	if m == nil {
+		return
+	}
+	a.metrics = m
+	a.metricsExplicit = true
+}
+
+// SetLogger replaces the logger. Used by helix.NewCQLClient to propagate
+// the client logger into the strategy if the caller didn't provide one.
+func (a *AdaptiveDualWrite) SetLogger(l types.Logger) {
+	if l == nil {
+		return
+	}
+	a.logger = l
+}
+
+// clusterName returns the display name for the given cluster.
+func (a *AdaptiveDualWrite) clusterName(cluster types.ClusterID) string {
+	if names := a.clusterNames.Load(); names != nil {
+		return names.Name(cluster)
+	}
+	return string(cluster)
 }
 
 // Execute performs adaptive concurrent writes to both clusters.
@@ -286,7 +399,7 @@ func (a *AdaptiveDualWrite) Execute(
 			latencyA = time.Since(start)
 		})
 	} else {
-		errA = a.fireAndForget(writeA, &a.stateA, &a.stateB)
+		errA = a.fireAndForget(types.ClusterA, writeA, &a.stateA, &a.stateB)
 	}
 
 	// Cluster B
@@ -297,7 +410,7 @@ func (a *AdaptiveDualWrite) Execute(
 			latencyB = time.Since(start)
 		})
 	} else {
-		errB = a.fireAndForget(writeB, &a.stateB, &a.stateA)
+		errB = a.fireAndForget(types.ClusterB, writeB, &a.stateB, &a.stateA)
 	}
 
 	// Wait for healthy clusters to complete
@@ -324,10 +437,17 @@ func (a *AdaptiveDualWrite) Execute(
 // fireAndForget executes a write in a background goroutine with its own timeout.
 // It tracks latency to enable recovery of degraded clusters via delta comparison.
 //
+// On a real error (not ErrWriteAsync/ErrWriteDropped, which are not raised
+// here anyway), the goroutine emits IncWriteError + a Warn log so the
+// background failure is visible. The replay safety net was already enqueued
+// by the caller based on the foreground ErrWriteAsync result; this is the
+// observability complement.
+//
 // Returns:
 //   - types.ErrWriteAsync if the write was accepted for background execution
 //   - types.ErrWriteDropped if the concurrency limit was reached
 func (a *AdaptiveDualWrite) fireAndForget(
+	cluster types.ClusterID,
 	write func(context.Context) error,
 	state *clusterWriteState,
 	siblingState *clusterWriteState,
@@ -353,8 +473,21 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		latency := time.Since(start)
 
 		// Track latency for potential recovery
-		if err != nil || latency >= a.absoluteMax {
-			// Write failed or was too slow - no recovery credit
+		if err != nil {
+			// Surface the background failure: IncWriteError makes it
+			// visible to dashboards, and the Warn log gives operators a
+			// breadcrumb that "the cluster you flagged degraded is
+			// actually erroring on its background writes." Replay
+			// reconciliation has already been enqueued by the caller.
+			a.metrics.IncWriteError(cluster)
+			a.logger.Warn("adaptive: fire-and-forget write failed on degraded cluster",
+				"cluster", a.clusterName(cluster),
+				"error", err.Error(),
+			)
+			return
+		}
+		if latency >= a.absoluteMax {
+			// Write succeeded but was too slow — no recovery credit.
 			return
 		}
 
