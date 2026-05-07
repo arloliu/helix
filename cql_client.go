@@ -127,12 +127,16 @@ type sessionHolder struct {
 // to decide when a cluster's session is permanently dead and needs a
 // RefreshSession call. lastRefreshNanos is the throttle: stamped before
 // each refresh attempt so a hung refresher cannot cause re-entrant
-// double-fire on the next detector tick.
+// double-fire on the next detector tick. lastErr captures the most
+// recently observed failure error and is threaded through to the
+// SessionRefresher's lastErr parameter so refreshers can tailor
+// reconnection strategy to the observed failure mode.
 type clusterStats struct {
 	consecutiveFailures atomic.Int32
 	lastSuccessNanos    atomic.Int64
 	lastFailureNanos    atomic.Int64
 	lastRefreshNanos    atomic.Int64
+	lastErr             atomic.Pointer[error]
 }
 
 // NowProvider returns the current time as Unix nanoseconds.
@@ -328,6 +332,7 @@ func (c *CQLClient) recordOpOutcome(cluster ClusterID, err error) {
 	case err == nil:
 		s.consecutiveFailures.Store(0)
 		s.lastSuccessNanos.Store(now)
+		s.lastErr.Store(nil)
 	case errors.Is(err, types.ErrWriteAsync),
 		errors.Is(err, types.ErrWriteDropped),
 		errors.Is(err, types.ErrNotFound):
@@ -336,6 +341,10 @@ func (c *CQLClient) recordOpOutcome(cluster ClusterID, err error) {
 	default:
 		s.consecutiveFailures.Add(1)
 		s.lastFailureNanos.Store(now)
+		// Stable heap pointer for atomic.Pointer; the err interface
+		// itself is two words and can't be stored directly.
+		errCopy := err
+		s.lastErr.Store(&errCopy)
 	}
 }
 
@@ -806,7 +815,17 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 		return types.ErrInvalidCluster
 	}
 
-	newSession, err := c.config.SessionRefresher(ctx, cluster, nil)
+	// Thread the most recently observed failure for this cluster through
+	// to the refresher so it can tailor reconnection strategy to the
+	// observed failure mode (e.g. "no hosts available" suggests a hard
+	// reachability issue while "timeout" suggests a slow but reachable
+	// cluster). Nil if the cluster has had no recorded failures.
+	var lastErr error
+	if e := c.statsForCluster(cluster).lastErr.Load(); e != nil {
+		lastErr = *e
+	}
+
+	newSession, err := c.config.SessionRefresher(ctx, cluster, lastErr)
 	if err != nil {
 		return fmt.Errorf("session refresher: %w", err)
 	}

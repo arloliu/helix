@@ -183,7 +183,7 @@ helix.WithSessionRefresher(func(ctx context.Context, cluster helix.ClusterID, la
 helix.WithAutoRefresh(),
 ```
 
-The `lastErr` parameter is currently always nil (reserved for v2.x per-cluster last-error threading). Don't rely on it being set yet.
+The `lastErr` parameter is the most recently observed failure error against this cluster at the time the refresher is invoked, or nil if no failure has been recorded (typical for caller-driven `RefreshSession` invoked before any op has failed). Refreshers may inspect it to tailor reconnection strategy — for example, a "no hosts available" pattern suggests a hard reachability change (DNS, port reassignment) while a timeout suggests a slow but reachable cluster.
 
 ---
 

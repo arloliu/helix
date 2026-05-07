@@ -12,6 +12,7 @@ import (
 
 	"github.com/arloliu/helix"
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/types"
 )
 
@@ -157,7 +158,12 @@ func TestRefreshSession_InvokesRefresherAndClosesOld(t *testing.T) {
 	refresher := func(_ context.Context, cluster helix.ClusterID, lastErr error) (cql.Session, error) {
 		calls.Add(1)
 		assert.Equal(t, helix.ClusterA, cluster)
-		assert.Nil(t, lastErr, "v1 always passes nil lastErr")
+		// No prior op failure has been recorded (this test calls
+		// RefreshSession directly without driving any failing ops first),
+		// so lastErr is nil. The "lastErr always nil" guarantee from v1
+		// no longer holds in v2: see TestRefreshSession_LastErrThreadedFromObservedFailure.
+		assert.Nil(t, lastErr, "no failure recorded before this RefreshSession; lastErr is nil")
+
 		return newMockA, nil
 	}
 
@@ -170,6 +176,42 @@ func TestRefreshSession_InvokesRefresherAndClosesOld(t *testing.T) {
 	assert.Same(t, newMockA, client.SessionA(), "new session installed")
 	assert.True(t, mockA.closed.Load(),
 		"RefreshSession closes the old session on the caller's behalf (refresh contract)")
+}
+
+// TestRefreshSession_LastErrThreadedFromObservedFailure verifies the
+// v2 lastErr threading: when ops have failed against a cluster before
+// RefreshSession is called, the most recently observed failure is
+// surfaced to the SessionRefresher's lastErr parameter.
+func TestRefreshSession_LastErrThreadedFromObservedFailure(t *testing.T) {
+	failErr := errors.New("simulated network partition")
+	mockA := newAlwaysFailSession(failErr)
+	mockB := newAlwaysOKMock()
+
+	var capturedLastErr error
+	refresher := func(_ context.Context, _ helix.ClusterID, lastErr error) (cql.Session, error) {
+		capturedLastErr = lastErr
+		return newAlwaysOKMock(), nil
+	}
+
+	client, err := helix.NewCQLClient(mockA, mockB,
+		helix.WithSessionRefresher(refresher),
+		helix.WithWriteStrategy(policy.NewSyncDualWrite()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	// Drive a write so cluster A records the failure via recordOpOutcome.
+	// SyncDualWrite under partial failure (A=err, B=ok) returns nil to
+	// the caller per the documented contract, but recordOpOutcome runs
+	// per-cluster so A's lastErr is updated.
+	require.NoError(t,
+		client.Query("INSERT INTO t (k,v) VALUES (?, ?)", 1, "v").
+			ExecContext(context.Background()),
+		"partial-success write returns nil to caller (B succeeded)")
+
+	require.NoError(t, client.RefreshSession(context.Background(), helix.ClusterA))
+	assert.ErrorIs(t, capturedLastErr, failErr,
+		"refresher must receive the most recent observed failure as lastErr")
 }
 
 func TestRefreshSession_NoRefresherConfigured(t *testing.T) {

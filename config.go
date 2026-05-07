@@ -127,9 +127,13 @@ type ClientConfig struct {
 // concrete adapter (cqlv1.NewSession, cqlv2.NewSession, etc.) — Helix never
 // imports a specific gocql driver and so cannot construct a session itself.
 //
-// lastErr is currently always nil; reserved for v2 per-cluster last-error
-// tracking that will let refreshers tailor reconnection strategy to the
-// observed failure mode.
+// lastErr is the most recently observed failure error against this cluster
+// at the time the refresher is invoked (or nil if no failure has been
+// recorded — typical for caller-driven RefreshSession invocations done
+// before any op has failed). Refreshers may inspect it to tailor
+// reconnection strategy to the observed failure mode (e.g., "no hosts
+// available" implies a hard reachability issue while a timeout implies
+// a slow but reachable cluster).
 type SessionRefresher func(ctx context.Context, cluster ClusterID, lastErr error) (cql.Session, error)
 
 // DefaultConfig returns a ClientConfig with sensible defaults.
