@@ -55,8 +55,11 @@ func (b *memoryBackend) start(_ types.ClusterID) {
 			}
 		}
 
-		// Execute the replay
-		b.executeWithRetry(payload, 1)
+		// Execute the replay with inline bounded retry. Returns true when the
+		// caller should exit (stopCh observed during backoff).
+		if b.executeWithRetry(payload) {
+			return
+		}
 	}
 }
 
@@ -80,71 +83,88 @@ func (b *memoryBackend) drainAndDrop() {
 	}
 }
 
-// executeWithRetry executes a replay with exponential backoff retry.
-// Used for MemoryReplayer which doesn't have built-in retry.
-func (b *memoryBackend) executeWithRetry(payload types.ReplayPayload, attempt int) {
-	start := time.Now()
-	err := b.executeOnce(payload)
-	elapsed := time.Since(start).Seconds()
+// executeWithRetry runs a payload through up to MaxAttempts with exponential
+// backoff between attempts. Returns true when stopCh was observed during a
+// backoff sleep (the caller should exit). Returns false after success or
+// after the payload is dropped via OnDrop because attempts were exhausted.
+//
+// Retries are inline (not re-enqueued). The previous re-enqueue strategy
+// re-entered start() with attempt always 1, which collapsed the documented
+// exponential backoff into a fixed RetryDelay and let a permanently-broken
+// cluster bounce the same payload through the queue forever. Inline retry
+// keeps the backoff honest and bounds attempts at MaxAttempts.
+func (b *memoryBackend) executeWithRetry(payload types.ReplayPayload) (stopped bool) {
+	maxAttempts := b.config.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
 
-	if err == nil {
-		b.config.Metrics.IncReplaySuccess(payload.TargetCluster)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		start := time.Now()
+		err := b.executeOnce(payload)
+		elapsed := time.Since(start).Seconds()
+
+		if err == nil {
+			b.config.Metrics.IncReplaySuccess(payload.TargetCluster)
+			b.config.Metrics.ObserveReplayDuration(payload.TargetCluster, elapsed)
+			if b.config.OnSuccess != nil {
+				b.config.OnSuccess(payload)
+			}
+
+			return false
+		}
+
+		lastErr = err
+		b.config.Metrics.IncReplayError(payload.TargetCluster)
 		b.config.Metrics.ObserveReplayDuration(payload.TargetCluster, elapsed)
-		if b.config.OnSuccess != nil {
-			b.config.OnSuccess(payload)
-		}
-
-		return
-	}
-
-	b.config.Metrics.IncReplayError(payload.TargetCluster)
-	b.config.Metrics.ObserveReplayDuration(payload.TargetCluster, elapsed)
-	b.config.Logger.Warn("replay execution failed",
-		"cluster", b.clusterName(payload.TargetCluster),
-		"attempt", attempt,
-		"error", err.Error(),
-	)
-	if b.config.OnError != nil {
-		b.config.OnError(payload, err, attempt)
-	}
-
-	// For memory replayer, re-enqueue with backoff
-	// (since we can't put it back at front of queue, we just re-enqueue)
-	delay := calculateBackoff(attempt, b.config.RetryDelay, b.config.MaxRetryDelay)
-
-	timer := time.NewTimer(delay)
-	select {
-	case <-b.stopCh:
-		timer.Stop()
-		// Payload dropped during shutdown — notify callback so the user
-		// has visibility into what was lost.
-		b.config.Metrics.IncReplayDropped(payload.TargetCluster)
-		b.config.Logger.Warn("replay message dropped during shutdown",
+		b.config.Logger.Warn("replay execution failed",
 			"cluster", b.clusterName(payload.TargetCluster),
-		)
-		if b.config.OnDrop != nil {
-			b.config.OnDrop(payload, err)
-		}
-
-		return
-	case <-timer.C:
-	}
-
-	// Re-enqueue for retry
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	if enqErr := b.replayer.Enqueue(ctx, payload); enqErr != nil {
-		// Queue is full, drop the message
-		b.config.Metrics.IncReplayDropped(payload.TargetCluster)
-		b.config.Logger.Error("replay message dropped, queue full",
-			"cluster", b.clusterName(payload.TargetCluster),
+			"attempt", attempt,
+			"maxAttempts", maxAttempts,
 			"error", err.Error(),
 		)
-		if b.config.OnDrop != nil {
-			b.config.OnDrop(payload, err)
+		if b.config.OnError != nil {
+			b.config.OnError(payload, err, attempt)
+		}
+
+		// No more attempts — fall through to the drop path below.
+		if attempt == maxAttempts {
+			break
+		}
+
+		delay := calculateBackoff(attempt, b.config.RetryDelay, b.config.MaxRetryDelay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-b.stopCh:
+			timer.Stop()
+			// Payload dropped during shutdown — notify callback so the
+			// user has visibility into what was lost.
+			b.config.Metrics.IncReplayDropped(payload.TargetCluster)
+			b.config.Logger.Warn("replay message dropped during shutdown",
+				"cluster", b.clusterName(payload.TargetCluster),
+			)
+			if b.config.OnDrop != nil {
+				b.config.OnDrop(payload, err)
+			}
+
+			return true
+		case <-timer.C:
 		}
 	}
+
+	// Attempts exhausted — drop the payload.
+	b.config.Metrics.IncReplayDropped(payload.TargetCluster)
+	b.config.Logger.Error("replay message dropped, max attempts exceeded",
+		"cluster", b.clusterName(payload.TargetCluster),
+		"maxAttempts", maxAttempts,
+		"error", lastErr.Error(),
+	)
+	if b.config.OnDrop != nil {
+		b.config.OnDrop(payload, lastErr)
+	}
+
+	return false
 }
 
 // executeOnce executes a single replay attempt with timeout.

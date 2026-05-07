@@ -3,6 +3,7 @@ package replay_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -445,4 +446,163 @@ func TestMemoryWorkerQueueDrainedOnShutdown(t *testing.T) {
 
 	assert.Equal(t, int32(total), dropped.Load(),
 		"OnDrop must be called for every payload: backoff item + remaining queue items")
+}
+
+// TestMemoryWorker_BackoffGrowsBetweenAttempts verifies that successive retry
+// attempts for the same payload observe an exponentially-growing delay. The
+// previous re-enqueue retry strategy collapsed every attempt to attempt=1,
+// which made calculateBackoff always return the base RetryDelay regardless
+// of attempt number — exponential backoff was effectively a fixed delay.
+func TestMemoryWorker_BackoffGrowsBetweenAttempts(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(10))
+	defer replayer.Close()
+
+	var attemptTimes []time.Time
+	var mu sync.Mutex
+
+	worker := replay.NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error {
+			mu.Lock()
+			attemptTimes = append(attemptTimes, time.Now())
+			mu.Unlock()
+
+			return errors.New("always fail")
+		},
+		replay.WithPollInterval(10*time.Millisecond),
+		replay.WithRetryDelay(40*time.Millisecond),
+		replay.WithMaxRetryDelay(time.Second),
+		replay.WithMaxAttempts(4),
+	)
+
+	err := replayer.Enqueue(t.Context(), types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT test",
+		Timestamp:     1,
+		Priority:      types.PriorityHigh,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, worker.Start())
+
+	// All four attempts plus the cumulative backoff (40+80+160 = 280ms)
+	// should comfortably finish under 1.5s.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(attemptTimes) >= 4
+	}, 2*time.Second, 10*time.Millisecond, "expected MaxAttempts=4 attempts")
+
+	worker.Stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Gaps should grow: gap(2-1) ~= 40ms, gap(3-2) ~= 80ms, gap(4-3) ~= 160ms.
+	// Allow generous slack for scheduling jitter — we only assert each gap
+	// is at least ~70% of the next-smaller-power-of-2 base.
+	gap1 := attemptTimes[1].Sub(attemptTimes[0])
+	gap2 := attemptTimes[2].Sub(attemptTimes[1])
+	gap3 := attemptTimes[3].Sub(attemptTimes[2])
+
+	assert.GreaterOrEqual(t, gap1, 25*time.Millisecond, "first backoff ~40ms")
+	assert.GreaterOrEqual(t, gap2, 55*time.Millisecond, "second backoff ~80ms")
+	assert.GreaterOrEqual(t, gap3, 110*time.Millisecond, "third backoff ~160ms")
+	assert.Greater(t, gap2, gap1, "backoff must grow between attempts")
+	assert.Greater(t, gap3, gap2, "backoff must grow between attempts")
+}
+
+// TestMemoryWorker_MaxAttemptsBoundsRetries verifies that a permanently-failing
+// payload is dropped exactly once after MaxAttempts attempts, with no
+// re-enqueue (the queue stays empty).
+func TestMemoryWorker_MaxAttemptsBoundsRetries(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(10))
+	defer replayer.Close()
+
+	var attempts atomic.Int32
+	var dropped atomic.Int32
+
+	worker := replay.NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error {
+			attempts.Add(1)
+
+			return errors.New("always fail")
+		},
+		replay.WithPollInterval(5*time.Millisecond),
+		replay.WithRetryDelay(5*time.Millisecond),
+		replay.WithMaxRetryDelay(20*time.Millisecond),
+		replay.WithMaxAttempts(3),
+		replay.WithOnDrop(func(_ types.ReplayPayload, _ error) {
+			dropped.Add(1)
+		}),
+	)
+
+	err := replayer.Enqueue(t.Context(), types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT test",
+		Timestamp:     1,
+		Priority:      types.PriorityHigh,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, worker.Start())
+
+	require.Eventually(t, func() bool {
+		return dropped.Load() == 1
+	}, time.Second, 5*time.Millisecond, "OnDrop must fire exactly once after MaxAttempts")
+
+	// Give the worker a moment to demonstrate it does NOT re-enqueue.
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(3), attempts.Load(), "exactly MaxAttempts attempts, no re-enqueue")
+	assert.Equal(t, 0, replayer.Len(), "queue must remain empty after drop")
+
+	worker.Stop()
+}
+
+// TestMemoryWorker_RecoveryBeforeMaxAttempts verifies that a transient failure
+// recovered before MaxAttempts is exhausted yields a successful replay and
+// no OnDrop call.
+func TestMemoryWorker_RecoveryBeforeMaxAttempts(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(10))
+	defer replayer.Close()
+
+	var attempts atomic.Int32
+	var success atomic.Int32
+	var dropped atomic.Int32
+
+	worker := replay.NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error {
+			n := attempts.Add(1)
+			if n < 3 {
+				return errors.New("transient")
+			}
+
+			return nil
+		},
+		replay.WithPollInterval(5*time.Millisecond),
+		replay.WithRetryDelay(5*time.Millisecond),
+		replay.WithMaxRetryDelay(20*time.Millisecond),
+		replay.WithMaxAttempts(5),
+		replay.WithOnSuccess(func(_ types.ReplayPayload) { success.Add(1) }),
+		replay.WithOnDrop(func(_ types.ReplayPayload, _ error) { dropped.Add(1) }),
+	)
+
+	err := replayer.Enqueue(t.Context(), types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT test",
+		Timestamp:     1,
+		Priority:      types.PriorityHigh,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, worker.Start())
+
+	require.Eventually(t, func() bool {
+		return success.Load() == 1
+	}, time.Second, 5*time.Millisecond, "transient failure must recover within MaxAttempts")
+
+	worker.Stop()
+
+	assert.Equal(t, int32(3), attempts.Load(), "should stop attempting after first success")
+	assert.Equal(t, int32(0), dropped.Load(), "OnDrop must not fire when payload eventually succeeds")
 }

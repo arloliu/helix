@@ -38,6 +38,17 @@ type WorkerConfig struct {
 	// Default: 30 seconds
 	ExecuteTimeout time.Duration
 
+	// MaxAttempts caps the number of in-line retries for a single payload
+	// in the memory backend. After MaxAttempts failures, the payload is
+	// dropped and OnDrop is invoked with the final error.
+	//
+	// The NATS backend uses NATSReplayerConfig.MaxDeliver instead and
+	// ignores this setting.
+	//
+	// Values <= 0 are treated as 1 (no retry beyond the initial attempt).
+	// Default: 5
+	MaxAttempts int
+
 	// HighPriorityRatio controls the ratio of high-priority to low-priority message processing.
 	// For every N high-priority batches processed, 1 low-priority batch is processed.
 	// This prevents low-priority starvation while ensuring high-priority messages are preferred.
@@ -91,6 +102,7 @@ func DefaultWorkerConfig() WorkerConfig {
 		RetryDelay:        100 * time.Millisecond,
 		MaxRetryDelay:     30 * time.Second,
 		ExecuteTimeout:    30 * time.Second,
+		MaxAttempts:       5,
 		HighPriorityRatio: 10,
 		StrictPriority:    false,
 		ClusterNames:      types.DefaultClusterNames(),
@@ -132,6 +144,17 @@ func WithMaxRetryDelay(d time.Duration) WorkerOption {
 func WithExecuteTimeout(d time.Duration) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.ExecuteTimeout = d
+	}
+}
+
+// WithMaxAttempts sets the maximum number of attempts for a single payload
+// in the memory backend before it is dropped via OnDrop.
+//
+// Memory only — the NATS backend uses MaxDeliver on the consumer.
+// Values <= 0 are treated as 1 (no retry beyond the initial attempt).
+func WithMaxAttempts(n int) WorkerOption {
+	return func(c *WorkerConfig) {
+		c.MaxAttempts = n
 	}
 }
 
