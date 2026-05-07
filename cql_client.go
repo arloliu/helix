@@ -91,12 +91,51 @@ type CQLClient struct {
 	// overrideErrSeq counts consecutive override errors for power-of-2 log backoff.
 	// Prevents log storms when the AllowedClusters provider is misconfigured.
 	overrideErrSeq atomic.Uint64
+
+	// statsA / statsB track per-cluster op outcomes for the auto-refresh
+	// detector (see WithAutoRefresh). Updated by recordOpOutcome on every
+	// hot-path op. When auto-refresh is disabled the fields are still
+	// updated (the cost is negligible) so toggling the option after
+	// construction would just-work in v2.x if/when we add it.
+	statsA clusterStats
+	statsB clusterStats
+
+	// nowFunc returns the current time as Unix nanoseconds. Defaults to
+	// DefaultNowProvider; tests substitute a deterministic clock so
+	// millisecond-scale time-based assertions don't depend on wall clock.
+	// Mirrors the TimestampProvider pattern in config.go.
+	nowFunc NowProvider
 }
 
 // sessionHolder wraps a cql.Session so it can live in an atomic.Pointer.
 // The indirection is required because cql.Session is an interface.
 type sessionHolder struct {
 	s cql.Session
+}
+
+// clusterStats holds per-cluster op-outcome counters. All fields are
+// atomics — no lock needed on the read or write side.
+//
+// The auto-refresh detector (commit 3) reads these fields to decide when
+// a cluster's session is permanently dead.
+type clusterStats struct {
+	consecutiveFailures atomic.Int32
+	lastSuccessNanos    atomic.Int64
+	lastFailureNanos    atomic.Int64
+}
+
+// NowProvider returns the current time as Unix nanoseconds.
+//
+// The default is [DefaultNowProvider] (which calls time.Now().UnixNano()).
+// Tests use a deterministic provider so the auto-refresh detector's
+// time-based conditions can be exercised without wall-clock dependence.
+//
+// Mirrors the [TimestampProvider] pattern in config.go.
+type NowProvider func() int64
+
+// DefaultNowProvider returns time.Now().UnixNano().
+func DefaultNowProvider() int64 {
+	return time.Now().UnixNano()
 }
 
 // loadSessionA returns the live session for cluster A. It is wait-free; the
@@ -129,6 +168,53 @@ func (c *CQLClient) storeSessionA(s cql.Session) {
 // without a nil-pointer-deref on the holder pointer.
 func (c *CQLClient) storeSessionB(s cql.Session) {
 	c.sessionB.Store(&sessionHolder{s: s})
+}
+
+// statsForCluster returns the stats container for the given cluster.
+// In single-cluster mode, only statsA is meaningful; statsB exists but
+// is never read by the auto-refresh detector.
+func (c *CQLClient) statsForCluster(cluster ClusterID) *clusterStats {
+	if cluster == ClusterB {
+		return &c.statsB
+	}
+
+	return &c.statsA
+}
+
+// recordOpOutcome updates the per-cluster stats based on a single op's
+// result for that cluster. Designed to be invoked PER cluster — never
+// gated on "all clusters succeeded" — so a dual-write where A succeeds
+// and B fails records success on A AND failure on B independently.
+//
+// err == nil counts as success. ErrWriteAsync, ErrWriteDropped, and
+// ErrNotFound are operational/data states (not health signals) and MUST
+// NOT count as failure. All other errors increment consecutiveFailures.
+//
+// The ErrNotFound exclusion depends on Helix's adapter normalization
+// contract: gocql v1's gocql.ErrNotFound and gocql v2's equivalent are
+// both translated to types.ErrNotFound at the adapter boundary
+// (verified in adapter/cql/v{1,2}/adapter.go:14). If a future adapter
+// surfaces a driver-native not-found instead of the Helix sentinel,
+// recordOpOutcome will count those as failures and a workload with
+// many genuine not-founds could trigger spurious auto-refreshes.
+// Revisit this helper if the adapter contract changes.
+func (c *CQLClient) recordOpOutcome(cluster ClusterID, err error) {
+	s := c.statsForCluster(cluster)
+	now := c.nowFunc()
+
+	switch {
+	case err == nil:
+		s.consecutiveFailures.Store(0)
+		s.lastSuccessNanos.Store(now)
+	case errors.Is(err, types.ErrWriteAsync),
+		errors.Is(err, types.ErrWriteDropped),
+		errors.Is(err, types.ErrNotFound):
+		// Operational/data state; not a health signal.
+		return
+	default:
+		s.consecutiveFailures.Add(1)
+		s.lastFailureNanos.Store(now)
+	}
 }
 
 // Compile-time assertion that CQLClient implements CQLSession.
@@ -200,9 +286,16 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
 
+	// Ensure NowProvider is never nil — auto-refresh + stats helpers
+	// dereference it on every recorded op outcome.
+	if config.NowProvider == nil {
+		config.NowProvider = DefaultNowProvider
+	}
+
 	client := &CQLClient{
 		config:        config,
 		singleCluster: sessionB == nil,
+		nowFunc:       config.NowProvider,
 	}
 	client.storeSessionA(sessionA)
 	// Store sessionB even if nil; in single-cluster mode the holder wraps a
@@ -879,9 +972,15 @@ func (c *CQLClient) executeWriteWithReplay(
 		return types.ErrSessionClosed
 	}
 
-	// Single-cluster mode: direct execution, no dual-write logic
+	// Single-cluster mode: direct execution, no dual-write logic.
+	// The auto-refresh detector tracks cluster-A outcomes only here —
+	// without this site single-cluster auto-refresh silently never fires
+	// because no other code path observes the err for stats purposes.
 	if c.IsSingleCluster() {
-		return writeFunc(ctx, c.loadSessionA())
+		err := writeFunc(ctx, c.loadSessionA())
+		c.recordOpOutcome(ClusterA, err)
+
+		return err
 	}
 
 	// Check drain mode
@@ -932,11 +1031,14 @@ func (c *CQLClient) executeWriteWithDrain(
 		c.config.Metrics.IncWriteTotal(healthyCluster)
 		c.config.Metrics.IncWriteError(healthyCluster)
 		c.config.Metrics.ObserveWriteDuration(healthyCluster, elapsed)
+		c.recordOpOutcome(healthyCluster, err)
+
 		return err
 	}
 
 	c.config.Metrics.IncWriteTotal(healthyCluster)
 	c.config.Metrics.ObserveWriteDuration(healthyCluster, elapsed)
+	c.recordOpOutcome(healthyCluster, nil)
 
 	// Enqueue for replay to the draining cluster
 	if c.config.Replayer != nil {
@@ -1050,6 +1152,14 @@ func (c *CQLClient) executeDualWrite(
 	case errB != nil:
 		c.config.Metrics.IncWriteError(ClusterB)
 	}
+
+	// Auto-refresh stat tracking — invoked PER cluster so partial-success
+	// (A=ok, B=err) correctly advances A's lastSuccess while accumulating
+	// failures on B. recordOpOutcome internally skips ErrWriteAsync /
+	// ErrWriteDropped / ErrNotFound so operational states don't poison
+	// the failure counters.
+	c.recordOpOutcome(ClusterA, errA)
+	c.recordOpOutcome(ClusterB, errB)
 
 	// Both succeeded definitively.
 	if errA == nil && errB == nil {
@@ -1215,6 +1325,9 @@ func (c *CQLClient) executeRead(
 		if err != nil && !types.IsNotFound(err) {
 			c.config.Metrics.IncReadError(ClusterA)
 		}
+		// Auto-refresh outcome — recordOpOutcome internally excludes
+		// ErrNotFound so the not-found check is doubly safe here.
+		c.recordOpOutcome(ClusterA, err)
 
 		return err
 	}
@@ -1246,11 +1359,15 @@ func (c *CQLClient) executeRead(
 
 	if err == nil {
 		c.recordReadSuccess(selectedCluster, elapsed, rt.snap.active)
+		c.recordOpOutcome(selectedCluster, nil)
 		return nil
 	}
 
 	// Not-found is NOT a health signal — the cluster responded correctly.
 	if types.IsNotFound(err) {
+		// recordOpOutcome handles the ErrNotFound exclusion internally,
+		// but we don't actually need to call it here — not-found is
+		// neither success nor failure for auto-refresh purposes.
 		if opts.fallbackRead {
 			return c.executeFallbackRead(ctx, rt.snap, selectedCluster, readFunc)
 		}
@@ -1259,6 +1376,7 @@ func (c *CQLClient) executeRead(
 
 	// Real error path: record failure and potentially failover.
 	c.config.Metrics.IncReadError(selectedCluster)
+	c.recordOpOutcome(selectedCluster, err)
 
 	if rt.snap.active {
 		return c.executeOverrideFailover(ctx, rt, err, readFunc)
@@ -1364,6 +1482,7 @@ func (c *CQLClient) tryFallbackCluster(
 
 	if err == nil {
 		c.recordReadSuccess(fallback, elapsed, overrideActive)
+		c.recordOpOutcome(fallback, nil)
 		return nil
 	}
 
@@ -1372,6 +1491,7 @@ func (c *CQLClient) tryFallbackCluster(
 	}
 
 	c.config.Metrics.IncReadError(fallback)
+	c.recordOpOutcome(fallback, err)
 	if c.config.FailoverPolicy != nil {
 		c.config.FailoverPolicy.RecordFailure(fallback)
 	}
@@ -1429,6 +1549,7 @@ func (c *CQLClient) executeFallbackRead(
 	if err == nil {
 		// Found the data on the alternative cluster — divergence (replay lag).
 		c.recordReadSuccess(alternativeCluster, elapsed, snap.active)
+		c.recordOpOutcome(alternativeCluster, nil)
 		c.config.Metrics.IncReadDivergence(selectedCluster)
 		c.config.Logger.Debug("fallback read: found data on alternative cluster",
 			"staleCluster", c.clusterName(selectedCluster),
@@ -1451,6 +1572,7 @@ func (c *CQLClient) executeFallbackRead(
 	// primary's not-found would have been returned cleanly. A "try harder"
 	// feature must not make things worse.
 	c.config.Metrics.IncReadError(alternativeCluster)
+	c.recordOpOutcome(alternativeCluster, err)
 	if c.config.FailoverPolicy != nil {
 		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
 	}
@@ -1582,7 +1704,10 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 		// to ensure consistency across clusters
 		query = query.WithTimestamp(ts)
 
-		return query.ExecContext(ctx)
+		err := query.ExecContext(ctx)
+		q.client.recordOpOutcome(ClusterA, err)
+
+		return err
 	}
 
 	wc := writeContext{
@@ -1811,7 +1936,10 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 		}
 		batch = batch.WithTimestamp(ts)
 
-		return batch.ExecContext(ctx)
+		err := batch.ExecContext(ctx)
+		b.client.recordOpOutcome(ClusterA, err)
+
+		return err
 	}
 
 	wc := writeContext{

@@ -85,6 +85,14 @@ type ClientConfig struct {
 	// AutoMemoryWorkerOpts are options passed to the auto-created Worker.
 	AutoMemoryWorkerOpts []replay.WorkerOption
 
+	// NowProvider returns the current time as Unix nanoseconds. Defaults to
+	// DefaultNowProvider (which calls time.Now().UnixNano()). Tests can
+	// substitute a deterministic clock so the auto-refresh detector's
+	// time-based conditions can be exercised without wall-clock dependence.
+	//
+	// Mirrors the [TimestampProvider] pattern above.
+	NowProvider NowProvider
+
 	// SessionRefresher is an optional caller-supplied factory used by
 	// [CQLClient.RefreshSession] to build a replacement [cql.Session] for a
 	// cluster whose live session is broken (e.g., the cluster restarted at a
