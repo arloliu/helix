@@ -201,7 +201,7 @@ func makeStrategyGroupClient(
 	failoverPolicy helix.FailoverPolicy,
 ) simulation.StrategyGroupSetupFunc {
 	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
-		memReplayer := replay.NewMemoryReplayer()
+		memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
 		topo := topology.NewLocal()
 
 		client, err := helix.NewCQLClient(sessionA, sessionB,
@@ -346,7 +346,7 @@ func fallbackReadGroup() simulation.StrategyGroup {
 	return simulation.StrategyGroup{
 		Name: "fallback-read",
 		SetupFunc: func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
-			memReplayer := replay.NewMemoryReplayer()
+			memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
 			topo := topology.NewLocal()
 
 			client, err := helix.NewCQLClient(sessionA, sessionB,
