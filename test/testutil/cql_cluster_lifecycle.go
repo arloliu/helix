@@ -77,6 +77,57 @@ func (c *CQLCluster) Unpause(ctx context.Context) error {
 	return cli.ContainerUnpause(ctx, ctr.GetContainerID())
 }
 
+// Kill sends SIGKILL to the container's PID 1, simulating a process crash.
+// This is harder than Stop (which first sends SIGTERM and waits for graceful
+// shutdown) — Kill terminates immediately. In-flight TCP connections are
+// abruptly closed; the OS sends RST to peers. Use this to test how Helix
+// reacts to abrupt cluster process death (OOM-kill, kernel panic, hard
+// reboot) rather than orderly shutdown.
+//
+// After Kill, the container is exited but not removed. Call Start to
+// restart it; the test still needs cluster.Reconnect afterwards because
+// the host port is reassigned.
+func (c *CQLCluster) Kill(ctx context.Context) error {
+	cli, ctr, err := c.dockerClient()
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	return cli.ContainerKill(ctx, ctr.GetContainerID(), "SIGKILL")
+}
+
+// NetworkDisconnect detaches the container from its (default) network,
+// simulating a network partition. The container keeps running but
+// becomes unreachable from the host. Existing TCP connections from
+// host-side clients are dropped or hang (zombie/half-open socket
+// territory). This is the closest reproducible analog to a real network
+// partition — different from Pause (process is still answering, just
+// stopped) and Kill (process is dead).
+//
+// NetworkReconnect (companion) restores connectivity.
+func (c *CQLCluster) NetworkDisconnect(ctx context.Context, networkName string) error {
+	cli, ctr, err := c.dockerClient()
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	const force = true
+	return cli.NetworkDisconnect(ctx, networkName, ctr.GetContainerID(), force)
+}
+
+// NetworkReconnect re-attaches the container to the named network after
+// a NetworkDisconnect. Existing host-side gocql sessions will still be
+// dead because their TCP state is invalid; tests should call Reconnect
+// after this to rebuild sessions.
+func (c *CQLCluster) NetworkReconnect(ctx context.Context, networkName string) error {
+	cli, ctr, err := c.dockerClient()
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	return cli.NetworkReconnect(ctx, networkName, ctr.GetContainerID())
+}
+
 // dockerClient returns a Docker API client (sourced from testcontainers'
 // DockerProvider so we don't add a direct dependency on docker/docker) and
 // the underlying container reference.
@@ -98,6 +149,9 @@ func (c *CQLCluster) dockerClient() (closer dockerCloser, ctr testcontainers.Con
 type dockerCloser interface {
 	ContainerPause(ctx context.Context, containerID string) error
 	ContainerUnpause(ctx context.Context, containerID string) error
+	ContainerKill(ctx context.Context, containerID, signal string) error
+	NetworkDisconnect(ctx context.Context, networkName, containerID string, force bool) error
+	NetworkReconnect(ctx context.Context, networkName, containerID string) error
 	Close() error
 }
 
@@ -112,6 +166,24 @@ func (p providerCloser) ContainerPause(ctx context.Context, id string) error {
 
 func (p providerCloser) ContainerUnpause(ctx context.Context, id string) error {
 	_, err := p.provider.Client().ContainerUnpause(ctx, id, client.ContainerUnpauseOptions{})
+	return err
+}
+
+func (p providerCloser) ContainerKill(ctx context.Context, id, signal string) error {
+	_, err := p.provider.Client().ContainerKill(ctx, id, client.ContainerKillOptions{Signal: signal})
+	return err
+}
+
+func (p providerCloser) NetworkDisconnect(ctx context.Context, network, id string, force bool) error {
+	_, err := p.provider.Client().NetworkDisconnect(ctx, network, client.NetworkDisconnectOptions{
+		Container: id,
+		Force:     force,
+	})
+	return err
+}
+
+func (p providerCloser) NetworkReconnect(ctx context.Context, network, id string) error {
+	_, err := p.provider.Client().NetworkConnect(ctx, network, client.NetworkConnectOptions{Container: id})
 	return err
 }
 
