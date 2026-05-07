@@ -7,7 +7,7 @@ Helix has multiple recovery mechanisms that work at different levels. Short blip
 | Layer | Scope | Automatic? | Recovers When |
 |-------|-------|------------|---------------|
 | **FailoverPolicy** (read) | Per-read routing | Yes | Single successful read resets CircuitBreaker |
-| **ReadStrategy** (read) | Sticky cluster preference | Yes | Cooldown expires (StickyRead) or recovery timeout probes succeed (PrimaryOnlyRead) |
+| **ReadStrategy** (read) | Sticky cluster preference | Partial | `PrimaryOnlyRead`: recovery timeout probes succeed. `StickyRead`: does NOT auto-recover — preferred only changes on a new failure of the current preferred. |
 | **AdaptiveDualWrite** (write) | Per-write mode | Yes | `recoveryThreshold` consecutive fast background writes |
 | **Replay** (write) | Data consistency | Yes (queue processing) | Worker drains the backlog |
 | **AllowedClusters** (read) | Operator override | No — manual | Operator removes the override |
@@ -29,9 +29,17 @@ A recovers
   → Background writes to A succeed → fastStrikes accumulate
   → 5 consecutive fast writes → A exits fire-and-forget
   → Next successful read → CircuitBreaker resets
-  → StickyRead cooldown expires → reads return to A
+  → Reads route per the configured strategy (see below)
   → Replay worker drains remaining queue
 ```
+
+> **Read-side recovery depends on the strategy.** With `PrimaryOnlyRead`,
+> reads probe back to A once the recovery timeout elapses. With
+> `StickyRead`, if `OnFailure` already swapped preferred to B during the
+> outage, reads stay on B until B itself fails — cooldown expiry alone
+> does not move preferred back. Use [`PrimaryOnlyRead`](strategy-policy.md#primaryonlyread)
+> for a strategy that probes the original cluster automatically, or
+> coordinate read recovery via [`WithAllowedClusters`](#phase-4-re-enable-in-the-correct-order).
 
 **Indicators that auto-recovery is handling it:**
 - Replay queue depth stays low (tens to low hundreds)
@@ -41,7 +49,7 @@ A recovers
 
 **No intervention needed when:**
 - GC pauses cause transient latency spikes
-- Network hiccups last less than your StickyRead cooldown
+- Network hiccups are short and the configured failover policy resets after a successful read
 - A deployment restart briefly disrupts one cluster
 
 ---
@@ -59,7 +67,7 @@ A is down           A comes back      reads auto-recover to A
 ```
 
 **Intervention is needed when:**
-- Outage lasted longer than your StickyRead cooldown or PrimaryOnlyRead recovery timeout
+- Outage exceeds your `PrimaryOnlyRead` recovery timeout, or you use `StickyRead` (which has no automatic path back to the original preferred)
 - Replay queue depth is in the thousands or higher
 - The recovering cluster missed a meaningful volume of writes
 - You need to guarantee read consistency before switching back
@@ -124,8 +132,10 @@ featureFlag.Set("exclude_cluster_A", false)
 // Step 2: Recover writes — resume synchronous dual-write
 writeStrategy.ForceRecover(helix.ClusterA)
 
-// Step 3 (optional): Reset strategy to a known state
-readStrategy.Reset()
+// Step 3 (optional, PrimaryOnlyRead only): force preferred back to A
+// StickyRead has no Reset — to force preferred back, rebuild the client
+// with WithPreferredCluster, or wait for the current preferred to fail.
+// primaryOnly.Reset()
 ```
 
 **Why this order?** If you call `ForceRecover` first (writes resume to both clusters) but reads are still overridden to B, new writes land on A but no reads go there — this is safe, just redundant. If you remove the read override first, reads may go to A which now has consistent data — also safe. The dangerous order would be recovering writes while reads are already going to A with stale data, which can't happen if you kept the override active during the outage.
@@ -221,7 +231,7 @@ See [External Cluster Control](strategy-policy.md#external-cluster-control-witha
 
 ## Best Practices
 
-1. **Let short blips self-heal.** Don't reach for ForceDegrade on every alert. AdaptiveDualWrite and CircuitBreaker handle transient issues automatically. Intervene only when the replay queue is growing unboundedly or the outage exceeds your StickyRead cooldown.
+1. **Let short blips self-heal.** Don't reach for ForceDegrade on every alert. AdaptiveDualWrite and CircuitBreaker handle transient issues automatically. Intervene only when the replay queue is growing unboundedly or the outage exceeds your `PrimaryOnlyRead` recovery timeout (or, for `StickyRead`, when you need preferred forced back to the original cluster).
 
 2. **Always use AllowedClusters with ForceDegrade.** ForceDegrade alone doesn't prevent reads from the failing cluster. AllowedClusters alone doesn't prevent write-side latency impact. Use both together for full isolation.
 
@@ -253,8 +263,9 @@ The override exists specifically to prevent this race. Don't remove it early bec
 ### Not using AllowedClusters with ForceDegrade
 
 ```
-❌ ForceDegrade(A) only → writes fire-and-forget, but StickyRead cooldown
-   expires → reads return to A → stale data
+❌ ForceDegrade(A) only → writes fire-and-forget, but the read strategy is
+   unaware (e.g., PrimaryOnlyRead probes A after recovery timeout, or
+   StickyRead leaves preferred on A if it never failed) → reads hit A → stale data
 
 ✅ ForceDegrade(A) + AllowedClusters → both reads and writes isolated
 ```

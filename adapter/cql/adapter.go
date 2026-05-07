@@ -60,6 +60,14 @@ type Session interface {
 	Batch(kind BatchType) Batch
 
 	// Close terminates the session.
+	//
+	// Implementations MUST be safe to call more than once: a second
+	// Close on an already-closed session must not panic and must not
+	// block indefinitely. [CQLClient.Close], [CQLClient.SwapSession],
+	// and [CQLClient.RefreshSession] can race in ways that lead to a
+	// double-Close on the same underlying session, and the bundled
+	// adapters in adapter/cql/v1 and adapter/cql/v2 already provide
+	// this guarantee. Custom adapters must do the same.
 	Close()
 }
 

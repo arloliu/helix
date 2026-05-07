@@ -515,7 +515,9 @@ The client calls `RecordLatency()` automatically after each successful read if t
 
 ### Problem: Stale Reads After Cluster Recovery
 
-When a cluster fails for an extended period, the replay queue accumulates writes destined for it. When the cluster comes back online, Helix's read strategies (`PrimaryOnlyRead` recovery timeout, `StickyRead` cooldown expiry) may automatically switch reads back — but the replay worker is still backfilling. The recovering cluster has incomplete data.
+When a cluster fails for an extended period, the replay queue accumulates writes destined for it. When the cluster comes back online, reads may resume on it without operator coordination: `PrimaryOnlyRead` automatically probes the original cluster once its recovery timeout elapses, and any strategy whose preferred was never swapped to the alternative will route reads back as soon as the failover policy (e.g., `CircuitBreaker`) closes. The replay worker is still backfilling, so the recovering cluster has incomplete data.
+
+(`StickyRead` has no symmetric path: once preferred has been swapped to the alternative, only a failure of the new preferred — not cooldown expiry — moves it back. But if the original preferred recovers before its first `OnFailure` swap, reads simply resume on it as the failover policy resets.)
 
 ```
 +-- A fails --- failover to B --- A comes back ---  strategy auto-recovers to A --+

@@ -35,7 +35,11 @@ type CQLSession interface {
 
 	// Close terminates connections to both clusters.
 	//
-	// After Close is called, the session cannot be reused.
+	// After Close is called, the session cannot be reused. Implementations
+	// must be idempotent: a second Close on an already-closed session must
+	// not panic and must not block indefinitely. [CQLClient] satisfies this
+	// contract; alternative implementations (mocks, decorators) must do the
+	// same.
 	Close()
 }
 
