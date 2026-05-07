@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-05-08
+
 ### Added
 
 - **Session refresh — manual API**: `*CQLClient.SwapSession(cluster, newSession)`
@@ -65,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`testutil.CQLCluster` lifecycle methods**: `Stop`, `Start`, `Pause`,
   `Unpause`, `Kill`, `NetworkDisconnect`, `NetworkReconnect`, `Reconnect`,
   `RefreshHost`. Supports the e2e suite's container-level chaos.
+- **Bounded retry for the memory replay worker**: New
+  `WorkerConfig.MaxAttempts` field (default `5`) and `WithMaxAttempts(n)`
+  option. The memory backend retries a failing payload inline with proper
+  exponential backoff up to `MaxAttempts`, then drops via `OnDrop`. Mirrors
+  the bounded-retry contract NATS already provides via JetStream's
+  `MaxDeliver`.
+- **Observability for `AdaptiveDualWrite` background writes**:
+  `WithAdaptiveMetrics(m)`, `WithAdaptiveLogger(l)`,
+  `WithAdaptiveClusterNames(names)` options on the strategy.
+  `helix.NewCQLClient` auto-injects the client-level metrics collector and
+  logger via `MetricsConfigured`/`SetMetrics` and `SetLogger` interfaces, so
+  the new visibility lights up by default with no caller change.
 
 ### Bug Fixes
 
@@ -95,6 +109,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors on column-count mismatch. Fixed by passing two destination
   values to `ScanCAS` to match Scylla's wider response — works on both
   backends.
+- **`CircuitBreaker.RecordFailure` mishandled `resetTimeout == 0`**: The
+  half-open work above (a) made `ShouldFailover` skip the timed
+  transition when `resetTimeout=0`, and (b) reset the failure counter to
+  1 on the timeout-reset branch in `RecordFailure`. The (b) branch was
+  missing a matching `resetTimeout > 0` guard, so with `resetTimeout=0`
+  every failure after the first matched
+  `time.Duration(now-lastFailure) > 0` and reset the counter to 1 — the
+  breaker could never accumulate to threshold and silently failed open.
+  `RecordFailure` now mirrors `ShouldFailover`: with `resetTimeout=0`,
+  failures keep accumulating until an explicit `RecordSuccess` closes
+  the breaker.
+- **Memory replay worker had inert exponential backoff and no
+  max-attempts cap**: `executeWithRetry` was always invoked with
+  `attempt=1` from the polling loop, so `calculateBackoff` always
+  returned the base `RetryDelay` regardless of attempt number — the
+  documented "exponential backoff" was effectively a fixed delay. The
+  re-enqueue retry strategy also had no upper bound: a permanently
+  broken cluster bounced the same payload through the queue forever
+  (until `ErrReplayQueueFull` happened to drop it via the re-enqueue
+  path, with the misleading log line "queue full"). Replaced with
+  inline bounded retry: a single payload is retried up to `MaxAttempts`
+  with growing backoff, then dropped via `OnDrop` with the actual
+  failure error. **Behavior change**: callers that relied on infinite
+  retry should set `WithMaxAttempts` higher (or use `NATSReplayer`
+  whose `MaxDeliver` semantics are unchanged).
+- **`topology/nats` watcher silently undrained clusters on transient
+  errors**: Both `fetchAndEmit` (any `kv.Get` error) and `processEntry`
+  (any `json.Unmarshal` error) called `handleNoDrain`, clearing drain
+  state for both clusters. A NATS KV blip during the pollLoop fallback
+  path or a malformed config push from operator tooling could silently
+  undrain a cluster the operator had marked offline for maintenance.
+  Fail closed instead: only `jetstream.ErrKeyNotFound` and explicit
+  Delete/Purge operations clear drain state. All other errors preserve
+  the last-known-good drain state, forcing an authoritative valid
+  config (or an explicit Delete) to actually undrain.
+- **`AdaptiveDualWrite` swallowed background-write errors**: When a
+  degraded cluster's fire-and-forget goroutine returned a real error
+  (not `ErrWriteAsync`/`ErrWriteDropped`), it returned silently — no
+  metric, no log, no strike. The replay safety net handled eventual
+  consistency, but operators couldn't tell a degraded cluster had
+  progressed to permanently broken until they noticed replay backlog
+  growing. The goroutine now emits `IncWriteError(cluster)` and a Warn
+  log on real errors, so the transition from "merely degraded" to
+  "actively erroring" is visible in dashboards.
+- **NATS replay worker delayed redelivery for the unprocessed batch
+  tail on shutdown**: When `stopCh` fired mid-batch, only the current
+  message was Nak'd. Remaining messages in the batch stayed
+  unacknowledged and relied on `AckWait` (default 30 s) before the
+  broker re-delivered them — inserting a 30-second visible delay
+  during graceful restarts before a fresh worker could see those
+  messages again. `processMessages` now Naks every unprocessed message
+  in the batch on shutdown so the broker re-delivers immediately. Each
+  Nak is independent; an error on one does not block the others.
+- **Adapter `Session.Close()` idempotency depended on driver internals**:
+  Both `adapter/cql/v1.Session` and `adapter/cql/v2.Session` delegated
+  Close directly to `gocql.Session.Close`. The `CQLClient` docstring
+  promises Close on bundled adapters is idempotent, but in practice
+  that guarantee leaned on each driver's own internal sync.Once — a
+  future driver release that drops its internal idempotency would
+  silently break the Helix promise. Added an explicit `sync.Once` in
+  each adapter so idempotency is a Helix-level contract independent of
+  any specific driver release.
+
+### Documentation
+
+- **`WithAllowedClusters` scope clarified**: The override applies to
+  reads ONLY. Writes (`Exec`/`ExecContext`, batch `Exec`) and CAS
+  operations always go through normal routing. To fence a cluster from
+  writes, drain it via `TopologyWatcher`/`TopologyOperator` — drain
+  skips writes to the affected cluster and enqueues them for replay.
+  The previous godoc only flagged CAS as exempt, leaving dual-write
+  behavior under override ambiguous.
+- **`WorkerConfig.HighPriorityRatio` unit clarified**: The ratio is
+  per-message for the memory backend but per-batch for the NATS
+  backend. With `BatchSize=100` and `HighPriorityRatio=10`, NATS
+  effectively processes ~1000 high-priority messages : ~100
+  low-priority messages per scheduling cycle. Memory worker users who
+  expected per-message semantics on NATS will see different operational
+  behavior and can plan accordingly.
+- **`NewMemoryWorker` shutdown burst documented**: `Stop` drains every
+  pending payload via `OnDrop`. High-throughput systems can see a
+  sudden burst of `OnDrop` callbacks at shutdown proportional to queue
+  depth — size the handler (and any synchronous fallback persistence)
+  accordingly.
 
 ### Internal
 
@@ -116,6 +214,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **testcontainers-go** upgraded `v0.40.0 → v0.42.0`. Docker SDK API
   breakage in `ContainerPause` / `ContainerUnpause` (now require options
   structs and return result values) absorbed in the testutil shim.
+- **`policy.safeWrite` panic recovery captures `runtime.Stack`**: The
+  recovered panic error now embeds the goroutine stack, mirroring the
+  `callAllowedClusters` recovery pattern in `cql_client.go`. Without
+  the stack, "panic: ..." with no trace was useless for debugging
+  panics that originated several frames deep in driver or caller code.
+- **`NewCQLClient` auto-injection helper extracted**: Metrics and
+  logger auto-injection for `ReplayWorker` and `WriteStrategy` moved
+  into `autoInjectMetricsAndLogger` to keep cyclomatic complexity
+  within the project's lint cap as new auto-inject targets land.
 
 ## [1.2.0] — 2026-04-15
 
