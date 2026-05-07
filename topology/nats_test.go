@@ -271,16 +271,97 @@ func TestNATSInvalidJSON(t *testing.T) {
 	_, err = kv.Put(ctx, "helix.topology.drain", []byte("not valid json"))
 	require.NoError(t, err)
 
-	// Wait for watcher to process - invalid JSON should be treated as no drain
-	// Since we start with no drain, we verify the state remains unchanged
+	// Wait for watcher to process. Starting from no-drain, malformed JSON
+	// must preserve the no-drain state (the same outcome as the previous
+	// "treat as no drain" behavior for this empty starting condition).
 	require.Eventually(t, func() bool {
-		// Just ensure the watcher had time to process by checking it's still not draining
 		return !watcher.IsDraining(types.ClusterA) && !watcher.IsDraining(types.ClusterB)
 	}, 2*time.Second, 50*time.Millisecond)
 
-	// Should treat invalid JSON as no drain
 	assert.False(t, watcher.IsDraining(types.ClusterA))
 	assert.False(t, watcher.IsDraining(types.ClusterB))
+}
+
+// TestNATSInvalidJSON_PreservesDrainState verifies the fail-closed contract:
+// malformed JSON written to the KV must NOT undrain a cluster that is
+// currently draining. Without this guard, a single bad config push from an
+// operator's tooling would silently undrain a cluster intended to stay
+// offline.
+func TestNATSInvalidJSON_PreservesDrainState(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	kv := createTestKV(t, js, "test-invalid-json-preserve")
+
+	watcher, err := topology.NewNATS(kv,
+		topology.WithPollInterval(50*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	_ = watcher.Watch(ctx)
+
+	// Establish drain on cluster A via a valid config.
+	good, err := json.Marshal(topology.DrainConfig{
+		Drain:  []types.ClusterID{types.ClusterA},
+		Reason: "maintenance",
+	})
+	require.NoError(t, err)
+	_, err = kv.Put(ctx, "helix.topology.drain", good)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return watcher.IsDraining(types.ClusterA)
+	}, 2*time.Second, 25*time.Millisecond, "drain must be applied")
+
+	// Now overwrite with malformed JSON. Drain must be preserved.
+	_, err = kv.Put(ctx, "helix.topology.drain", []byte("not valid json"))
+	require.NoError(t, err)
+
+	// Give the watcher time to observe the malformed update.
+	time.Sleep(200 * time.Millisecond)
+
+	assert.True(t, watcher.IsDraining(types.ClusterA),
+		"malformed JSON must not undrain a previously-draining cluster")
+	assert.False(t, watcher.IsDraining(types.ClusterB))
+}
+
+// TestNATSKeyDelete_ClearsDrain verifies that an explicit Delete of the
+// drain key clears drain state — the fail-closed semantics for malformed
+// JSON do not apply to authoritative deletes.
+func TestNATSKeyDelete_ClearsDrain(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	kv := createTestKV(t, js, "test-key-delete")
+
+	watcher, err := topology.NewNATS(kv,
+		topology.WithPollInterval(50*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	_ = watcher.Watch(ctx)
+
+	good, err := json.Marshal(topology.DrainConfig{
+		Drain:  []types.ClusterID{types.ClusterA, types.ClusterB},
+		Reason: "both",
+	})
+	require.NoError(t, err)
+	_, err = kv.Put(ctx, "helix.topology.drain", good)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return watcher.IsDraining(types.ClusterA) && watcher.IsDraining(types.ClusterB)
+	}, 2*time.Second, 25*time.Millisecond)
+
+	require.NoError(t, kv.Delete(ctx, "helix.topology.drain"))
+
+	require.Eventually(t, func() bool {
+		return !watcher.IsDraining(types.ClusterA) && !watcher.IsDraining(types.ClusterB)
+	}, 2*time.Second, 25*time.Millisecond, "Delete must clear drain")
 }
 
 func TestNATSClose(t *testing.T) {

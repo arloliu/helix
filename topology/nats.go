@@ -237,14 +237,29 @@ func (n *NATS) pollLoop(ctx context.Context) {
 }
 
 // fetchAndEmit fetches the current KV value and emits updates if changed.
+//
+// Fail-closed semantics:
+//   - jetstream.ErrKeyNotFound is treated as a legitimate "no drain configured"
+//     and clears any previously-observed drain state. This is how operators
+//     remove drain via key Delete + the initial-startup-without-config case.
+//   - Any other Get error (transient JetStream unreachability, deadline, etc.)
+//     preserves the last-known-good drain state. Without this guard, a
+//     network blip during pollLoop fallback would silently undrain a cluster
+//     the operator had set offline for maintenance.
 func (n *NATS) fetchAndEmit(ctx context.Context) {
 	fetchCtx, cancel := context.WithTimeout(ctx, n.config.InitialFetchTimeout)
 	defer cancel()
 
 	entry, err := n.kv.Get(fetchCtx, n.config.Key)
 	if err != nil {
-		// Key doesn't exist or error - treat as no drain
-		n.handleNoDrain()
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			n.handleNoDrain()
+			return
+		}
+		// Transient error — preserve current drain state. Logging requires
+		// a logger, which the watcher does not currently take; surface via
+		// the next successful fetch so an operator inspecting GetDrainReason
+		// after the blip clears sees the latest authoritative state.
 		return
 	}
 
@@ -252,6 +267,11 @@ func (n *NATS) fetchAndEmit(ctx context.Context) {
 }
 
 // processEntry parses a KV entry and emits topology updates.
+//
+// Malformed JSON preserves the last-known-good drain state rather than
+// clearing it. Treating bad config as "no drain" lets a single bad push
+// silently undrain a cluster the operator had marked offline; preserving
+// state forces the operator to fix the config to actually change behavior.
 func (n *NATS) processEntry(entry jetstream.KeyValueEntry) {
 	// Handle deletion
 	if entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge {
@@ -261,8 +281,7 @@ func (n *NATS) processEntry(entry jetstream.KeyValueEntry) {
 
 	var config DrainConfig
 	if err := json.Unmarshal(entry.Value(), &config); err != nil {
-		// Invalid JSON - treat as no drain
-		n.handleNoDrain()
+		// Invalid JSON — preserve last-known-good drain state.
 		return
 	}
 
