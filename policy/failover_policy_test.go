@@ -87,6 +87,35 @@ func TestCircuitBreakerResetTimeout(t *testing.T) {
 	require.Equal(t, 1, policy.Failures(types.ClusterA))
 }
 
+// TestCircuitBreaker_ZeroResetTimeout_AccumulatesFailures verifies that when
+// ResetTimeout is set to 0, the timed half-open transition is disabled and
+// the breaker still trips at threshold. ShouldFailover documents that
+// resetTimeout=0 disables timed transitions, but RecordFailure must honor
+// the same semantics — without this, every failure after the first resets
+// failures to 1 and the breaker can never accumulate to threshold.
+func TestCircuitBreaker_ZeroResetTimeout_AccumulatesFailures(t *testing.T) {
+	policy := NewCircuitBreaker(
+		WithThreshold(3),
+		WithResetTimeout(0), // disable timed half-open
+	)
+
+	for i := 1; i <= 5; i++ {
+		policy.RecordFailure(types.ClusterA)
+		require.Equal(t, i, policy.Failures(types.ClusterA),
+			"failures must accumulate; resetTimeout=0 disables timed transitions, not counting")
+	}
+	require.True(t, policy.ShouldFailover(types.ClusterA, nil),
+		"breaker must trip at threshold even with resetTimeout=0")
+
+	// Without an explicit RecordSuccess, the breaker stays open indefinitely.
+	require.True(t, policy.ShouldFailover(types.ClusterA, nil))
+
+	// Explicit success is the only path back to closed.
+	policy.RecordSuccess(types.ClusterA)
+	require.Equal(t, 0, policy.Failures(types.ClusterA))
+	require.False(t, policy.ShouldFailover(types.ClusterA, nil))
+}
+
 // TestCircuitBreaker_ConcurrentRecordFailure_NoRace verifies that concurrent
 // RecordFailure calls don't data-race on internal state. Run with -race.
 func TestCircuitBreaker_ConcurrentRecordFailure_NoRace(t *testing.T) {

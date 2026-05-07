@@ -262,11 +262,15 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 	if cluster == types.ClusterA {
 		c.muA.Lock()
 		lastFailure := c.lastFailureA.Load()
-		if lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
+		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
 			// Half-open window expired without a recovery — counter resets
 			// to 1 AND the trip latch clears so a re-trip on this cycle
 			// fires IncCircuitBreakerTrip again. Without clearing trippedA,
 			// observability undercounts trips across multi-cycle outages.
+			//
+			// resetTimeout=0 disables the timed transition (matches the
+			// guard in ShouldFailover) — the breaker stays open until an
+			// explicit RecordSuccess, so failures must keep accumulating.
 			c.failuresA.Store(1)
 			newFailures = 1
 			c.trippedA = false
@@ -282,7 +286,7 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 	} else {
 		c.muB.Lock()
 		lastFailure := c.lastFailureB.Load()
-		if lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
+		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
 			c.failuresB.Store(1)
 			newFailures = 1
 			c.trippedB = false
