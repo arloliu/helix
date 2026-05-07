@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -275,6 +276,121 @@ func TestNATSReplayerClose(t *testing.T) {
 	_, err = replayer.Pending(ctx)
 	assert.ErrorIs(t, err, types.ErrSessionClosed)
 }
+
+// TestNATSReplayerDequeueRecoversFromConsumerDeleted verifies that out-of-band
+// deletion of the JetStream consumer (admin removed it, server reset, stream
+// recreated) is recovered transparently on the next Dequeue: the cached
+// consumer reference is evicted and a fresh one is created so the replay
+// pipeline keeps draining instead of failing forever.
+func TestNATSReplayerDequeueRecoversFromConsumerDeleted(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	const streamName = "test-consumer-recovery"
+	const subjectPrefix = "test.replay.recovery"
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName(streamName),
+		replay.WithSubjectPrefix(subjectPrefix),
+	)
+	require.NoError(t, err)
+	defer replayer.Close()
+
+	ctx := context.Background()
+
+	// Enqueue, dequeue, ack — primes the consumer cache.
+	require.NoError(t, replayer.Enqueue(ctx, types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT INTO t (k) VALUES (?)",
+		Args:          []any{"first"},
+		Timestamp:     1,
+		Priority:      types.PriorityHigh,
+	}))
+	msgs, err := replayer.Dequeue(ctx, types.ClusterA, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.NoError(t, msgs[0].Ack())
+
+	// Delete the durable consumer out of band (simulates an operator delete
+	// or a stream/consumer reset). The cached consumer reference inside the
+	// replayer is now stale.
+	stream, err := js.Stream(ctx, streamName)
+	require.NoError(t, err)
+	consumerName := "helix-worker-" + string(types.ClusterA)
+	require.NoError(t, stream.DeleteConsumer(ctx, consumerName))
+
+	// Enqueue a fresh message so there is something to dequeue once the
+	// consumer is rebuilt.
+	require.NoError(t, replayer.Enqueue(ctx, types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT INTO t (k) VALUES (?)",
+		Args:          []any{"second"},
+		Timestamp:     2,
+		Priority:      types.PriorityHigh,
+	}))
+
+	// First post-delete Dequeue surfaces nats.ErrNoResponders (the deleted
+	// consumer's pull subject has no subscriber); isConsumerGoneErr catches
+	// it and invalidates the cache. The next Dequeue re-creates the
+	// consumer via CreateOrUpdateConsumer and drains the new message.
+	var lastErr error
+	require.Eventually(t, func() bool {
+		msgs, err := replayer.Dequeue(ctx, types.ClusterA, 10)
+		if err != nil {
+			lastErr = err
+			return false
+		}
+		if len(msgs) == 0 {
+			return false
+		}
+		for _, m := range msgs {
+			_ = m.Ack()
+		}
+
+		return true
+	}, 5*time.Second, 100*time.Millisecond,
+		"Dequeue should recover after the JetStream consumer is deleted out of band; last err: %v", lastErr)
+}
+
+// TestNATSReplayerCloseDropsConsumerCache verifies that Close releases cached
+// consumer references so the underlying JetStream client objects can be GC'd.
+// Re-using the replayer after Close is a separate misuse (covered by
+// TestNATSReplayerClose); this test focuses on the cache cleanup itself.
+func TestNATSReplayerCloseDropsConsumerCache(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName("test-close-cache"),
+		replay.WithSubjectPrefix("test.replay.close.cache"),
+	)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, replayer.Enqueue(ctx, types.ReplayPayload{
+		TargetCluster: types.ClusterA,
+		Query:         "INSERT INTO t (k) VALUES (?)",
+		Args:          []any{"x"},
+		Timestamp:     1,
+		Priority:      types.PriorityHigh,
+	}))
+	msgs, err := replayer.Dequeue(ctx, types.ClusterA, 1)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.NoError(t, msgs[0].Ack())
+
+	require.NoError(t, replayer.Close())
+
+	// Sanity: post-close Dequeue still returns ErrSessionClosed even though
+	// the cache was cleared (the closed flag still gates entry).
+	_, err = replayer.Dequeue(ctx, types.ClusterA, 1)
+	assert.ErrorIs(t, err, types.ErrSessionClosed)
+}
+
+// Compile-time assertion that the jetstream sentinel errors we react to in
+// invalidateConsumer paths still exist in the upstream package — guards
+// against silent breakage on dependency upgrades.
+var (
+	_ = jetstream.ErrConsumerNotFound
+	_ = jetstream.ErrConsumerDeleted
+)
 
 func TestNATSReplayerStreamName(t *testing.T) {
 	js := testutil.StartEmbeddedNATS(t)

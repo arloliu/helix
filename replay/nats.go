@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/tinylib/msgp/msgp"
 
@@ -456,7 +457,7 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 		return nil, err
 	}
 
-	return n.fetchReplayMessages(consumer, batchSize)
+	return n.fetchReplayMessages(consumerName, consumer, batchSize)
 }
 
 // DequeueByPriority retrieves a batch of replay messages for a specific priority.
@@ -500,7 +501,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		return nil, err
 	}
 
-	return n.fetchReplayMessages(consumer, batchSize)
+	return n.fetchReplayMessages(consumerName, consumer, batchSize)
 }
 
 func (n *NATSReplayer) getOrCreateConsumer(
@@ -546,6 +547,7 @@ func (n *NATSReplayer) getOrCreateConsumer(
 }
 
 func (n *NATSReplayer) fetchReplayMessages(
+	consumerName string,
 	consumer jetstream.Consumer,
 	batchSize int,
 ) ([]ReplayMessage, error) {
@@ -554,6 +556,12 @@ func (n *NATSReplayer) fetchReplayMessages(
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, jetstream.ErrNoMessages) {
 			return nil, nil // No messages available
+		}
+		// Out-of-band consumer deletion (admin removed it, server reset,
+		// stream recreated) leaves a stale entry in n.consumers that would
+		// fail every subsequent fetch. Evict so the next call rebuilds.
+		if isConsumerGoneErr(err) {
+			n.invalidateConsumer(consumerName)
 		}
 
 		return nil, fmt.Errorf("helix: failed to fetch messages: %w", err)
@@ -626,11 +634,41 @@ msgLoop:
 	// Check for errors during iteration
 	if err := msgs.Error(); err != nil {
 		if !errors.Is(err, jetstream.ErrNoMessages) {
+			if isConsumerGoneErr(err) {
+				n.invalidateConsumer(consumerName)
+			}
+
 			return result, fmt.Errorf("helix: error during message fetch: %w", err)
 		}
 	}
 
 	return result, nil
+}
+
+// isConsumerGoneErr reports whether err indicates the cached JetStream
+// consumer reference is stale and must be rebuilt.
+//
+// jetstream.ErrConsumerNotFound is returned by management calls when the
+// consumer was already missing at request time. jetstream.ErrConsumerDeleted
+// is surfaced via MessageBatch.Error when a delete races with an in-flight
+// pull. nats.ErrNoResponders surfaces in practice from consumer.Fetch when
+// the durable consumer was deleted out of band — the subject the pull
+// request targets has no subscriber. Treating ErrNoResponders as "evict
+// and retry" is also safe under transient JetStream unreachability: the
+// next call simply re-creates the consumer via CreateOrUpdateConsumer.
+func isConsumerGoneErr(err error) bool {
+	return errors.Is(err, jetstream.ErrConsumerNotFound) ||
+		errors.Is(err, jetstream.ErrConsumerDeleted) ||
+		errors.Is(err, nats.ErrNoResponders)
+}
+
+// invalidateConsumer removes a stale consumer entry from the cache so the
+// next Dequeue/DequeueByPriority for that name re-creates it via
+// CreateOrUpdateConsumer. Safe to call when the entry is already absent.
+func (n *NATSReplayer) invalidateConsumer(consumerName string) {
+	n.mu.Lock()
+	delete(n.consumers, consumerName)
+	n.mu.Unlock()
 }
 
 // encodeArgs encodes []any arguments to msgp.Raw.
@@ -898,6 +936,9 @@ func (n *NATSReplayer) Close() error {
 	defer n.mu.Unlock()
 
 	n.closed = true
+	// Drop cached consumer references; the durable consumers themselves
+	// remain on the server and are owned by the caller's NATS connection.
+	n.consumers = nil
 	// We don't close the NATS connection - caller owns it
 
 	return nil
