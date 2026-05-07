@@ -34,9 +34,9 @@ func (s *RoundRobinReadBalance) Run(ctx context.Context, env *types.Environment)
 	_, scanAStart, _ := env.ChaosA.Counters()
 	_, scanBStart, _ := env.ChaosB.Counters()
 
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 	_ = waitUntil(ctx, 10*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+100
+		return env.Tracker.TotalWrites() >= startCount+100
 	})
 
 	_, scanAAfter, _ := env.ChaosA.Counters()

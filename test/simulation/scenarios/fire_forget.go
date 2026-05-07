@@ -23,7 +23,7 @@ func (s *FireForgetLimit) Description() string {
 
 func (s *FireForgetLimit) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting FireForgetLimit scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 
 	// 1. Degrade Cluster A to trigger fire-and-forget mode (> delta threshold).
 	//    500ms exceeds both 100ms (quick) and 300ms (soak) delta thresholds.
@@ -32,7 +32,7 @@ func (s *FireForgetLimit) Run(ctx context.Context, env *types.Environment) error
 
 	// 2. Wait for adaptive write to switch A into fire-and-forget mode
 	_ = waitUntil(ctx, 10*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+30
+		return env.Tracker.TotalWrites() >= startCount+30
 	})
 
 	// 3. Flood writes via extra goroutines to exhaust the fire-and-forget semaphore.
@@ -81,9 +81,9 @@ func (s *FireForgetLimit) Run(ctx context.Context, env *types.Environment) error
 	// 5. Recover and verify writes resume
 	env.Logger.Info("Recovering Cluster A")
 	env.ChaosA.SetLatency(0)
-	recoveryStart := env.Tracker.Count()
+	recoveryStart := env.Tracker.TotalWrites()
 	_ = waitUntil(ctx, 10*time.Second, func() bool {
-		return env.Tracker.Count() >= recoveryStart+50
+		return env.Tracker.TotalWrites() >= recoveryStart+50
 	})
 
 	env.Logger.Info("FireForgetLimit scenario completed")

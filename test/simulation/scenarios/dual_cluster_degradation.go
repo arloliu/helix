@@ -34,9 +34,9 @@ func (s *DualClusterDegradation) Run(ctx context.Context, env *types.Environment
 	// 2. Run under dual degradation. Use a fresh baseline so the wait gate
 	//    measures writes that flow through the error-injected sessions, not
 	//    pre-injection writes already accumulated.
-	injectCount := env.Tracker.Count()
+	injectCount := env.Tracker.TotalWrites()
 	_ = waitUntil(ctx, 15*time.Second, func() bool {
-		return env.Tracker.Count() >= injectCount+200
+		return env.Tracker.TotalWrites() >= injectCount+200
 	})
 
 	dualErrors := env.Stats.DualClusterErr.Load()

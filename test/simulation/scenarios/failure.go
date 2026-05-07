@@ -20,7 +20,7 @@ func (s *CompleteFailure) Description() string {
 
 func (s *CompleteFailure) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting CompleteFailure scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 
 	// Kill Cluster A completely
 	env.Logger.Info("Killing Cluster A")
@@ -37,7 +37,7 @@ func (s *CompleteFailure) Run(ctx context.Context, env *types.Environment) error
 	env.Logger.Info("Recovering Cluster A")
 	env.ChaosA.SetErrorRate(0.0)
 	_ = waitUntil(ctx, 10*time.Second, func() bool {
-		return env.Tracker.Count() > startCount
+		return env.Tracker.TotalWrites() > startCount
 	})
 	env.Logger.Info("CompleteFailure scenario completed")
 

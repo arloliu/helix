@@ -34,20 +34,20 @@ func (s *AdaptiveRecovery) Run(ctx context.Context, env *types.Environment) erro
 
 		env.Logger.Info(fmt.Sprintf("Flapping iteration %d: Cluster B DOWN", i+1))
 		env.ChaosB.SetErrorRate(1.0) // 100% errors
-		downStart := env.Tracker.Count()
+		downStart := env.Tracker.TotalWrites()
 		// Wait until at least 20 write attempts have been made while B is down,
 		// giving the adaptive strategy enough samples to react.
 		if err := waitUntil(ctx, 5*time.Second, func() bool {
-			return env.Tracker.Count() >= downStart+20
+			return env.Tracker.TotalWrites() >= downStart+20
 		}); err != nil {
 			return fmt.Errorf("flap iteration %d: down-phase write gate not reached: %w", i+1, err)
 		}
 
 		env.Logger.Info(fmt.Sprintf("Flapping iteration %d: Cluster B UP", i+1))
 		env.ChaosB.SetErrorRate(0.0)
-		upStart := env.Tracker.Count()
+		upStart := env.Tracker.TotalWrites()
 		_ = waitUntil(ctx, 10*time.Second, func() bool {
-			return env.Tracker.Count() > upStart
+			return env.Tracker.TotalWrites() > upStart
 		})
 	}
 

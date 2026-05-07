@@ -25,7 +25,7 @@ func (s *LatencyCircuitBreakerTrip) Description() string {
 
 func (s *LatencyCircuitBreakerTrip) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting LatencyCircuitBreakerTrip scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 
 	lcb, _ := env.Client.Config().FailoverPolicy.(*policy.LatencyCircuitBreaker)
 	if lcb == nil {
@@ -65,9 +65,9 @@ func (s *LatencyCircuitBreakerTrip) Run(ctx context.Context, env *types.Environm
 	env.Logger.Info("LatencyCircuitBreaker closed")
 
 	// 5. Confirm writes resume normally
-	recoveryStart := env.Tracker.Count()
+	recoveryStart := env.Tracker.TotalWrites()
 	_ = waitUntil(ctx, 10*time.Second, func() bool {
-		return env.Tracker.Count() >= recoveryStart+30
+		return env.Tracker.TotalWrites() >= recoveryStart+30
 	})
 
 	_ = startCount // acknowledged

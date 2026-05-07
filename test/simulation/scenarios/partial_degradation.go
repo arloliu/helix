@@ -25,7 +25,7 @@ func (s *PartialDegradation) Description() string {
 
 func (s *PartialDegradation) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting PartialDegradation scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 	_, _, dropsBefore := env.ChaosA.Counters()
 
 	// 1. Inject 30% drop rate on Cluster A
@@ -34,7 +34,7 @@ func (s *PartialDegradation) Run(ctx context.Context, env *types.Environment) er
 
 	// 2. Run for long enough to accumulate both drops and replay entries
 	if err := waitUntil(ctx, 20*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+200
+		return env.Tracker.TotalWrites() >= startCount+200
 	}); err != nil {
 		return fmt.Errorf("write volume gate not reached before drop check: %w", err)
 	}

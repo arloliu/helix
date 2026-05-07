@@ -26,7 +26,7 @@ func (s *PrimaryOnlyReadRecovery) Description() string {
 
 func (s *PrimaryOnlyReadRecovery) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting PrimaryOnlyReadRecovery scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 
 	por, _ := env.Client.Config().ReadStrategy.(*policy.PrimaryOnlyRead)
 	if por == nil {
@@ -35,7 +35,7 @@ func (s *PrimaryOnlyReadRecovery) Run(ctx context.Context, env *types.Environmen
 
 	// 1. Baseline: reads should go to Cluster A (primary)
 	_ = waitUntil(ctx, 5*time.Second, func() bool {
-		return env.Tracker.Count() > startCount
+		return env.Tracker.TotalWrites() > startCount
 	})
 	_, scanABefore, _ := env.ChaosA.Counters()
 	env.Logger.Info("Baseline scan count on A", "scan_a", scanABefore)

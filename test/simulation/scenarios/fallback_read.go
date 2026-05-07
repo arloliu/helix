@@ -33,9 +33,9 @@ func (s *FallbackReadDivergence) Run(ctx context.Context, env *types.Environment
 	env.Logger.Info("Starting FallbackReadDivergence scenario")
 
 	// Phase 1: Wait for live workload traffic to establish a baseline.
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 	if err := waitUntil(ctx, 15*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+20
+		return env.Tracker.TotalWrites() >= startCount+20
 	}); err != nil {
 		return fmt.Errorf("baseline write volume not reached: %w", err)
 	}

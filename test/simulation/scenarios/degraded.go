@@ -23,14 +23,14 @@ func (s *DegradedCluster) Description() string {
 
 func (s *DegradedCluster) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting DegradedCluster scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 
 	adw, _ := env.Client.Config().WriteStrategy.(*policy.AdaptiveDualWrite)
 
 	// 1. Baseline: Normal operation
 	env.Logger.Info("Phase 1: Normal operation")
 	_ = waitUntil(ctx, 5*time.Second, func() bool {
-		return env.Tracker.Count() > startCount
+		return env.Tracker.TotalWrites() > startCount
 	})
 
 	// 2. Inject latency into Cluster A and snapshot counters for later diagnostics.

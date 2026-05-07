@@ -20,7 +20,7 @@ func (s *ReplaySaturation) Description() string {
 
 func (s *ReplaySaturation) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting ReplaySaturation scenario")
-	startCount := env.Tracker.Count()
+	startCount := env.Tracker.TotalWrites()
 
 	// 1. Disconnect Cluster B
 	env.Logger.Info("Disconnecting Cluster B")
@@ -28,7 +28,7 @@ func (s *ReplaySaturation) Run(ctx context.Context, env *types.Environment) erro
 
 	// 2. Wait for writes to accumulate and replay queue to grow
 	if err := waitUntil(ctx, 30*time.Second, func() bool {
-		return env.Tracker.Count() >= startCount+250
+		return env.Tracker.TotalWrites() >= startCount+250
 	}); err != nil {
 		return fmt.Errorf("write volume gate not reached before replay check: %w", err)
 	}
@@ -54,9 +54,9 @@ func (s *ReplaySaturation) Run(ctx context.Context, env *types.Environment) erro
 	env.Logger.Info("Replay queue drained", "total_replayed", env.Metrics.GetTotalReplaySuccess())
 
 	// 5. Wait for additional writes to confirm throughput resumed
-	drainEnd := env.Tracker.Count()
+	drainEnd := env.Tracker.TotalWrites()
 	_ = waitUntil(ctx, 15*time.Second, func() bool {
-		return env.Tracker.Count() >= drainEnd+50
+		return env.Tracker.TotalWrites() >= drainEnd+50
 	})
 
 	env.Logger.Info("ReplaySaturation scenario completed")
