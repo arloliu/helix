@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,8 +48,13 @@ func TestS10_AutoRefresh_RecoversFromStopStartWithoutManualCall(t *testing.T) {
 	ctx := context.Background()
 
 	// Refresher rebuilds the cluster's gocql session against the (now
-	// reassigned) host:port. Same pattern as S9.
+	// reassigned) host:port. The atomic counter is the airtight proof
+	// that the closure actually ran — the SessionRefreshSuccess metric
+	// is necessary but not strictly sufficient (a metric-side bug could
+	// in principle fire it without the closure executing).
+	var refresherCalls atomic.Int32
 	refresher := func(rctx context.Context, cluster helix.ClusterID, _ error) (cql.Session, error) {
+		refresherCalls.Add(1)
 		if cluster != helix.ClusterA {
 			return nil, fmt.Errorf("test refresher only handles ClusterA, got %s", cluster)
 		}
@@ -92,6 +98,12 @@ func TestS10_AutoRefresh_RecoversFromStopStartWithoutManualCall(t *testing.T) {
 		"baseline read must succeed",
 	)
 
+	// Capture cluster A's live session reference NOW. After auto-refresh
+	// fires, the swap installs a different cql.Session — comparing
+	// pointers in Phase 4 is direct proof that the swap happened (vs.
+	// gocql somehow having reconnected on its own).
+	preStopSessionA := client.SessionA()
+
 	// Phase 2: graceful Stop+Start. Data persists, but the host port is
 	// reassigned so the live gocql session is permanently broken.
 	require.NoError(t, a.Stop(ctx, 30*time.Second))
@@ -131,15 +143,28 @@ func TestS10_AutoRefresh_RecoversFromStopStartWithoutManualCall(t *testing.T) {
 	require.GreaterOrEqual(t, mc.GetSessionRefreshSuccesses(htypes.ClusterA), int64(1),
 		"the refresher must have rebuilt the session successfully")
 
-	// Phase 4: post-refresh reads succeed against the SAME helix.CQLClient
-	// instance — the topology watcher and any other background components
-	// stayed alive throughout.
+	// Direct proof #1: the refresher closure actually executed. This
+	// corroborates the metrics — a metric-side bug couldn't fire the
+	// counter without the closure running.
+	require.GreaterOrEqual(t, refresherCalls.Load(), int32(1),
+		"the SessionRefresher closure must have been invoked")
+
+	// Direct proof #2: the live SessionA reference is different from
+	// the pre-Stop one. Confirms the swap installed a new session
+	// (vs. gocql somehow recovering the original).
+	postRefreshSessionA := client.SessionA()
+	assert.NotSame(t, preStopSessionA, postRefreshSessionA,
+		"client.SessionA() must point at a NEW session after auto-refresh")
+
+	// Direct proof #3: cluster A is operational via the rebuilt session.
+	// Querying through client.SessionA() bypasses Helix's read strategy
+	// entirely, so a successful response can ONLY come from cluster A.
+	// (Phase 4's earlier read via client.Query went through StickyRead
+	// and could have been served by B; this assertion plugs that hole.)
 	rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	require.NoError(t,
-		client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
-			ScanContext(rCtx, &got),
-		"post-auto-refresh read must succeed",
-	)
+	q := postRefreshSessionA.Query("SELECT value FROM "+table+" WHERE key = ?", "k")
+	require.NoError(t, q.ScanContext(rCtx, &got),
+		"direct read via client.SessionA() must succeed — proves cluster A is operational")
 	cancel()
 	assert.Equal(t, "v", got, "data persisted across Stop/Start (graceful drain)")
 }
@@ -161,7 +186,9 @@ func TestS10_AutoRefresh_NoStormUnderPersistentFailure(t *testing.T) {
 	ctx := context.Background()
 
 	rebuildErr := errors.New("refresher always fails for this test")
+	var refresherCalls atomic.Int32
 	refresher := func(_ context.Context, _ helix.ClusterID, _ error) (cql.Session, error) {
+		refresherCalls.Add(1)
 		return nil, rebuildErr
 	}
 
@@ -222,4 +249,9 @@ func TestS10_AutoRefresh_NoStormUnderPersistentFailure(t *testing.T) {
 		"throttle must cap attempts well below the failure rate")
 	assert.Equal(t, attempts, errCount,
 		"every failing attempt should increment SessionRefreshError")
+
+	// Direct proof: the refresher closure was actually invoked
+	// `attempts` times — not just the metric counter.
+	assert.EqualValues(t, attempts, refresherCalls.Load(),
+		"refresher closure invocations must equal attempt count")
 }
