@@ -76,41 +76,44 @@ func (t *WriteTracker) Verify() error {
 
 // VerifyAndPrune verifies writes older than minAge and removes them to save memory.
 // This is essential for long-running soak tests.
+//
+// The lock is held only while collecting and deleting stale keys from the map.
+// DB verification queries run after the lock is released so that concurrent
+// TrackWrite and Count calls are not blocked for the duration of the queries.
 func (t *WriteTracker) VerifyAndPrune(sessionA, sessionB cql.Session, minAge time.Duration) (int, error) {
+	// Step 1: collect and delete stale keys under the lock.
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	now := time.Now().UnixNano()
 	cutoffNano := now - minAge.Nanoseconds()
-	pruned := 0
-	var missingA, missingB int
-
+	var toVerify []gocql.UUID
 	for key, ts := range t.writes {
 		if ts < cutoffNano {
-			// Verify existence in both clusters
-			existsA := rowExists(sessionA, key)
-			existsB := rowExists(sessionB, key)
-
-			if !existsA {
-				missingA++
-			}
-			if !existsB {
-				missingB++
-			}
-
-			// Remove from map to free memory regardless of result
-			// (In a real scenario, we might want to keep failed ones for investigation,
-			// but for soak test we want to avoid OOM)
+			toVerify = append(toVerify, key)
 			delete(t.writes, key)
-			pruned++
+		}
+	}
+	t.mu.Unlock()
+
+	if len(toVerify) == 0 {
+		return 0, nil
+	}
+
+	// Step 2: verify against both clusters without holding the lock.
+	var missingA, missingB int
+	for _, key := range toVerify {
+		if !rowExists(sessionA, key) {
+			missingA++
+		}
+		if !rowExists(sessionB, key) {
+			missingB++
 		}
 	}
 
 	if missingA > 0 || missingB > 0 {
-		return pruned, fmt.Errorf("consistency check failed during pruning: missingA=%d, missingB=%d", missingA, missingB)
+		return len(toVerify), fmt.Errorf("consistency check failed during pruning: missingA=%d, missingB=%d", missingA, missingB)
 	}
 
-	return pruned, nil
+	return len(toVerify), nil
 }
 
 // RandomKey returns a random key from the tracked writes.
