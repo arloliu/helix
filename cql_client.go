@@ -59,10 +59,28 @@ import (
 //   - Underlying sessions are closed
 //   - The client cannot be reused (operations return ErrSessionClosed)
 type CQLClient struct {
-	sessionA cql.Session
-	sessionB cql.Session // nil for single-cluster mode
-	config   *ClientConfig
-	closed   atomic.Bool
+	// sessionA / sessionB hold the live cql.Session references behind an
+	// atomic.Pointer so they can be replaced at runtime via SwapSession or
+	// RefreshSession without locking the read path. The wrapper struct is
+	// required because cql.Session is an interface — atomic.Pointer needs a
+	// concrete type, and atomic.Value would panic when successive Stores
+	// have different dynamic types (which we explicitly support, e.g.
+	// swapping a chaos-wrapped session for a plain one).
+	//
+	// Both pointers always reference a non-nil holder after NewCQLClient.
+	// In single-cluster mode, sessionB's holder wraps a nil cql.Session;
+	// callers should consult IsSingleCluster (or the singleCluster bool) to
+	// distinguish modes rather than nil-checking the loaded session.
+	sessionA atomic.Pointer[sessionHolder]
+	sessionB atomic.Pointer[sessionHolder]
+
+	// singleCluster captures the construction-time mode and is immutable
+	// for the lifetime of the client. SwapSession / RefreshSession cannot
+	// promote a single-cluster client to dual-cluster.
+	singleCluster bool
+
+	config *ClientConfig
+	closed atomic.Bool
 
 	// Drain mode state
 	drainA        atomic.Bool
@@ -73,6 +91,44 @@ type CQLClient struct {
 	// overrideErrSeq counts consecutive override errors for power-of-2 log backoff.
 	// Prevents log storms when the AllowedClusters provider is misconfigured.
 	overrideErrSeq atomic.Uint64
+}
+
+// sessionHolder wraps a cql.Session so it can live in an atomic.Pointer.
+// The indirection is required because cql.Session is an interface.
+type sessionHolder struct {
+	s cql.Session
+}
+
+// loadSessionA returns the live session for cluster A. It is wait-free; the
+// returned session reference is stable for the duration of the calling
+// goroutine's use, but a concurrent SwapSession may install a new session
+// for the next caller.
+func (c *CQLClient) loadSessionA() cql.Session {
+	return c.sessionA.Load().s
+}
+
+// loadSessionB returns the live session for cluster B, or nil if the client
+// was constructed in single-cluster mode.
+func (c *CQLClient) loadSessionB() cql.Session {
+	h := c.sessionB.Load()
+	if h == nil {
+		return nil
+	}
+
+	return h.s
+}
+
+// storeSessionA installs s as the cluster A session. Used by NewCQLClient
+// during construction and by SwapSession at runtime.
+func (c *CQLClient) storeSessionA(s cql.Session) {
+	c.sessionA.Store(&sessionHolder{s: s})
+}
+
+// storeSessionB installs s as the cluster B session. In single-cluster mode
+// it stores a holder wrapping nil so loadSessionB() returns nil safely
+// without a nil-pointer-deref on the holder pointer.
+func (c *CQLClient) storeSessionB(s cql.Session) {
+	c.sessionB.Store(&sessionHolder{s: s})
 }
 
 // Compile-time assertion that CQLClient implements CQLSession.
@@ -145,10 +201,14 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	}
 
 	client := &CQLClient{
-		sessionA: sessionA,
-		sessionB: sessionB,
-		config:   config,
+		config:        config,
+		singleCluster: sessionB == nil,
 	}
+	client.storeSessionA(sessionA)
+	// Store sessionB even if nil; in single-cluster mode the holder wraps a
+	// nil cql.Session so loadSessionB() returns nil safely without a
+	// nil-pointer-deref-risk on the holder pointer itself.
+	client.storeSessionB(sessionB)
 
 	// Create auto memory worker if configured
 	if config.AutoMemoryWorker {
@@ -358,9 +418,9 @@ func (c *CQLClient) Close() {
 			c.config.ReplayWorker.Stop()
 		}
 
-		c.sessionA.Close()
-		if c.sessionB != nil {
-			c.sessionB.Close()
+		c.loadSessionA().Close()
+		if !c.singleCluster {
+			c.loadSessionB().Close()
 		}
 	}
 }
@@ -431,19 +491,21 @@ func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 // IsSingleCluster returns true if the client is operating in single-cluster mode.
 //
 // In single-cluster mode, all operations are executed directly on the primary
-// session without dual-write or failover logic.
+// session without dual-write or failover logic. The mode is fixed at
+// construction time; SwapSession and RefreshSession cannot promote a
+// single-cluster client to dual-cluster.
 func (c *CQLClient) IsSingleCluster() bool {
-	return c.sessionB == nil
+	return c.singleCluster
 }
 
 // getSession returns the session for the given cluster.
 // In single-cluster mode, always returns sessionA.
 func (c *CQLClient) getSession(cluster ClusterID) cql.Session {
-	if c.IsSingleCluster() || cluster == ClusterA {
-		return c.sessionA
+	if c.singleCluster || cluster == ClusterA {
+		return c.loadSessionA()
 	}
 
-	return c.sessionB
+	return c.loadSessionB()
 }
 
 // getDrainStates returns the current drain state for both clusters.
@@ -668,7 +730,7 @@ func (c *CQLClient) executeWriteWithReplay(
 
 	// Single-cluster mode: direct execution, no dual-write logic
 	if c.IsSingleCluster() {
-		return writeFunc(ctx, c.sessionA)
+		return writeFunc(ctx, c.loadSessionA())
 	}
 
 	// Check drain mode
@@ -701,11 +763,11 @@ func (c *CQLClient) executeWriteWithDrain(
 	var healthyCluster, drainingCluster ClusterID
 
 	if drainA {
-		session = c.sessionB
+		session = c.loadSessionB()
 		healthyCluster = ClusterB
 		drainingCluster = ClusterA
 	} else {
-		session = c.sessionA
+		session = c.loadSessionA()
 		healthyCluster = ClusterA
 		drainingCluster = ClusterB
 	}
@@ -766,13 +828,18 @@ func (c *CQLClient) executeDualWrite(
 	// when WriteStrategy uses fire-and-forget (background goroutines).
 	var startA, startB atomic.Int64
 
+	// Session refs are resolved at call time inside the closure body so a
+	// concurrent SwapSession or RefreshSession is observed by the next
+	// dispatch. In-flight closures that have already loaded their session
+	// continue against that captured ref; this preserves "the write was
+	// dispatched to cluster X" semantics for fire-and-forget strategies.
 	writeA := func(ctx context.Context) error {
 		startA.Store(time.Now().UnixNano())
-		return writeFunc(ctx, c.sessionA)
+		return writeFunc(ctx, c.loadSessionA())
 	}
 	writeB := func(ctx context.Context) error {
 		startB.Store(time.Now().UnixNano())
-		return writeFunc(ctx, c.sessionB)
+		return writeFunc(ctx, c.loadSessionB())
 	}
 
 	var errA, errB error
@@ -987,7 +1054,7 @@ func (c *CQLClient) executeRead(
 	// there is no second session to failover or FallbackRead to.
 	if c.IsSingleCluster() {
 		start := time.Now()
-		err := readFunc(ctx, c.sessionA)
+		err := readFunc(ctx, c.loadSessionA())
 		elapsed := time.Since(start).Seconds()
 
 		c.config.Metrics.IncReadTotal(ClusterA)
@@ -1358,7 +1425,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 			return types.ErrSessionClosed
 		}
 
-		query := q.client.sessionA.Query(q.statement, q.values...)
+		query := q.client.loadSessionA().Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 		// Important for writes to generate the timestamp on the client side
 		// to ensure consistency across clusters
@@ -1581,7 +1648,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 			return types.ErrSessionClosed
 		}
 
-		batch := b.client.sessionA.Batch(b.kind)
+		batch := b.client.loadSessionA().Batch(b.kind)
 		for _, entry := range b.entries {
 			batch = batch.Query(entry.statement, entry.args...)
 		}
@@ -1842,21 +1909,27 @@ func (s *cqlScanner) Err() error {
 // SessionA returns the underlying session for cluster A.
 //
 // Use with caution - direct access bypasses Helix's dual-cluster logic.
+// Each call performs an atomic load and returns the live session, so the
+// reference is current as of the call. Callers that store the returned
+// reference will hold a stale pointer if SwapSession or RefreshSession is
+// invoked subsequently — prefer calling SessionA() at point of use.
 //
 // Returns:
 //   - cql.Session: The raw session for cluster A
 func (c *CQLClient) SessionA() cql.Session {
-	return c.sessionA
+	return c.loadSessionA()
 }
 
-// SessionB returns the underlying session for cluster B.
+// SessionB returns the underlying session for cluster B, or nil in
+// single-cluster mode.
 //
 // Use with caution - direct access bypasses Helix's dual-cluster logic.
+// See SessionA for the swap-vs-stored-reference caveat.
 //
 // Returns:
-//   - cql.Session: The raw session for cluster B
+//   - cql.Session: The raw session for cluster B (nil in single-cluster mode)
 func (c *CQLClient) SessionB() cql.Session {
-	return c.sessionB
+	return c.loadSessionB()
 }
 
 // Config returns the current client configuration.
