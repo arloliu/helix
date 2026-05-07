@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/moby/moby/client"
 	"github.com/testcontainers/testcontainers-go"
 )
 
@@ -105,11 +106,13 @@ type providerCloser struct {
 }
 
 func (p providerCloser) ContainerPause(ctx context.Context, id string) error {
-	return p.provider.Client().ContainerPause(ctx, id)
+	_, err := p.provider.Client().ContainerPause(ctx, id, client.ContainerPauseOptions{})
+	return err
 }
 
 func (p providerCloser) ContainerUnpause(ctx context.Context, id string) error {
-	return p.provider.Client().ContainerUnpause(ctx, id)
+	_, err := p.provider.Client().ContainerUnpause(ctx, id, client.ContainerUnpauseOptions{})
+	return err
 }
 
 func (p providerCloser) Close() error { return p.provider.Close() }
