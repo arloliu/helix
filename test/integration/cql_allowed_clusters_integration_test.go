@@ -308,10 +308,19 @@ func TestAllowedClusters_Integration_CAS_NotOverridden(t *testing.T) {
 	// Note: We do NOT call client.Close() because it would close the shared gocql sessions.
 
 	// CAS INSERT on the strategy-selected cluster (A).
+	//
+	// We pass (key, value) destinations even though we only care about
+	// `applied`. This is because Scylla's IF NOT EXISTS returns 3 columns
+	// ([applied], key, value) even when applied=true, while Cassandra
+	// returns only [applied] in that case. gocql's ScanCAS errors with
+	// "not enough columns to scan into" on a column-count mismatch, so
+	// the destination shape must match Scylla's wider response. Cassandra
+	// happily fills in zero values for the missing columns when applied=true.
+	var existingKey, existingValue string
 	applied, err := client.Query(
 		"INSERT INTO "+table+" (key, value) VALUES (?, ?) IF NOT EXISTS",
 		"cas_key", "cas_value",
-	).ScanCASContext(ctx)
+	).ScanCASContext(ctx, &existingKey, &existingValue)
 	require.NoError(t, err)
 	assert.True(t, applied, "CAS should be applied (new row)")
 
