@@ -302,7 +302,7 @@ if err != nil && !errors.Is(err, types.ErrWriteAsync) {
 | Replay error callbacks | Target cluster rejecting replays | Check cluster health |
 | CircuitBreaker trip/close events | Read-path health transitions | Usually informational |
 | `helix_failover_total` metric | Frequency of read failovers | High rate = instability |
-| `helix_read_error_total` metric | Read failures per cluster | Correlate with circuit breaker |
+| `helix_read_errors_total` metric | Read failures per cluster | Correlate with circuit breaker |
 
 ---
 
