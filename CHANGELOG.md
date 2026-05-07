@@ -69,16 +69,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefreshHost`. Supports the e2e suite's container-level chaos.
 - **Bounded retry for the memory replay worker**: New
   `WorkerConfig.MaxAttempts` field (default `5`) and `WithMaxAttempts(n)`
-  option. The memory backend retries a failing payload inline with proper
-  exponential backoff up to `MaxAttempts`, then drops via `OnDrop`. Mirrors
-  the bounded-retry contract NATS already provides via JetStream's
-  `MaxDeliver`.
+  option. The memory backend runs the first attempt synchronously on the
+  dequeue loop and dispatches attempts 2..MaxAttempts to a bounded
+  retry-goroutine pool, then drops via `OnDrop`. Splitting attempt 1
+  from the rest keeps unrelated traffic flowing while a single payload
+  retries; the bounded pool prevents goroutine fan-out under sustained
+  failure storms. Mirrors the bounded-retry contract NATS already
+  provides via JetStream's `MaxDeliver`.
 - **Observability for `AdaptiveDualWrite` background writes**:
   `WithAdaptiveMetrics(m)`, `WithAdaptiveLogger(l)`,
   `WithAdaptiveClusterNames(names)` options on the strategy.
   `helix.NewCQLClient` auto-injects the client-level metrics collector and
-  logger via `MetricsConfigured`/`SetMetrics` and `SetLogger` interfaces, so
-  the new visibility lights up by default with no caller change.
+  logger via `MetricsConfigured`/`SetMetrics` and
+  `LoggerConfigured`/`SetLogger` interfaces, so the new visibility lights
+  up by default with no caller change. Explicit `WithAdaptiveMetrics` /
+  `WithAdaptiveLogger` configuration wins over auto-injection — callers
+  who deliberately route background-write logs or metrics to a separate
+  sink keep that routing.
 
 ### Bug Fixes
 
@@ -128,12 +135,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-enqueue retry strategy also had no upper bound: a permanently
   broken cluster bounced the same payload through the queue forever
   (until `ErrReplayQueueFull` happened to drop it via the re-enqueue
-  path, with the misleading log line "queue full"). Replaced with
-  inline bounded retry: a single payload is retried up to `MaxAttempts`
-  with growing backoff, then dropped via `OnDrop` with the actual
-  failure error. **Behavior change**: callers that relied on infinite
-  retry should set `WithMaxAttempts` higher (or use `NATSReplayer`
-  whose `MaxDeliver` semantics are unchanged).
+  path, with the misleading log line "queue full"). Replaced with a
+  synchronous-first attempt + bounded asynchronous retries: attempt 1
+  runs on the dequeue loop, attempts 2..MaxAttempts run in a dedicated
+  retry goroutine pool (default 100). The dequeue loop is therefore
+  never blocked behind a permanently-failing payload, including
+  payloads targeting a different cluster. After MaxAttempts the
+  payload drops via `OnDrop` with the actual failure error.
+  **Behavior change**: callers that relied on infinite retry should
+  set `WithMaxAttempts` higher (or use `NATSReplayer` whose
+  `MaxDeliver` semantics are unchanged). When the retry pool is full
+  under sustained failure, further failures drop immediately via
+  `OnDrop` (reason `retry pool saturated`) rather than queue behind
+  in-flight retries.
 - **`topology/nats` watcher silently undrained clusters on transient
   errors**: Both `fetchAndEmit` (any `kv.Get` error) and `processEntry`
   (any `json.Unmarshal` error) called `handleNoDrain`, clearing drain
