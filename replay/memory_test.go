@@ -47,6 +47,7 @@ func TestMemoryReplayerDequeue(t *testing.T) {
 	require.Equal(t, payload.Query, dequeued.Query)
 	require.Equal(t, payload.Timestamp, dequeued.Timestamp)
 	require.Equal(t, payload.Priority, dequeued.Priority)
+	require.Equal(t, 0, replayer.Len())
 }
 
 func TestMemoryReplayerQueueFull(t *testing.T) {

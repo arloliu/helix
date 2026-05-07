@@ -317,7 +317,12 @@ func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
 		return types.ReplayPayload{}, false
 	}
 
-	return m.tryDequeueWithPriority()
+	payload, ok := m.tryDequeueWithPriority()
+	if ok {
+		m.releaseSlot()
+	}
+
+	return payload, ok
 }
 
 // Len returns the current number of pending replays across both queues.
