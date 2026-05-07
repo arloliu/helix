@@ -248,6 +248,19 @@ var (
 	// This is a fail-closed condition; the panic is recovered and the read fails.
 	ErrClusterOverridePanic = errors.New("helix: cluster override function panicked")
 
+	// ErrInvalidCluster indicates an operation referenced a cluster the client
+	// is not configured for (e.g., SwapSession(ClusterB, …) on a single-cluster
+	// client) or used an unknown ClusterID value.
+	//
+	// Distinct from ErrInvalidClusterOverride, which is read-override-specific.
+	ErrInvalidCluster = errors.New("helix: invalid cluster for this client")
+
+	// ErrNoSessionRefresher indicates RefreshSession was called but no
+	// SessionRefresher was registered via WithSessionRefresher. The caller
+	// must either register one at construction or use the lower-level
+	// SwapSession to provide a freshly-built session directly.
+	ErrNoSessionRefresher = errors.New("helix: no session refresher configured")
+
 	// ErrNotFound indicates that a query returned zero rows.
 	//
 	// This is the Helix sentinel for "not found" results, mapped from
