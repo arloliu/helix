@@ -40,8 +40,9 @@ func (s *WorkloadStats) Reset() {
 
 // WriteTracker tracks successful writes for verification.
 type WriteTracker struct {
-	mu     sync.RWMutex
-	writes map[gocql.UUID]int64 // key -> timestamp (unix nanos)
+	mu          sync.RWMutex
+	writes      map[gocql.UUID]int64 // key -> timestamp (unix nanos)
+	totalWrites atomic.Int64         // monotonically increasing write counter
 }
 
 // NewWriteTracker creates a new write tracker.
@@ -56,6 +57,7 @@ func (t *WriteTracker) TrackWrite(key gocql.UUID, timestampUnixNano int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.writes[key] = timestampUnixNano
+	t.totalWrites.Add(1)
 }
 
 // Verify checks if the tracked writes exist in the database.
@@ -130,11 +132,21 @@ func (t *WriteTracker) RandomKey() gocql.UUID {
 }
 
 // Count returns the number of currently tracked writes.
+// This value may decrease when VerifyAndPrune removes old entries.
+// For write volume gates that need a monotonically increasing counter,
+// use TotalWrites instead.
 func (t *WriteTracker) Count() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	return len(t.writes)
+}
+
+// TotalWrites returns the total number of writes tracked since creation.
+// Unlike Count, this value never decreases (pruning does not affect it),
+// making it safe for write volume gate checks in scenarios.
+func (t *WriteTracker) TotalWrites() int64 {
+	return t.totalWrites.Load()
 }
 
 // VerifyConsistency checks if all tracked writes exist in both clusters.
