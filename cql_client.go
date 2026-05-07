@@ -697,10 +697,19 @@ func (c *CQLClient) MapExecuteBatchCAS(batch Batch, dest map[string]any) (applie
 // fire-and-forget writes to finish. Work that already captured a session may
 // continue racing with shutdown and can fail when that session is closed.
 //
+// Close DOES wait for the configured ReplayWorker to finish via its Stop()
+// method, which blocks until the worker's in-flight batch returns. Bound
+// that batch's wall time via the worker's own timeouts if you need a hard
+// upper bound on Close latency.
+//
 // Calling Close concurrently with SwapSession or RefreshSession is undefined:
 // Close may end up closing either the old or the new session depending on
 // scheduling, and the caller of SwapSession still owns the session it
-// received. Synchronize externally if you need a deterministic order.
+// received. Synchronize externally if you need a deterministic order. The
+// underlying [cql.Session] adapters bundled with Helix (adapter/cql/v1 and
+// adapter/cql/v2) make Close idempotent so a double-Close on the same
+// session does not panic; custom [cql.Session] implementations must follow
+// the same contract or callers must serialize Close with their own swap.
 func (c *CQLClient) Close() {
 	if c.closed.CompareAndSwap(false, true) {
 		// Stop topology watcher
