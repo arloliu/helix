@@ -146,23 +146,67 @@ old (now-dead) sessions. Tests must rebuild the helix client too.
 
 ## Findings from running the suite (2026-05-06)
 
-### 6. Replay queue overflow under sustained load — INVALIDATED, observable via instrumentation
+### 6. Replay queue overflow under sustained load — REVISED to surface a real metric-undercounting gotcha
 
-Original symptom: S1 driving 4898 writes flat-out against a paused A
-ended with `A=600` and `B=4898`. The "silent loss" framing was wrong.
+The original v1 unit reproducer (`cql_client_replay_drop_test.go:
+TestReplayDrop_QueueOverflow_IsObservable`) asserted `enqueued +
+dropped == writes` and passed. Based on that, F6 was marked
+invalidated. But the unit test never started a real replay worker —
+items just sat in the queue.
 
-Verification (`cql_client_replay_drop_test.go:TestReplayDrop_QueueOverflow_IsObservable`):
+The deliberate sustained-load probe with a real worker
+(`test/e2e/cql/replay_overflow_test.go:TestS11_ReplayOverflow_ConservationLaw`)
+surfaces the real issue. With cluster A paused and 1000 writes
+against a 50-capacity queue:
 
-- `WithQueueCapacity(10) + 100 writes against failing A`:
-  `enqueued=5  dropped(metric)=95  dropped(callback)=95`
-- Full accounting holds: `enqueued + dropped == writes` (5 + 95 = 100).
-- `OnReplayDropped` callback count == `IncReplayDropped` metric — symmetric.
+```
+writes accepted:        1000     rows on A: 25     rows on B: 1000
+ReplayEnqueued(A):        36     ReplaySuccess(A): 25
+ReplayDropped(A):        975     OnReplayDropped (client cb): 964
+                                 OnDrop          (worker cb):  11
+```
 
-So drops are **fully observable**, just opt-in. The original e2e test had
-neither subscribed to `OnReplayDropped` nor read `IncReplayDropped`, so
-the loss appeared silent from the test's perspective only.
+Six conservation invariants all hold:
 
-Two design observations worth noting:
+  1. Client-side:  writes_accepted = enqueued + client_drops    (1000 = 36 + 964)
+  2. Worker-side:  enqueued = successes + worker_drops          (36 = 25 + 11)
+  3. Metric:       droppedMetric = client_drops + worker_drops  (975 = 964 + 11)
+  4. Data:         rows_on_A = ReplaySuccess                    (25 = 25)
+  5. Survivor:     rows_on_B = writes_accepted                  (1000 = 1000)
+  6. Operator:     writes_accepted = rows_on_A + droppedMetric  (1000 = 25 + 975)
+
+**BUT:** the metric counter only reflects all of this if the worker
+was constructed with `replay.WithWorkerMetrics(yourMetricsCollector)`.
+Without that option, `NewMemoryWorker` falls back to an internal
+`NopMetrics` and:
+
+- `IncReplaySuccess` from the worker is silently discarded
+- `IncReplayDropped` from the worker is silently discarded
+- `IncReplayError` from the worker is silently discarded
+- The `OnDrop` callback fires regardless (separate path)
+
+Concretely, in the same scenario WITHOUT `WithWorkerMetrics`:
+
+```
+ReplaySuccess(A):         0    ← was actually 25
+ReplayDropped(A):       964    ← was actually 975 (worker drops invisible)
+```
+
+The user who instruments via metrics-only (typical Prometheus setup)
+sees undercounted successes and drops — and may (as we did originally)
+conclude there's a "silent loss" when in fact the count is correct,
+just hidden in the worker's separate metrics collector.
+
+This is **a real Helix usability gotcha** (not a correctness bug —
+the data and callbacks are right, just the metric path is bifurcated):
+
+- `replay.NewMemoryWorker(replayer, executeFn, replay.WithWorkerMetrics(mc), …)`
+  is the correct pattern.
+- A future improvement could detect `client.Config().Metrics` at the
+  point where `client.Config().ReplayWorker = worker` is assigned and
+  inject it if the worker doesn't already have one.
+
+Two design observations from the v1 doc retained:
 
 a) `WithQueueCapacity(N)` allocates N/2 per priority queue (high + low),
    not N total slots. Documented at `replay/memory.go:122-125` but easy
@@ -173,8 +217,10 @@ b) `client.Query().Exec()` returns nil on partial success even when the
    replay drops must subscribe to `OnReplayDropped` or watch
    `IncReplayDropped`.
 
-No code fix needed. The e2e S1 test was updated to demonstrate the
-visibility pattern (subscribe to OnReplayDropped, read the metric).
+The e2e S1 test (which uses a slow workload and doesn't trigger
+overflow) keeps testing the happy-path drain. The e2e S11 test now
+covers the deliberate-overflow conservation law and serves as the
+guard against future instrumentation regressions.
 
 ### 8. CircuitBreaker had no half-open probe path — FIXED
 
