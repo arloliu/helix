@@ -1,5 +1,7 @@
 package helix
 
+import "context"
+
 // Test-only exports that let helix_test access internals without making
 // them part of the public API. Files named *_test.go are only compiled
 // for tests in this package.
@@ -8,7 +10,7 @@ package helix
 // given function. Used by auto-refresh tests to drive a deterministic
 // clock instead of wall-clock.
 func SetClientNowFuncForTest(c *CQLClient, fn NowProvider) {
-	c.nowFunc = fn
+	c.config.NowProvider = fn
 }
 
 // MaybeAutoRefreshForTest drives a single auto-refresh evaluation for
@@ -28,10 +30,6 @@ func AutoRefreshEnabledForTest(c *CQLClient) bool {
 // AutoRefreshCtxForTest returns the auto-refresh detector's context, or
 // nil if the detector was not started. Tests use this to assert the
 // goroutine's lifecycle (e.g., that Close cancels it).
-func AutoRefreshCtxForTest(c *CQLClient) interface{ Done() <-chan struct{} } {
-	if c.autoRefreshCtx == nil {
-		return nil
-	}
-
+func AutoRefreshCtxForTest(c *CQLClient) context.Context {
 	return c.autoRefreshCtx
 }

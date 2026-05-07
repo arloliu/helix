@@ -112,8 +112,8 @@ type ClientConfig struct {
 	// build a session itself — only the caller knows whether to wrap a
 	// gocql v1, gocql v2, chaos-injecting, or test-mock implementation. The
 	// refresher receives the target ClusterID and the most recently observed
-	// error (currently always nil in v1; reserved for future per-cluster
-	// last-error tracking) and returns a fresh session.
+	// failure error (or nil if no op has failed yet) and returns a fresh
+	// session.
 	//
 	// If unset, [CQLClient.RefreshSession] returns [types.ErrNoSessionRefresher].
 	// The lower-level [CQLClient.SwapSession] does not require a refresher
@@ -223,8 +223,9 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 // context.
 //
 // Parameters:
-//   - fn: The session factory; receives the target cluster and (in v1) a nil
-//     lastErr. Reserved for future per-cluster last-error threading.
+//   - fn: The session factory; receives the target cluster and the most
+//     recently observed failure error against that cluster (nil if no op
+//     has failed yet).
 //
 // Returns:
 //   - Option: Configuration option

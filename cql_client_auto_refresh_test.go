@@ -401,10 +401,9 @@ func TestAutoRefresh_RefresherErrorIncrementsErrorMetric(t *testing.T) {
 }
 
 func TestAutoRefresh_PartialSuccessDoesNotMisfireOnHealthyCluster(t *testing.T) {
-	// THE regression test: dual-write where A is healthy and B is
-	// failing. Without per-cluster recordOpOutcome (which v2 commit 2
-	// introduced), A's lastSuccess would never advance and the detector
-	// would falsely fire on the healthy cluster.
+	// Regression: in a dual-write where A succeeds and B fails, A's
+	// lastSuccess must advance independently. Otherwise the detector
+	// could falsely fire on the healthy cluster.
 	clock := newManualClock(time.Unix(1_700_000_000, 0))
 	mockA := newFailingMock() // healthy
 	mockB := newFailingMock() // dead
@@ -473,7 +472,7 @@ func TestAutoRefresh_SingleClusterFires(t *testing.T) {
 	helix.MaybeAutoRefreshForTest(client, helix.ClusterA)
 
 	assert.Equal(t, int64(1), mc.GetSessionRefreshAttempts(helix.ClusterA),
-		"single-cluster auto-refresh must fire — the fast path is wired in commit 2")
+		"single-cluster auto-refresh must fire on the read/write fast path")
 }
 
 func TestAutoRefresh_GoroutineFiresOnTick(t *testing.T) {

@@ -100,12 +100,6 @@ type CQLClient struct {
 	statsA clusterStats
 	statsB clusterStats
 
-	// nowFunc returns the current time as Unix nanoseconds. Defaults to
-	// DefaultNowProvider; tests substitute a deterministic clock so
-	// millisecond-scale time-based assertions don't depend on wall clock.
-	// Mirrors the TimestampProvider pattern in config.go.
-	nowFunc NowProvider
-
 	// autoRefreshCtx / autoRefreshClose control the auto-refresh
 	// background goroutine's lifetime. Nil if WithAutoRefresh was not
 	// configured (or if no SessionRefresher was registered, since the
@@ -245,12 +239,11 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	}
 
 	s := c.statsForCluster(cluster)
-	now := c.nowFunc()
+	now := c.config.NowProvider()
 	cfg := c.config.AutoRefresh
 
-	// Compare via int64 to dodge gosec's int → int32 conversion warning;
-	// FailureThreshold can in principle exceed int32 max but in practice
-	// is always single/double digits.
+	// FailureThreshold is an int but compared against an int32 atomic;
+	// widen both sides so gosec doesn't flag the narrowing conversion.
 	if int64(s.consecutiveFailures.Load()) < int64(cfg.FailureThreshold) {
 		return
 	}
@@ -266,8 +259,9 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	// hangs or panics.
 	s.lastRefreshNanos.Store(now)
 
-	if m, ok := c.config.Metrics.(types.SessionRefreshMetrics); ok {
-		m.IncSessionRefreshAttempt(cluster)
+	refreshMetrics, _ := c.config.Metrics.(types.SessionRefreshMetrics)
+	if refreshMetrics != nil {
+		refreshMetrics.IncSessionRefreshAttempt(cluster)
 	}
 	c.config.Logger.Info("auto-refresh: session believed dead, invoking refresher",
 		"cluster", c.clusterName(cluster),
@@ -279,8 +273,8 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	defer cancel()
 
 	if err := c.RefreshSession(ctx, cluster); err != nil {
-		if m, ok := c.config.Metrics.(types.SessionRefreshMetrics); ok {
-			m.IncSessionRefreshError(cluster)
+		if refreshMetrics != nil {
+			refreshMetrics.IncSessionRefreshError(cluster)
 		}
 		c.config.Logger.Warn("auto-refresh: session refresh failed",
 			"cluster", c.clusterName(cluster),
@@ -290,8 +284,8 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 		return
 	}
 
-	if m, ok := c.config.Metrics.(types.SessionRefreshMetrics); ok {
-		m.IncSessionRefreshSuccess(cluster)
+	if refreshMetrics != nil {
+		refreshMetrics.IncSessionRefreshSuccess(cluster)
 	}
 	c.config.Logger.Info("auto-refresh: session refreshed",
 		"cluster", c.clusterName(cluster),
@@ -325,22 +319,39 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 // many genuine not-founds could trigger spurious auto-refreshes.
 // Revisit this helper if the adapter contract changes.
 func (c *CQLClient) recordOpOutcome(cluster ClusterID, err error) {
+	c.recordOpOutcomeAt(cluster, err, 0)
+}
+
+// recordOpOutcomeAt is the same as recordOpOutcome but accepts a caller-
+// captured timestamp to avoid a redundant nowFunc() call when the caller
+// already has one. Pass nowNano == 0 to let the helper sample the clock
+// itself; the clock is only sampled when the outcome actually needs to
+// stamp lastSuccess/lastFailure.
+func (c *CQLClient) recordOpOutcomeAt(cluster ClusterID, err error, nowNano int64) {
 	s := c.statsForCluster(cluster)
-	now := c.nowFunc()
 
 	switch {
 	case err == nil:
+		if nowNano == 0 {
+			nowNano = c.config.NowProvider()
+		}
 		s.consecutiveFailures.Store(0)
-		s.lastSuccessNanos.Store(now)
-		s.lastErr.Store(nil)
+		s.lastSuccessNanos.Store(nowNano)
+		// Steady-state lastErr is already nil; skip the redundant Store.
+		if s.lastErr.Load() != nil {
+			s.lastErr.Store(nil)
+		}
 	case errors.Is(err, types.ErrWriteAsync),
 		errors.Is(err, types.ErrWriteDropped),
 		errors.Is(err, types.ErrNotFound):
 		// Operational/data state; not a health signal.
 		return
 	default:
+		if nowNano == 0 {
+			nowNano = c.config.NowProvider()
+		}
 		s.consecutiveFailures.Add(1)
-		s.lastFailureNanos.Store(now)
+		s.lastFailureNanos.Store(nowNano)
 		// Stable heap pointer for atomic.Pointer; the err interface
 		// itself is two words and can't be stored directly.
 		errCopy := err
@@ -426,7 +437,6 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	client := &CQLClient{
 		config:        config,
 		singleCluster: sessionB == nil,
-		nowFunc:       config.NowProvider,
 	}
 	client.storeSessionA(sessionA)
 	// Store sessionB even if nil; in single-cluster mode the holder wraps a
@@ -784,10 +794,9 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 //     client was closed between the refresher call and the swap), the
 //     newly-built session is closed before returning the error so no
 //     connection is leaked.
-//   - The "lastErr" passed to the refresher is currently nil. v2 will
-//     thread the most-recently-observed error per cluster through this
-//     argument so refreshers can tailor reconnection strategy to the
-//     observed failure mode.
+//   - The lastErr passed to the refresher is the most recently observed
+//     failure error against this cluster (or nil if no op has failed
+//     yet). Refreshers can inspect it to tailor reconnection strategy.
 //
 // Parameters:
 //   - ctx: Context for the refresher and any timeouts the refresher honors.
@@ -1157,9 +1166,8 @@ func (c *CQLClient) executeWriteWithReplay(
 	}
 
 	// Single-cluster mode: direct execution, no dual-write logic.
-	// The auto-refresh detector tracks cluster-A outcomes only here —
-	// without this site single-cluster auto-refresh silently never fires
-	// because no other code path observes the err for stats purposes.
+	// recordOpOutcome must run here so the auto-refresh detector sees
+	// cluster-A outcomes — no other code path observes err for stats.
 	if c.IsSingleCluster() {
 		err := writeFunc(ctx, c.loadSessionA())
 		c.recordOpOutcome(ClusterA, err)
@@ -1339,11 +1347,12 @@ func (c *CQLClient) executeDualWrite(
 
 	// Auto-refresh stat tracking — invoked PER cluster so partial-success
 	// (A=ok, B=err) correctly advances A's lastSuccess while accumulating
-	// failures on B. recordOpOutcome internally skips ErrWriteAsync /
+	// failures on B. recordOpOutcomeAt internally skips ErrWriteAsync /
 	// ErrWriteDropped / ErrNotFound so operational states don't poison
-	// the failure counters.
-	c.recordOpOutcome(ClusterA, errA)
-	c.recordOpOutcome(ClusterB, errB)
+	// the failure counters. Reuse the already-captured nowNano so the
+	// helper does not re-sample the clock.
+	c.recordOpOutcomeAt(ClusterA, errA, nowNano)
+	c.recordOpOutcomeAt(ClusterB, errB, nowNano)
 
 	// Both succeeded definitively.
 	if errA == nil && errB == nil {
