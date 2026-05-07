@@ -18,6 +18,14 @@ import (
 // to maximize cache hits. On failure, it can fail over to the secondary cluster.
 // Cooldown only gates future state changes; it does not trigger passive probing
 // back to a recovered cluster in the absence of another read failure.
+//
+// StickyRead has no programmatic way to return the preferred cluster to its
+// original choice once it has failed over (unlike PrimaryOnlyRead.Reset).
+// To force preferred back to a specific cluster, the operator must:
+//   - wait for the current preferred to fail (failover will swap them again,
+//     subject to cooldown), or
+//   - reconstruct a new StickyRead with WithPreferredCluster and rebuild the
+//     CQLClient.
 type StickyRead struct {
 	preferred        atomic.Value // types.ClusterID
 	mu               sync.RWMutex
