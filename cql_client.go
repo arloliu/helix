@@ -434,6 +434,18 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.NowProvider = DefaultNowProvider
 	}
 
+	// Sanitize auto-refresh tuning. Per-knob option setters (e.g.
+	// WithAutoRefreshCheckInterval) blindly store whatever the caller
+	// passes; non-positive values either panic (CheckInterval feeds
+	// time.NewTicker) or produce nonsensical refresh behavior
+	// (RefreshTimeout <= 0 starts every attempt with a dead context;
+	// FailureThreshold <= 0 fires on every check). Replace bad values
+	// with the documented defaults and log a warning so the misuse is
+	// visible in production logs.
+	if config.AutoRefresh.Enabled {
+		sanitizeAutoRefreshConfig(&config.AutoRefresh, config.Logger)
+	}
+
 	client := &CQLClient{
 		config:        config,
 		singleCluster: sessionB == nil,
@@ -785,6 +797,13 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 // because the refresh contract implies the old one is dead. If the
 // refresher returns an error or a nil session, no swap occurs and the
 // existing session remains live.
+//
+// Because the old session is closed immediately after the swap, in-flight
+// ops that already captured the old session reference may be aborted by
+// drivers that fail outstanding work on Close. Use RefreshSession only
+// when the old session is already non-functional. If you need to drain
+// in-flight ops before tearing down the old session, use SwapSession and
+// close the returned session yourself once the in-flights are quiet.
 //
 // Behavior:
 //   - The refresher is invoked synchronously on the calling goroutine.
@@ -1944,7 +1963,10 @@ func (q *cqlQuery) Iter() Iter {
 // NOTE: Iterators do NOT support automatic failover. If the selected cluster
 // fails during iteration, the error is returned to the caller.
 // ReadStrategy.OnSuccess is only called if the iterator is closed successfully
-// and no AllowedClusters override is active.
+// and no AllowedClusters override is active. Auto-refresh accounting is
+// updated on Close regardless of outcome (success or error), so iterator
+// failures advance the same consecutiveFailures / lastErr stats as Exec
+// reads — only failover and OnFailure routing are skipped.
 //
 // If resolveReadTarget returns an error (fail-closed), an errorIter is returned
 // that defers the error to Close(). Always call Close() and check its error.
@@ -2290,9 +2312,14 @@ func (i *cqlIter) Scan(dest ...any) bool {
 
 func (i *cqlIter) Close() error {
 	err := i.iter.Close()
+	// Auto-refresh accounting must see iterator outcomes too — without
+	// this the detector is blind to iterator-driven workloads. Iterators
+	// still don't fail over (no OnFailure call) by documented contract.
+	i.client.recordOpOutcome(i.cluster, err)
 	if err == nil && !i.overrideActive && i.client.config.ReadStrategy != nil {
 		i.client.config.ReadStrategy.OnSuccess(i.cluster)
 	}
+
 	return err
 }
 

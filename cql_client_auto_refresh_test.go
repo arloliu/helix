@@ -549,3 +549,120 @@ func TestAutoRefresh_StopsOnClose(t *testing.T) {
 		t.Fatal("auto-refresh ctx not cancelled within 500ms of Close")
 	}
 }
+
+// driveIters issues client.Query(...).IterContext(...).Close() N times.
+// Iterator close errors must feed recordOpOutcome the same way Exec
+// errors do, otherwise iterator-driven workloads stay invisible to the
+// auto-refresh detector.
+func driveIters(t *testing.T, c *helix.CQLClient, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		_ = c.Query("SELECT * FROM t WHERE k = ?", i).IterContext(context.Background()).Close()
+	}
+}
+
+func TestAutoRefresh_IteratorFailuresAdvanceCounters(t *testing.T) {
+	// Regression: iterator-driven reads must feed the auto-refresh
+	// detector. Before this fix, cqlIter.Close only called
+	// ReadStrategy.OnSuccess on a clean close; failures were invisible
+	// to recordOpOutcome so consecutiveFailures never advanced.
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	mockA := newFailingMock()
+	mockB := newFailingMock() // healthy throughout
+
+	mc := testutil.NewTestMetricsCollector()
+	var refresherCalls atomic.Int32
+	refresher := func(_ context.Context, _ helix.ClusterID, _ error) (cql.Session, error) {
+		refresherCalls.Add(1)
+		return newFailingMock(), nil
+	}
+
+	client, err := helix.NewCQLClient(mockA, mockB,
+		helix.WithSessionRefresher(refresher),
+		helix.WithAutoRefresh(fastAutoRefreshOpts()...),
+		helix.WithMetrics(mc),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	helix.SetClientNowFuncForTest(client, clock.NowFunc())
+
+	// Drive iterator failures only — no Exec calls. The detector must
+	// still trip purely from iterator close errors.
+	mockA.fail.Store(true)
+	driveIters(t, client, 5)
+	clock.Advance(50 * time.Millisecond)
+
+	helix.MaybeAutoRefreshForTest(client, helix.ClusterA)
+
+	assert.EqualValues(t, 1, refresherCalls.Load(),
+		"iterator failures must advance auto-refresh counters and trigger the refresher")
+	assert.Equal(t, int64(1), mc.GetSessionRefreshAttempts(helix.ClusterA))
+	assert.Equal(t, int64(1), mc.GetSessionRefreshSuccesses(helix.ClusterA))
+}
+
+func TestAutoRefresh_IteratorFailureThreadsLastErrToRefresher(t *testing.T) {
+	// Iterator failures must populate lastErr so the refresher can
+	// inspect the observed failure mode.
+	clock := newManualClock(time.Unix(1_700_000_000, 0))
+	mockA := newFailingMock()
+	mockB := newFailingMock()
+
+	mc := testutil.NewTestMetricsCollector()
+	var observed atomic.Value
+	refresher := func(_ context.Context, _ helix.ClusterID, lastErr error) (cql.Session, error) {
+		if lastErr != nil {
+			observed.Store(lastErr.Error())
+		}
+		return newFailingMock(), nil
+	}
+
+	client, err := helix.NewCQLClient(mockA, mockB,
+		helix.WithSessionRefresher(refresher),
+		helix.WithAutoRefresh(fastAutoRefreshOpts()...),
+		helix.WithMetrics(mc),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	helix.SetClientNowFuncForTest(client, clock.NowFunc())
+
+	mockA.fail.Store(true)
+	driveIters(t, client, 5)
+	clock.Advance(50 * time.Millisecond)
+	helix.MaybeAutoRefreshForTest(client, helix.ClusterA)
+
+	got, _ := observed.Load().(string)
+	assert.Equal(t, "simulated cluster failure", got,
+		"refresher's lastErr must reflect the iterator failure")
+}
+
+func TestNewCQLClient_SanitizesInvalidAutoRefreshKnobs(t *testing.T) {
+	// Regression: WithAutoRefreshCheckInterval(0) used to panic
+	// time.NewTicker inside the auto-refresh goroutine. NewCQLClient
+	// must replace non-positive tuning values with the documented
+	// defaults so the goroutine starts safely.
+	mockA := newFailingMock()
+	refresher := func(_ context.Context, _ helix.ClusterID, _ error) (cql.Session, error) {
+		return newFailingMock(), nil
+	}
+
+	client, err := helix.NewCQLClient(mockA, nil,
+		helix.WithSessionRefresher(refresher),
+		helix.WithAutoRefresh(
+			helix.WithAutoRefreshCheckInterval(0),
+			helix.WithAutoRefreshRefreshTimeout(-1*time.Second),
+			helix.WithAutoRefreshMinRetryInterval(0),
+			helix.WithAutoRefreshSustainedFailureWindow(-1),
+			helix.WithAutoRefreshFailureThreshold(0),
+		),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	cfg := client.Config().AutoRefresh
+	defaults := helix.DefaultAutoRefreshConfig()
+	assert.Equal(t, defaults.CheckInterval, cfg.CheckInterval)
+	assert.Equal(t, defaults.RefreshTimeout, cfg.RefreshTimeout)
+	assert.Equal(t, defaults.MinRetryInterval, cfg.MinRetryInterval)
+	assert.Equal(t, defaults.SustainedFailureWindow, cfg.SustainedFailureWindow)
+	assert.Equal(t, defaults.FailureThreshold, cfg.FailureThreshold)
+}

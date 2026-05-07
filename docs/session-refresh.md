@@ -124,7 +124,8 @@ oldSession.Close()
 ## Concurrency and Lifecycle Semantics
 
 - The swap is **lock-free on the read path**. Concurrent `Query`/`Batch`/`Iter` callers see either the old or the new session, never a partially-swapped state.
-- Operations that have **already resolved their session** (in-flight `Iter` or CAS, mid-execution synchronous calls, fire-and-forget writes captured into a goroutine) continue against the session they captured. Only operations that resolve the session AFTER the swap observe the new one. This preserves "the write was dispatched to cluster X" semantics.
+- **In-flight ops on the old session — `SwapSession` only.** Operations that have already resolved their session (in-flight `Iter` or CAS, mid-execution synchronous calls, fire-and-forget writes captured into a goroutine) continue against the session they captured. Only operations that resolve the session AFTER the swap observe the new one. This preserves "the write was dispatched to cluster X" semantics — but it relies on the caller deferring `oldSession.Close()` until in-flights have drained, which is `SwapSession`'s contract.
+- **`RefreshSession` does not preserve in-flights.** The old session is closed immediately after the atomic swap (the refresh contract implies the old one is dead). Drivers that abort outstanding work on `Close()` will fail any in-flight ops that captured the old session reference. Only call `RefreshSession` when the old session is already non-functional, or use `SwapSession` if you need to drain.
 - `SwapSession` and `RefreshSession` reject calls on a closed client (`types.ErrSessionClosed`).
 - `SwapSession` rejects nil sessions (`types.ErrNilSession`) and `ClusterB` on a single-cluster client (`types.ErrInvalidCluster`).
 - `RefreshSession` returns `types.ErrNoSessionRefresher` if no refresher was registered.
