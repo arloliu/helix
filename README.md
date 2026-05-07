@@ -28,6 +28,7 @@ If one strand snaps, the other keeps the organism alive. It's 4 billion years of
 - **Sticky Read Routing** - Per-client sticky reads to maximize cache hits across clusters
 - **Active Failover** - Immediate failover to secondary cluster on read failures
 - **Replay System** - Asynchronous reconciliation via in-memory queue or NATS JetStream
+- **Session Refresh** - Manual or automatic recovery from permanently-dead sessions (cluster restart with port reassignment, DNS rotation) without rebuilding the client — see [Session Refresh Guide](docs/session-refresh.md)
 - **Drop-in Replacement** - Interface-based design mirrors `gocql` API for minimal migration effort
 
 > **CAS/LWT Warning:** Lightweight Transactions (`INSERT ... IF NOT EXISTS`, `ScanCAS`, etc.) are **not safe** in a shared-nothing dual-cluster architecture. Each cluster has an independent Paxos state, so CAS conditions cannot be coordinated across clusters. Do not use Helix for CAS/LWT operations.
@@ -271,6 +272,16 @@ helix.NewCQLClient(sessionA, sessionB,
     helix.WithTimestampProvider(func() int64 {
         return time.Now().UnixMicro()
     }),
+
+    // Session refresh — recover from permanently-dead sessions
+    // (cluster restart with port reassignment, DNS rotation) without
+    // rebuilding the client. See docs/session-refresh.md.
+    helix.WithSessionRefresher(func(ctx context.Context, cluster helix.ClusterID, lastErr error) (cql.Session, error) {
+        // Caller code: rebuild gocql session against the cluster's
+        // current endpoint, wrapped with the v1/v2 adapter.
+        return v1.NewSession(rebuildGocqlSession(cluster)), nil
+    }),
+    helix.WithAutoRefresh(),  // Helix-driven refresh on observed dead session
 )
 ```
 
@@ -286,6 +297,7 @@ See the [examples](examples/) directory:
 ## Documentation
 
 - [Auto-Recovery Guide](docs/auto-recovery.md) - Recovery lifecycle, operator workflow, and best practices
+- [Session Refresh Guide](docs/session-refresh.md) - Recover from permanently-dead sessions (cluster restart, DNS rotation) without rebuilding the client
 - [FallbackRead Guide](docs/fallback-read.md) - Best-effort dual-cluster reads for critical data
 - [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) - Latency-aware write strategy tuning
 - [Replay System](docs/replay-system.md) - Replay patterns and best practices

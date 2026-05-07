@@ -10,6 +10,9 @@
 //   - Sticky Read Routing: Per-client sticky reads to maximize cache hits
 //   - Active Failover: Immediate failover to secondary cluster on read failures
 //   - Replay System: Asynchronous reconciliation via in-memory queue or NATS JetStream
+//   - Session Refresh: Manual or automatic recovery from permanently-dead sessions
+//     (cluster restart with port reassignment, DNS rotation) without rebuilding
+//     the client; see docs/session-refresh.md
 //   - Drop-in Replacement: Interface-based design mirrors gocql API
 //
 // # Basic Usage
@@ -108,6 +111,36 @@
 //	helix.WithTimestampProvider(func() int64 {
 //	    return time.Now().UnixMicro()
 //	})
+//
+// # Session Lifecycle and Refresh
+//
+// helix.NewCQLClient takes two cql.Session references and uses them for the
+// lifetime of the client by default. When a real cluster's endpoint changes
+// (restart with port reassignment, DNS rotation, host migration), the
+// driver's internal reconnect cannot recover and every subsequent op fails.
+//
+// Helix provides three layers for handling this:
+//
+//   - SwapSession (manual, full caller control over old-session lifecycle)
+//   - RefreshSession (manual, uses a registered SessionRefresher and closes
+//     the old session)
+//   - WithAutoRefresh (background detector that invokes the SessionRefresher
+//     when Helix observes a cluster's session is permanently dead)
+//
+// All three preserve the decoupling principle: Helix never imports a specific
+// gocql driver, so SessionRefresher is a caller-supplied factory that builds
+// a fresh session and wraps it with the v1 or v2 adapter.
+//
+// Quick start with auto-refresh:
+//
+//	client, err := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithSessionRefresher(func(ctx context.Context, cluster helix.ClusterID, lastErr error) (cql.Session, error) {
+//	        return v1.NewSession(rebuildGocqlSession(cluster)), nil
+//	    }),
+//	    helix.WithAutoRefresh(),
+//	)
+//
+// See docs/session-refresh.md for the full guide.
 //
 // # CAS/LWT Warning
 //
