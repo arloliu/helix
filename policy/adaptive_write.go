@@ -56,6 +56,7 @@ type AdaptiveDualWrite struct {
 	metrics         types.MetricsCollector
 	logger          types.Logger
 	metricsExplicit bool
+	loggerExplicit  bool
 	clusterNames    atomic.Pointer[types.ClusterNames]
 
 	// Per-cluster state
@@ -218,6 +219,11 @@ func WithAdaptiveMetrics(m types.MetricsCollector) AdaptiveDualWriteOption {
 
 // WithAdaptiveLogger sets the logger for fire-and-forget background writes.
 //
+// Marks the configuration as "logger explicitly set" so a parent caller
+// (e.g. helix.NewCQLClient) does not auto-inject a different logger
+// later via [AdaptiveDualWrite.SetLogger]. This mirrors the
+// [WithAdaptiveMetrics] / explicit-wins contract.
+//
 // Parameters:
 //   - l: The logger
 //
@@ -225,7 +231,11 @@ func WithAdaptiveMetrics(m types.MetricsCollector) AdaptiveDualWriteOption {
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveLogger(l types.Logger) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
+		if l == nil {
+			return
+		}
 		a.logger = l
+		a.loggerExplicit = true
 	}
 }
 
@@ -344,13 +354,26 @@ func (a *AdaptiveDualWrite) SetMetrics(m types.MetricsCollector) {
 	a.metricsExplicit = true
 }
 
-// SetLogger replaces the logger. Used by helix.NewCQLClient to propagate
-// the client logger into the strategy if the caller didn't provide one.
+// LoggerConfigured reports whether the logger was explicitly set via
+// WithAdaptiveLogger. Mirrors MetricsConfigured so the helix client
+// can use the same auto-injection guard for both knobs.
+func (a *AdaptiveDualWrite) LoggerConfigured() bool {
+	return a.loggerExplicit
+}
+
+// SetLogger replaces the logger. No-op once LoggerConfigured returns
+// true (caller's explicit choice wins) or if l is nil. Used by
+// helix.NewCQLClient to propagate the client logger into the strategy
+// when the caller did not provide one.
 func (a *AdaptiveDualWrite) SetLogger(l types.Logger) {
+	if a.loggerExplicit {
+		return
+	}
 	if l == nil {
 		return
 	}
 	a.logger = l
+	a.loggerExplicit = true
 }
 
 // clusterName returns the display name for the given cluster.

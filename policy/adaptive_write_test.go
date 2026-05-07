@@ -225,6 +225,94 @@ func TestAdaptiveDualWrite_FireAndForgetSurfacesError(t *testing.T) {
 		"healthy cluster must not see IncWriteError")
 }
 
+// TestAdaptiveDualWrite_ExplicitLoggerWinsOverInjection verifies that
+// WithAdaptiveLogger marks the strategy's logger as explicitly set, so a
+// subsequent SetLogger from the helix client's auto-injection path does
+// NOT overwrite it. Without this guard, callers who deliberately route
+// background-write logs to a separate sink would silently lose that
+// configuration once a client logger is wired up.
+func TestAdaptiveDualWrite_ExplicitLoggerWinsOverInjection(t *testing.T) {
+	explicit := &recordingLogger{}
+	clientLogger := &recordingLogger{}
+
+	a := NewAdaptiveDualWrite(WithAdaptiveLogger(explicit))
+	require.True(t, a.LoggerConfigured(), "WithAdaptiveLogger must mark configured")
+
+	// Simulate the helix client auto-injection path.
+	a.SetLogger(clientLogger)
+
+	// Force degrade and run a background failure to provoke a Warn log.
+	bgErr := errors.New("background failure")
+	a.ForceDegrade(types.ClusterA)
+
+	_, _ = a.Execute(t.Context(),
+		func(_ context.Context) error { return bgErr },
+		func(_ context.Context) error { return nil },
+	)
+
+	// Wait for the background goroutine to log.
+	require.Eventually(t, func() bool {
+		return explicit.warnCount() >= 1
+	}, time.Second, 10*time.Millisecond,
+		"explicit logger must receive the background-write Warn")
+
+	assert.Zero(t, clientLogger.warnCount(),
+		"client-injected logger must not receive logs once an explicit logger is configured")
+}
+
+// TestAdaptiveDualWrite_SetLoggerInjectsWhenUnconfigured verifies the
+// other side of the contract: when no WithAdaptiveLogger was provided,
+// SetLogger does install the client logger.
+func TestAdaptiveDualWrite_SetLoggerInjectsWhenUnconfigured(t *testing.T) {
+	clientLogger := &recordingLogger{}
+
+	a := NewAdaptiveDualWrite() // no explicit logger
+	require.False(t, a.LoggerConfigured())
+
+	a.SetLogger(clientLogger)
+	require.True(t, a.LoggerConfigured(),
+		"SetLogger must mark configured to prevent further auto-injection")
+
+	bgErr := errors.New("background failure")
+	a.ForceDegrade(types.ClusterA)
+
+	_, _ = a.Execute(t.Context(),
+		func(_ context.Context) error { return bgErr },
+		func(_ context.Context) error { return nil },
+	)
+
+	require.Eventually(t, func() bool {
+		return clientLogger.warnCount() >= 1
+	}, time.Second, 10*time.Millisecond,
+		"client-injected logger must receive logs when no explicit logger was set")
+}
+
+// recordingLogger is a minimal types.Logger implementation that counts
+// Warn calls. Sufficient for verifying which logger received what.
+type recordingLogger struct {
+	mu    sync.Mutex
+	warns int
+}
+
+func (l *recordingLogger) Debug(_ string, _ ...any) {}
+func (l *recordingLogger) Info(_ string, _ ...any)  {}
+func (l *recordingLogger) Warn(_ string, _ ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns++
+}
+func (l *recordingLogger) Error(_ string, _ ...any) {}
+func (l *recordingLogger) Fatal(_ string, _ ...any) {}
+func (l *recordingLogger) With(_ ...any) types.Logger {
+	return l
+}
+
+func (l *recordingLogger) warnCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.warns
+}
+
 func TestAdaptiveDualWrite_Recovery(t *testing.T) {
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveMinFloor(100*time.Millisecond),
