@@ -128,6 +128,14 @@ type Collector struct {
 	drainModeEnteredB *metrics.Counter
 	drainModeExitedA  *metrics.Counter
 	drainModeExitedB  *metrics.Counter
+
+	// Session refresh metrics (optional types.SessionRefreshMetrics)
+	sessionRefreshAttemptA *metrics.Counter
+	sessionRefreshAttemptB *metrics.Counter
+	sessionRefreshSuccessA *metrics.Counter
+	sessionRefreshSuccessB *metrics.Counter
+	sessionRefreshErrorA   *metrics.Counter
+	sessionRefreshErrorB   *metrics.Counter
 }
 
 // New creates a new VictoriaMetrics-based metrics collector.
@@ -240,6 +248,14 @@ func (c *Collector) initMetrics() {
 	c.drainModeEnteredB = c.set.NewCounter(fmt.Sprintf(`%s_drain_mode_entered_total{cluster="%s"}`, p, nB))
 	c.drainModeExitedA = c.set.NewCounter(fmt.Sprintf(`%s_drain_mode_exited_total{cluster="%s"}`, p, nA))
 	c.drainModeExitedB = c.set.NewCounter(fmt.Sprintf(`%s_drain_mode_exited_total{cluster="%s"}`, p, nB))
+
+	// Session refresh metrics (optional types.SessionRefreshMetrics)
+	c.sessionRefreshAttemptA = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_attempt_total{cluster="%s"}`, p, nA))
+	c.sessionRefreshAttemptB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_attempt_total{cluster="%s"}`, p, nB))
+	c.sessionRefreshSuccessA = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_success_total{cluster="%s"}`, p, nA))
+	c.sessionRefreshSuccessB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_success_total{cluster="%s"}`, p, nB))
+	c.sessionRefreshErrorA = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_error_total{cluster="%s"}`, p, nA))
+	c.sessionRefreshErrorB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_error_total{cluster="%s"}`, p, nB))
 }
 
 func (c *Collector) Set() *metrics.Set {
@@ -480,3 +496,39 @@ func (c *Collector) IncDrainModeExited(cluster types.ClusterID) {
 		c.drainModeExitedB.Inc()
 	}
 }
+
+// IncSessionRefreshAttempt increments the counter when the auto-refresh
+// detector decides a cluster's session is permanently dead and is about
+// to invoke the SessionRefresher. Part of the optional
+// types.SessionRefreshMetrics interface.
+func (c *Collector) IncSessionRefreshAttempt(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.sessionRefreshAttemptA.Inc()
+	} else {
+		c.sessionRefreshAttemptB.Inc()
+	}
+}
+
+// IncSessionRefreshSuccess increments the counter after a successful
+// auto-refresh (refresher returned a non-nil session and the swap installed it).
+func (c *Collector) IncSessionRefreshSuccess(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.sessionRefreshSuccessA.Inc()
+	} else {
+		c.sessionRefreshSuccessB.Inc()
+	}
+}
+
+// IncSessionRefreshError increments the counter when an auto-refresh
+// attempt failed (refresher errored, returned nil, or swap failed).
+func (c *Collector) IncSessionRefreshError(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.sessionRefreshErrorA.Inc()
+	} else {
+		c.sessionRefreshErrorB.Inc()
+	}
+}
+
+// Compile-time assertion that *Collector implements the optional
+// types.SessionRefreshMetrics interface.
+var _ types.SessionRefreshMetrics = (*Collector)(nil)

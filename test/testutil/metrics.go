@@ -45,6 +45,11 @@ type TestMetricsCollector struct {
 	DrainModeEntered map[types.ClusterID]int64
 	DrainModeExited  map[types.ClusterID]int64
 
+	// Session refresh (optional types.SessionRefreshMetrics)
+	SessionRefreshAttempts  map[types.ClusterID]int64
+	SessionRefreshSuccesses map[types.ClusterID]int64
+	SessionRefreshErrors    map[types.ClusterID]int64
+
 	// Atomic counters for quick access
 	totalReplayEnqueued atomic.Int64
 	totalReplaySuccess  atomic.Int64
@@ -57,27 +62,30 @@ var _ types.MetricsCollector = (*TestMetricsCollector)(nil)
 // NewTestMetricsCollector creates a new test metrics collector.
 func NewTestMetricsCollector() *TestMetricsCollector {
 	return &TestMetricsCollector{
-		ReadTotal:           make(map[types.ClusterID]int64),
-		ReadErrors:          make(map[types.ClusterID]int64),
-		ReadDuration:        make(map[types.ClusterID][]float64),
-		ReadDivergence:      make(map[types.ClusterID]int64),
-		WriteTotal:          make(map[types.ClusterID]int64),
-		WriteErrors:         make(map[types.ClusterID]int64),
-		WriteAsync:          make(map[types.ClusterID]int64),
-		WriteDropped:        make(map[types.ClusterID]int64),
-		WriteDuration:       make(map[types.ClusterID][]float64),
-		FailoverTotal:       make(map[string]int64),
-		CircuitBreakerState: make(map[types.ClusterID]int),
-		CircuitBreakerTrips: make(map[types.ClusterID]int64),
-		ReplayEnqueued:      make(map[types.ClusterID]int64),
-		ReplaySuccess:       make(map[types.ClusterID]int64),
-		ReplayErrors:        make(map[types.ClusterID]int64),
-		ReplayDropped:       make(map[types.ClusterID]int64),
-		ReplayQueueDepth:    make(map[types.ClusterID]int),
-		ReplayDuration:      make(map[types.ClusterID][]float64),
-		ClusterDraining:     make(map[types.ClusterID]bool),
-		DrainModeEntered:    make(map[types.ClusterID]int64),
-		DrainModeExited:     make(map[types.ClusterID]int64),
+		ReadTotal:               make(map[types.ClusterID]int64),
+		ReadErrors:              make(map[types.ClusterID]int64),
+		ReadDuration:            make(map[types.ClusterID][]float64),
+		ReadDivergence:          make(map[types.ClusterID]int64),
+		WriteTotal:              make(map[types.ClusterID]int64),
+		WriteErrors:             make(map[types.ClusterID]int64),
+		WriteAsync:              make(map[types.ClusterID]int64),
+		WriteDropped:            make(map[types.ClusterID]int64),
+		WriteDuration:           make(map[types.ClusterID][]float64),
+		FailoverTotal:           make(map[string]int64),
+		CircuitBreakerState:     make(map[types.ClusterID]int),
+		CircuitBreakerTrips:     make(map[types.ClusterID]int64),
+		ReplayEnqueued:          make(map[types.ClusterID]int64),
+		ReplaySuccess:           make(map[types.ClusterID]int64),
+		ReplayErrors:            make(map[types.ClusterID]int64),
+		ReplayDropped:           make(map[types.ClusterID]int64),
+		ReplayQueueDepth:        make(map[types.ClusterID]int),
+		ReplayDuration:          make(map[types.ClusterID][]float64),
+		ClusterDraining:         make(map[types.ClusterID]bool),
+		DrainModeEntered:        make(map[types.ClusterID]int64),
+		DrainModeExited:         make(map[types.ClusterID]int64),
+		SessionRefreshAttempts:  make(map[types.ClusterID]int64),
+		SessionRefreshSuccesses: make(map[types.ClusterID]int64),
+		SessionRefreshErrors:    make(map[types.ClusterID]int64),
 	}
 }
 
@@ -236,6 +244,59 @@ func (m *TestMetricsCollector) IncDrainModeExited(cluster types.ClusterID) {
 }
 
 // ----------------------
+// Session Refresh (optional types.SessionRefreshMetrics)
+// ----------------------
+
+func (m *TestMetricsCollector) IncSessionRefreshAttempt(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SessionRefreshAttempts[cluster]++
+}
+
+func (m *TestMetricsCollector) IncSessionRefreshSuccess(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SessionRefreshSuccesses[cluster]++
+}
+
+func (m *TestMetricsCollector) IncSessionRefreshError(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SessionRefreshErrors[cluster]++
+}
+
+// GetSessionRefreshAttempts returns the cumulative auto-refresh attempt
+// count for the given cluster.
+func (m *TestMetricsCollector) GetSessionRefreshAttempts(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.SessionRefreshAttempts[cluster]
+}
+
+// GetSessionRefreshSuccesses returns the cumulative auto-refresh success
+// count for the given cluster.
+func (m *TestMetricsCollector) GetSessionRefreshSuccesses(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.SessionRefreshSuccesses[cluster]
+}
+
+// GetSessionRefreshErrors returns the cumulative auto-refresh error
+// count for the given cluster.
+func (m *TestMetricsCollector) GetSessionRefreshErrors(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.SessionRefreshErrors[cluster]
+}
+
+// Compile-time assertion that TestMetricsCollector implements the
+// optional types.SessionRefreshMetrics interface.
+var _ types.SessionRefreshMetrics = (*TestMetricsCollector)(nil)
+
+// ----------------------
 // Test Helpers
 // ----------------------
 
@@ -345,6 +406,9 @@ func (m *TestMetricsCollector) Reset() {
 	m.ClusterDraining = make(map[types.ClusterID]bool)
 	m.DrainModeEntered = make(map[types.ClusterID]int64)
 	m.DrainModeExited = make(map[types.ClusterID]int64)
+	m.SessionRefreshAttempts = make(map[types.ClusterID]int64)
+	m.SessionRefreshSuccesses = make(map[types.ClusterID]int64)
+	m.SessionRefreshErrors = make(map[types.ClusterID]int64)
 
 	m.totalReplayEnqueued.Store(0)
 	m.totalReplaySuccess.Store(0)

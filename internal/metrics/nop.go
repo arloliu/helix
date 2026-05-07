@@ -106,3 +106,21 @@ func (m *NopMetrics) IncDrainModeEntered(_ types.ClusterID) {}
 
 // IncDrainModeExited discards the metric.
 func (m *NopMetrics) IncDrainModeExited(_ types.ClusterID) {}
+
+// ----------------------
+// Session Refresh (optional types.SessionRefreshMetrics)
+// ----------------------
+
+// IncSessionRefreshAttempt discards the metric.
+func (m *NopMetrics) IncSessionRefreshAttempt(_ types.ClusterID) {}
+
+// IncSessionRefreshSuccess discards the metric.
+func (m *NopMetrics) IncSessionRefreshSuccess(_ types.ClusterID) {}
+
+// IncSessionRefreshError discards the metric.
+func (m *NopMetrics) IncSessionRefreshError(_ types.ClusterID) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.SessionRefreshMetrics interface, so embedders pick up the
+// no-op coverage automatically.
+var _ types.SessionRefreshMetrics = (*NopMetrics)(nil)
