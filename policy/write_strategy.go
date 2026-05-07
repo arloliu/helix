@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 )
 
@@ -164,10 +165,16 @@ func (s *SyncDualWrite) Execute(
 }
 
 // safeWrite calls write and recovers from panics, converting them to errors.
+//
+// The captured stack is included in the returned error so post-mortem debugging
+// is possible. Without the stack, "panic: ..." with no trace is essentially
+// useless when the panic originated several frames deep in caller code.
 func safeWrite(ctx context.Context, write func(context.Context) error, cluster string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("helix: panic in cluster %s write: %v", cluster, r)
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			err = fmt.Errorf("helix: panic in cluster %s write: %v\n%s", cluster, r, buf[:n])
 		}
 	}()
 

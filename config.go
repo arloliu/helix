@@ -449,6 +449,14 @@ func WithClusterNames(nameA, nameB string) Option {
 // WithAllowedClusters sets an operator-driven function that controls which
 // clusters are eligible for reads.
 //
+// Scope: READS ONLY. Dual-writes (Exec/ExecContext, batch Exec) and CAS
+// operations (ScanCAS, MapScanCAS, batch ExecCAS/MapExecCAS) are not
+// affected — writes always go to both clusters per the configured
+// WriteStrategy, and CAS is single-cluster controlled by ForceDegrade /
+// ForceRecover on the write side. To fence a cluster from writes, drain
+// it via the [TopologyWatcher] / [TopologyOperator] — drain skips writes
+// to the affected cluster and enqueues them for replay.
+//
 // When the function returns a non-empty list, the read strategy is bypassed
 // and the list directly controls read routing. The first element is the
 // primary read target; subsequent elements are failover candidates in order.
@@ -462,10 +470,6 @@ func WithClusterNames(nameA, nameB string) Option {
 // clusters are draining, the read returns an error (ErrInvalidClusterOverride
 // or ErrNoValidClusters). A panicking function returns ErrClusterOverridePanic.
 // This prevents silent misrouting from stale or misconfigured flags.
-//
-// CAS operations (ScanCAS, MapScanCAS, batch ExecCAS/MapExecCAS) are NOT
-// affected by this override — they are single-cluster, write-like operations
-// controlled by ForceDegrade/ForceRecover on the write side.
 //
 // Iterator paths (IterContext) defer override errors to Close(). Always call
 // Close() and check its error.

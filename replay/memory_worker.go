@@ -182,6 +182,15 @@ func (b *memoryBackend) clusterName(cluster types.ClusterID) string {
 
 // NewMemoryWorker creates a worker that processes messages from a MemoryReplayer.
 //
+// # Shutdown semantics
+//
+// On Stop, every pending payload still in the queue is dequeued and the
+// configured OnDrop callback is invoked for each. High-throughput systems
+// can therefore see a sudden burst of OnDrop callbacks at shutdown
+// proportional to the queue depth at that moment. Size your OnDrop handler
+// (and any synchronous fallback persistence) to absorb that burst, or
+// configure WithMaxAttempts and call Stop only after a quiet window.
+//
 // Parameters:
 //   - replayer: The memory replayer to consume from
 //   - execute: Function to execute replay payloads

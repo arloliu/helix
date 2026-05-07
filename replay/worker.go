@@ -49,11 +49,19 @@ type WorkerConfig struct {
 	// Default: 5
 	MaxAttempts int
 
-	// HighPriorityRatio controls the ratio of high-priority to low-priority message processing.
-	// For every N high-priority batches processed, 1 low-priority batch is processed.
-	// This prevents low-priority starvation while ensuring high-priority messages are preferred.
-	// Set to 0 for equal priority processing (1:1 ratio).
-	// Default: 10 (10:1 ratio - process 10 high-priority batches, then 1 low-priority)
+	// HighPriorityRatio controls the ratio of high-priority to low-priority
+	// processing. The exact unit depends on the backend:
+	//
+	//   - Memory backend: per-message ratio. For every N high-priority
+	//     messages dequeued, 1 low-priority message is dequeued.
+	//   - NATS backend: per-batch ratio. For every N high-priority batches
+	//     fetched, 1 low-priority batch is fetched. With BatchSize=100 and
+	//     ratio=10, this is roughly 1000 high messages : 100 low messages
+	//     per scheduling cycle.
+	//
+	// This prevents low-priority starvation while ensuring high-priority
+	// messages are preferred. Set to 0 for equal priority processing (1:1).
+	// Default: 10
 	HighPriorityRatio int
 
 	// StrictPriority when true, drains all high-priority messages before processing any

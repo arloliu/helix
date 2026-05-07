@@ -259,3 +259,24 @@ func TestSyncDualWrite_PanicInB(t *testing.T) {
 	assert.Contains(t, errB.Error(), "panic")
 	assert.Contains(t, errB.Error(), "B panicked")
 }
+
+// TestSafeWrite_PanicErrorIncludesStack verifies that the recovered panic
+// error embeds the captured goroutine stack, not just the panic value. The
+// stack is the only useful debugging signal when the panic originated several
+// frames deep in driver or caller code.
+func TestSafeWrite_PanicErrorIncludesStack(t *testing.T) {
+	strategy := NewConcurrentDualWrite()
+
+	errA, _ := strategy.Execute(
+		context.Background(),
+		func(_ context.Context) error { panic("kaboom") },
+		func(_ context.Context) error { return nil },
+	)
+
+	require.Error(t, errA)
+	assert.Contains(t, errA.Error(), "kaboom")
+	assert.Contains(t, errA.Error(), "goroutine ",
+		"stack trace marker missing — panic recovery should include runtime.Stack output")
+	assert.Contains(t, errA.Error(), "safeWrite",
+		"stack trace must reference the recovery frame")
+}
