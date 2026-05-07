@@ -46,6 +46,10 @@ debug.log
 test.log
 testdata/tmp/
 
+# Cluade generated files
+.claude/settings.local.json
+.claude/*.lock
+
 # Generated files (keep tracked, but ignore if regenerated)
 # replay/nats_message_gen.go  # Uncomment to ignore generated msgp files
 
