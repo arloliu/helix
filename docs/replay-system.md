@@ -89,8 +89,14 @@ type ReplayWorker interface {
 
 | Implementation | Processing Model | Use Case |
 |---------------|------------------|----------|
-| `MemoryWorker` | Single goroutine | Paired with MemoryReplayer |
-| `NATSWorker` | One goroutine per cluster | Paired with NATSReplayer |
+| `MemoryWorker` | Single dequeue goroutine + bounded retry pool | Paired with MemoryReplayer |
+| `NATSWorker` | One dequeue goroutine per cluster | Paired with NATSReplayer |
+
+The memory worker dequeues sequentially but dispatches retry attempts to a
+bounded goroutine pool (default 100), so a single permanently-failing
+payload does not stall the dequeue loop or block work targeting other
+clusters. Retries and drop semantics are detailed in
+[Memory Worker Retries](#memory-worker-retries) below.
 
 ---
 
@@ -478,6 +484,55 @@ func main() {
 
 ---
 
+## Memory Worker Retries
+
+The memory worker treats the first execution of a payload as a synchronous
+attempt on the dequeue loop. On failure, attempts 2 through `MaxAttempts`
+run in a dedicated retry goroutine, sleeping the configured exponential
+backoff between attempts.
+
+This split means the dequeue loop is **never blocked** behind a
+permanently-failing payload. A failing payload targeting cluster A does
+not stall payloads targeting cluster B; both make progress.
+
+| Aspect | Behavior |
+|--------|----------|
+| Attempt 1 | Synchronous, on the dequeue goroutine |
+| Attempts 2..N | Asynchronous, in a bounded retry-goroutine pool |
+| Retry pool size | 100 (hardcoded) |
+| Backoff | Exponential, starting at `RetryDelay`, capped by `MaxRetryDelay` |
+| Cap | `WithMaxAttempts(n)`, default 5 |
+| `OnError` | Fires per attempt with the attempt number |
+| `OnDrop` | Fires once per payload after one of: attempts exhausted, retry pool saturated, shutdown |
+
+### Drop Reasons
+
+`OnDrop` is the terminal callback. It fires for one of three reasons,
+distinguishable in the worker's log output by the `reason` field:
+
+- `max attempts exceeded` — every retry attempt failed.
+- `retry pool saturated` — too many concurrent failures; the retry pool
+  is full, so further failures drop immediately rather than queue
+  behind in-flight retries. Indicates a sustained failure storm; the
+  pool size is a deliberate safety valve, not a tuning knob.
+- `shutdown` — `Worker.Stop` was called while the payload was either
+  in the queue or sleeping in retry backoff.
+
+### Comparing Memory and NATS
+
+| Concern | Memory backend | NATS backend |
+|---------|----------------|--------------|
+| Retry budget | `WithMaxAttempts(n)` (worker config, default 5) | `WithMaxDeliver(n)` (replayer config, default 5) |
+| Backoff | Inline exponential between attempts | Server-side, controlled by `AckWait` |
+| Where retries run | In-process retry goroutine pool | NATS server re-delivery |
+| Survives process crash | No (in-memory) | Yes (JetStream durable) |
+| Drop visibility | `OnDrop` callback | `OnDrop` callback |
+
+If you need durable replay or more sophisticated retry semantics, use
+`NATSReplayer` + `NATSWorker`.
+
+---
+
 ## Configuration Reference
 
 ### MemoryReplayer Options
@@ -508,19 +563,20 @@ func main() {
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithBatchSize(n)` | 100 | Messages per dequeue |
+| `WithBatchSize(n)` | 100 | Messages per dequeue (NATS only) |
 | `WithPollInterval(d)` | 100ms | Polling interval when idle |
-| `WithRetryDelay(d)` | 100ms | Initial retry delay |
-| `WithMaxRetryDelay(d)` | 30s | Maximum retry delay |
+| `WithRetryDelay(d)` | 100ms | Base retry delay (memory only — NATS uses `AckWait`) |
+| `WithMaxRetryDelay(d)` | 30s | Maximum retry delay (memory only) |
 | `WithExecuteTimeout(d)` | 30s | Timeout per replay execution |
-| `WithHighPriorityRatio(n)` | 10 | Process N high-priority batches before 1 low-priority |
+| `WithMaxAttempts(n)` | 5 | **Memory only.** Total attempts (1 inline + N-1 retried) before drop via `OnDrop`. NATS uses `WithMaxDeliver` on the replayer config instead. |
+| `WithHighPriorityRatio(n)` | 10 | Memory: per-message ratio. NATS: per-batch ratio (10 high batches : 1 low batch). |
 | `WithStrictPriority(bool)` | false | Drain all high-priority before any low-priority |
 | `WithWorkerMetrics(m)` | nil | Metrics collector for statistics |
 | `WithWorkerLogger(l)` | nil | Structured logger for events |
 | `WithWorkerClusterNames(n)` | A/B | Custom cluster display names |
 | `WithOnSuccess(fn)` | nil | Callback on successful replay |
-| `WithOnError(fn)` | nil | Callback on failed replay |
-| `WithOnDrop(fn)` | nil | Callback when message dropped |
+| `WithOnError(fn)` | nil | Callback on failed replay (fires per attempt) |
+| `WithOnDrop(fn)` | nil | Callback when message dropped (memory: after `MaxAttempts`, retry-pool saturation, or shutdown; NATS: after `MaxDeliver` exhaustion) |
 
 ---
 
@@ -573,19 +629,37 @@ replay.NewNATSReplayer(js,
 
 ### 4. Handle Poison Messages
 
-Messages that consistently fail will be redelivered up to NATS's `MaxDeliver` limit. Use `OnDrop` callback to handle these:
+Both backends bound retry attempts and surface terminal failures via the
+`OnDrop` callback. The cap differs:
+
+- **NATS:** consumer-side via `WithMaxDeliver` on the replayer config
+  (default 5). After exhaustion the message is `Term`'d and `OnDrop`
+  fires with the final error.
+- **Memory:** worker-side via `WithMaxAttempts` on the worker config
+  (default 5). The first attempt runs inline on the dequeue loop;
+  attempts 2..MaxAttempts run in a bounded goroutine pool (default 100).
+  `OnDrop` fires for three reasons: max attempts exhausted, retry pool
+  saturated under sustained failure, or shutdown.
+
+Wire `OnDrop` to a dead-letter store and alerting on either backend:
 
 ```go
 replay.NewNATSWorker(replayer, executeFunc,
     replay.WithOnDrop(func(p types.ReplayPayload, err error) {
-        // Log for investigation
         log.Printf("Poison message dropped: %+v", p)
-
-        // Send to dead letter queue
         deadLetterQueue.Enqueue(p)
-
-        // Alert operations team
         alerting.SendAlert("Replay message dropped", p, err)
+    }),
+)
+```
+
+Or for the memory backend:
+
+```go
+replay.NewMemoryWorker(replayer, executeFunc,
+    replay.WithMaxAttempts(5),
+    replay.WithOnDrop(func(p types.ReplayPayload, err error) {
+        deadLetterQueue.Enqueue(p)
     }),
 )
 ```
