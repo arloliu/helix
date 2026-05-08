@@ -49,9 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Throttle stamp set BEFORE invoking the refresher so a hung refresher
     cannot cause re-entrant double-fire.
   - Optional metrics interface `types.SessionRefreshMetrics` (Inc
-    SessionRefreshAttempt / Success / Error). Implementations that embed
-    `internal/metrics.NopMetrics` get the new methods for free; by-hand
-    implementations stay source-compatible across this release.
+    SessionRefreshAttempt / Success / Error). The CQLClient
+    type-asserts on this interface and silently no-ops if the configured
+    collector does not implement it, so by-hand `MetricsCollector`
+    implementations stay source-compatible. The bundled
+    `contrib/metrics/vm` collector implements it.
 - **`NowProvider`** abstraction in `config.go`, mirroring `TimestampProvider`.
   Lets tests substitute a deterministic clock for the auto-refresh detector.
 - **Session Refresh Guide** (`docs/session-refresh.md`): when you need this,

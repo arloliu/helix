@@ -5,12 +5,11 @@ package types
 // CQLClient's auto-refresh detector (see helix.WithAutoRefresh).
 //
 // Helix's auto-refresh path type-asserts on this interface and silently
-// no-ops if the configured collector does not implement it. External
-// callers who implement [MetricsCollector] via embedding of
-// internal/metrics.NopMetrics get the new methods for free; external
-// callers who implement [MetricsCollector] by hand stay source-
-// compatible across the v2 release and may opt in to the new metrics
-// later by adding the three methods.
+// no-ops if the configured collector does not implement it. By-hand
+// [MetricsCollector] implementations stay source-compatible across this
+// release and may opt in to the new metrics later by adding the three
+// methods. Bundled collectors (e.g. contrib/metrics/vm) implement this
+// interface directly.
 //
 // Counter semantics:
 //   - IncSessionRefreshAttempt: incremented every time the auto-refresh
