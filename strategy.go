@@ -131,6 +131,41 @@ type FailoverPolicy interface {
 	RecordSuccess(cluster ClusterID)
 }
 
+// StrictWriter is an optional interface for write strategies that support
+// Strict() per-statement semantics.
+//
+// When a [Query] or [Batch] is marked with [Query.Strict]/[Batch.Strict],
+// the client type-asserts the configured WriteStrategy to StrictWriter and
+// calls ExecuteStrict instead of Execute. A nil WriteStrategy falls back to
+// an inline concurrent write (matching the default non-strict path). A non-nil
+// WriteStrategy that does not implement StrictWriter fails with
+// [types.ErrStrictUnsupported].
+//
+// All built-in strategies ([policy.ConcurrentDualWrite], [policy.SyncDualWrite],
+// [policy.AdaptiveDualWrite]) implement StrictWriter. Custom strategies may
+// opt in by adding ExecuteStrict.
+//
+// ExecuteStrict MUST NOT fire-and-forget writes or enqueue replay for partial
+// failures. On partial failure it returns the failing cluster's error directly
+// so the caller can surface it as [types.PartialWriteError].
+type StrictWriter interface {
+	WriteStrategy
+
+	// ExecuteStrict performs writes without fire-and-forget or replay enqueue.
+	//
+	// On AdaptiveDualWrite: if a cluster is currently degraded, ExecuteStrict
+	// skips that cluster's write and returns [types.ErrClusterDegraded] for it
+	// instead of dispatching a fire-and-forget goroutine.
+	//
+	// Returns the raw errors from each cluster (nil on success). The caller is
+	// responsible for interpreting partial vs total failure.
+	ExecuteStrict(
+		ctx context.Context,
+		writeA func(context.Context) error,
+		writeB func(context.Context) error,
+	) (errA, errB error)
+}
+
 // LatencyRecorder is an optional interface for failover policies that track latency.
 //
 // Policies implementing this interface will have RecordLatency called automatically

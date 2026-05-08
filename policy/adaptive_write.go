@@ -418,7 +418,7 @@ func (a *AdaptiveDualWrite) Execute(
 	if !degradedA {
 		wg.Go(func() {
 			start := time.Now()
-			errA = writeA(ctx)
+			errA = safeWrite(ctx, writeA, "A")
 			latencyA = time.Since(start)
 		})
 	} else {
@@ -429,7 +429,7 @@ func (a *AdaptiveDualWrite) Execute(
 	if !degradedB {
 		wg.Go(func() {
 			start := time.Now()
-			errB = writeB(ctx)
+			errB = safeWrite(ctx, writeB, "B")
 			latencyB = time.Since(start)
 		})
 	} else {
@@ -492,7 +492,7 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		defer cancel()
 
 		start := time.Now()
-		err := write(ctx)
+		err := safeWrite(ctx, write, a.clusterName(cluster))
 		latency := time.Since(start)
 
 		// Track latency for potential recovery
@@ -583,15 +583,24 @@ func (a *AdaptiveDualWrite) updateHealthState(
 }
 
 // handleErrors records strikes for write errors.
-// ErrWriteAsync and ErrWriteDropped are excluded: both are expected operational
-// states for degraded clusters, not performance signals.
+// ErrWriteAsync, ErrWriteDropped, ErrClusterDegraded, and ErrClusterDraining are
+// excluded: they are expected operational states, not genuine write failures.
 func (a *AdaptiveDualWrite) handleErrors(errA, errB error) {
-	if errA != nil && !errors.Is(errA, types.ErrWriteAsync) && !errors.Is(errA, types.ErrWriteDropped) {
+	if errA != nil && !isSkippedErr(errA) {
 		a.recordStrike(&a.stateA)
 	}
-	if errB != nil && !errors.Is(errB, types.ErrWriteAsync) && !errors.Is(errB, types.ErrWriteDropped) {
+	if errB != nil && !isSkippedErr(errB) {
 		a.recordStrike(&a.stateB)
 	}
+}
+
+// isSkippedErr reports whether err is an expected operational state that should
+// not count as a write strike.
+func isSkippedErr(err error) bool {
+	return errors.Is(err, types.ErrWriteAsync) ||
+		errors.Is(err, types.ErrWriteDropped) ||
+		errors.Is(err, types.ErrClusterDegraded) ||
+		errors.Is(err, types.ErrClusterDraining)
 }
 
 // checkAbsoluteCap checks if latencies exceed the absolute max and records strikes.
@@ -764,6 +773,83 @@ func (a *AdaptiveDualWrite) ForceRecover(cluster types.ClusterID) {
 		a.stateB.fastStrikes = 0
 		a.stateB.mu.Unlock()
 	}
+}
+
+// ExecuteStrict performs adaptive concurrent writes without fire-and-forget dispatch.
+//
+// Unlike Execute, ExecuteStrict never spawns background goroutines. If a cluster
+// is currently degraded, its write is skipped and [types.ErrClusterDegraded] is
+// returned for that cluster — the caller receives the skip signal rather than the
+// fire-and-forget [types.ErrWriteAsync]. Healthy clusters are written synchronously
+// as in [AdaptiveDualWrite.Execute].
+//
+// Health state (strikes, recovery credit) is updated for clusters that actually
+// run; degraded-and-skipped clusters are not penalised further. Recovery of
+// degraded clusters in strict-only workloads is driven by the recovery probe
+// configured via WithRecoveryProbe.
+func (a *AdaptiveDualWrite) ExecuteStrict(
+	ctx context.Context,
+	writeA func(context.Context) error,
+	writeB func(context.Context) error,
+) (resultA, resultB error) {
+	degradedA := a.stateA.isDegraded.Load()
+	degradedB := a.stateB.isDegraded.Load()
+
+	if degradedA && degradedB {
+		return types.ErrClusterDegraded, types.ErrClusterDegraded
+	}
+
+	var wg sync.WaitGroup
+	var latencyA, latencyB time.Duration
+	var errA, errB error
+
+	if !degradedA {
+		wg.Go(func() {
+			start := time.Now()
+			errA = safeWrite(ctx, writeA, "A")
+			latencyA = time.Since(start)
+		})
+	} else {
+		errA = types.ErrClusterDegraded
+	}
+
+	if !degradedB {
+		wg.Go(func() {
+			start := time.Now()
+			errB = safeWrite(ctx, writeB, "B")
+			latencyB = time.Since(start)
+		})
+	} else {
+		errB = types.ErrClusterDegraded
+	}
+
+	wg.Wait()
+
+	if errA == nil {
+		a.stateA.lastLatency.Store(latencyA.Nanoseconds())
+	}
+	if errB == nil {
+		a.stateB.lastLatency.Store(latencyB.Nanoseconds())
+	}
+
+	// Pass ErrClusterDegraded for skipped clusters — handleErrors excludes it
+	// from strike accounting, and updateHealthState treats non-nil as no latency.
+	a.updateHealthState(latencyA, latencyB, errA, errB, degradedA, degradedB)
+
+	return errA, errB
+}
+
+// RecordProbeSuccess credits one successful recovery probe against the cluster.
+// After the existing consecutive-fast threshold is reached, the cluster
+// transitions back to healthy. Safe to call when the cluster is not degraded
+// (no-op in that case).
+//
+// This feeds the same recovery counter as natural fast writes (via
+// [AdaptiveDualWrite.RecordFastWrite]) so strict-only workloads still benefit
+// from Helix's auto-healing principle even when no write-side recovery signal
+// is generated.
+func (a *AdaptiveDualWrite) RecordProbeSuccess(cluster types.ClusterID) {
+	a.RecordFastWrite(cluster)
 }
 
 // RecordFastWrite manually records a fast write for a cluster.

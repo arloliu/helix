@@ -1033,6 +1033,147 @@ func TestAdaptiveDualWrite_HealthyClusterClearsStrikesWhileSiblingDegraded(t *te
 		"A must remain healthy after fast writes while sibling is degraded")
 }
 
+// TestAdaptiveDualWrite_ExecuteStrict_BothHealthy verifies that ExecuteStrict
+// runs both writes synchronously when both clusters are healthy.
+func TestAdaptiveDualWrite_ExecuteStrict_BothHealthy(t *testing.T) {
+	a := NewAdaptiveDualWrite()
+	ctx := t.Context()
+
+	var callsA, callsB int32
+	errA, errB := a.ExecuteStrict(ctx,
+		func(_ context.Context) error { atomic.AddInt32(&callsA, 1); return nil },
+		func(_ context.Context) error { atomic.AddInt32(&callsB, 1); return nil },
+	)
+
+	assert.NoError(t, errA)
+	assert.NoError(t, errB)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callsA))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callsB))
+}
+
+// TestAdaptiveDualWrite_ExecuteStrict_OneDegraded verifies that when one cluster
+// is degraded, ExecuteStrict skips it (returns ErrClusterDegraded) and still
+// writes to the healthy cluster — no fire-and-forget goroutine is launched.
+func TestAdaptiveDualWrite_ExecuteStrict_OneDegraded(t *testing.T) {
+	a := NewAdaptiveDualWrite()
+	ctx := t.Context()
+
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	var calledA, calledB int32
+	errA, errB := a.ExecuteStrict(ctx,
+		func(_ context.Context) error { atomic.AddInt32(&calledA, 1); return nil },
+		func(_ context.Context) error { atomic.AddInt32(&calledB, 1); return nil },
+	)
+
+	require.ErrorIs(t, errA, types.ErrClusterDegraded, "degraded cluster must return ErrClusterDegraded")
+	require.NoError(t, errB)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&calledA), "write must not be called for degraded cluster")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&calledB))
+}
+
+// TestAdaptiveDualWrite_ExecuteStrict_BothDegraded verifies that when both clusters
+// are degraded, ExecuteStrict returns ErrClusterDegraded for both without calling
+// any write function.
+func TestAdaptiveDualWrite_ExecuteStrict_BothDegraded(t *testing.T) {
+	a := NewAdaptiveDualWrite()
+	ctx := t.Context()
+
+	a.ForceDegrade(types.ClusterA)
+	a.ForceDegrade(types.ClusterB)
+
+	var called int32
+	errA, errB := a.ExecuteStrict(ctx,
+		func(_ context.Context) error { atomic.AddInt32(&called, 1); return nil },
+		func(_ context.Context) error { atomic.AddInt32(&called, 1); return nil },
+	)
+
+	require.ErrorIs(t, errA, types.ErrClusterDegraded)
+	require.ErrorIs(t, errB, types.ErrClusterDegraded)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&called), "no write must be called when both clusters are degraded")
+}
+
+// TestAdaptiveDualWrite_ExecuteStrict_NoFireAndForget verifies that ExecuteStrict
+// does not launch fire-and-forget goroutines when a cluster is degraded. The
+// write function for the degraded cluster must never be called, even after a delay.
+func TestAdaptiveDualWrite_ExecuteStrict_NoFireAndForget(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveFireForgetTimeout(100 * time.Millisecond))
+	ctx := t.Context()
+
+	a.ForceDegrade(types.ClusterA)
+
+	var calledA int32
+	errA, errB := a.ExecuteStrict(ctx,
+		func(_ context.Context) error { atomic.AddInt32(&calledA, 1); return nil },
+		func(_ context.Context) error { return nil },
+	)
+
+	require.ErrorIs(t, errA, types.ErrClusterDegraded)
+	require.NoError(t, errB)
+
+	// Wait longer than the fire-and-forget timeout to confirm no goroutine ran
+	time.Sleep(150 * time.Millisecond)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&calledA), "write must not be called via fire-and-forget")
+}
+
+// TestAdaptiveDualWrite_ExecuteStrict_DegradedDoesNotStrike verifies that
+// ErrClusterDegraded returned by ExecuteStrict for a skipped cluster is NOT
+// counted as a strike against that cluster.
+func TestAdaptiveDualWrite_ExecuteStrict_DegradedDoesNotStrike(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(1))
+	ctx := t.Context()
+
+	// Degrade A via ForceDegrade (not via strikes)
+	a.ForceDegrade(types.ClusterA)
+	a.ForceRecover(types.ClusterA)
+	require.False(t, a.IsDegraded(types.ClusterA))
+	require.Equal(t, int32(0), a.stateA.slowStrikes)
+
+	// Now ForceDegrade again and run ExecuteStrict
+	a.ForceDegrade(types.ClusterA)
+
+	_, _ = a.ExecuteStrict(ctx,
+		func(_ context.Context) error { return nil },
+		func(_ context.Context) error { return nil },
+	)
+
+	// Recover A; if strikes were counted, it would re-degrade immediately
+	a.ForceRecover(types.ClusterA)
+	require.False(t, a.IsDegraded(types.ClusterA))
+	assert.Equal(t, int32(0), a.stateA.slowStrikes, "ErrClusterDegraded must not record a strike")
+}
+
+// TestAdaptiveDualWrite_RecordProbeSuccess verifies that RecordProbeSuccess feeds
+// the existing recovery counter (recordFast), enabling degraded clusters to
+// recover via probe signals.
+func TestAdaptiveDualWrite_RecordProbeSuccess(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveRecoveryThreshold(3))
+
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	a.RecordProbeSuccess(types.ClusterA)
+	a.RecordProbeSuccess(types.ClusterA)
+	assert.True(t, a.IsDegraded(types.ClusterA), "not yet recovered after 2/3 probe successes")
+
+	a.RecordProbeSuccess(types.ClusterA)
+	assert.False(t, a.IsDegraded(types.ClusterA), "must recover after 3 probe successes")
+}
+
+// TestAdaptiveDualWrite_HandleErrors_ExcludesStrict verifies that ErrClusterDegraded
+// and ErrClusterDraining do NOT count as strikes.
+func TestAdaptiveDualWrite_HandleErrors_ExcludesStrict(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(1))
+
+	// Two strict-sentinel calls must not record any strikes
+	a.handleErrors(types.ErrClusterDegraded, nil)
+	a.handleErrors(types.ErrClusterDraining, nil)
+
+	assert.Equal(t, int32(0), a.stateA.slowStrikes)
+	assert.False(t, a.IsDegraded(types.ClusterA), "ErrClusterDegraded/ErrClusterDraining must not cause degradation")
+}
+
 // TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded verifies
 // that when a cluster still exceeds absoluteMax while its sibling is degraded,
 // recordFastIfNoViolation does NOT reset slowStrikes — the cap-violation

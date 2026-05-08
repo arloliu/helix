@@ -75,6 +75,19 @@ func (c *ConcurrentDualWrite) Execute(
 	return resultA, resultB
 }
 
+// ExecuteStrict performs concurrent writes to both clusters with strict semantics.
+//
+// For ConcurrentDualWrite, ExecuteStrict is identical to Execute: writes are
+// already synchronous and never fire-and-forget. The method exists to satisfy
+// the [helix.StrictWriter] interface so strict statements can use this strategy.
+func (c *ConcurrentDualWrite) ExecuteStrict(
+	ctx context.Context,
+	writeA func(context.Context) error,
+	writeB func(context.Context) error,
+) (errA, errB error) {
+	return c.Execute(ctx, writeA, writeB)
+}
+
 // SyncDualWrite implements a sequential dual-write strategy.
 //
 // Writes are executed sequentially: first to cluster A, then to cluster B.
@@ -162,6 +175,19 @@ func (s *SyncDualWrite) Execute(
 	}
 
 	return resultA, resultB
+}
+
+// ExecuteStrict performs sequential writes to both clusters with strict semantics.
+//
+// For SyncDualWrite, ExecuteStrict is identical to Execute: writes are already
+// synchronous and never fire-and-forget. The method exists to satisfy the
+// [helix.StrictWriter] interface so strict statements can use this strategy.
+func (s *SyncDualWrite) ExecuteStrict(
+	ctx context.Context,
+	writeA func(context.Context) error,
+	writeB func(context.Context) error,
+) (errA, errB error) {
+	return s.Execute(ctx, writeA, writeB)
 }
 
 // safeWrite calls write and recovers from panics, converting them to errors.

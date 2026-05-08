@@ -260,6 +260,48 @@ func TestSyncDualWrite_PanicInB(t *testing.T) {
 	assert.Contains(t, errB.Error(), "B panicked")
 }
 
+func TestConcurrentDualWrite_ExecuteStrict_BothSucceed(t *testing.T) {
+	s := NewConcurrentDualWrite()
+	errA, errB := s.ExecuteStrict(t.Context(),
+		func(_ context.Context) error { return nil },
+		func(_ context.Context) error { return nil },
+	)
+	assert.NoError(t, errA)
+	assert.NoError(t, errB)
+}
+
+func TestConcurrentDualWrite_ExecuteStrict_OneFails(t *testing.T) {
+	s := NewConcurrentDualWrite()
+	want := errors.New("A fail")
+	errA, errB := s.ExecuteStrict(t.Context(),
+		func(_ context.Context) error { return want },
+		func(_ context.Context) error { return nil },
+	)
+	assert.ErrorIs(t, errA, want)
+	assert.NoError(t, errB)
+}
+
+func TestSyncDualWrite_ExecuteStrict_BothSucceed(t *testing.T) {
+	s := NewSyncDualWrite()
+	errA, errB := s.ExecuteStrict(t.Context(),
+		func(_ context.Context) error { return nil },
+		func(_ context.Context) error { return nil },
+	)
+	assert.NoError(t, errA)
+	assert.NoError(t, errB)
+}
+
+func TestSyncDualWrite_ExecuteStrict_OneFails(t *testing.T) {
+	s := NewSyncDualWrite()
+	want := errors.New("B fail")
+	errA, errB := s.ExecuteStrict(t.Context(),
+		func(_ context.Context) error { return nil },
+		func(_ context.Context) error { return want },
+	)
+	assert.NoError(t, errA)
+	assert.ErrorIs(t, errB, want)
+}
+
 // TestSafeWrite_PanicErrorIncludesStack verifies that the recovered panic
 // error embeds the captured goroutine stack, not just the panic value. The
 // stack is the only useful debugging signal when the panic originated several
