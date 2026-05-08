@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror e2e tests with real cluster lifecycle (v1.4.0 follow-up)**: the
+  Phase 5 integration tests fake destination outages with mock-session
+  `execErr` fields. The repo's `test/e2e/cql/` harness already supports
+  real container lifecycle (`Pause`, `Unpause`, `Stop`, `Start`, `Kill`,
+  `NetworkDisconnect`) but no mirror test used it. Added `mirror_test.go`
+  under that build tag covering:
+  - `TestMirror_DestinationPausedAndRecovered` — pause the mirror
+    destination cluster while the app keeps writing, verify failures land
+    in the auto-built replay worker and catch up after `Unpause`. Uses
+    real gocql session timeouts and reconnects.
+  - `TestMirror_BothPrimaryClustersPaused_NoMirrorFire` — answers the
+    "did we test A and B both down, not just A or B?" question. With both
+    primary clusters paused, `Mirror()` returns `DualClusterError` and
+    the engine queue stays empty (no `IncMirrorEnqueueSuccess` call).
+  - `TestMirror_PrimaryPartialOutage_MirrorStillFires` — pause one
+    primary cluster, verify any-cluster-ack returns nil and mirror
+    dispatch fires against the live destination (real CQL roundtrip,
+    not mocked).
+
+  Each test runs against both v1 and v2 adapters (6 subtests total). All
+  green against ScyllaDB.
+
 - **Mirror test gap closures (v1.4.0 follow-up)**: a critical pass through
   the mirror feature surface flagged real coverage holes. Closing them:
   - Dual-cluster primary + Mirror() trigger conditions now tested:
