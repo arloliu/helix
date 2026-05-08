@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror e2e Stop+Start and Kill scenarios (v1.4.0 follow-up)**:
+  combination-coverage audit found the original mirror e2e suite covered
+  only `Pause` (graceful TCP-open hang). Real migrations also see
+  graceful container halts and process crashes — different gocql code
+  paths. Added two more e2e tests pairing the mirror engine with helix's
+  existing `AutoRefresh` + `SessionRefresher` machinery:
+  - `TestMirror_DestinationStopAndStart_AutoRefreshRecovers` — `Stop`
+    the mirror cluster mid-write, `Start` it back. AutoRefresh on the
+    mirror client detects the dead session, refreshes via the
+    SessionRefresher, and the auto-built replay worker drains the
+    backlog. Scylla-only.
+  - `TestMirror_DestinationKilled_AutoRefreshRecovers` — `Kill`
+    (SIGKILL) the mirror destination, `Start` it back. Same recovery
+    path, exercising the harder RST-on-existing-connection failure mode.
+    Scylla-only.
+
+  Both run against v1 and v2 adapters. Total mirror e2e: 5 tests × 2
+  drivers = 10 subtests, ~55s wall-clock.
+
 - **Mirror e2e tests with real cluster lifecycle (v1.4.0 follow-up)**: the
   Phase 5 integration tests fake destination outages with mock-session
   `execErr` fields. The repo's `test/e2e/cql/` harness already supports
