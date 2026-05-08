@@ -132,3 +132,54 @@ func TestS2_PauseA_ReadFailover(t *testing.T) {
 		}
 	}
 }
+
+// TestS2b_PauseB_StickyReadFailover is the cluster-B symmetric counterpart
+// to TestS2_PauseA_ReadFailover/StickyRead. Every existing failover test
+// uses cluster A as the failing one; B-side coverage proves the assumed
+// symmetry (different gocql session, different driver state, different
+// ports, different keyspace name).
+func TestS2b_PauseB_StickyReadFailover(t *testing.T) {
+	a, b := sharedClusters(t)
+	withRestoredCluster(t, b)
+
+	table := createKVTableOnBoth(t, "s2b_paused_b")
+	seedKV(t, a, b, table, "k", "v")
+
+	for _, d := range allDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			rs := policy.NewStickyRead(
+				policy.WithPreferredCluster(htypes.ClusterB),
+				policy.WithStickyReadCooldown(1*time.Hour),
+			)
+			mc := testutil.NewTestMetricsCollector()
+
+			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
+				helix.WithReadStrategy(rs),
+				helix.WithFailoverPolicy(policy.NewActiveFailover()),
+				helix.WithMetrics(mc),
+			)
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			ctx := context.Background()
+			require.NoError(t, b.Pause(ctx))
+			defer func() { _ = b.Unpause(context.Background()) }()
+
+			for i := 0; i < 4; i++ {
+				qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				var got string
+				err = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
+					ScanContext(qCtx, &got)
+				cancel()
+				require.NoError(t, err,
+					"[%s] read %d should succeed via cluster A while B is paused", d.name, i)
+				assert.Equal(t, "v", got)
+			}
+
+			assert.GreaterOrEqual(t, mc.GetTotalFailovers(), int64(1),
+				"[%s] expected at least one failover event from B to A", d.name)
+			assert.Equal(t, htypes.ClusterA, rs.Preferred(),
+				"[%s] StickyRead must have switched preferred to ClusterA", d.name)
+		})
+	}
+}

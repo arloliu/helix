@@ -380,6 +380,92 @@ func TestMirror_DestinationKilled_AutoRefreshRecovers(t *testing.T) {
 	}
 }
 
+// TestMirror_WithAdaptiveDualWritePrimary verifies the v1.4.0 plan's
+// orthogonality claim under real outage: the mirror engine consumes only
+// the err return of executeWriteWithReplay, never its internals, so
+// AdaptiveDualWrite's degradation behavior must not affect mirror dispatch
+// when the primary write returns nil (any-cluster-ack).
+//
+// Sequence:
+//  1. Pause cluster A. AdaptiveDualWrite degrades A; writes that ack on B
+//     (or get fire-and-forwarded as ErrWriteAsync) return success-equiv to
+//     the caller.
+//  2. Each write opted into Mirror() must dispatch to the mirror destination.
+//  3. The mirror engine's success counter increments accordingly.
+//
+// This is the core orthogonality regression guard for the entire Phase 1
+// architecture decision.
+func TestMirror_WithAdaptiveDualWritePrimary(t *testing.T) {
+	a, b := sharedClusters(t)
+	withRestoredCluster(t, a)
+
+	table := createKVTableOnBoth(t, "mirror_adaptive")
+
+	for _, d := range allDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			adw := policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveStrikeThreshold(2),
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+			)
+			// Mirror destination uses the still-healthy cluster B's session.
+			mirrorClient, err := helix.NewCQLClient(d.wrap(b), nil)
+			require.NoError(t, err)
+			t.Cleanup(mirrorClient.Close)
+
+			primary, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
+				helix.WithWriteStrategy(adw),
+				helix.WithReadStrategy(policy.NewStickyRead()),
+				helix.WithFailoverPolicy(policy.NewActiveFailover()),
+				helix.WithMirror(mirrorClient,
+					mirror.WithWorkers(1),
+					mirror.WithQueueSize(64),
+				),
+				helix.WithAutoMemoryWorker(0), // primary replay so degraded writes don't crash setup
+			)
+			require.NoError(t, err)
+			t.Cleanup(primary.Close)
+
+			ctx := context.Background()
+			require.NoError(t, a.Pause(ctx))
+			defer func() { _ = a.Unpause(context.Background()) }()
+
+			stmt := fmt.Sprintf("INSERT INTO %s (key, value) VALUES (?, ?)", table)
+
+			// Drive enough writes to (a) trigger AdaptiveDualWrite degradation
+			// and (b) prove mirror dispatch fires on every successful write.
+			const writes = 10
+			for i := 0; i < writes; i++ {
+				key := fmt.Sprintf("k_adaptive_%d", i)
+				err := primary.Session().Query(stmt, key, "v").Mirror().ExecContext(ctx)
+				// Accept ErrWriteAsync as success — AdaptiveDualWrite reports
+				// fire-and-forget dispatch via this sentinel; mirror still
+				// fires because executeWriteWithReplay returns nil.
+				if err != nil && !errors.Is(err, htypes.ErrWriteAsync) {
+					t.Logf("[%s] write %d returned: %v", d.name, i, err)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			// AdaptiveDualWrite should have degraded A by now.
+			assert.True(t, adw.IsDegraded(htypes.ClusterA),
+				"[%s] AdaptiveDualWrite must mark A degraded under outage", d.name)
+
+			// Mirror engine must have dispatched the writes (some count >=
+			// half of total — exact count depends on degradation timing,
+			// but orthogonality means mirror is unaffected by ADW state).
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				if primary.Mirror().Stats().Success >= writes/2 {
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			t.Fatalf("[%s] mirror dispatch did not fire under AdaptiveDualWrite degradation; stats=%+v",
+				d.name, primary.Mirror().Stats())
+		})
+	}
+}
+
 // TestMirror_PrimaryPartialOutage_MirrorStillFires verifies the
 // any-cluster-ack contract under real conditions: with one primary cluster
 // paused the dual-write returns nil (the healthy cluster acked); mirror

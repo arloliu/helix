@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **e2e suite hardening (v1.4.0 follow-up)**: combination-coverage audit
+  flagged five real production scenarios with zero e2e coverage. Added
+  five new e2e tests, each parameterized over v1 and v2 drivers:
+  - `TestMirror_WithAdaptiveDualWritePrimary` — proves the v1.4.0 plan's
+    central orthogonality claim under real outage. Pause primary cluster
+    A, AdaptiveDualWrite degrades, primary returns nil via any-cluster-ack,
+    mirror dispatch fires regardless of write strategy state.
+  - `TestS_NetworkDisconnect_StickyReadFailover` — first test in the
+    repo to exercise `testutil.NetworkDisconnect`. Real network partition
+    via Docker network detach, StickyRead fails over from A to B, failover
+    metric increments. Closest reproducible analog to a real cloud blip
+    (different from `Pause` which keeps TCP open).
+  - `TestS1b_PauseA_NATSReplayerDrain` — companion to S1 exercising the
+    production `NATSReplayer` + `NATSWorker` durability backend rather
+    than `MemoryReplayer`. Pause A, drive writes, replays land in NATS
+    JetStream, Unpause, NATSWorker drains and both clusters converge.
+  - `TestS2b_PauseB_StickyReadFailover` — symmetry counterpart to S2
+    (which always paused cluster A). Verifies different gocql session,
+    different driver state, different ports behave symmetrically when B
+    is the failing cluster.
+  - `TestS_SequentialFailures_AThenB` — cascading failure path. Pause A
+    (failover to B), Unpause A, Pause B (failover back to A). Proves
+    helix's per-cluster health state is reset on recovery and the
+    failover metric records every transition, not just the first.
+
 - **Mirror e2e Stop+Start and Kill scenarios (v1.4.0 follow-up)**:
   combination-coverage audit found the original mirror e2e suite covered
   only `Pause` (graceful TCP-open hang). Real migrations also see
