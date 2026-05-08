@@ -12,6 +12,57 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+// RecoveryProbe configures the background recovery probe that accelerates
+// [policy.AdaptiveDualWrite] cluster recovery.
+//
+// When a cluster is degraded, the probe fires at each Interval and executes
+// Probe against that cluster's live session. A nil (success) result credits
+// one recovery point via [policy.AdaptiveDualWrite.RecordProbeSuccess]; the
+// cluster returns to healthy state once it accumulates the strategy's
+// recovery threshold of consecutive successes.
+//
+// The probe is intentionally lightweight: the default reads a single cell
+// from system.local to verify the driver can reach the cluster, without
+// write traffic or schema dependencies. Operators with write-path-specific
+// failure modes may supply a custom Probe function (e.g., a test write to a
+// dedicated probe table).
+//
+// Recovery probe is default-on for [policy.AdaptiveDualWrite] users. Use
+// [WithRecoveryProbeDisabled] to opt out.
+type RecoveryProbe struct {
+	// Probe is the health check executed against a degraded cluster's live
+	// session. Return nil to credit a recovery point; return non-nil to
+	// leave the cluster in its current degraded state.
+	//
+	// The context is bound by Timeout. If nil, the default probe queries
+	// SELECT release_version FROM system.local.
+	Probe func(ctx context.Context, session cql.Session) error
+
+	// Interval is the period between probe checks. Default: 2s.
+	Interval time.Duration
+
+	// Timeout bounds each individual probe call. Default: 1s.
+	Timeout time.Duration
+}
+
+// DefaultRecoveryProbe returns a RecoveryProbe with production-safe defaults:
+// a system.local read probe, 2-second interval, and 1-second per-probe timeout.
+func DefaultRecoveryProbe() RecoveryProbe {
+	return RecoveryProbe{
+		Probe:    systemLocalProbe,
+		Interval: 2 * time.Second,
+		Timeout:  1 * time.Second,
+	}
+}
+
+// systemLocalProbe is the default RecoveryProbe.Probe implementation: it
+// reads release_version from system.local to verify the driver can reach the
+// cluster, without write traffic or schema dependencies.
+func systemLocalProbe(ctx context.Context, session cql.Session) error {
+	var ver string
+	return session.Query("SELECT release_version FROM system.local").ScanContext(ctx, &ver)
+}
+
 // TimestampProvider generates timestamps for write operations.
 //
 // The default provider uses time.Now().UnixMicro().
@@ -159,6 +210,18 @@ type ClientConfig struct {
 	// The lower-level [CQLClient.SwapSession] does not require a refresher
 	// because the caller passes the new session directly.
 	SessionRefresher SessionRefresher
+
+	// RecoveryProbe configures the background probe that runs against degraded
+	// clusters to accelerate recovery for [policy.AdaptiveDualWrite]. When nil
+	// and the write strategy is AdaptiveDualWrite, a default probe is used
+	// automatically. When recoveryProbeOff is true, no probe is started.
+	//
+	// Set via [WithRecoveryProbe]; disable via [WithRecoveryProbeDisabled].
+	RecoveryProbe *RecoveryProbe
+
+	// recoveryProbeOff disables the recovery probe even when AdaptiveDualWrite
+	// is detected. Set via [WithRecoveryProbeDisabled].
+	recoveryProbeOff bool
 }
 
 // SessionRefresher builds a fresh [cql.Session] for the given cluster.
@@ -272,6 +335,48 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 func WithSessionRefresher(fn SessionRefresher) Option {
 	return func(c *ClientConfig) {
 		c.SessionRefresher = fn
+	}
+}
+
+// WithRecoveryProbe configures a custom recovery probe for [policy.AdaptiveDualWrite].
+//
+// The probe is called on each Interval against a degraded cluster's live session.
+// A nil return credits one recovery point; a non-nil return leaves the cluster
+// degraded. Interval and Timeout must both be positive; zero values are replaced
+// with the defaults from [DefaultRecoveryProbe].
+//
+// When not set, a default probe (system.local read, 2s interval, 1s timeout) runs
+// automatically for any client whose WriteStrategy is [policy.AdaptiveDualWrite].
+// Use [WithRecoveryProbeDisabled] to suppress all probing.
+//
+// Returns:
+//   - Option: Configuration option
+func WithRecoveryProbe(p RecoveryProbe) Option {
+	def := DefaultRecoveryProbe()
+	if p.Probe == nil {
+		p.Probe = def.Probe
+	}
+	if p.Interval <= 0 {
+		p.Interval = def.Interval
+	}
+	if p.Timeout <= 0 {
+		p.Timeout = def.Timeout
+	}
+
+	return func(c *ClientConfig) {
+		c.RecoveryProbe = &p
+	}
+}
+
+// WithRecoveryProbeDisabled disables the background recovery probe even when
+// [policy.AdaptiveDualWrite] is the configured write strategy. Use this when
+// you prefer fully manual recovery via [policy.AdaptiveDualWrite.ForceRecover].
+//
+// Returns:
+//   - Option: Configuration option
+func WithRecoveryProbeDisabled() Option {
+	return func(c *ClientConfig) {
+		c.recoveryProbeOff = true
 	}
 }
 

@@ -153,3 +153,17 @@ func (m *NopMetrics) SetMirrorEnabled(_ bool) {}
 // Compile-time assertion that NopMetrics implements the optional
 // types.MirrorMetrics interface so embedders pick up no-op coverage.
 var _ types.MirrorMetrics = (*NopMetrics)(nil)
+
+// ----------------------
+// Recovery probe (optional types.RecoveryProbeMetrics)
+// ----------------------
+
+// IncRecoveryProbeSuccess discards the metric.
+func (m *NopMetrics) IncRecoveryProbeSuccess(_ types.ClusterID) {}
+
+// IncRecoveryProbeFailure discards the metric.
+func (m *NopMetrics) IncRecoveryProbeFailure(_ types.ClusterID) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.RecoveryProbeMetrics interface so embedders pick up no-op coverage.
+var _ types.RecoveryProbeMetrics = (*NopMetrics)(nil)
