@@ -7,6 +7,7 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
+	"github.com/arloliu/helix/mirror"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
@@ -102,6 +103,19 @@ type ClientConfig struct {
 	// [WithAutoRefresh] to enable; tune individual knobs with the
 	// AutoRefresh*Option helpers.
 	AutoRefresh AutoRefreshConfig
+
+	// MirrorTarget is the destination helix CQLClient that receives async
+	// mirror writes for queries / batches opted in via [Query.Mirror] /
+	// [Batch.Mirror]. When nil, Mirror() is a no-op. Set via [WithMirror].
+	MirrorTarget *CQLClient
+
+	// MirrorOptions configures the mirror engine constructed when
+	// MirrorTarget is non-nil. Set via [WithMirror].
+	MirrorOptions []mirror.Option
+
+	// MirrorEngine is the constructed mirror engine. Populated during
+	// NewCQLClient when MirrorTarget is set; otherwise nil.
+	MirrorEngine *mirror.Engine
 
 	// SessionRefresher is an optional caller-supplied factory used by
 	// [CQLClient.RefreshSession] to build a replacement [cql.Session] for a
@@ -232,6 +246,50 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 func WithSessionRefresher(fn SessionRefresher) Option {
 	return func(c *ClientConfig) {
 		c.SessionRefresher = fn
+	}
+}
+
+// WithMirror configures the helix CQLClient to asynchronously mirror writes
+// opted in via [Query.Mirror] / [Batch.Mirror] to a second helix dual-cluster
+// pair represented by target.
+//
+// The target must be a fully constructed helix CQLClient pointing at the
+// mirror destination (e.g., a new pair stood up for a migration). Mirror
+// writes preserve the original client-generated timestamp so server-side
+// WRITETIME semantics on the mirror cluster match the primary cluster.
+//
+// Mirroring is fire-and-forget: the mirror leg never surfaces an error to
+// the caller. When the queue is full or the engine is disabled, captures
+// are dropped (with metrics, logs, and an optional [mirror.WithOnDrop]
+// callback). Mirror engine behavior is configured via mirror.Option values.
+//
+// The mirror engine is started during NewCQLClient and stopped during
+// CQLClient.Close. Runtime control is available via CQLClient.Mirror()
+// (Enable / Disable / Enabled / Stats).
+//
+// Example:
+//
+//	mirrorClient, _ := helix.NewCQLClient(newA, newB,
+//	    helix.WithWriteStrategy(helix.ConcurrentDualWrite),
+//	)
+//	client, _ := helix.NewCQLClient(currentA, currentB,
+//	    helix.WithWriteStrategy(helix.ConcurrentDualWrite),
+//	    helix.WithMirror(mirrorClient,
+//	        mirror.WithQueueSize(8192),
+//	        mirror.WithWorkers(4),
+//	    ),
+//	)
+//
+// Parameters:
+//   - target: The destination helix CQLClient.
+//   - opts:   Mirror engine options.
+//
+// Returns:
+//   - Option: Configuration option.
+func WithMirror(target *CQLClient, opts ...mirror.Option) Option {
+	return func(c *ClientConfig) {
+		c.MirrorTarget = target
+		c.MirrorOptions = opts
 	}
 }
 

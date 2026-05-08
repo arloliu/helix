@@ -12,6 +12,7 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
+	"github.com/arloliu/helix/mirror"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
@@ -525,6 +526,31 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// expanding the public ReplayWorker / WriteStrategy interfaces.
 	autoInjectMetricsAndLogger(config)
 
+	// Dispatch mirror writes through the target's full Exec path so its
+	// own write strategy and client-generated timestamp pinning apply.
+	if config.MirrorTarget != nil {
+		mirrorTarget := config.MirrorTarget
+		execute := func(ctx context.Context, payload types.ReplayPayload) error {
+			if payload.IsBatch {
+				batch := mirrorTarget.Batch(payload.BatchType)
+				for _, stmt := range payload.BatchStatements {
+					batch = batch.Query(stmt.Query, stmt.Args...)
+				}
+				return batch.WithTimestamp(payload.Timestamp).ExecContext(ctx)
+			}
+
+			return mirrorTarget.Query(payload.Query, payload.Args...).
+				WithTimestamp(payload.Timestamp).
+				ExecContext(ctx)
+		}
+		opts := append(
+			[]mirror.Option{mirror.WithLogger(config.Logger)},
+			config.MirrorOptions...,
+		)
+		config.MirrorEngine = mirror.NewEngine(execute, opts...)
+		config.MirrorEngine.Start()
+	}
+
 	// Start topology watcher if configured. The cancel function is stashed so
 	// that it is called on any subsequent initialization error, preventing the
 	// watchTopology goroutine from leaking.
@@ -757,6 +783,10 @@ func (c *CQLClient) Close() {
 		// Stop replay worker
 		if c.config.ReplayWorker != nil {
 			c.config.ReplayWorker.Stop()
+		}
+
+		if c.config.MirrorEngine != nil {
+			c.config.MirrorEngine.Stop()
 		}
 
 		c.loadSessionA().Close()
@@ -1855,6 +1885,7 @@ type cqlQuery struct {
 	timestamp         *int64
 	priority          *PriorityLevel
 	fallbackRead      bool
+	mirror            bool
 }
 
 func (q *cqlQuery) WithContext(ctx context.Context) Query {
@@ -1905,6 +1936,11 @@ func (q *cqlQuery) FallbackRead() Query {
 	return q
 }
 
+func (q *cqlQuery) Mirror() Query {
+	q.mirror = true
+	return q
+}
+
 func (q *cqlQuery) getContext() context.Context {
 	if q.ctx != nil {
 		return q.ctx
@@ -1947,8 +1983,17 @@ func (q *cqlQuery) Exec() error {
 	return q.ExecContext(q.getContext())
 }
 
-func (q *cqlQuery) ExecContext(ctx context.Context) error {
+func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 	ts := q.getTimestamp()
+	priority := q.getPriority()
+
+	if q.mirror {
+		defer func() {
+			if err == nil {
+				q.client.dispatchMirrorQuery(q.statement, q.values, ts, priority)
+			}
+		}()
+	}
 
 	// Fast path for single-cluster mode to avoid allocations
 	if q.client.IsSingleCluster() {
@@ -1962,7 +2007,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 		// to ensure consistency across clusters
 		query = query.WithTimestamp(ts)
 
-		err := query.ExecContext(ctx)
+		err = query.ExecContext(ctx)
 		q.client.recordOpOutcome(ClusterA, err)
 
 		return err
@@ -1972,10 +2017,10 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 		statement: q.statement,
 		args:      q.values,
 		timestamp: ts,
-		priority:  q.getPriority(),
+		priority:  priority,
 	}
 
-	return q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
+	err = q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 		// Important for writes to generate the timestamp on the client side
@@ -1984,6 +2029,8 @@ func (q *cqlQuery) ExecContext(ctx context.Context) error {
 
 		return query.ExecContext(ctx)
 	})
+
+	return err
 }
 
 func (q *cqlQuery) Scan(dest ...any) error {
@@ -2104,6 +2151,7 @@ type cqlBatch struct {
 	serialConsistency *Consistency
 	timestamp         *int64
 	priority          *PriorityLevel
+	mirror            bool
 }
 
 func (b *cqlBatch) Query(stmt string, args ...any) Batch {
@@ -2151,6 +2199,11 @@ func (b *cqlBatch) WithPriority(p PriorityLevel) Batch {
 	return b
 }
 
+func (b *cqlBatch) Mirror() Batch {
+	b.mirror = true
+	return b
+}
+
 func (b *cqlBatch) getContext() context.Context {
 	if b.ctx != nil {
 		return b.ctx
@@ -2176,8 +2229,17 @@ func (b *cqlBatch) Exec() error {
 	return b.ExecContext(b.getContext())
 }
 
-func (b *cqlBatch) ExecContext(ctx context.Context) error {
+func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 	ts := b.getTimestamp()
+	priority := b.getPriority()
+
+	if b.mirror {
+		defer func() {
+			if err == nil {
+				b.client.dispatchMirrorBatch(b.kind, b.entries, ts, priority)
+			}
+		}()
+	}
 
 	// Fast path for single-cluster mode to avoid allocations
 	if b.client.IsSingleCluster() {
@@ -2197,7 +2259,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 		}
 		batch = batch.WithTimestamp(ts)
 
-		err := batch.ExecContext(ctx)
+		err = batch.ExecContext(ctx)
 		b.client.recordOpOutcome(ClusterA, err)
 
 		return err
@@ -2207,13 +2269,13 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 		statement:    "", // Empty for batch
 		args:         nil,
 		timestamp:    ts,
-		priority:     b.getPriority(),
+		priority:     priority,
 		isBatch:      true,
 		batchType:    b.kind,
 		batchEntries: b.entries, // Pass directly, convert lazily if needed for replay
 	}
 
-	return b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
+	err = b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
 		batch := session.Batch(b.kind)
 		for _, entry := range b.entries {
 			batch = batch.Query(entry.statement, entry.args...)
@@ -2228,6 +2290,8 @@ func (b *cqlBatch) ExecContext(ctx context.Context) error {
 
 		return batch.ExecContext(ctx)
 	})
+
+	return err
 }
 
 // IterContext executes the batch and returns an iterator for the results.

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Async mirror writes (v1.4.0 Phase 1)**: per-statement opt-in mirroring of
+  writes to a second helix dual-cluster pair, designed for seamless Cassandra
+  cluster migrations where the application needs N days of write history on
+  the new clusters before cutover.
+  - `Query.Mirror()` / `Batch.Mirror()`: fluent opt-in on a single statement
+    or batch. Always async, fire-and-forget; the mirror leg never surfaces
+    an error to the caller. The original client-generated timestamp is
+    preserved on the mirror exec so server-side `WRITETIME`, LWW, TTL, and
+    tombstone semantics match the primary cluster.
+  - `helix.WithMirror(target, opts...)`: configures the mirror destination
+    (a second helix `*CQLClient`) and engine options. Mirroring fires only
+    after the primary write succeeds (any-cluster ack); total primary
+    failure suppresses the mirror.
+  - `mirror.Engine`: bounded in-memory queue + worker pool with non-blocking
+    enqueue and drop-on-full policy. Drop logs are rate-limited; an optional
+    `mirror.WithOnDrop` callback receives every dropped capture.
+  - `*CQLClient.Mirror()`: runtime control surface — `Enable`, `Disable`
+    (drains in-flight queue), `Enabled`, and a `Stats` snapshot
+    (Enqueued / Dropped / Success / Error / QueueDepth).
+  - Bound `[]any` args (and batch statement args) are deep-copied
+    synchronously before Exec returns, so caller-side buffer reuse / pooling
+    cannot corrupt mirror payloads.
+
+  Phase 1 ships in-memory dispatch only; failed mirror writes are logged and
+  counted but not retried. Phase 2 will integrate the existing replay system
+  for durability; Phase 3 adds an out-of-process NATS publisher mode. See
+  `docs/plans/v1.4.0-async-mirror.md` for the full plan.
+
 ## [1.3.0] — 2026-05-08
 
 ### Added

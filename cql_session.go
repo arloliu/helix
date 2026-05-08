@@ -121,6 +121,25 @@ type Query interface {
 	//   - Query: The same query for chaining
 	SerialConsistency(c Consistency) Query
 
+	// Mirror marks this write to be asynchronously mirrored to the helix
+	// mirror destination configured via [WithMirror].
+	//
+	// Mirroring is fire-and-forget: the mirror write is dispatched on a
+	// background worker pool after the primary write completes successfully
+	// (at least one current-pair cluster acked). Errors on the mirror leg
+	// are never surfaced to the caller. Captures are dropped silently (with
+	// metrics and a log entry) when the mirror queue is full or the engine
+	// is disabled.
+	//
+	// Mirror has no effect on read or CAS operations and no effect when
+	// [WithMirror] was not configured. The original write timestamp is
+	// preserved on the mirror exec so server-side WRITETIME, LWW, TTL, and
+	// tombstone semantics match the primary cluster.
+	//
+	// Returns:
+	//   - Query: The same query for chaining
+	Mirror() Query
+
 	// FallbackRead enables best-effort read from both clusters for this query.
 	//
 	// When the selected cluster returns not-found (zero rows), Helix silently
@@ -344,6 +363,17 @@ type Batch interface {
 	// Returns:
 	//   - Batch: The same batch for chaining
 	SerialConsistency(c Consistency) Batch
+
+	// Mirror marks this batch to be asynchronously mirrored to the helix
+	// mirror destination configured via [WithMirror]. The whole batch is
+	// mirrored atomically; mixed mirror/non-mirror statements within a
+	// single batch are not supported.
+	//
+	// See [Query.Mirror] for full semantics.
+	//
+	// Returns:
+	//   - Batch: The same batch for chaining
+	Mirror() Batch
 
 	// Size returns the number of statements in the batch.
 	//
