@@ -140,6 +140,37 @@ type Query interface {
 	//   - Query: The same query for chaining
 	Mirror() Query
 
+	// Strict marks the statement for strong-consistency dual-write semantics.
+	//
+	// On partial failure (one cluster fails, times out, is degraded, or is
+	// draining), Strict returns [*types.PartialWriteError] instead of silently
+	// enqueueing for replay. On [policy.AdaptiveDualWrite], Strict fast-fails to
+	// degraded clusters rather than fire-and-forgetting; the recovery probe
+	// continues running in the background so degraded clusters still self-heal.
+	// Pair with [Query.FallbackRead] on reads when the row may be absent on one cluster.
+	//
+	// What Strict guarantees: no Helix-side replay; no fire-and-forget;
+	// explicit partial-failure surface to the caller.
+	//
+	// What Strict does NOT guarantee: atomic dual-cluster writes,
+	// exactly-once delivery, or divergence detection. A [*types.PartialWriteError]
+	// means the unacknowledged cluster did not respond OK before the deadline;
+	// the mutation MAY have applied. Caller retries on PartialWriteError can
+	// still double-apply non-idempotent ops.
+	//
+	// Use only for writes whose replay is unsafe (counters, list/set append,
+	// tombstone-race-sensitive flows). Normal column overwrites are already
+	// replay-safe via timestamps; using Strict() for those is unnecessary.
+	//
+	// Strict and Mirror are mutually exclusive: combining them returns
+	// [types.ErrStrictMirrorUnsupported] before any write is attempted.
+	//
+	// In single-cluster mode or CAS operations, Strict is a documented no-op.
+	//
+	// Returns:
+	//   - Query: The same query for chaining
+	Strict() Query
+
 	// FallbackRead enables best-effort read from both clusters for this query.
 	//
 	// When the selected cluster returns not-found (zero rows), Helix silently
@@ -374,6 +405,14 @@ type Batch interface {
 	// Returns:
 	//   - Batch: The same batch for chaining
 	Mirror() Batch
+
+	// Strict marks the batch for strong-consistency dual-write semantics.
+	//
+	// See [Query.Strict] for full semantics and guarantees.
+	//
+	// Returns:
+	//   - Batch: The same batch for chaining
+	Strict() Batch
 
 	// Size returns the number of statements in the batch.
 	//

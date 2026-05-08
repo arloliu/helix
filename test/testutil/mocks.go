@@ -212,6 +212,11 @@ func (m *MockQuery) Mirror() helix.Query {
 	return m
 }
 
+// Strict marks this query for strict dual-write semantics (no-op in mock).
+func (m *MockQuery) Strict() helix.Query {
+	return m
+}
+
 // Exec executes the query.
 func (m *MockQuery) Exec() error {
 	m.mu.RLock()
@@ -423,6 +428,11 @@ func (m *MockBatch) WithTimestamp(ts int64) helix.Batch {
 
 // Mirror marks this batch for async mirror dispatch (no-op in mock).
 func (m *MockBatch) Mirror() helix.Batch {
+	return m
+}
+
+// Strict marks this batch for strict dual-write semantics (no-op in mock).
+func (m *MockBatch) Strict() helix.Batch {
 	return m
 }
 

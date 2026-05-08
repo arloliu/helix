@@ -345,7 +345,9 @@ func (c *CQLClient) recordOpOutcomeAt(cluster ClusterID, err error, nowNano int6
 		}
 	case errors.Is(err, types.ErrWriteAsync),
 		errors.Is(err, types.ErrWriteDropped),
-		errors.Is(err, types.ErrNotFound):
+		errors.Is(err, types.ErrNotFound),
+		errors.Is(err, types.ErrClusterDegraded),
+		errors.Is(err, types.ErrClusterDraining):
 		// Operational/data state; not a health signal.
 		return
 	default:
@@ -1223,6 +1225,7 @@ type writeContext struct {
 	isBatch      bool
 	batchType    BatchType
 	batchEntries []batchEntry // Internal format, converted lazily for replay
+	strict       bool         // if true: no replay, returns PartialWriteError on partial failure
 }
 
 // toBatchStatements converts internal batchEntries to types.BatchStatement for replay.
@@ -1276,6 +1279,13 @@ func (c *CQLClient) executeWriteWithReplay(
 
 	// If both clusters are draining, fail immediately
 	if drainA && drainB {
+		if wc.strict {
+			return &types.DualClusterError{
+				ErrorA: types.ErrClusterDraining,
+				ErrorB: types.ErrClusterDraining,
+			}
+		}
+
 		return types.ErrBothClustersDraining
 	}
 
@@ -1320,12 +1330,30 @@ func (c *CQLClient) executeWriteWithDrain(
 		c.config.Metrics.ObserveWriteDuration(healthyCluster, elapsed)
 		c.recordOpOutcome(healthyCluster, err)
 
+		if wc.strict {
+			// Healthy cluster also failed: return DualClusterError with both causes.
+			if drainA {
+				return &types.DualClusterError{ErrorA: types.ErrClusterDraining, ErrorB: err}
+			}
+
+			return &types.DualClusterError{ErrorA: err, ErrorB: types.ErrClusterDraining}
+		}
+
 		return err
 	}
 
 	c.config.Metrics.IncWriteTotal(healthyCluster)
 	c.config.Metrics.ObserveWriteDuration(healthyCluster, elapsed)
 	c.recordOpOutcome(healthyCluster, nil)
+
+	if wc.strict {
+		// Strict: draining cluster is a skip, not a replay target.
+		return &types.PartialWriteError{
+			Acknowledged:   healthyCluster,
+			Unacknowledged: drainingCluster,
+			Cause:          types.ErrClusterDraining,
+		}
+	}
 
 	// Enqueue for replay to the draining cluster
 	if c.config.Replayer != nil {
@@ -1363,6 +1391,9 @@ func (c *CQLClient) executeDualWrite(
 	wc writeContext,
 	writeFunc func(context.Context, cql.Session) error,
 ) error {
+	if wc.strict {
+		return c.executeStrictDualWrite(ctx, writeFunc)
+	}
 	// Dual-cluster mode: concurrent writes with replay support
 	// Note: We capture start times outside the write functions to avoid data races
 	// when WriteStrategy uses fire-and-forget (background goroutines).
@@ -1531,6 +1562,87 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 		if c.config.OnReplayDropped != nil {
 			c.config.OnReplayDropped(payload, enqueueErr)
 		}
+	}
+}
+
+// executeStrictDualWrite performs dual-cluster writes with Strict() semantics:
+// no replay enqueue, no fire-and-forget. Returns [*types.PartialWriteError] on
+// partial failure or [*types.DualClusterError] when both clusters fail.
+//
+// A nil WriteStrategy uses the same inline concurrent write as the default
+// non-strict path. A non-nil WriteStrategy that does not implement [StrictWriter]
+// surfaces as [types.ErrStrictUnsupported].
+func (c *CQLClient) executeStrictDualWrite(
+	ctx context.Context,
+	writeFunc func(context.Context, cql.Session) error,
+) error {
+	var startA, startB atomic.Int64
+
+	writeA := func(ctx context.Context) error {
+		startA.Store(time.Now().UnixNano())
+		return writeFunc(ctx, c.loadSessionA())
+	}
+	writeB := func(ctx context.Context) error {
+		startB.Store(time.Now().UnixNano())
+		return writeFunc(ctx, c.loadSessionB())
+	}
+
+	var errA, errB error
+
+	if sw, ok := c.config.WriteStrategy.(StrictWriter); ok {
+		errA, errB = sw.ExecuteStrict(ctx, writeA, writeB)
+	} else if c.config.WriteStrategy != nil {
+		return types.ErrStrictUnsupported
+	} else {
+		var wg sync.WaitGroup
+		wg.Go(func() { errA = writeA(ctx) })
+		wg.Go(func() { errB = writeB(ctx) })
+		wg.Wait()
+	}
+
+	now := time.Now()
+	nowNano := now.UnixNano()
+
+	isSkippedA := errors.Is(errA, types.ErrClusterDegraded) || errors.Is(errA, types.ErrClusterDraining)
+	isSkippedB := errors.Is(errB, types.ErrClusterDegraded) || errors.Is(errB, types.ErrClusterDraining)
+
+	c.config.Metrics.IncWriteTotal(ClusterA)
+	if startANano := startA.Load(); startANano > 0 {
+		c.config.Metrics.ObserveWriteDuration(ClusterA, float64(nowNano-startANano)/float64(time.Second))
+	}
+	if errA != nil && !isSkippedA {
+		c.config.Metrics.IncWriteError(ClusterA)
+	}
+
+	c.config.Metrics.IncWriteTotal(ClusterB)
+	if startBNano := startB.Load(); startBNano > 0 {
+		c.config.Metrics.ObserveWriteDuration(ClusterB, float64(nowNano-startBNano)/float64(time.Second))
+	}
+	if errB != nil && !isSkippedB {
+		c.config.Metrics.IncWriteError(ClusterB)
+	}
+
+	c.recordOpOutcomeAt(ClusterA, errA, nowNano)
+	c.recordOpOutcomeAt(ClusterB, errB, nowNano)
+
+	if errA == nil && errB == nil {
+		return nil
+	}
+	if errA != nil && errB != nil {
+		return &types.DualClusterError{ErrorA: errA, ErrorB: errB}
+	}
+	if errA != nil {
+		return &types.PartialWriteError{
+			Acknowledged:   ClusterB,
+			Unacknowledged: ClusterA,
+			Cause:          errA,
+		}
+	}
+
+	return &types.PartialWriteError{
+		Acknowledged:   ClusterA,
+		Unacknowledged: ClusterB,
+		Cause:          errB,
 	}
 }
 
@@ -1886,6 +1998,7 @@ type cqlQuery struct {
 	priority          *PriorityLevel
 	fallbackRead      bool
 	mirror            bool
+	strict            bool
 }
 
 func (q *cqlQuery) WithContext(ctx context.Context) Query {
@@ -1941,6 +2054,11 @@ func (q *cqlQuery) Mirror() Query {
 	return q
 }
 
+func (q *cqlQuery) Strict() Query {
+	q.strict = true
+	return q
+}
+
 func (q *cqlQuery) getContext() context.Context {
 	if q.ctx != nil {
 		return q.ctx
@@ -1987,6 +2105,10 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 	ts := q.getTimestamp()
 	priority := q.getPriority()
 
+	if q.strict && q.mirror {
+		return types.ErrStrictMirrorUnsupported
+	}
+
 	if q.mirror {
 		defer func() {
 			if err == nil {
@@ -2018,6 +2140,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		args:      q.values,
 		timestamp: ts,
 		priority:  priority,
+		strict:    q.strict,
 	}
 
 	err = q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
@@ -2152,6 +2275,7 @@ type cqlBatch struct {
 	timestamp         *int64
 	priority          *PriorityLevel
 	mirror            bool
+	strict            bool
 }
 
 func (b *cqlBatch) Query(stmt string, args ...any) Batch {
@@ -2204,6 +2328,11 @@ func (b *cqlBatch) Mirror() Batch {
 	return b
 }
 
+func (b *cqlBatch) Strict() Batch {
+	b.strict = true
+	return b
+}
+
 func (b *cqlBatch) getContext() context.Context {
 	if b.ctx != nil {
 		return b.ctx
@@ -2232,6 +2361,10 @@ func (b *cqlBatch) Exec() error {
 func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 	ts := b.getTimestamp()
 	priority := b.getPriority()
+
+	if b.strict && b.mirror {
+		return types.ErrStrictMirrorUnsupported
+	}
 
 	if b.mirror {
 		defer func() {
@@ -2273,6 +2406,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		isBatch:      true,
 		batchType:    b.kind,
 		batchEntries: b.entries, // Pass directly, convert lazily if needed for replay
+		strict:       b.strict,
 	}
 
 	err = b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
