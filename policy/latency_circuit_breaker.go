@@ -100,6 +100,7 @@ func WithLatencyResetTimeout(d time.Duration) LatencyCircuitBreakerOption {
 func WithLatencyMetrics(m types.MetricsCollector) LatencyCircuitBreakerOption {
 	return func(l *LatencyCircuitBreaker) {
 		l.metrics = m
+		l.metricsExplicit = true
 	}
 }
 
@@ -116,6 +117,7 @@ func WithLatencyMetrics(m types.MetricsCollector) LatencyCircuitBreakerOption {
 func WithLatencyLogger(log types.Logger) LatencyCircuitBreakerOption {
 	return func(l *LatencyCircuitBreaker) {
 		l.logger = log
+		l.loggerExplicit = true
 	}
 }
 

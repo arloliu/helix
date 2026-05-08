@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **FailoverPolicy metrics and logger auto-injection** — surfaced while
+  writing the plain-`CircuitBreaker` e2e test. `NewCQLClient`'s
+  `autoInjectMetricsAndLogger` walked `ReplayWorker` and `WriteStrategy`
+  but not `FailoverPolicy`, so users wiring `helix.WithMetrics(collector)`
+  + `helix.WithFailoverPolicy(policy.NewCircuitBreaker(...))` saw zero
+  `IncCircuitBreakerTrip` events in their dashboard — they had to also
+  pass `policy.WithCircuitBreakerMetrics(collector)` redundantly.
+  `CircuitBreaker` (and `LatencyCircuitBreaker` via embedding) now
+  satisfy the same `metricsAware` / `loggerAware` interfaces as
+  `AdaptiveDualWrite` and `replay.Worker`, and the auto-inject pass
+  walks `FailoverPolicy` too. Caller-supplied `WithCircuitBreakerMetrics`
+  / `WithLatencyMetrics` / `WithCircuitBreakerLogger` /
+  `WithLatencyLogger` still win on conflict (last-write-wins via
+  the `metricsExplicit` / `loggerExplicit` guard).
+
 ### Added
 
 - **e2e final-pass: plain CB, FallbackRead, Mirror+drain (v1.4.0)**:

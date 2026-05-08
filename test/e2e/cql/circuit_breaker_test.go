@@ -39,15 +39,11 @@ func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
-			mc := testutil.NewTestMetricsCollector()
 			cb := policy.NewCircuitBreaker(
 				policy.WithThreshold(3),
 				policy.WithResetTimeout(3*time.Second),
-				// FailoverPolicy is not auto-injected with the client's
-				// metrics collector — wire it explicitly so the trip
-				// counter is observable.
-				policy.WithCircuitBreakerMetrics(mc),
 			)
+			mc := testutil.NewTestMetricsCollector()
 
 			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
 				helix.WithReadStrategy(policy.NewStickyRead(

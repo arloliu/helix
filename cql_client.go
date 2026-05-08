@@ -393,11 +393,23 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 				ws.SetMetrics(config.Metrics)
 			}
 		}
+		if config.FailoverPolicy != nil {
+			if fp, ok := config.FailoverPolicy.(metricsAware); ok && !fp.MetricsConfigured() {
+				fp.SetMetrics(config.Metrics)
+			}
+		}
 	}
 
-	if config.Logger != nil && config.WriteStrategy != nil {
-		if ws, ok := config.WriteStrategy.(loggerAware); ok {
-			ws.SetLogger(config.Logger)
+	if config.Logger != nil {
+		if config.WriteStrategy != nil {
+			if ws, ok := config.WriteStrategy.(loggerAware); ok {
+				ws.SetLogger(config.Logger)
+			}
+		}
+		if config.FailoverPolicy != nil {
+			if fp, ok := config.FailoverPolicy.(loggerAware); ok {
+				fp.SetLogger(config.Logger)
+			}
 		}
 	}
 }

@@ -83,6 +83,14 @@ type CircuitBreaker struct {
 	logger       types.Logger
 	clusterNames atomic.Pointer[types.ClusterNames]
 
+	// metricsExplicit / loggerExplicit track whether the caller passed
+	// WithCircuitBreakerMetrics / WithCircuitBreakerLogger (or the
+	// LatencyCircuitBreaker equivalents). Without these flags, helix's
+	// auto-inject pass would overwrite a caller's explicit choice with
+	// the client-level collector / logger.
+	metricsExplicit bool
+	loggerExplicit  bool
+
 	muA          sync.Mutex   // serializes compound ops for cluster A
 	trippedA     bool         // circuit open for A; guarded by muA
 	failuresA    atomic.Int32 // lock-free for ShouldFailover; written under muA
@@ -133,6 +141,7 @@ func WithResetTimeout(d time.Duration) CircuitBreakerOption {
 func WithCircuitBreakerMetrics(m types.MetricsCollector) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
 		c.metrics = m
+		c.metricsExplicit = true
 	}
 }
 
@@ -146,7 +155,53 @@ func WithCircuitBreakerMetrics(m types.MetricsCollector) CircuitBreakerOption {
 func WithCircuitBreakerLogger(l types.Logger) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
 		c.logger = l
+		c.loggerExplicit = true
 	}
+}
+
+// MetricsConfigured reports whether the metrics collector was explicitly
+// set via [WithCircuitBreakerMetrics] (or [WithLatencyMetrics] for the
+// embedded LatencyCircuitBreaker case). Helix's CQLClient uses this to
+// detect a caller-passed policy without metrics and inject its own
+// collector so circuit-breaker trips participate in unified instrumentation.
+func (c *CircuitBreaker) MetricsConfigured() bool {
+	return c.metricsExplicit
+}
+
+// SetMetrics replaces the metrics collector. No-op once
+// [CircuitBreaker.MetricsConfigured] returns true (caller's explicit
+// choice wins) or if m is nil.
+func (c *CircuitBreaker) SetMetrics(m types.MetricsCollector) {
+	if c.metricsExplicit {
+		return
+	}
+	if m == nil {
+		return
+	}
+	c.metrics = m
+	c.metricsExplicit = true
+}
+
+// LoggerConfigured reports whether the logger was explicitly set via
+// [WithCircuitBreakerLogger] / [WithLatencyLogger]. Mirrors
+// MetricsConfigured so the helix client can use the same auto-injection
+// guard for both knobs.
+func (c *CircuitBreaker) LoggerConfigured() bool {
+	return c.loggerExplicit
+}
+
+// SetLogger replaces the logger. No-op once
+// [CircuitBreaker.LoggerConfigured] returns true (caller's explicit
+// choice wins) or if l is nil.
+func (c *CircuitBreaker) SetLogger(l types.Logger) {
+	if c.loggerExplicit {
+		return
+	}
+	if l == nil {
+		return
+	}
+	c.logger = l
+	c.loggerExplicit = true
 }
 
 // WithCircuitBreakerClusterNames sets the cluster display names for log messages.
