@@ -87,6 +87,73 @@ func TestDualClusterError_BothNil(t *testing.T) {
 	assert.Equal(t, []error{ErrBothClustersFailed}, err.Unwrap())
 }
 
+func TestPartialWriteError(t *testing.T) {
+	cause := errors.New("write timeout")
+	err := &PartialWriteError{
+		Acknowledged:   ClusterA,
+		Unacknowledged: ClusterB,
+		Cause:          cause,
+	}
+
+	assert.Contains(t, err.Error(), string(ClusterA))
+	assert.Contains(t, err.Error(), string(ClusterB))
+	assert.Contains(t, err.Error(), "write timeout")
+
+	// Unwrap exposes the cause
+	assert.True(t, errors.Is(err, cause))
+
+	// errors.As through a wrapping error
+	wrapped := fmt.Errorf("operation: %w", err)
+	var target *PartialWriteError
+	require.True(t, errors.As(wrapped, &target))
+	assert.Equal(t, ClusterA, target.Acknowledged)
+	assert.Equal(t, ClusterB, target.Unacknowledged)
+}
+
+func TestPartialWriteError_SentinelCause(t *testing.T) {
+	err := &PartialWriteError{
+		Acknowledged:   ClusterA,
+		Unacknowledged: ClusterB,
+		Cause:          ErrClusterDegraded,
+	}
+	assert.True(t, errors.Is(err, ErrClusterDegraded))
+	assert.Contains(t, err.Error(), "strict write acknowledged on A but not on B")
+}
+
+func TestAsPartialWriteError(t *testing.T) {
+	cause := errors.New("timeout")
+	pwe := &PartialWriteError{Acknowledged: ClusterA, Unacknowledged: ClusterB, Cause: cause}
+
+	got, ok := AsPartialWriteError(pwe)
+	require.True(t, ok)
+	assert.Equal(t, pwe, got)
+
+	// Wrapped
+	wrapped := fmt.Errorf("ctx: %w", pwe)
+	got, ok = AsPartialWriteError(wrapped)
+	require.True(t, ok)
+	assert.Equal(t, pwe, got)
+
+	// Unrelated error
+	got, ok = AsPartialWriteError(errors.New("unrelated"))
+	assert.False(t, ok)
+	assert.Nil(t, got)
+
+	// nil
+	got, ok = AsPartialWriteError(nil)
+	assert.False(t, ok)
+	assert.Nil(t, got)
+}
+
+func TestIsPartialWrite(t *testing.T) {
+	pwe := &PartialWriteError{Acknowledged: ClusterA, Unacknowledged: ClusterB, Cause: errors.New("err")}
+
+	assert.True(t, IsPartialWrite(pwe))
+	assert.True(t, IsPartialWrite(fmt.Errorf("wrapped: %w", pwe)))
+	assert.False(t, IsPartialWrite(errors.New("unrelated")))
+	assert.False(t, IsPartialWrite(nil))
+}
+
 func TestSentinelErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -101,6 +168,10 @@ func TestSentinelErrors(t *testing.T) {
 		{"ErrWriteAsync", ErrWriteAsync, "write sent asynchronously"},
 		{"ErrWriteDropped", ErrWriteDropped, "write dropped"},
 		{"ErrNotFound", ErrNotFound, "not found"},
+		{"ErrClusterDegraded", ErrClusterDegraded, "cluster is degraded"},
+		{"ErrClusterDraining", ErrClusterDraining, "cluster is draining"},
+		{"ErrStrictUnsupported", ErrStrictUnsupported, "does not support Strict()"},
+		{"ErrStrictMirrorUnsupported", ErrStrictMirrorUnsupported, "Strict() and Mirror() cannot be combined"},
 	}
 
 	for _, tt := range tests {

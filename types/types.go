@@ -6,6 +6,7 @@ package types
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 )
 
@@ -203,6 +204,47 @@ type ReplayPayload struct {
 	Priority PriorityLevel
 }
 
+// PartialWriteError indicates that a Strict() write was acknowledged by exactly
+// one cluster. The other cluster did not respond OK before the deadline; the
+// mutation MAY OR MAY NOT have applied there.
+//
+// Callers MUST NOT assume the unacknowledged cluster is in a known state.
+// Compensating retries on non-idempotent operations (counters, list/set append)
+// can double-apply.
+type PartialWriteError struct {
+	// Acknowledged is the cluster that returned OK.
+	Acknowledged ClusterID
+
+	// Unacknowledged is the cluster that did not ack (reason in Cause).
+	Unacknowledged ClusterID
+
+	// Cause is the underlying error: timeout, sentinel, or driver error.
+	Cause error
+}
+
+// Error implements the error interface.
+func (e *PartialWriteError) Error() string {
+	return fmt.Sprintf("helix: strict write acknowledged on %s but not on %s: %v",
+		e.Acknowledged, e.Unacknowledged, e.Cause)
+}
+
+// Unwrap returns the underlying cause for errors.Is/As compatibility.
+func (e *PartialWriteError) Unwrap() error { return e.Cause }
+
+// AsPartialWriteError extracts a *PartialWriteError from err using errors.As.
+// Returns the error and true if found, or nil and false otherwise.
+func AsPartialWriteError(err error) (*PartialWriteError, bool) {
+	var pwe *PartialWriteError
+	ok := errors.As(err, &pwe)
+	return pwe, ok
+}
+
+// IsPartialWrite reports whether err contains a *PartialWriteError.
+func IsPartialWrite(err error) bool {
+	_, ok := AsPartialWriteError(err)
+	return ok
+}
+
 // Sentinel errors for common failure scenarios.
 var (
 	// ErrBothClustersFailed indicates that a write failed on both clusters.
@@ -260,6 +302,27 @@ var (
 	// must either register one at construction or use the lower-level
 	// SwapSession to provide a freshly-built session directly.
 	ErrNoSessionRefresher = errors.New("helix: no session refresher configured")
+
+	// ErrClusterDegraded indicates a Strict() write was skipped because the
+	// cluster is currently flagged degraded by AdaptiveDualWrite. The write
+	// was not sent to that cluster and was not enqueued for replay.
+	ErrClusterDegraded = errors.New("helix: cluster is degraded; strict write skipped")
+
+	// ErrClusterDraining indicates a Strict() write was skipped because the
+	// cluster is currently in topology drain mode. The write was not sent to
+	// that cluster and was not enqueued for replay.
+	ErrClusterDraining = errors.New("helix: cluster is draining; strict write skipped")
+
+	// ErrStrictUnsupported indicates the configured WriteStrategy does not
+	// implement StrictWriter and a Strict() statement was attempted. Switch to
+	// ConcurrentDualWrite, SyncDualWrite, or AdaptiveDualWrite to use Strict().
+	ErrStrictUnsupported = errors.New("helix: configured WriteStrategy does not support Strict() writes")
+
+	// ErrStrictMirrorUnsupported indicates Strict() and Mirror() were combined
+	// on one statement. The combination is rejected before attempting the write:
+	// strict writes are commonly replay-unsafe, and mirror destinations may
+	// retry or replay failed dispatches.
+	ErrStrictMirrorUnsupported = errors.New("helix: Strict() and Mirror() cannot be combined")
 
 	// ErrMirrorModeConflict indicates that both WithMirror and
 	// WithMirrorPublisher were configured. The two mirror modes are
