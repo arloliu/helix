@@ -124,3 +124,32 @@ func (m *NopMetrics) IncSessionRefreshError(_ types.ClusterID) {}
 // types.SessionRefreshMetrics interface, so embedders pick up the
 // no-op coverage automatically.
 var _ types.SessionRefreshMetrics = (*NopMetrics)(nil)
+
+// ----------------------
+// Mirror (optional types.MirrorMetrics)
+// ----------------------
+
+// IncMirrorEnqueueSuccess discards the metric.
+func (m *NopMetrics) IncMirrorEnqueueSuccess() {}
+
+// IncMirrorEnqueueDropped discards the metric.
+func (m *NopMetrics) IncMirrorEnqueueDropped() {}
+
+// IncMirrorExecSuccess discards the metric.
+func (m *NopMetrics) IncMirrorExecSuccess() {}
+
+// IncMirrorExecError discards the metric.
+func (m *NopMetrics) IncMirrorExecError() {}
+
+// ObserveMirrorExecDuration discards the metric.
+func (m *NopMetrics) ObserveMirrorExecDuration(_ float64) {}
+
+// SetMirrorQueueDepth discards the metric.
+func (m *NopMetrics) SetMirrorQueueDepth(_ int) {}
+
+// SetMirrorEnabled discards the metric.
+func (m *NopMetrics) SetMirrorEnabled(_ bool) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.MirrorMetrics interface so embedders pick up no-op coverage.
+var _ types.MirrorMetrics = (*NopMetrics)(nil)

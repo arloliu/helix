@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/mirror"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
@@ -540,6 +541,75 @@ func TestMirrorPublisherEndToEndConsumerLandsWrites(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("publisher engine did not drain successfully; stats=%+v", app.Mirror().Stats())
+}
+
+// recordingMirrorAwareMetrics implements both types.MetricsCollector
+// (via embedding the internal NopMetrics) and types.MirrorMetrics.
+type recordingMirrorAwareMetrics struct {
+	*metrics.NopMetrics
+	mu        sync.Mutex
+	enqueueOK int
+	execOK    int
+	execErr   int
+	enabled   bool
+}
+
+func (r *recordingMirrorAwareMetrics) IncMirrorEnqueueSuccess() {
+	r.mu.Lock()
+	r.enqueueOK++
+	r.mu.Unlock()
+}
+func (r *recordingMirrorAwareMetrics) IncMirrorEnqueueDropped() {}
+func (r *recordingMirrorAwareMetrics) IncMirrorExecSuccess() {
+	r.mu.Lock()
+	r.execOK++
+	r.mu.Unlock()
+}
+func (r *recordingMirrorAwareMetrics) IncMirrorExecError() {
+	r.mu.Lock()
+	r.execErr++
+	r.mu.Unlock()
+}
+func (r *recordingMirrorAwareMetrics) ObserveMirrorExecDuration(float64) {}
+func (r *recordingMirrorAwareMetrics) SetMirrorQueueDepth(int)           {}
+func (r *recordingMirrorAwareMetrics) SetMirrorEnabled(enabled bool) {
+	r.mu.Lock()
+	r.enabled = enabled
+	r.mu.Unlock()
+}
+
+// TestMirrorMetricsAutoInjectFromClientMetrics verifies that helix's
+// CQLClient auto-wires a MetricsCollector that also implements MirrorMetrics
+// into the mirror engine — so users get mirror observability for free when
+// they pass a bundled (or compatible) collector to WithMetrics.
+func TestMirrorMetricsAutoInjectFromClientMetrics(t *testing.T) {
+	rec := &recordingMirrorAwareMetrics{NopMetrics: metrics.NewNopMetrics()}
+
+	mirrorTarget, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	defer mirrorTarget.Close()
+
+	client, err := NewCQLClient(newMockSession(), nil,
+		WithMetrics(rec),
+		WithMirror(mirrorTarget, mirror.WithWorkers(1)),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.Query("INSERT", "x").Mirror().ExecContext(context.Background()))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec.mu.Lock()
+		ok := rec.enqueueOK >= 1 && rec.execOK >= 1
+		rec.mu.Unlock()
+		if ok {
+			require.True(t, rec.enabled, "engine Start should emit enabled=true")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("mirror metrics were not auto-wired from client metrics")
 }
 
 func TestCloneArgs(t *testing.T) {

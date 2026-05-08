@@ -78,6 +78,7 @@ type config struct {
 	onDrop    DropHandler
 	onError   ErrorHandler
 	logger    types.Logger
+	metrics   types.MirrorMetrics
 }
 
 // Option configures an [Engine].
@@ -129,6 +130,21 @@ func WithLogger(l types.Logger) Option {
 	}
 }
 
+// WithMetrics installs a [types.MirrorMetrics] collector that receives
+// per-event counters and gauge updates. Defaults to a no-op collector.
+//
+// Helix's CQLClient auto-wires this when its configured
+// [types.MetricsCollector] also implements [types.MirrorMetrics] — so
+// using a bundled collector (e.g. contrib/metrics/vm) gives mirror
+// observability for free.
+func WithMetrics(m types.MirrorMetrics) Option {
+	return func(c *config) {
+		if m != nil {
+			c.metrics = m
+		}
+	}
+}
+
 // Engine captures async mirror writes, holds them in a bounded queue, and
 // drains them through a worker pool that calls [ExecuteFunc].
 //
@@ -169,6 +185,7 @@ func NewEngine(execute ExecuteFunc, opts ...Option) *Engine {
 		workers:   DefaultWorkers,
 		enabled:   true,
 		logger:    logging.NewNopLogger(),
+		metrics:   nopMirrorMetrics{},
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -184,9 +201,22 @@ func NewEngine(execute ExecuteFunc, opts ...Option) *Engine {
 	return e
 }
 
+// nopMirrorMetrics discards every metric. Used when no collector is
+// configured to avoid nil checks on the hot path.
+type nopMirrorMetrics struct{}
+
+func (nopMirrorMetrics) IncMirrorEnqueueSuccess()          {}
+func (nopMirrorMetrics) IncMirrorEnqueueDropped()          {}
+func (nopMirrorMetrics) IncMirrorExecSuccess()             {}
+func (nopMirrorMetrics) IncMirrorExecError()               {}
+func (nopMirrorMetrics) ObserveMirrorExecDuration(float64) {}
+func (nopMirrorMetrics) SetMirrorQueueDepth(int)           {}
+func (nopMirrorMetrics) SetMirrorEnabled(bool)             {}
+
 // Start spawns the worker pool. Calling Start more than once is a no-op.
 func (e *Engine) Start() {
 	e.startOnce.Do(func() {
+		e.cfg.metrics.SetMirrorEnabled(e.enabled.Load())
 		for i := 0; i < e.cfg.workers; i++ {
 			e.wg.Add(1)
 			go e.worker()
@@ -203,16 +233,23 @@ func (e *Engine) Stop() {
 		close(e.queue)
 		e.enqueueMu.Unlock()
 		e.wg.Wait()
+		e.cfg.metrics.SetMirrorEnabled(false)
 	})
 }
 
 // Enable resumes accepting new captures. Items already in the queue are
 // always processed regardless of the enabled flag.
-func (e *Engine) Enable() { e.enabled.Store(true) }
+func (e *Engine) Enable() {
+	e.enabled.Store(true)
+	e.cfg.metrics.SetMirrorEnabled(true)
+}
 
 // Disable stops accepting new captures. In-flight queued captures continue
 // draining through the worker pool.
-func (e *Engine) Disable() { e.enabled.Store(false) }
+func (e *Engine) Disable() {
+	e.enabled.Store(false)
+	e.cfg.metrics.SetMirrorEnabled(false)
+}
 
 // Enabled reports the current enable state.
 func (e *Engine) Enabled() bool { return e.enabled.Load() }
@@ -249,6 +286,8 @@ func (e *Engine) TryEnqueue(payload types.ReplayPayload) bool {
 	select {
 	case e.queue <- payload:
 		e.enqueued.Add(1)
+		e.cfg.metrics.IncMirrorEnqueueSuccess()
+		e.cfg.metrics.SetMirrorQueueDepth(len(e.queue))
 		return true
 	default:
 		e.dropOne(payload, dropQueueFull)
@@ -258,6 +297,7 @@ func (e *Engine) TryEnqueue(payload types.ReplayPayload) bool {
 
 func (e *Engine) dropOne(payload types.ReplayPayload, reason string) {
 	e.dropped.Add(1)
+	e.cfg.metrics.IncMirrorEnqueueDropped()
 
 	now := time.Now().UnixNano()
 	last := e.lastDropLogNanos.Load()
@@ -282,8 +322,15 @@ func (e *Engine) worker() {
 	ctx := context.Background()
 
 	for payload := range e.queue {
-		if err := e.execute(ctx, payload); err != nil {
+		e.cfg.metrics.SetMirrorQueueDepth(len(e.queue))
+
+		start := time.Now()
+		err := e.execute(ctx, payload)
+		e.cfg.metrics.ObserveMirrorExecDuration(time.Since(start).Seconds())
+
+		if err != nil {
 			e.errored.Add(1)
+			e.cfg.metrics.IncMirrorExecError()
 			e.cfg.logger.Warn("mirror write failed",
 				"error", err.Error(),
 				"isBatch", payload.IsBatch,
@@ -295,5 +342,6 @@ func (e *Engine) worker() {
 			continue
 		}
 		e.success.Add(1)
+		e.cfg.metrics.IncMirrorExecSuccess()
 	}
 }

@@ -136,6 +136,15 @@ type Collector struct {
 	sessionRefreshSuccessB *metrics.Counter
 	sessionRefreshErrorA   *metrics.Counter
 	sessionRefreshErrorB   *metrics.Counter
+
+	// Mirror metrics (optional types.MirrorMetrics)
+	mirrorEnqueueSuccess *metrics.Counter
+	mirrorEnqueueDropped *metrics.Counter
+	mirrorExecSuccess    *metrics.Counter
+	mirrorExecError      *metrics.Counter
+	mirrorExecDuration   *metrics.Histogram
+	mirrorQueueDepth     atomic.Int64
+	mirrorEnabled        atomic.Int64
 }
 
 // New creates a new VictoriaMetrics-based metrics collector.
@@ -256,6 +265,19 @@ func (c *Collector) initMetrics() {
 	c.sessionRefreshSuccessB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_success_total{cluster="%s"}`, p, nB))
 	c.sessionRefreshErrorA = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_error_total{cluster="%s"}`, p, nA))
 	c.sessionRefreshErrorB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_error_total{cluster="%s"}`, p, nB))
+
+	// Mirror metrics (optional types.MirrorMetrics)
+	c.mirrorEnqueueSuccess = c.set.NewCounter(fmt.Sprintf(`%s_mirror_enqueue_success_total`, p))
+	c.mirrorEnqueueDropped = c.set.NewCounter(fmt.Sprintf(`%s_mirror_enqueue_dropped_total`, p))
+	c.mirrorExecSuccess = c.set.NewCounter(fmt.Sprintf(`%s_mirror_exec_success_total`, p))
+	c.mirrorExecError = c.set.NewCounter(fmt.Sprintf(`%s_mirror_exec_errors_total`, p))
+	c.mirrorExecDuration = c.set.NewHistogram(fmt.Sprintf(`%s_mirror_exec_duration_seconds`, p))
+	c.set.NewGauge(fmt.Sprintf(`%s_mirror_queue_depth`, p), func() float64 {
+		return float64(c.mirrorQueueDepth.Load())
+	})
+	c.set.NewGauge(fmt.Sprintf(`%s_mirror_enabled`, p), func() float64 {
+		return float64(c.mirrorEnabled.Load())
+	})
 }
 
 func (c *Collector) Set() *metrics.Set {
@@ -532,3 +554,43 @@ func (c *Collector) IncSessionRefreshError(cluster types.ClusterID) {
 // Compile-time assertion that *Collector implements the optional
 // types.SessionRefreshMetrics interface.
 var _ types.SessionRefreshMetrics = (*Collector)(nil)
+
+// ----------------------
+// Mirror metrics (optional types.MirrorMetrics)
+// ----------------------
+
+// IncMirrorEnqueueSuccess increments the mirror enqueue-success counter.
+func (c *Collector) IncMirrorEnqueueSuccess() { c.mirrorEnqueueSuccess.Inc() }
+
+// IncMirrorEnqueueDropped increments the mirror enqueue-dropped counter.
+func (c *Collector) IncMirrorEnqueueDropped() { c.mirrorEnqueueDropped.Inc() }
+
+// IncMirrorExecSuccess increments the mirror exec-success counter.
+func (c *Collector) IncMirrorExecSuccess() { c.mirrorExecSuccess.Inc() }
+
+// IncMirrorExecError increments the mirror exec-error counter.
+func (c *Collector) IncMirrorExecError() { c.mirrorExecError.Inc() }
+
+// ObserveMirrorExecDuration records the mirror exec duration.
+func (c *Collector) ObserveMirrorExecDuration(seconds float64) {
+	c.mirrorExecDuration.Update(seconds)
+}
+
+// SetMirrorQueueDepth updates the mirror queue depth gauge.
+func (c *Collector) SetMirrorQueueDepth(depth int) {
+	c.mirrorQueueDepth.Store(int64(depth))
+}
+
+// SetMirrorEnabled updates the mirror enabled gauge (1 = accepting,
+// 0 = disabled or stopped).
+func (c *Collector) SetMirrorEnabled(enabled bool) {
+	if enabled {
+		c.mirrorEnabled.Store(1)
+	} else {
+		c.mirrorEnabled.Store(0)
+	}
+}
+
+// Compile-time assertion that *Collector implements the optional
+// types.MirrorMetrics interface.
+var _ types.MirrorMetrics = (*Collector)(nil)

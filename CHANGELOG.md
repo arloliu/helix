@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror metrics (v1.4.0 Phase 4)**: dedicated `helix_mirror_*` metric
+  surface for the async mirror engine.
+  - New optional interface `types.MirrorMetrics` (paralleling
+    `types.SessionRefreshMetrics`). Implementations may opt in by adding
+    the methods; bundled collectors (`internal/metrics.NopMetrics` and
+    `contrib/metrics/vm.Collector`) implement it directly.
+  - Metric set: `mirror_enqueue_success_total`,
+    `mirror_enqueue_dropped_total`, `mirror_exec_success_total`,
+    `mirror_exec_errors_total`, `mirror_exec_duration_seconds`
+    (histogram), `mirror_queue_depth` (gauge), `mirror_enabled` (gauge).
+    Mirror metrics are not cluster-scoped — per-cluster routing on the
+    mirror destination is recorded against that destination's own
+    metrics namespace.
+  - `mirror.WithMetrics(types.MirrorMetrics)` option. Helix's CQLClient
+    auto-wires the mirror engine when the configured `MetricsCollector`
+    also satisfies `MirrorMetrics`, so passing a bundled collector to
+    `helix.WithMetrics` enables mirror observability without extra
+    plumbing.
+
 - **Mirror publisher mode (v1.4.0 Phase 3)**: out-of-process mirroring for
   production cluster migrations. The app publishes captured mirror writes
   to a [Replayer] (typically [replay.NATSReplayer]) instead of writing

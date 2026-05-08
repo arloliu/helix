@@ -248,6 +248,137 @@ func TestEngineOnErrorNotFiredOnSuccess(t *testing.T) {
 	require.Equal(t, int32(0), called.Load())
 }
 
+type recordingMirrorMetrics struct {
+	mu             sync.Mutex
+	enqueueOK      int
+	enqueueDropped int
+	execOK         int
+	execErr        int
+	execObs        []float64
+	queueDepth     int
+	enabled        bool
+}
+
+func (r *recordingMirrorMetrics) IncMirrorEnqueueSuccess() {
+	r.mu.Lock()
+	r.enqueueOK++
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) IncMirrorEnqueueDropped() {
+	r.mu.Lock()
+	r.enqueueDropped++
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) IncMirrorExecSuccess() {
+	r.mu.Lock()
+	r.execOK++
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) IncMirrorExecError() {
+	r.mu.Lock()
+	r.execErr++
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) ObserveMirrorExecDuration(seconds float64) {
+	r.mu.Lock()
+	r.execObs = append(r.execObs, seconds)
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) SetMirrorQueueDepth(depth int) {
+	r.mu.Lock()
+	r.queueDepth = depth
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) SetMirrorEnabled(enabled bool) {
+	r.mu.Lock()
+	r.enabled = enabled
+	r.mu.Unlock()
+}
+
+func (r *recordingMirrorMetrics) snapshot() recordingMirrorMetrics {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return recordingMirrorMetrics{
+		enqueueOK:      r.enqueueOK,
+		enqueueDropped: r.enqueueDropped,
+		execOK:         r.execOK,
+		execErr:        r.execErr,
+		execObs:        append([]float64(nil), r.execObs...),
+		queueDepth:     r.queueDepth,
+		enabled:        r.enabled,
+	}
+}
+
+func TestEngineMetricsOnSuccess(t *testing.T) {
+	rec := &recordingExecutor{}
+	m := &recordingMirrorMetrics{}
+	e := NewEngine(rec.fn(), WithWorkers(1), WithMetrics(m))
+	e.Start()
+	defer e.Stop()
+
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "ok"}))
+	waitForCount(t, func() int { return int(e.Stats().Success) }, 1)
+
+	snap := m.snapshot()
+	require.Equal(t, 1, snap.enqueueOK)
+	require.Equal(t, 0, snap.enqueueDropped)
+	require.Equal(t, 1, snap.execOK)
+	require.Equal(t, 0, snap.execErr)
+	require.Len(t, snap.execObs, 1)
+	require.True(t, snap.enabled)
+}
+
+func TestEngineMetricsOnError(t *testing.T) {
+	rec := &recordingExecutor{err: errors.New("boom")}
+	m := &recordingMirrorMetrics{}
+	e := NewEngine(rec.fn(), WithWorkers(1), WithMetrics(m))
+	e.Start()
+	defer e.Stop()
+
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "boom"}))
+	waitForCount(t, func() int { return int(e.Stats().Error) }, 1)
+
+	snap := m.snapshot()
+	require.Equal(t, 1, snap.enqueueOK)
+	require.Equal(t, 1, snap.execErr)
+	require.Equal(t, 0, snap.execOK)
+	require.Len(t, snap.execObs, 1, "duration recorded even on error")
+}
+
+func TestEngineMetricsOnDrop(t *testing.T) {
+	rec := &recordingExecutor{}
+	m := &recordingMirrorMetrics{}
+	e := NewEngine(rec.fn(), WithEnabled(false), WithMetrics(m))
+	e.Start()
+	defer e.Stop()
+
+	require.False(t, e.TryEnqueue(types.ReplayPayload{Query: "x"}))
+	require.Equal(t, 1, m.snapshot().enqueueDropped)
+}
+
+func TestEngineMetricsEnableDisable(t *testing.T) {
+	rec := &recordingExecutor{}
+	m := &recordingMirrorMetrics{}
+	e := NewEngine(rec.fn(), WithMetrics(m))
+	e.Start()
+	require.True(t, m.snapshot().enabled, "Start emits enabled=true")
+
+	e.Disable()
+	require.False(t, m.snapshot().enabled)
+
+	e.Enable()
+	require.True(t, m.snapshot().enabled)
+
+	e.Stop()
+	require.False(t, m.snapshot().enabled, "Stop emits enabled=false")
+}
+
 func TestEngineConcurrentEnqueue(t *testing.T) {
 	rec := &recordingExecutor{}
 	e := NewEngine(rec.fn(), WithWorkers(4), WithQueueSize(4096))

@@ -63,7 +63,7 @@ func setupMirror(config *ClientConfig) error {
 func setupMirrorTargetMode(config *ClientConfig) error {
 	execute := mirrorExecuteFunc(config.MirrorTarget)
 
-	opts := []mirror.Option{mirror.WithLogger(config.Logger)}
+	opts := defaultMirrorOptions(config)
 	if config.MirrorReplayer != nil {
 		opts = append(opts, mirror.WithOnError(mirrorReplayOnError(config)))
 	}
@@ -97,14 +97,25 @@ func setupMirrorTargetMode(config *ClientConfig) error {
 }
 
 func setupMirrorPublisherMode(config *ClientConfig) error {
-	opts := append(
-		[]mirror.Option{mirror.WithLogger(config.Logger)},
-		config.MirrorOptions...,
-	)
+	opts := append(defaultMirrorOptions(config), config.MirrorOptions...)
 	config.MirrorEngine = mirror.NewEngine(config.MirrorPublisher.Enqueue, opts...)
 	config.MirrorEngine.Start()
 
 	return nil
+}
+
+// defaultMirrorOptions returns the mirror engine options that helix injects
+// before any caller-supplied [mirror.Option] values: the client logger, and
+// — when the configured [MetricsCollector] also satisfies the optional
+// [types.MirrorMetrics] interface — the mirror metrics collector. These
+// come first so caller options win on conflict.
+func defaultMirrorOptions(config *ClientConfig) []mirror.Option {
+	opts := []mirror.Option{mirror.WithLogger(config.Logger)}
+	if mm, ok := config.Metrics.(types.MirrorMetrics); ok {
+		opts = append(opts, mirror.WithMetrics(mm))
+	}
+
+	return opts
 }
 
 // mirrorReplayOnError returns a mirror.ErrorHandler that pushes failed
