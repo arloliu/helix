@@ -35,6 +35,7 @@ import (
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/test/testutil"
+	"github.com/arloliu/helix/topology"
 	htypes "github.com/arloliu/helix/types"
 )
 
@@ -461,6 +462,82 @@ func TestMirror_WithAdaptiveDualWritePrimary(t *testing.T) {
 				time.Sleep(100 * time.Millisecond)
 			}
 			t.Fatalf("[%s] mirror dispatch did not fire under AdaptiveDualWrite degradation; stats=%+v",
+				d.name, primary.Mirror().Stats())
+		})
+	}
+}
+
+// TestMirror_PrimaryClusterDraining_MirrorStillFires verifies the
+// combination of mirror with the topology drain mode. When primary cluster
+// A is in drain mode, writes to A are skipped and enqueued for replay; B
+// succeeds; executeWriteWithReplay returns nil (any-cluster-ack). The
+// mirror engine must still dispatch — the orthogonality contract holds
+// against drain just as against pause/kill.
+//
+// Real-world relevance: during a phased migration, ops may drain the old
+// cluster pair piece-by-piece while still wanting mirror writes to land on
+// the new pair.
+func TestMirror_PrimaryClusterDraining_MirrorStillFires(t *testing.T) {
+	a, b := sharedClusters(t)
+
+	table := createKVTableOnBoth(t, "mirror_drain")
+
+	for _, d := range allDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			topo := topology.NewLocal()
+
+			// Mirror destination (use cluster B's session — it stays
+			// healthy throughout this test).
+			mirrorClient, err := helix.NewCQLClient(d.wrap(b), nil)
+			require.NoError(t, err)
+			t.Cleanup(mirrorClient.Close)
+
+			primary, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
+				helix.WithTopologyWatcher(topo),
+				helix.WithAutoMemoryWorker(0), // primary replay accepts the drained-A writes
+				helix.WithMirror(mirrorClient,
+					mirror.WithWorkers(1),
+					mirror.WithQueueSize(64),
+				),
+			)
+			require.NoError(t, err)
+			t.Cleanup(primary.Close)
+
+			ctx := context.Background()
+
+			// Drain cluster A. Writes targeting A will be skipped and
+			// enqueued for primary replay; cluster B will receive them.
+			require.NoError(t, topo.SetDrain(ctx, htypes.ClusterA, true, "test drain"))
+			defer func() { _ = topo.SetDrain(context.Background(), htypes.ClusterA, false, "") }()
+
+			// Wait briefly for the topology watcher goroutine to observe
+			// the drain event (the client polls via the Watch channel).
+			require.Eventually(t, func() bool {
+				return primary.IsDraining(htypes.ClusterA)
+			}, 5*time.Second, 50*time.Millisecond,
+				"[%s] primary client did not observe drain on A", d.name)
+
+			stmt := fmt.Sprintf("INSERT INTO %s (key, value) VALUES (?, ?)", table)
+			const writes = 5
+			for i := 0; i < writes; i++ {
+				key := fmt.Sprintf("k_drain_%d", i)
+				err := primary.Session().Query(stmt, key, "v").Mirror().ExecContext(ctx)
+				require.NoError(t, err,
+					"[%s] write %d should succeed via cluster B while A is draining", d.name, i)
+			}
+
+			// Mirror engine must have fired for each successful primary
+			// write — orthogonality: drain on the source should not
+			// suppress mirror dispatch when the write reached at least
+			// one cluster.
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if primary.Mirror().Stats().Success >= writes {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			t.Fatalf("[%s] mirror dispatch did not fire under drain mode; stats=%+v",
 				d.name, primary.Mirror().Stats())
 		})
 	}

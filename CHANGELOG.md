@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **e2e final-pass: plain CB, FallbackRead, Mirror+drain (v1.4.0)**:
+  three more combinations from the audit gap list:
+  - `TestS_PlainCircuitBreaker_TripAndClose` — counter-based
+    `CircuitBreaker` (vs LCB which already had S3 coverage). Pause A,
+    accumulate failures past threshold, verify trip + reset-timeout
+    half-open + close after Unpause + successful probe. Wires
+    `WithCircuitBreakerMetrics` explicitly because FailoverPolicy is
+    not auto-injected by helix.
+  - `TestS_FallbackRead_RowMissingOnPreferredButPresentOnOther` and
+    `TestS_FallbackRead_AlternativeUnreachable_ReturnsNotFound` —
+    real-cluster coverage for `FallbackRead`. Verifies the lag-recovery
+    path (row only on B, FallbackRead recovers it) and the
+    "alternative unreachable returns ErrNotFound, not network error"
+    contract.
+  - `TestMirror_PrimaryClusterDraining_MirrorStillFires` — mirror +
+    topology drain mode. With cluster A in drain, writes are skipped
+    on A, B succeeds, primary returns nil via any-cluster-ack, mirror
+    must still fire. Real migration scenario.
+
 - **e2e suite hardening (v1.4.0 follow-up)**: combination-coverage audit
   flagged five real production scenarios with zero e2e coverage. Added
   five new e2e tests, each parameterized over v1 and v2 drivers:
