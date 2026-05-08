@@ -117,6 +117,11 @@ type ClientConfig struct {
 	// NewCQLClient when MirrorTarget is set; otherwise nil.
 	MirrorEngine *mirror.Engine
 
+	// MirrorPublisher is the replayer that captured mirror writes are
+	// published to in publisher mode. Mutually exclusive with MirrorTarget.
+	// Set via [WithMirrorPublisher].
+	MirrorPublisher Replayer
+
 	// MirrorReplayer holds failed mirror writes for durable retry. Set via
 	// [WithMirrorReplayer].
 	MirrorReplayer Replayer
@@ -301,6 +306,66 @@ func WithSessionRefresher(fn SessionRefresher) Option {
 func WithMirror(target *CQLClient, opts ...mirror.Option) Option {
 	return func(c *ClientConfig) {
 		c.MirrorTarget = target
+		c.MirrorOptions = opts
+	}
+}
+
+// WithMirrorPublisher configures the helix CQLClient to mirror writes by
+// publishing captures to a [Replayer] (typically a [replay.NATSReplayer])
+// instead of writing them directly to a mirror destination from this
+// process. The actual writes against the mirror clusters are performed by
+// a separate consumer binary that runs a worker built via
+// [NewMirrorWorker].
+//
+// This mode is the recommended production deployment for cluster
+// migrations: the app does not depend on the mirror clusters' availability,
+// captures are durable from the moment they are published (they survive
+// app restart), and the consumer can be scaled and tuned independently.
+//
+// The captures pass through helix's bounded in-memory ring buffer (the
+// same engine queue used in target mode) before reaching the publisher.
+// When the buffer is full, captures are dropped per the engine's
+// drop-on-full policy. When the publisher itself returns an error, the
+// engine accounts the failure but does not retry — durability is the
+// publisher's responsibility (NATS JetStream persistence, etc.).
+//
+// Engine knobs (queue size, worker count, drop callback) are configured
+// via mirror.Option values passed as opts. Pair with [mirror.WithOnError]
+// to observe publisher.Enqueue failures (e.g. NATS publish error rate);
+// [WithOnReplayDropped] is not invoked for publisher errors — durability
+// is the publisher's responsibility.
+//
+// Mutually exclusive with [WithMirror]. NewCQLClient returns
+// [types.ErrMirrorModeConflict] if both are configured.
+//
+// Example (app side):
+//
+//	natsReplayer, _ := replay.NewNATSReplayer(ctx, replay.NATSReplayerConfig{ ... })
+//	client, _ := helix.NewCQLClient(currentA, currentB,
+//	    helix.WithMirrorPublisher(natsReplayer,
+//	        mirror.WithQueueSize(8192),
+//	        mirror.WithWorkers(4),
+//	    ),
+//	)
+//	// session.Query(...).Mirror().ExecContext(ctx) — same opt-in as target mode.
+//
+// Example (consumer binary):
+//
+//	mirrorTarget, _ := helix.NewCQLClient(newA, newB)
+//	worker, _ := helix.NewMirrorWorker(natsReplayer, mirrorTarget)
+//	_ = worker.Start()
+//	defer worker.Stop()
+//	defer mirrorTarget.Close()
+//
+// Parameters:
+//   - publisher: The replayer to publish captures to. Must not be nil.
+//   - opts:      Mirror engine options.
+//
+// Returns:
+//   - Option: Configuration option.
+func WithMirrorPublisher(publisher Replayer, opts ...mirror.Option) Option {
+	return func(c *ClientConfig) {
+		c.MirrorPublisher = publisher
 		c.MirrorOptions = opts
 	}
 }

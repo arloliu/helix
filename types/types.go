@@ -261,6 +261,16 @@ var (
 	// SwapSession to provide a freshly-built session directly.
 	ErrNoSessionRefresher = errors.New("helix: no session refresher configured")
 
+	// ErrMirrorModeConflict indicates that both WithMirror and
+	// WithMirrorPublisher were configured. The two mirror modes are
+	// mutually exclusive: target mode dispatches writes from this process,
+	// publisher mode publishes captures for an out-of-process consumer.
+	ErrMirrorModeConflict = errors.New("helix: WithMirror and WithMirrorPublisher are mutually exclusive")
+
+	// ErrNilMirrorTarget indicates that NewMirrorWorker was called with a
+	// nil mirror destination CQLClient.
+	ErrNilMirrorTarget = errors.New("helix: mirror target cannot be nil")
+
 	// ErrNotFound indicates that a query returned zero rows.
 	//
 	// This is the Helix sentinel for "not found" results, mapped from

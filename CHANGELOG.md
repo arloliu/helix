@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror publisher mode (v1.4.0 Phase 3)**: out-of-process mirroring for
+  production cluster migrations. The app publishes captured mirror writes
+  to a [Replayer] (typically [replay.NATSReplayer]) instead of writing
+  them in-process; a separate consumer binary performs the actual writes
+  against the mirror clusters.
+  - `helix.WithMirrorPublisher(publisher Replayer, opts ...mirror.Option)`:
+    configures publisher mode. Captures pass through helix's bounded
+    in-memory ring buffer (the same engine queue used in target mode)
+    before reaching the publisher; queue overflow is dropped per the
+    engine's drop-on-full policy. Mutually exclusive with `WithMirror` —
+    NewCQLClient returns `types.ErrMirrorModeConflict` if both are set.
+    Pair with `mirror.WithOnError` to observe `publisher.Enqueue`
+    failures (e.g., NATS publish errors).
+  - `helix.NewMirrorWorker(replayer, target, opts ...replay.WorkerOption)`:
+    constructor for the consumer-side worker. Type-switches on the
+    replayer's concrete type (`*replay.MemoryReplayer` or
+    `*replay.NATSReplayer`) and binds the worker to the same execute
+    path the in-process mirror engine uses, so timestamps and dual-write
+    behavior on the mirror destination are preserved across modes. No
+    metrics auto-injection — the consumer binary owns its observability
+    stack and passes options explicitly.
+  - New sentinel errors: `types.ErrMirrorModeConflict`,
+    `types.ErrNilMirrorTarget`.
+
 - **Mirror replay durability (v1.4.0 Phase 2)**: failed mirror writes are
   now durably retried via the existing replay system.
   - `helix.WithMirrorReplayer(replayer, workerOpts...)`: configures a

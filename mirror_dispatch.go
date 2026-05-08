@@ -32,15 +32,35 @@ func mirrorExecuteFunc(target *CQLClient) replay.ExecuteFunc {
 	}
 }
 
-// setupMirror constructs the mirror engine (and optionally an auto-built
-// mirror replay worker) according to MirrorTarget / MirrorReplayer config.
-// Returns an error only when worker startup fails; topology rollback is
-// the caller's responsibility.
+// setupMirror constructs the mirror engine and (in target mode) an
+// optional auto-built replay worker. Two mutually exclusive deployment
+// modes are recognized:
+//
+//   - Target mode (set via WithMirror): the engine writes directly to a
+//     second helix CQLClient in this process. Optionally pairs with
+//     WithMirrorReplayer for in-process retry of failed mirror writes.
+//   - Publisher mode (set via WithMirrorPublisher): the engine publishes
+//     captures to a Replayer; a separate consumer binary built via
+//     NewMirrorWorker performs the actual writes.
+//
+// Returns an error if both modes are configured or when worker startup
+// fails. Topology rollback is the caller's responsibility.
 func setupMirror(config *ClientConfig) error {
-	if config.MirrorTarget == nil {
-		return nil
+	if config.MirrorTarget != nil && config.MirrorPublisher != nil {
+		return types.ErrMirrorModeConflict
 	}
 
+	switch {
+	case config.MirrorTarget != nil:
+		return setupMirrorTargetMode(config)
+	case config.MirrorPublisher != nil:
+		return setupMirrorPublisherMode(config)
+	default:
+		return nil
+	}
+}
+
+func setupMirrorTargetMode(config *ClientConfig) error {
 	execute := mirrorExecuteFunc(config.MirrorTarget)
 
 	opts := []mirror.Option{mirror.WithLogger(config.Logger)}
@@ -76,6 +96,17 @@ func setupMirror(config *ClientConfig) error {
 	return nil
 }
 
+func setupMirrorPublisherMode(config *ClientConfig) error {
+	opts := append(
+		[]mirror.Option{mirror.WithLogger(config.Logger)},
+		config.MirrorOptions...,
+	)
+	config.MirrorEngine = mirror.NewEngine(config.MirrorPublisher.Enqueue, opts...)
+	config.MirrorEngine.Start()
+
+	return nil
+}
+
 // mirrorReplayOnError returns a mirror.ErrorHandler that pushes failed
 // captures onto config.MirrorReplayer; if Enqueue itself fails, the
 // existing OnReplayDropped callback fires so mirror and primary replay
@@ -100,10 +131,69 @@ func mirrorReplayOnError(config *ClientConfig) mirror.ErrorHandler {
 	}
 }
 
-// buildMirrorReplayWorker constructs a [ReplayWorker] for the configured
-// mirror replayer. Returns nil for unrecognized replayer types — the
-// engine still pushes failures to the replayer in that case, but the
-// application is expected to run its own worker.
+// NewMirrorWorker constructs a [ReplayWorker] for the consumer side of
+// publisher-mode mirroring. It binds the worker to the same execute path
+// the in-process mirror engine would use, so client-generated timestamps,
+// dual-write strategy, and per-cluster routing on the mirror destination
+// are preserved on every retry.
+//
+// The replayer's concrete type selects the worker implementation:
+//   - [*replay.MemoryReplayer] uses [replay.NewMemoryWorker]
+//   - [*replay.NATSReplayer]   uses [replay.NewNATSWorker]
+//
+// Returns an error for any other replayer type. The caller owns the
+// returned worker's lifecycle and must call Start / Stop. The mirror
+// target's lifecycle is also caller-owned.
+//
+// Workers in the consumer binary typically run their own observability
+// stack — pass [replay.WithWorkerMetrics] / [replay.WithWorkerLogger] (or
+// equivalent) via opts. No metrics are auto-injected.
+//
+// Example:
+//
+//	mirrorTarget, _ := helix.NewCQLClient(newA, newB)
+//	worker, err := helix.NewMirrorWorker(natsReplayer, mirrorTarget,
+//	    replay.WithMaxAttempts(5),
+//	    replay.WithRetryDelay(100*time.Millisecond),
+//	)
+//	if err != nil { return err }
+//	_ = worker.Start()
+//	defer worker.Stop()
+//	defer mirrorTarget.Close()
+//
+// Parameters:
+//   - replayer: The transport that holds captured mirror writes.
+//   - target:   The destination helix CQLClient.
+//   - opts:     [replay.WorkerOption] values applied to the constructed worker.
+//
+// Returns:
+//   - ReplayWorker: The constructed worker.
+//   - error:        Non-nil if replayer's concrete type is not supported.
+func NewMirrorWorker(replayer Replayer, target *CQLClient, opts ...replay.WorkerOption) (ReplayWorker, error) {
+	if target == nil {
+		return nil, types.ErrNilMirrorTarget
+	}
+
+	return newReplayWorkerFor(replayer, mirrorExecuteFunc(target), opts)
+}
+
+// newReplayWorkerFor type-switches a [Replayer] to its matching worker
+// constructor. Shared by [NewMirrorWorker] and [buildMirrorReplayWorker].
+func newReplayWorkerFor(replayer Replayer, exec replay.ExecuteFunc, opts []replay.WorkerOption) (ReplayWorker, error) {
+	switch r := replayer.(type) {
+	case *replay.MemoryReplayer:
+		return replay.NewMemoryWorker(r, exec, opts...), nil
+	case *replay.NATSReplayer:
+		return replay.NewNATSWorker(r, exec, opts...), nil
+	default:
+		return nil, fmt.Errorf("unsupported replayer type %T (supported: *replay.MemoryReplayer, *replay.NATSReplayer)", replayer)
+	}
+}
+
+// buildMirrorReplayWorker constructs the auto-wired [ReplayWorker] used in
+// target-mode mirroring with [WithMirrorReplayer]. Unrecognized replayer
+// types yield a nil worker plus a warning log — the engine still pushes
+// failures to the replayer, but the application must run its own worker.
 func buildMirrorReplayWorker(
 	replayer Replayer,
 	exec replay.ExecuteFunc,
@@ -114,18 +204,16 @@ func buildMirrorReplayWorker(
 	// Auto-inject metrics first so caller-supplied options win on conflict.
 	full := append([]replay.WorkerOption{replay.WithWorkerMetrics(metrics)}, opts...)
 
-	switch r := replayer.(type) {
-	case *replay.MemoryReplayer:
-		return replay.NewMemoryWorker(r, exec, full...)
-	case *replay.NATSReplayer:
-		return replay.NewNATSWorker(r, exec, full...)
-	default:
+	worker, err := newReplayWorkerFor(replayer, exec, full)
+	if err != nil {
 		logger.Warn("unrecognized mirror replayer type; mirror failures are still enqueued but no replay worker is auto-built — run your own worker",
 			"type", fmt.Sprintf("%T", replayer),
 		)
 
 		return nil
 	}
+
+	return worker
 }
 
 // Mirror returns the runtime control surface for the async mirror engine,
