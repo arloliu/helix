@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror test gap closures (v1.4.0 follow-up)**: a critical pass through
+  the mirror feature surface flagged real coverage holes. Closing them:
+  - Dual-cluster primary + Mirror() trigger conditions now tested:
+    both-success fires, partial-success (any-cluster-ack returns nil)
+    fires, total-failure (DualClusterError) suppresses.
+  - `WithMirror(nil)` and `WithMirrorPublisher(nil)` now reject at
+    construction with `types.ErrNilMirrorTarget` /
+    `types.ErrNilMirrorPublisher` instead of silently disabling
+    mirroring (added internal `mirrorTargetSet` / `mirrorPublisherSet`
+    config flags to distinguish "passed nil" from "never called").
+  - Caller-supplied `Query.WithTimestamp()` is preserved through mirror
+    dispatch (regression test against future refactors).
+  - `client.Close()` drains the in-flight mirror queue before returning.
+  - Auto-built NATS replay worker path (`WithMirrorReplayer` +
+    `*replay.NATSReplayer`) end-to-end test against embedded NATS +
+    real CQL — previously only the `MemoryReplayer` branch was covered.
+  - `docs/mirror.md`: added "Per-query consistency is not preserved on
+    mirror exec" to the Known Parity Gaps section. Matches the existing
+    primary-replay omission.
+
 - **Mirror docs, examples, and integration tests (v1.4.0 Phase 5)**:
   - `docs/mirror.md` — user guide covering target / publisher modes,
     semantics, runtime control, observability, known parity gaps, and

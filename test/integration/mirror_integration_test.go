@@ -220,6 +220,77 @@ func TestMirrorPublisherModeEndToEnd(t *testing.T) {
 	}, "consumer worker never delivered k1 to mirror destination")
 }
 
+// TestMirrorReplayerNATSAutoBuiltWorker exercises the WithMirrorReplayer
+// auto-build path with *replay.NATSReplayer (rather than MemoryReplayer):
+// failed mirror writes land in the NATS stream, the auto-built NATSWorker
+// drains them, and once the destination recovers the row appears.
+//
+// The publisher-mode integration test exercises NewNATSWorker directly via
+// NewMirrorWorker. This test exercises the *implicit* construction path
+// inside setupMirrorTargetMode → buildMirrorReplayWorker → newReplayWorkerFor
+// for the NATS branch, which had no end-to-end coverage before.
+func TestMirrorReplayerNATSAutoBuiltWorker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	sessionA, sessionB := getSharedSessions(t)
+	table := fmt.Sprintf("mirror_nats_auto_%d", time.Now().UnixNano())
+
+	require.NoError(t, sessionA.Query(fmt.Sprintf(mirrorTableSchema, table)).Exec())
+	t.Cleanup(func() {
+		_ = sessionA.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s", table)).Exec()
+		_ = sessionB.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s", table)).Exec()
+	})
+
+	js := testutil.StartEmbeddedNATS(t)
+
+	natsReplayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName("test-mirror-nats-auto"),
+		replay.WithSubjectPrefix("test.mirror.nats.auto"),
+	)
+	require.NoError(t, err)
+	defer natsReplayer.Close()
+
+	mirrorClient, err := helix.NewCQLClient(cqlv1.NewSession(sessionB), nil)
+	require.NoError(t, err)
+
+	// WithMirrorReplayer + NATSReplayer should auto-build a NATSWorker.
+	primary, err := helix.NewCQLClient(cqlv1.NewSession(sessionA), nil,
+		helix.WithMirror(mirrorClient,
+			mirror.WithWorkers(1),
+			mirror.WithQueueSize(8),
+		),
+		helix.WithMirrorReplayer(natsReplayer,
+			replay.WithPollInterval(20*time.Millisecond),
+			replay.WithRetryDelay(20*time.Millisecond),
+			replay.WithMaxAttempts(200),
+		),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, primary.Mirror())
+
+	// The auto-built worker should be present (target mode + recognized
+	// replayer type).
+	require.NotNil(t, primary.Session(), "client constructed")
+
+	stmt := fmt.Sprintf("INSERT INTO %s (id, v) VALUES (?, ?)", table)
+	require.NoError(t, primary.Session().Query(stmt, "k1", "v1").Mirror().ExecContext(t.Context()))
+
+	// Mirror table on cluster B doesn't exist yet → first attempt fails →
+	// pushed into NATS replayer → NATSWorker drains and retries.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_ = sessionB.Query(fmt.Sprintf(mirrorTableSchema, table)).Exec()
+	}()
+
+	requireEventually(t, 10*time.Second, func() bool {
+		var v string
+		err := sessionB.Query(fmt.Sprintf("SELECT v FROM %s WHERE id = ?", table), "k1").Scan(&v)
+		return err == nil && v == "v1"
+	}, "auto-built NATS replay worker never delivered k1 to mirror destination")
+}
+
 // TestMirrorTimestampPreservation verifies that a mirrored write uses the
 // same client-generated timestamp on the mirror destination as on the
 // primary, so server-side WRITETIME is consistent across the two clusters.

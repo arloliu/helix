@@ -267,9 +267,13 @@ var (
 	// publisher mode publishes captures for an out-of-process consumer.
 	ErrMirrorModeConflict = errors.New("helix: WithMirror and WithMirrorPublisher are mutually exclusive")
 
-	// ErrNilMirrorTarget indicates that NewMirrorWorker was called with a
-	// nil mirror destination CQLClient.
+	// ErrNilMirrorTarget indicates that NewMirrorWorker or NewCQLClient
+	// (with WithMirror) was called with a nil mirror destination CQLClient.
 	ErrNilMirrorTarget = errors.New("helix: mirror target cannot be nil")
+
+	// ErrNilMirrorPublisher indicates that NewCQLClient was called with
+	// WithMirrorPublisher and a nil Replayer.
+	ErrNilMirrorPublisher = errors.New("helix: mirror publisher cannot be nil")
 
 	// ErrNotFound indicates that a query returned zero rows.
 	//

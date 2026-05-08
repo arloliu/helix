@@ -46,14 +46,14 @@ func mirrorExecuteFunc(target *CQLClient) replay.ExecuteFunc {
 // Returns an error if both modes are configured or when worker startup
 // fails. Topology rollback is the caller's responsibility.
 func setupMirror(config *ClientConfig) error {
-	if config.MirrorTarget != nil && config.MirrorPublisher != nil {
+	if config.mirrorTargetSet && config.mirrorPublisherSet {
 		return types.ErrMirrorModeConflict
 	}
 
 	switch {
-	case config.MirrorTarget != nil:
+	case config.mirrorTargetSet:
 		return setupMirrorTargetMode(config)
-	case config.MirrorPublisher != nil:
+	case config.mirrorPublisherSet:
 		return setupMirrorPublisherMode(config)
 	default:
 		return nil
@@ -61,6 +61,10 @@ func setupMirror(config *ClientConfig) error {
 }
 
 func setupMirrorTargetMode(config *ClientConfig) error {
+	if config.MirrorTarget == nil {
+		return types.ErrNilMirrorTarget
+	}
+
 	execute := mirrorExecuteFunc(config.MirrorTarget)
 
 	opts := defaultMirrorOptions(config)
@@ -97,6 +101,10 @@ func setupMirrorTargetMode(config *ClientConfig) error {
 }
 
 func setupMirrorPublisherMode(config *ClientConfig) error {
+	if config.MirrorPublisher == nil {
+		return types.ErrNilMirrorPublisher
+	}
+
 	opts := append(defaultMirrorOptions(config), config.MirrorOptions...)
 	config.MirrorEngine = mirror.NewEngine(config.MirrorPublisher.Enqueue, opts...)
 	config.MirrorEngine.Start()

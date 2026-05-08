@@ -181,6 +181,15 @@ destination is recorded against that destination's own metrics namespace
 
 ## Known parity gaps
 
+- **Per-query consistency is not preserved on mirror exec.** Mirror writes
+  execute against the mirror destination at *that destination's* default
+  consistency, not the consistency the original write specified via
+  `Query.Consistency` / `Batch.Consistency` / `SerialConsistency`. The
+  mirror payload (`types.ReplayPayload`) has no consistency field; this
+  matches the existing primary-replay path, which has the same omission.
+  If your migration validates consistency-sensitive queries, set the
+  desired consistency on the mirror destination's `CQLClient` config so
+  it's the destination default.
 - **Writes that succeed only via the *primary's* replay path are not mirrored.**
   When both current clusters fail at `Exec` time and the primary returns an
   error, the primary replay system later lands the write — but the mirror

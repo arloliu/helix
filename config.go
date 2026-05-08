@@ -117,6 +117,15 @@ type ClientConfig struct {
 	// NewCQLClient when MirrorTarget is set; otherwise nil.
 	MirrorEngine *mirror.Engine
 
+	// mirrorTargetSet tracks whether [WithMirror] was called. Used to
+	// distinguish "user passed nil" from "option was never called" —
+	// without it, WithMirror(nil) silently disables mirroring instead of
+	// surfacing the bug.
+	mirrorTargetSet bool
+
+	// mirrorPublisherSet tracks whether [WithMirrorPublisher] was called.
+	mirrorPublisherSet bool
+
 	// MirrorPublisher is the replayer that captured mirror writes are
 	// published to in publisher mode. Mutually exclusive with MirrorTarget.
 	// Set via [WithMirrorPublisher].
@@ -303,8 +312,13 @@ func WithSessionRefresher(fn SessionRefresher) Option {
 //
 // Returns:
 //   - Option: Configuration option.
+//
+// Passing a nil target is rejected at construction with
+// [types.ErrNilMirrorTarget] — see [WithMirrorPublisher] for the publisher
+// equivalent.
 func WithMirror(target *CQLClient, opts ...mirror.Option) Option {
 	return func(c *ClientConfig) {
+		c.mirrorTargetSet = true
 		c.MirrorTarget = target
 		c.MirrorOptions = opts
 	}
@@ -365,6 +379,7 @@ func WithMirror(target *CQLClient, opts ...mirror.Option) Option {
 //   - Option: Configuration option.
 func WithMirrorPublisher(publisher Replayer, opts ...mirror.Option) Option {
 	return func(c *ClientConfig) {
+		c.mirrorPublisherSet = true
 		c.MirrorPublisher = publisher
 		c.MirrorOptions = opts
 	}

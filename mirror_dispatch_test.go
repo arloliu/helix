@@ -173,6 +173,28 @@ func TestMirrorControllerEnableDisable(t *testing.T) {
 	require.Len(t, rec.snapshot(), 1)
 }
 
+// TestMirrorPreservesCallerWithTimestamp verifies that a caller-provided
+// WithTimestamp() on the original Query is captured at Mirror() opt-in
+// time and applied to the mirror exec — not the client's auto-generated
+// TimestampProvider value.
+func TestMirrorPreservesCallerWithTimestamp(t *testing.T) {
+	rec := newRecordingMirror()
+	client, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	defer client.Close()
+	installMirrorEngine(t, client, rec.execute(), mirror.WithWorkers(1))
+
+	const explicitTS int64 = 1700000000000000 // a fixed microsecond timestamp
+	require.NoError(t, client.Query("INSERT", "x").
+		WithTimestamp(explicitTS).
+		Mirror().
+		ExecContext(context.Background()))
+
+	rec.waitForOne(t, 2*time.Second)
+	require.Equal(t, explicitTS, rec.snapshot()[0].Timestamp,
+		"mirror must preserve caller-supplied WithTimestamp, not regenerate one")
+}
+
 func TestMirrorBatchDispatch(t *testing.T) {
 	rec := newRecordingMirror()
 	client, err := NewCQLClient(newMockSession(), nil)
@@ -228,6 +250,31 @@ func TestMirrorWithMirrorTargetEndToEnd(t *testing.T) {
 	t.Fatalf("mirror engine did not record success; stats=%+v", client.Mirror().Stats())
 }
 
+// TestMirrorClientCloseDrainsInFlightItems verifies that client.Close
+// processes all queued mirror captures before returning, rather than
+// dropping them on the floor. This tightens the documented contract that
+// engine.Stop "drains in-flight captures."
+func TestMirrorClientCloseDrainsInFlightItems(t *testing.T) {
+	rec := newRecordingMirror()
+	client, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	// One worker + delay forces the queue to fill before the worker
+	// drains, exposing whether Close waits for them.
+	installMirrorEngine(t, client, func(ctx context.Context, p types.ReplayPayload) error {
+		time.Sleep(2 * time.Millisecond)
+		return rec.execute()(ctx, p)
+	}, mirror.WithWorkers(1), mirror.WithQueueSize(64))
+
+	for i := 0; i < 20; i++ {
+		require.NoError(t, client.Query("INSERT", i).Mirror().ExecContext(context.Background()))
+	}
+
+	// After Close returns, every captured payload must have been processed.
+	client.Close()
+	require.Len(t, rec.snapshot(), 20,
+		"client.Close must drain in-flight mirror queue before returning")
+}
+
 func TestMirrorEngineStoppedOnClientClose(t *testing.T) {
 	rec := newRecordingMirror()
 	client, err := NewCQLClient(newMockSession(), nil)
@@ -242,6 +289,74 @@ func TestMirrorEngineStoppedOnClientClose(t *testing.T) {
 	// (Cleanup-installed engine is stopped twice; sync.Once protects this.)
 	// Note: Close() calls engine.Stop() too — both Stops coexist.
 	require.False(t, engine.TryEnqueue(types.ReplayPayload{Query: "after close"}))
+}
+
+// TestMirrorDispatchOnDualClusterBothSucceed verifies that mirror fires
+// when the primary client is in dual-cluster mode and both clusters ack.
+func TestMirrorDispatchOnDualClusterBothSucceed(t *testing.T) {
+	rec := newRecordingMirror()
+	primarySA := newMockSession()
+	primarySB := newMockSession()
+	client, err := NewCQLClient(primarySA, primarySB)
+	require.NoError(t, err)
+	defer client.Close()
+	installMirrorEngine(t, client, rec.execute(), mirror.WithWorkers(1))
+
+	require.NoError(t, client.Query("INSERT", "x").Mirror().ExecContext(context.Background()))
+
+	rec.waitForOne(t, 2*time.Second)
+	require.Len(t, rec.snapshot(), 1)
+}
+
+// TestMirrorDispatchOnDualClusterPartialSuccess verifies that mirror fires
+// when one primary cluster succeeds and the other errors. The dual-write
+// path returns nil (any-cluster-ack) so the caller treats this as success;
+// mirror must do the same.
+func TestMirrorDispatchOnDualClusterPartialSuccess(t *testing.T) {
+	rec := newRecordingMirror()
+	primarySA := newMockSession()
+	primarySB := newMockSession()
+	primarySB.execErr = errors.New("cluster B unavailable")
+
+	// Use AutoMemoryWorker so the partial-failure replay path doesn't
+	// abort construction; we don't care about the replay outcome here,
+	// only that mirror fires when ExecContext returns nil.
+	client, err := NewCQLClient(primarySA, primarySB,
+		WithAutoMemoryWorker(0),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+	installMirrorEngine(t, client, rec.execute(), mirror.WithWorkers(1))
+
+	// Partial failure: one cluster acks → executeWriteWithReplay returns
+	// nil → mirror fires.
+	require.NoError(t, client.Query("INSERT", "x").Mirror().ExecContext(context.Background()))
+
+	rec.waitForOne(t, 2*time.Second)
+	require.Len(t, rec.snapshot(), 1, "any-cluster-ack must trigger mirror")
+}
+
+// TestMirrorNotDispatchedOnDualClusterTotalFailure verifies that mirror
+// does NOT fire when both primary clusters fail. The dual-write path
+// returns DualClusterError; mirror must not fire on a non-nil err.
+func TestMirrorNotDispatchedOnDualClusterTotalFailure(t *testing.T) {
+	rec := newRecordingMirror()
+	primarySA := newMockSession()
+	primarySA.execErr = errors.New("cluster A down")
+	primarySB := newMockSession()
+	primarySB.execErr = errors.New("cluster B down")
+	client, err := NewCQLClient(primarySA, primarySB,
+		WithAutoMemoryWorker(0),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+	installMirrorEngine(t, client, rec.execute(), mirror.WithWorkers(1))
+
+	err = client.Query("INSERT", "x").Mirror().ExecContext(context.Background())
+	require.Error(t, err, "both-cluster failure must surface DualClusterError")
+
+	time.Sleep(50 * time.Millisecond)
+	require.Empty(t, rec.snapshot(), "mirror must not fire on total primary failure")
 }
 
 // TestMirrorReplayerEnqueuesOnFailure verifies that when WithMirrorReplayer
@@ -494,6 +609,18 @@ func TestNewMirrorWorkerRejectsNilTarget(t *testing.T) {
 	mem := replay.NewMemoryReplayer()
 	_, err := NewMirrorWorker(mem, nil)
 	require.ErrorIs(t, err, types.ErrNilMirrorTarget)
+}
+
+func TestWithMirrorNilTargetRejected(t *testing.T) {
+	_, err := NewCQLClient(newMockSession(), nil, WithMirror(nil))
+	require.ErrorIs(t, err, types.ErrNilMirrorTarget,
+		"WithMirror(nil) must surface a clear construction-time error rather than silently disabling mirror")
+}
+
+func TestWithMirrorPublisherNilRejected(t *testing.T) {
+	_, err := NewCQLClient(newMockSession(), nil, WithMirrorPublisher(nil))
+	require.ErrorIs(t, err, types.ErrNilMirrorPublisher,
+		"WithMirrorPublisher(nil) must surface a clear construction-time error rather than silently disabling mirror")
 }
 
 // TestMirrorPublisherEndToEndConsumerLandsWrites verifies the publisher /
