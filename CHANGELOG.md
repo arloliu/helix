@@ -42,6 +42,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Strict writes** (`Strict()` per-statement option): A query or batch marked
+  `Strict()` bypasses replay and fire-and-forget. On partial failure the caller
+  receives `*types.PartialWriteError{Acknowledged, Unacknowledged, Cause}`
+  immediately — the `Replayer` is never invoked. Both-cluster failure returns
+  `*types.DualClusterError`. Drain-path: the draining cluster is skipped and
+  named as `Unacknowledged` with `Cause: ErrClusterDraining`.
+  `Strict().Mirror()` returns `ErrStrictMirrorUnsupported` before any write
+  attempt. Single-cluster mode and CAS/LWT are no-ops (Strict is ignored).
+
+- **`StrictWriter` interface** (`helix` package): Optional interface for write
+  strategies that support `Strict()` semantics. `ConcurrentDualWrite`,
+  `SyncDualWrite`, and `AdaptiveDualWrite` all implement `ExecuteStrict`.
+  `AdaptiveDualWrite.ExecuteStrict` fast-fails degraded clusters with
+  `ErrClusterDegraded` instead of fire-and-forgetting; `RecordProbeSuccess`
+  advances the recovery counter so the cluster can self-heal.
+
+- **Background recovery probe** for `AdaptiveDualWrite`: A configurable
+  background goroutine probes degraded clusters at a tunable interval (default
+  2 s), credits recovery via `RecordProbeSuccess`, and automatically restores
+  degraded clusters — no operator action required, no live dual-write needed.
+  Configure with `WithRecoveryProbe(cfg)` or opt out with
+  `WithRecoveryProbeDisabled()`. Goroutines stop cleanly on `Close()`.
+
+- **`StrictMetrics` optional interface** (`types` package): Adds
+  `IncWriteSkipped(cluster)` so metrics collectors can distinguish writes
+  skipped due to degraded/draining state from genuine write errors, without
+  breaking existing `MetricsCollector` implementors.
+
+- **`RecoveryProbeMetrics` optional interface** (`types` package):
+  `IncRecoveryProbeSuccess` and `IncRecoveryProbeFailure` counters for probe
+  observability.
+
+- **Root re-exports** (`helix` package): `PartialWriteError`, `DualClusterError`,
+  `ErrClusterDegraded`, `ErrClusterDraining`, `ErrStrictUnsupported`,
+  `ErrStrictMirrorUnsupported`, `AsPartialWriteError`, and `IsPartialWrite` are
+  now accessible directly from the `helix` package without importing `types`.
+
 - **e2e final-pass: plain CB, FallbackRead, Mirror+drain (v1.4.0)**:
   three more combinations from the audit gap list:
   - `TestS_PlainCircuitBreaker_TripAndClose` — counter-based

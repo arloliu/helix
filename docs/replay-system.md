@@ -761,6 +761,95 @@ The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `h
 
 ---
 
+## Strict Writes (Bypass Replay)
+
+`Strict()` is a per-statement option that opts a single write out of the replay
+system entirely. When one cluster fails, the caller receives the error immediately
+rather than waiting for async reconciliation.
+
+```go
+err := client.Query("INSERT INTO orders (id, status) VALUES (?, ?)", id, "placed").
+    Strict().
+    ExecContext(ctx)
+
+var pwe *helix.PartialWriteError
+if errors.As(err, &pwe) {
+    // One cluster acknowledged; the other did not.
+    // No replay was enqueued — the caller must decide what to do.
+    log.Printf("partial write: acked by %v, not acked by %v: %v",
+        pwe.Acknowledged, pwe.Unacknowledged, pwe.Cause)
+}
+```
+
+### Trade-offs vs. replay-based eventual consistency
+
+| | Replay (default) | Strict() |
+|---|---|---|
+| **Partial failure handling** | Enqueued for async replay | Caller receives `*PartialWriteError` immediately |
+| **Caller complexity** | Low — Helix reconciles silently | Higher — caller must handle partial errors |
+| **Consistency window** | Eventually consistent (replay lag) | No replay lag; no background repair |
+| **Divergence risk** | Minimized by replay | Present until caller reconciles |
+| **Fire-and-forget bypass** | No — `AdaptiveDualWrite` may async-write | Yes — `ExecuteStrict` never fire-and-forgets |
+
+Use `Strict()` when the caller must know immediately whether both clusters
+acknowledged the write — for example, financial records, inventory commits, or
+operations that must not silently diverge.
+
+### FallbackRead after a strict partial write
+
+`FallbackRead()` helps when a strict partial write leaves the selected cluster
+without the row — it will attempt the other cluster before returning
+`ErrNotFound`. It does **not** detect divergence (rows that differ between
+clusters); that case returns whichever value the selected cluster holds.
+
+### Recovery probe and auto-healing under AdaptiveDualWrite
+
+When the write strategy is `AdaptiveDualWrite`, degraded clusters are skipped
+by `ExecuteStrict` rather than receiving fire-and-forget goroutines. This means
+strict-only workloads do not generate the live dual-writes that normally
+advance `AdaptiveDualWrite`'s recovery counter.
+
+The **background recovery probe** (enabled by default) compensates: a goroutine
+periodically executes a lightweight probe query against each degraded cluster
+and calls `RecordProbeSuccess` on each success. After the existing
+`recoveryThreshold` successes the cluster is restored to healthy, and
+subsequent strict writes resume dual-cluster behavior — no operator action
+required.
+
+To tune or disable the probe:
+
+```go
+// Custom probe interval and timeout
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithRecoveryProbe(helix.RecoveryProbe{
+        Interval: 5 * time.Second,
+        Timeout:  2 * time.Second,
+    }),
+)
+
+// Disable the probe (manual ForceRecover only)
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithRecoveryProbeDisabled(),
+)
+```
+
+### Drain-mode interaction
+
+When a cluster is in drain mode and the write is `Strict()`, the draining
+cluster is treated the same as a degraded cluster: it is skipped, and the
+caller receives `*PartialWriteError{Cause: ErrClusterDraining}`. No replay
+is enqueued regardless of whether a `Replayer` is configured.
+
+### Incompatibility with Mirror
+
+`Strict().Mirror()` is rejected before any write attempt with
+`ErrStrictMirrorUnsupported`. Mirror writes are fire-and-forget by design and
+cannot provide the acknowledgement guarantees that `Strict()` requires.
+
+---
+
 ## See Also
 
 - [Auto-Recovery Guide](auto-recovery.md) - End-to-end recovery lifecycle and operator workflow
