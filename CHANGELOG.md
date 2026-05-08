@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TestS1 e2e flake — `MemoryReplayer.Len()==0` is not a "drain done"
+  signal**. The S1 happy-path drain test was using `memReplayer.Len()==0`
+  to decide when replay was complete; under sustained suite pressure
+  AdaptiveDualWrite did not always degrade and every Exec ran sync
+  against paused A (~2s gocql timeout each), producing a long tail of
+  retries. The worker holds payloads in flight between attempts —
+  outside the queue but still actively retrying — so Len() can
+  transiently report 0 while ~70 items remain to retry. The drain
+  check passed prematurely, the test exited, and only ~28 of 100 rows
+  reached cluster A. Diagnostic worker callbacks confirmed
+  `success=8, error=98, dropped=0` with MaxAttempts=1000 — proving
+  the issue was check semantics, not retry exhaustion. The test now
+  uses row-count convergence (the authoritative downstream signal),
+  and `MemoryReplayer.Len()` carries a Godoc note explaining the gotcha
+  so future users avoid the same trap.
+
 - **FailoverPolicy metrics and logger auto-injection** — surfaced while
   writing the plain-`CircuitBreaker` e2e test. `NewCQLClient`'s
   `autoInjectMetricsAndLogger` walked `ReplayWorker` and `WriteStrategy`

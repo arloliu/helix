@@ -355,8 +355,19 @@ func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
 
 // Len returns the current number of pending replays across both queues.
 //
+// IMPORTANT: Len reports queue depth only — items dequeued by a worker
+// for an attempt are NOT counted while in flight, even though they still
+// represent active work. A worker pulling a payload, attempting it,
+// failing, and re-enqueueing with backoff produces a transient
+// `Len() == 0` window even though work remains. Do not use Len()==0 as a
+// "replay drained" signal in tests or operational checks; instead observe
+// an authoritative downstream signal (row counts on the destination,
+// success-counter convergence, or worker-callback completion). Misuse of
+// this contract was the root cause of the S1 e2e flake fixed in
+// `test/e2e/cql/write_replay_test.go` — see the comment there.
+//
 // Returns:
-//   - int: Total number of items in high and low priority queues
+//   - int: Total number of items currently in the high and low priority queues
 func (m *MemoryReplayer) Len() int {
 	return int(m.pending.Load())
 }
