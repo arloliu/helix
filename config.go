@@ -117,6 +117,18 @@ type ClientConfig struct {
 	// NewCQLClient when MirrorTarget is set; otherwise nil.
 	MirrorEngine *mirror.Engine
 
+	// MirrorReplayer holds failed mirror writes for durable retry. Set via
+	// [WithMirrorReplayer].
+	MirrorReplayer Replayer
+
+	// MirrorReplayWorkerOpts configures the auto-built mirror replay worker.
+	// Set via [WithMirrorReplayer].
+	MirrorReplayWorkerOpts []replay.WorkerOption
+
+	// MirrorReplayWorker drains MirrorReplayer. Populated during
+	// NewCQLClient when MirrorReplayer's concrete type is recognized.
+	MirrorReplayWorker ReplayWorker
+
 	// SessionRefresher is an optional caller-supplied factory used by
 	// [CQLClient.RefreshSession] to build a replacement [cql.Session] for a
 	// cluster whose live session is broken (e.g., the cluster restarted at a
@@ -290,6 +302,59 @@ func WithMirror(target *CQLClient, opts ...mirror.Option) Option {
 	return func(c *ClientConfig) {
 		c.MirrorTarget = target
 		c.MirrorOptions = opts
+	}
+}
+
+// WithMirrorReplayer enables durable retry of failed mirror writes by
+// pushing each error-returning capture onto a [Replayer] and (when the
+// replayer's concrete type is recognized) automatically constructing and
+// running a [ReplayWorker] that drains the replayer back into the mirror
+// destination.
+//
+// Recognized replayer types (auto-worker):
+//   - [replay.MemoryReplayer] — uses [replay.NewMemoryWorker]
+//   - [replay.NATSReplayer]   — uses [replay.NewNATSWorker]
+//
+// For other replayer implementations, the engine still pushes failures to
+// the replayer but no worker is auto-built; the application is expected to
+// run its own worker. A warning is logged in that case.
+//
+// The auto-built worker reuses the same execute function the mirror engine
+// uses, so timestamps, dual-write strategy, and per-cluster routing on the
+// mirror destination are preserved on retry.
+//
+// workerOpts are applied after helix's metrics auto-injection so
+// caller-supplied options win on conflict.
+//
+// If a mirror failure cannot be enqueued (queue full, transport down) the
+// configured [WithOnReplayDropped] callback is invoked just like the
+// primary replay path — set it once to alert / persist for both paths.
+//
+// Operational notes:
+//   - With [replay.NATSReplayer] the per-failure Enqueue is bounded by
+//     `NATSReplayerConfig.PublishTimeout`. A degraded NATS therefore
+//     throttles the mirror engine's worker pool. Size
+//     [mirror.WithWorkers] accordingly when migrating against unsteady
+//     NATS infra.
+//   - The auto-built [replay.MemoryWorker] uses the replay package's own
+//     concurrency defaults, which are tuned for primary replay (one
+//     pair). For migration the mirror destination is often newer and
+//     less elastic — consider [replay.WithMaxAttempts] and lower
+//     concurrency via the appropriate [replay.WorkerOption].
+//
+// Has no effect if [WithMirror] is not also configured.
+//
+// Parameters:
+//   - replayer:   The durable store for failed mirror writes.
+//   - workerOpts: Options applied to the auto-built worker (no effect for
+//     unrecognized replayer types).
+//
+// Returns:
+//   - Option: Configuration option.
+func WithMirrorReplayer(replayer Replayer, workerOpts ...replay.WorkerOption) Option {
+	return func(c *ClientConfig) {
+		c.MirrorReplayer = replayer
+		c.MirrorReplayWorkerOpts = workerOpts
 	}
 }
 

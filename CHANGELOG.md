@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror replay durability (v1.4.0 Phase 2)**: failed mirror writes are
+  now durably retried via the existing replay system.
+  - `helix.WithMirrorReplayer(replayer, workerOpts...)`: configures a
+    [Replayer] that receives any mirror write whose execute returned an
+    error. When the replayer's concrete type is `*replay.MemoryReplayer`
+    or `*replay.NATSReplayer` an appropriate `ReplayWorker` is auto-built
+    and bound to the same execute function the mirror engine uses, so
+    timestamps, dual-write strategy, and per-cluster routing on the
+    mirror destination are preserved on retry. The worker is started
+    during `NewCQLClient` and stopped during `Close`.
+  - `mirror.WithOnError(handler)`: generic per-execute-error hook on the
+    mirror engine. Helix uses it internally to route failures to the
+    configured `MirrorReplayer`; custom integrations (alerting, alternate
+    durability stores) can install their own.
+  - `mirror.ExecuteFunc` is now a type alias for `replay.ExecuteFunc` so
+    the same function is used for the mirror engine's initial dispatch
+    and the auto-built replay worker.
+  - When a mirror enqueue itself fails (e.g., replayer queue saturated),
+    the existing `WithOnReplayDropped` callback fires — mirror and primary
+    replay share one alerting path.
+
 - **Async mirror writes (v1.4.0 Phase 1)**: per-statement opt-in mirroring of
   writes to a second helix dual-cluster pair, designed for seamless Cassandra
   cluster migrations where the application needs N days of write history on

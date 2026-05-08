@@ -12,7 +12,6 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
-	"github.com/arloliu/helix/mirror"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
@@ -526,29 +525,12 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// expanding the public ReplayWorker / WriteStrategy interfaces.
 	autoInjectMetricsAndLogger(config)
 
-	// Dispatch mirror writes through the target's full Exec path so its
-	// own write strategy and client-generated timestamp pinning apply.
-	if config.MirrorTarget != nil {
-		mirrorTarget := config.MirrorTarget
-		execute := func(ctx context.Context, payload types.ReplayPayload) error {
-			if payload.IsBatch {
-				batch := mirrorTarget.Batch(payload.BatchType)
-				for _, stmt := range payload.BatchStatements {
-					batch = batch.Query(stmt.Query, stmt.Args...)
-				}
-				return batch.WithTimestamp(payload.Timestamp).ExecContext(ctx)
-			}
-
-			return mirrorTarget.Query(payload.Query, payload.Args...).
-				WithTimestamp(payload.Timestamp).
-				ExecContext(ctx)
+	if err := setupMirror(config); err != nil {
+		if client.topologyClose != nil {
+			client.topologyClose()
 		}
-		opts := append(
-			[]mirror.Option{mirror.WithLogger(config.Logger)},
-			config.MirrorOptions...,
-		)
-		config.MirrorEngine = mirror.NewEngine(execute, opts...)
-		config.MirrorEngine.Start()
+
+		return nil, err
 	}
 
 	// Start topology watcher if configured. The cancel function is stashed so
@@ -780,13 +762,19 @@ func (c *CQLClient) Close() {
 			c.autoRefreshClose()
 		}
 
+		// Stop the mirror engine first so it stops generating new failure
+		// captures, then drain any failures that landed in the mirror
+		// replayer through its worker.
+		if c.config.MirrorEngine != nil {
+			c.config.MirrorEngine.Stop()
+		}
+		if c.config.MirrorReplayWorker != nil {
+			c.config.MirrorReplayWorker.Stop()
+		}
+
 		// Stop replay worker
 		if c.config.ReplayWorker != nil {
 			c.config.ReplayWorker.Stop()
-		}
-
-		if c.config.MirrorEngine != nil {
-			c.config.MirrorEngine.Stop()
 		}
 
 		c.loadSessionA().Close()

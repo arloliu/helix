@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/mirror"
+	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/require"
 )
@@ -240,6 +241,186 @@ func TestMirrorEngineStoppedOnClientClose(t *testing.T) {
 	// (Cleanup-installed engine is stopped twice; sync.Once protects this.)
 	// Note: Close() calls engine.Stop() too — both Stops coexist.
 	require.False(t, engine.TryEnqueue(types.ReplayPayload{Query: "after close"}))
+}
+
+// TestMirrorReplayerEnqueuesOnFailure verifies that when WithMirrorReplayer
+// is configured and the mirror execute returns an error, the failed payload
+// lands in the replayer.
+func TestMirrorReplayerEnqueuesOnFailure(t *testing.T) {
+	mirrorSA := newMockSession()
+	mirrorSA.execErr = errors.New("mirror cluster down")
+	mirrorTarget, err := NewCQLClient(mirrorSA, nil)
+	require.NoError(t, err)
+	defer mirrorTarget.Close()
+
+	// Use a custom replayer that records what it receives, so we don't
+	// need to peek into MemoryReplayer internals.
+	replayer := &recordingReplayer{}
+
+	client, err := NewCQLClient(newMockSession(), nil,
+		WithMirror(mirrorTarget,
+			mirror.WithWorkers(1),
+			mirror.WithQueueSize(8),
+		),
+		WithMirrorReplayer(replayer),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.Query("INSERT INTO t (k) VALUES (?)", "x").Mirror().ExecContext(context.Background()))
+
+	// Wait for the mirror engine to attempt the write, fail, and enqueue.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if replayer.count() >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	require.Equal(t, 1, replayer.count())
+	got := replayer.first()
+	require.Equal(t, "INSERT INTO t (k) VALUES (?)", got.Query)
+	require.Equal(t, []any{"x"}, got.Args)
+	require.NotZero(t, got.Timestamp)
+}
+
+// TestMirrorReplayerEndToEndExhaustsRetriesViaOnDrop verifies the full
+// Phase 2 loop: mirror execute fails → payload lands in MemoryReplayer →
+// auto-built MemoryWorker retries up to MaxAttempts → OnDrop fires.
+//
+// We use OnDrop as the verification anchor (rather than flipping a session
+// to eventual success) because the replay worker's retry behavior is what
+// Phase 2 wires; the eventual-success path uses the same code and is
+// covered by the existing replay package tests.
+func TestMirrorReplayerEndToEndExhaustsRetriesViaOnDrop(t *testing.T) {
+	mirrorSA := newMockSession()
+	mirrorSA.execErr = errors.New("mirror cluster down")
+	mirrorTarget, err := NewCQLClient(mirrorSA, nil)
+	require.NoError(t, err)
+	defer mirrorTarget.Close()
+
+	memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(64))
+
+	dropCh := make(chan types.ReplayPayload, 4)
+	client, err := NewCQLClient(newMockSession(), nil,
+		WithMirror(mirrorTarget,
+			mirror.WithWorkers(1),
+			mirror.WithQueueSize(8),
+		),
+		WithMirrorReplayer(memReplayer,
+			replay.WithPollInterval(20*time.Millisecond),
+			replay.WithRetryDelay(10*time.Millisecond),
+			replay.WithMaxAttempts(2),
+			replay.WithOnDrop(func(p types.ReplayPayload, _ error) {
+				dropCh <- p
+			}),
+		),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+	require.NotNil(t, client.config.MirrorReplayWorker)
+
+	require.NoError(t, client.Query("INSERT INTO t (k) VALUES (?)", "y").Mirror().ExecContext(context.Background()))
+
+	select {
+	case dropped := <-dropCh:
+		require.Equal(t, "INSERT INTO t (k) VALUES (?)", dropped.Query)
+		require.Equal(t, []any{"y"}, dropped.Args)
+		require.NotZero(t, dropped.Timestamp)
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay worker did not exhaust retries within timeout")
+	}
+}
+
+// TestMirrorReplayerEnqueueFailureFiresOnReplayDropped verifies that when
+// the mirror failure path cannot enqueue into the replayer, the existing
+// OnReplayDropped callback fires — keeping mirror and primary replay
+// alerting unified.
+func TestMirrorReplayerEnqueueFailureFiresOnReplayDropped(t *testing.T) {
+	mirrorSA := newMockSession()
+	mirrorSA.execErr = errors.New("mirror cluster down")
+	mirrorTarget, err := NewCQLClient(mirrorSA, nil)
+	require.NoError(t, err)
+	defer mirrorTarget.Close()
+
+	replayer := &recordingReplayer{enqueueErr: errors.New("replayer queue full")}
+
+	dropCh := make(chan types.ReplayPayload, 4)
+	client, err := NewCQLClient(newMockSession(), nil,
+		WithMirror(mirrorTarget, mirror.WithWorkers(1)),
+		WithMirrorReplayer(replayer),
+		WithOnReplayDropped(func(p types.ReplayPayload, _ error) {
+			dropCh <- p
+		}),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.Query("INSERT", "z").Mirror().ExecContext(context.Background()))
+
+	select {
+	case dropped := <-dropCh:
+		require.Equal(t, "INSERT", dropped.Query)
+		require.Equal(t, []any{"z"}, dropped.Args)
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnReplayDropped did not fire on mirror enqueue failure")
+	}
+}
+
+// TestMirrorReplayerUnrecognizedTypeNoWorker verifies that passing a custom
+// Replayer (neither MemoryReplayer nor NATSReplayer) still wires the engine
+// hook but leaves MirrorReplayWorker nil; the application is responsible
+// for running its own worker.
+func TestMirrorReplayerUnrecognizedTypeNoWorker(t *testing.T) {
+	mirrorSA := newMockSession()
+	mirrorTarget, err := NewCQLClient(mirrorSA, nil)
+	require.NoError(t, err)
+	defer mirrorTarget.Close()
+
+	custom := &recordingReplayer{}
+	client, err := NewCQLClient(newMockSession(), nil,
+		WithMirror(mirrorTarget),
+		WithMirrorReplayer(custom),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.Nil(t, client.config.MirrorReplayWorker, "custom replayer must not auto-build a worker")
+}
+
+// recordingReplayer is a Replayer that captures Enqueued payloads, suitable
+// for tests that don't want a worker draining behind their back. Not a
+// recognized type for buildMirrorReplayWorker, so no auto-worker is built.
+type recordingReplayer struct {
+	mu         sync.Mutex
+	captured   []types.ReplayPayload
+	enqueueErr error
+	enqueueCnt int
+}
+
+func (r *recordingReplayer) Enqueue(_ context.Context, p types.ReplayPayload) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enqueueCnt++
+	if r.enqueueErr != nil {
+		return r.enqueueErr
+	}
+	r.captured = append(r.captured, p)
+
+	return nil
+}
+
+func (r *recordingReplayer) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.captured)
+}
+
+func (r *recordingReplayer) first() types.ReplayPayload {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.captured[0]
 }
 
 func TestCloneArgs(t *testing.T) {

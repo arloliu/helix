@@ -197,6 +197,57 @@ func TestEngineExecuteErrorIncrementsCounter(t *testing.T) {
 	require.Equal(t, uint64(0), e.Stats().Success)
 }
 
+func TestEngineOnErrorFiresOnExecuteFailure(t *testing.T) {
+	wantErr := errors.New("kaboom")
+	rec := &recordingExecutor{err: wantErr}
+
+	var (
+		mu          sync.Mutex
+		gotPayloads []types.ReplayPayload
+		gotErrors   []error
+	)
+	onError := func(p types.ReplayPayload, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		gotPayloads = append(gotPayloads, p)
+		gotErrors = append(gotErrors, err)
+	}
+
+	e := NewEngine(rec.fn(), WithWorkers(1), WithOnError(onError))
+	e.Start()
+	defer e.Stop()
+
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "stmt", Timestamp: 12345}))
+	waitForCount(t, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(gotPayloads)
+	}, 1)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, "stmt", gotPayloads[0].Query)
+	require.Equal(t, int64(12345), gotPayloads[0].Timestamp)
+	require.Equal(t, wantErr, gotErrors[0])
+}
+
+func TestEngineOnErrorNotFiredOnSuccess(t *testing.T) {
+	rec := &recordingExecutor{}
+	called := atomic.Int32{}
+	onError := func(types.ReplayPayload, error) {
+		called.Add(1)
+	}
+
+	e := NewEngine(rec.fn(), WithWorkers(1), WithOnError(onError))
+	e.Start()
+	defer e.Stop()
+
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "ok"}))
+	waitForCount(t, func() int { return int(e.Stats().Success) }, 1)
+
+	require.Equal(t, int32(0), called.Load())
+}
+
 func TestEngineConcurrentEnqueue(t *testing.T) {
 	rec := &recordingExecutor{}
 	e := NewEngine(rec.fn(), WithWorkers(4), WithQueueSize(4096))

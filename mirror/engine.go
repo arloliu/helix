@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/internal/logging"
+	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
 
@@ -15,13 +16,29 @@ import (
 // Implementations typically dispatch through a helix CQLClient bound to the
 // new dual-cluster pair, preserving the original write timestamp via
 // WithTimestamp(payload.Timestamp).
-type ExecuteFunc func(ctx context.Context, payload types.ReplayPayload) error
+//
+// ExecuteFunc is a type alias for [replay.ExecuteFunc] — the mirror engine's
+// initial dispatch and a [replay.Worker] draining a [types.Replayer] share
+// the same execution shape.
+type ExecuteFunc = replay.ExecuteFunc
 
 // DropHandler is invoked when a captured write cannot be enqueued because
 // the queue is full or the engine has stopped.
 //
 // The handler runs on the caller's goroutine; keep it fast and non-blocking.
 type DropHandler func(payload types.ReplayPayload)
+
+// ErrorHandler is invoked synchronously by a worker after [ExecuteFunc]
+// returns a non-nil error. It receives the original payload and the error.
+//
+// Typical use is to push the failed payload onto a [types.Replayer] for
+// durable retry; helix wires this internally when [helix.WithMirrorReplayer]
+// is configured. Custom handlers may also implement alerting, escalation,
+// or alternative durability stores.
+//
+// The handler runs on a worker goroutine and blocks the worker until it
+// returns. Keep it fast — slow handlers throttle mirror throughput.
+type ErrorHandler func(payload types.ReplayPayload, err error)
 
 // Stats reports a snapshot of engine counters and queue state.
 //
@@ -59,6 +76,7 @@ type config struct {
 	workers   int
 	enabled   bool
 	onDrop    DropHandler
+	onError   ErrorHandler
 	logger    types.Logger
 }
 
@@ -93,6 +111,12 @@ func WithEnabled(enabled bool) Option {
 // WithOnDrop installs a callback invoked for every dropped capture.
 func WithOnDrop(fn DropHandler) Option {
 	return func(c *config) { c.onDrop = fn }
+}
+
+// WithOnError installs a callback invoked synchronously by a worker after
+// [ExecuteFunc] returns a non-nil error. See [ErrorHandler] for semantics.
+func WithOnError(fn ErrorHandler) Option {
+	return func(c *config) { c.onError = fn }
 }
 
 // WithLogger sets the logger used for engine events. Defaults to a no-op
@@ -264,6 +288,10 @@ func (e *Engine) worker() {
 				"error", err.Error(),
 				"isBatch", payload.IsBatch,
 			)
+			if e.cfg.onError != nil {
+				e.cfg.onError(payload, err)
+			}
+
 			continue
 		}
 		e.success.Add(1)
