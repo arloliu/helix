@@ -1392,6 +1392,10 @@ func (c *CQLClient) executeWriteWithReplay(
 	// If both clusters are draining, fail immediately
 	if drainA && drainB {
 		if wc.strict {
+			if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
+				sm.IncWriteSkipped(ClusterA)
+				sm.IncWriteSkipped(ClusterB)
+			}
 			return &types.DualClusterError{
 				ErrorA: types.ErrClusterDraining,
 				ErrorB: types.ErrClusterDraining,
@@ -1443,7 +1447,10 @@ func (c *CQLClient) executeWriteWithDrain(
 		c.recordOpOutcome(healthyCluster, err)
 
 		if wc.strict {
-			// Healthy cluster also failed: return DualClusterError with both causes.
+			// Healthy cluster also failed: draining cluster was still skipped.
+			if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
+				sm.IncWriteSkipped(drainingCluster)
+			}
 			if drainA {
 				return &types.DualClusterError{ErrorA: types.ErrClusterDraining, ErrorB: err}
 			}
@@ -1460,6 +1467,9 @@ func (c *CQLClient) executeWriteWithDrain(
 
 	if wc.strict {
 		// Strict: draining cluster is a skip, not a replay target.
+		if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
+			sm.IncWriteSkipped(drainingCluster)
+		}
 		return &types.PartialWriteError{
 			Acknowledged:   healthyCluster,
 			Unacknowledged: drainingCluster,
@@ -1718,12 +1728,16 @@ func (c *CQLClient) executeStrictDualWrite(
 	isSkippedA := errors.Is(errA, types.ErrClusterDegraded) || errors.Is(errA, types.ErrClusterDraining)
 	isSkippedB := errors.Is(errB, types.ErrClusterDegraded) || errors.Is(errB, types.ErrClusterDraining)
 
+	sm, _ := c.config.Metrics.(types.StrictMetrics)
+
 	c.config.Metrics.IncWriteTotal(ClusterA)
 	if startANano := startA.Load(); startANano > 0 {
 		c.config.Metrics.ObserveWriteDuration(ClusterA, float64(nowNano-startANano)/float64(time.Second))
 	}
 	if errA != nil && !isSkippedA {
 		c.config.Metrics.IncWriteError(ClusterA)
+	} else if isSkippedA && sm != nil {
+		sm.IncWriteSkipped(ClusterA)
 	}
 
 	c.config.Metrics.IncWriteTotal(ClusterB)
@@ -1732,6 +1746,8 @@ func (c *CQLClient) executeStrictDualWrite(
 	}
 	if errB != nil && !isSkippedB {
 		c.config.Metrics.IncWriteError(ClusterB)
+	} else if isSkippedB && sm != nil {
+		sm.IncWriteSkipped(ClusterB)
 	}
 
 	c.recordOpOutcomeAt(ClusterA, errA, nowNano)

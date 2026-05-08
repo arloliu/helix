@@ -155,6 +155,17 @@ func (m *NopMetrics) SetMirrorEnabled(_ bool) {}
 var _ types.MirrorMetrics = (*NopMetrics)(nil)
 
 // ----------------------
+// Strict writes (optional types.StrictMetrics)
+// ----------------------
+
+// IncWriteSkipped discards the metric.
+func (m *NopMetrics) IncWriteSkipped(_ types.ClusterID) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.StrictMetrics interface so embedders pick up no-op coverage.
+var _ types.StrictMetrics = (*NopMetrics)(nil)
+
+// ----------------------
 // Recovery probe (optional types.RecoveryProbeMetrics)
 // ----------------------
 

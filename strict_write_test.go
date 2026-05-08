@@ -4,14 +4,33 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// strictMetricsCollector wraps NopMetrics and tracks IncWriteSkipped calls.
+type strictMetricsCollector struct {
+	metrics.NopMetrics
+	skippedA, skippedB atomic.Int32
+}
+
+func (s *strictMetricsCollector) IncWriteSkipped(cluster types.ClusterID) {
+	if cluster == ClusterA {
+		s.skippedA.Add(1)
+	} else {
+		s.skippedB.Add(1)
+	}
+}
+
+var _ types.MetricsCollector = (*strictMetricsCollector)(nil)
+var _ types.StrictMetrics = (*strictMetricsCollector)(nil)
 
 // newDualClient creates a dual-cluster client with the given sessions and options.
 func newDualClient(t *testing.T, sessionA, sessionB *mockSession, opts ...Option) *CQLClient {
@@ -256,4 +275,75 @@ func TestStrict_NoReplayOnPartialFailure(t *testing.T) {
 	enqueued := len(replayer.payloads)
 	replayer.Unlock()
 	assert.Equal(t, 0, enqueued, "strict partial failure must not enqueue replay")
+}
+
+// TestStrict_WriteSkippedMetric_DegradedCluster verifies that IncWriteSkipped
+// is incremented for the degraded cluster and IncWriteError is not.
+func TestStrict_WriteSkippedMetric_DegradedCluster(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	adaptive := policy.NewAdaptiveDualWrite()
+	adaptive.ForceDegrade(types.ClusterA)
+
+	mc := &strictMetricsCollector{}
+	client := newDualClient(t, sa, sb,
+		WithWriteStrategy(adaptive),
+		WithMetrics(mc),
+		WithRecoveryProbeDisabled(),
+	)
+
+	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().ExecContext(t.Context())
+
+	require.True(t, types.IsPartialWrite(err))
+	assert.Equal(t, int32(1), mc.skippedA.Load(), "IncWriteSkipped must fire for degraded cluster A")
+	assert.Equal(t, int32(0), mc.skippedB.Load(), "IncWriteSkipped must not fire for healthy cluster B")
+}
+
+// TestStrict_WriteSkippedMetric_DrainingCluster verifies that IncWriteSkipped
+// is incremented for a draining cluster in the strict drain path.
+func TestStrict_WriteSkippedMetric_DrainingCluster(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	watcher := newMockTopologyWatcher()
+
+	mc := &strictMetricsCollector{}
+	client := newDualClient(t, sa, sb,
+		WithWriteStrategy(policy.NewConcurrentDualWrite()),
+		WithTopologyWatcher(watcher),
+		WithMetrics(mc),
+	)
+
+	watcher.SetDrain(ClusterA, true)
+	time.Sleep(50 * time.Millisecond)
+
+	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().ExecContext(t.Context())
+
+	pwe, ok := types.AsPartialWriteError(err)
+	require.True(t, ok)
+	assert.ErrorIs(t, pwe.Cause, types.ErrClusterDraining)
+	assert.Equal(t, int32(1), mc.skippedA.Load(), "IncWriteSkipped must fire for draining cluster A")
+	assert.Equal(t, int32(0), mc.skippedB.Load())
+}
+
+// TestStrict_WriteSkippedMetric_BothDraining verifies that IncWriteSkipped fires
+// for both clusters when both are draining.
+func TestStrict_WriteSkippedMetric_BothDraining(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	watcher := newMockTopologyWatcher()
+
+	mc := &strictMetricsCollector{}
+	client := newDualClient(t, sa, sb,
+		WithWriteStrategy(policy.NewConcurrentDualWrite()),
+		WithTopologyWatcher(watcher),
+		WithMetrics(mc),
+	)
+
+	watcher.SetDrain(ClusterA, true)
+	watcher.SetDrain(ClusterB, true)
+	time.Sleep(50 * time.Millisecond)
+
+	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().ExecContext(t.Context())
+
+	var dce *types.DualClusterError
+	require.True(t, errors.As(err, &dce))
+	assert.Equal(t, int32(1), mc.skippedA.Load(), "IncWriteSkipped must fire for draining cluster A")
+	assert.Equal(t, int32(1), mc.skippedB.Load(), "IncWriteSkipped must fire for draining cluster B")
 }

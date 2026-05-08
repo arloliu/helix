@@ -55,6 +55,50 @@ const (
 
 var ErrNotFound = types.ErrNotFound
 
+// Sentinel errors for strict write paths.
+var (
+	// ErrClusterDegraded is returned by a Strict() write when a cluster is
+	// degraded (AdaptiveDualWrite only). The write was not attempted on that
+	// cluster; the error surfaces as [PartialWriteError.Cause].
+	ErrClusterDegraded = types.ErrClusterDegraded
+
+	// ErrClusterDraining is returned by a Strict() write when a cluster is
+	// in drain mode. The write was not attempted on that cluster; the error
+	// surfaces as [PartialWriteError.Cause].
+	ErrClusterDraining = types.ErrClusterDraining
+
+	// ErrStrictUnsupported is returned when Strict() is called but the
+	// configured WriteStrategy does not implement [StrictWriter].
+	ErrStrictUnsupported = types.ErrStrictUnsupported
+
+	// ErrStrictMirrorUnsupported is returned when both Strict() and Mirror()
+	// are called on the same query or batch. The two modes are incompatible.
+	ErrStrictMirrorUnsupported = types.ErrStrictMirrorUnsupported
+)
+
+// Re-export strict write result types.
+type (
+	// PartialWriteError is returned by a Strict() write when exactly one
+	// cluster acknowledged the write. See [types.PartialWriteError] for details.
+	PartialWriteError = types.PartialWriteError
+
+	// DualClusterError is returned when both clusters return errors for the
+	// same operation. See [types.DualClusterError] for details.
+	DualClusterError = types.DualClusterError
+)
+
+// AsPartialWriteError unwraps err as a [PartialWriteError]. See
+// [types.AsPartialWriteError] for details.
+func AsPartialWriteError(err error) (*PartialWriteError, bool) {
+	return types.AsPartialWriteError(err)
+}
+
+// IsPartialWrite reports whether err is a [PartialWriteError]. See
+// [types.IsPartialWrite] for details.
+func IsPartialWrite(err error) bool {
+	return types.IsPartialWrite(err)
+}
+
 // IsNotFound reports whether err represents a "not found" result.
 // See [types.IsNotFound] for details.
 func IsNotFound(err error) bool {
