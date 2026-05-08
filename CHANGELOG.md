@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mirror docs, examples, and integration tests (v1.4.0 Phase 5)**:
+  - `docs/mirror.md` — user guide covering target / publisher modes,
+    semantics, runtime control, observability, known parity gaps, and
+    failure observability paths.
+  - `examples/mirror/` — runnable wiring example for both modes
+    (target via `WithMirror` + optional `WithMirrorReplayer`, and the
+    publisher / consumer split via `WithMirrorPublisher` + `NewMirrorWorker`).
+  - `test/integration/mirror_integration_test.go` — end-to-end integration
+    tests against shared CQL clusters (and an embedded NATS JetStream
+    server for publisher mode) covering target-mode dispatch, durable
+    retry via `WithMirrorReplayer`, publisher / consumer split, and
+    server-side timestamp parity (`WRITETIME` matches across
+    primary / mirror).
+
+### Changed
+
+- **Mirror payload routing**: dispatched mirror payloads now carry
+  `TargetCluster = ClusterA` so transports that route by cluster (NATS
+  subjects use `{prefix}.{priority}.{cluster}`) deliver mirror messages
+  to the consumer. Mirror writes target the mirror destination as a
+  single logical sink — the destination's own write strategy handles
+  per-cluster fan-out internally — so the conventional ClusterA tag has
+  no real per-cluster meaning at the source.
+
 - **Mirror metrics (v1.4.0 Phase 4)**: dedicated `helix_mirror_*` metric
   surface for the async mirror engine.
   - New optional interface `types.MirrorMetrics` (paralleling

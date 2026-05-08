@@ -290,6 +290,15 @@ func cloneBatchEntries(entries []batchEntry) []types.BatchStatement {
 	return out
 }
 
+// mirrorTargetCluster is the conventional TargetCluster value attached to
+// every mirror payload. Mirror writes target the mirror destination as a
+// single logical sink — the destination's own write strategy (dual-write,
+// per-cluster routing) handles cluster fan-out internally — so no real
+// per-cluster routing happens at the source. The value is required by
+// transports that route by cluster (e.g., NATSReplayer subjects):
+// without it those transports drop the message.
+const mirrorTargetCluster = ClusterA
+
 // dispatchMirrorQuery enqueues a captured single-statement write to the
 // mirror engine. Safe to call when the engine is nil or disabled.
 func (c *CQLClient) dispatchMirrorQuery(stmt string, values []any, ts int64, priority PriorityLevel) {
@@ -297,10 +306,11 @@ func (c *CQLClient) dispatchMirrorQuery(stmt string, values []any, ts int64, pri
 		return
 	}
 	c.config.MirrorEngine.TryEnqueue(types.ReplayPayload{
-		Query:     stmt,
-		Args:      cloneArgs(values),
-		Timestamp: ts,
-		Priority:  priority,
+		TargetCluster: mirrorTargetCluster,
+		Query:         stmt,
+		Args:          cloneArgs(values),
+		Timestamp:     ts,
+		Priority:      priority,
 	})
 }
 
@@ -312,6 +322,7 @@ func (c *CQLClient) dispatchMirrorBatch(kind BatchType, entries []batchEntry, ts
 	}
 	c.config.MirrorEngine.TryEnqueue(types.ReplayPayload{
 		IsBatch:         true,
+		TargetCluster:   mirrorTargetCluster,
 		BatchType:       kind,
 		BatchStatements: cloneBatchEntries(entries),
 		Timestamp:       ts,
