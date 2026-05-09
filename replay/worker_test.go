@@ -48,6 +48,49 @@ func TestMemoryWorkerStartStop(t *testing.T) {
 	worker.Stop()
 }
 
+func TestMemoryWorkerCannotRestartAfterStop(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
+	defer replayer.Close()
+
+	worker := replay.NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		replay.WithPollInterval(10*time.Millisecond),
+	)
+
+	require.NoError(t, worker.Start())
+	worker.Stop()
+
+	err := worker.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "worker has been stopped")
+	assert.False(t, worker.IsRunning())
+}
+
+func TestMemoryWorkerStartRejectsNilInputs(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
+	defer replayer.Close()
+
+	worker := replay.NewMemoryWorker(nil,
+		func(_ context.Context, _ types.ReplayPayload) error { return nil },
+	)
+	err := worker.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-nil replayer")
+
+	worker = replay.NewMemoryWorker(replayer, nil)
+	err = worker.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-nil execute")
+}
+
+func TestWorkerStartRejectsZeroValue(t *testing.T) {
+	var worker replay.Worker
+
+	err := worker.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not initialized")
+}
+
 func TestMemoryWorkerProcessesMessages(t *testing.T) {
 	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
 	defer replayer.Close()

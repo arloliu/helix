@@ -40,6 +40,11 @@ type NATSReplayerConfig struct {
 	// Default: 1GB
 	MaxBytes int64
 
+	// DiscardPolicy controls what JetStream does when MaxMsgs or MaxBytes
+	// is reached. Default: DiscardOld, preserving write availability by
+	// retaining the newest replay window and evicting older messages.
+	DiscardPolicy jetstream.DiscardPolicy
+
 	// Replicas is the number of stream replicas (for fault tolerance).
 	// Default: 1 (use 3 for production clusters)
 	Replicas int
@@ -90,6 +95,7 @@ func DefaultNATSReplayerConfig() NATSReplayerConfig {
 		MaxAge:          24 * time.Hour,
 		MaxMsgs:         1_000_000,
 		MaxBytes:        1 << 30, // 1GB
+		DiscardPolicy:   jetstream.DiscardOld,
 		Replicas:        1,
 		PublishTimeout:  5 * time.Second,
 		MaxAckPending:   1000,
@@ -178,6 +184,36 @@ func WithMaxBytes(n int64) NATSReplayerOption {
 	return func(c *NATSReplayerConfig) {
 		c.MaxBytes = n
 	}
+}
+
+// WithDiscardPolicy sets the JetStream discard policy used when stream limits are reached.
+//
+// The default is [jetstream.DiscardOld], an availability-first policy that
+// keeps accepting new replay messages and retains the newest repair window.
+// Use [jetstream.DiscardNew] when preserving already-admitted replay work is
+// more important than keeping enqueue calls successful during a prolonged outage.
+//
+// Parameters:
+//   - policy: JetStream discard policy for MaxMsgs/MaxBytes pressure
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithDiscardPolicy(policy jetstream.DiscardPolicy) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.DiscardPolicy = policy
+	}
+}
+
+// WithRejectNewOnLimit configures JetStream to reject new replay messages when full.
+//
+// This is a backpressure-first mode. Existing replay messages are preserved
+// when MaxMsgs or MaxBytes is reached, and new Enqueue calls fail instead of
+// evicting older replay work.
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithRejectNewOnLimit() NATSReplayerOption {
+	return WithDiscardPolicy(jetstream.DiscardNew)
 }
 
 // WithReplicas sets the number of stream replicas.
@@ -331,7 +367,7 @@ func NewNATSReplayer(js jetstream.JetStream, opts ...NATSReplayerOption) (*NATSR
 		MaxBytes:    config.MaxBytes,
 		Replicas:    config.Replicas,
 		Storage:     jetstream.FileStorage,
-		Discard:     jetstream.DiscardOld,
+		Discard:     config.DiscardPolicy,
 	}
 
 	stream, err := js.CreateOrUpdateStream(ctx, streamConfig)
@@ -457,7 +493,7 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 		return nil, err
 	}
 
-	return n.fetchReplayMessages(consumerName, consumer, batchSize)
+	return n.fetchReplayMessages(ctx, consumerName, consumer, batchSize)
 }
 
 // DequeueByPriority retrieves a batch of replay messages for a specific priority.
@@ -501,7 +537,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		return nil, err
 	}
 
-	return n.fetchReplayMessages(consumerName, consumer, batchSize)
+	return n.fetchReplayMessages(ctx, consumerName, consumer, batchSize)
 }
 
 func (n *NATSReplayer) getOrCreateConsumer(
@@ -547,13 +583,20 @@ func (n *NATSReplayer) getOrCreateConsumer(
 }
 
 func (n *NATSReplayer) fetchReplayMessages(
+	ctx context.Context,
 	consumerName string,
 	consumer jetstream.Consumer,
 	batchSize int,
 ) ([]ReplayMessage, error) {
 	// Fetch messages
-	msgs, err := consumer.Fetch(batchSize, jetstream.FetchMaxWait(time.Second))
+	fetchCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	msgs, err := consumer.Fetch(batchSize, jetstream.FetchContext(fetchCtx))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, jetstream.ErrNoMessages) {
 			return nil, nil // No messages available
 		}
@@ -772,11 +815,16 @@ func tryConvertToUUID(arg any) (UUID, bool) {
 		if rv.Kind() == reflect.Array && rv.Type().Len() == 16 && rv.Type().Elem().Kind() == reflect.Uint8 {
 			// Create a new UUID and copy bytes
 			var u UUID
+			byteType := reflect.TypeOf(byte(0))
 			// We can't directly cast, so we copy
 			// reflect.Copy requires both to be slices or arrays, but we can iterate
 			// or use Unsafe, but iteration is safer and fast enough for 16 bytes
 			for i := range 16 {
-				u[i] = byte(rv.Index(i).Uint())
+				converted, ok := rv.Index(i).Convert(byteType).Interface().(byte)
+				if !ok {
+					return UUID{}, false
+				}
+				u[i] = converted
 			}
 
 			return u, true
@@ -910,8 +958,7 @@ func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 		msgs = uint64(^uint(0) >> 1)
 	}
 
-	//nolint:gosec // overflow is handled by the cap above
-	return int(msgs), nil
+	return int(msgs), nil //nolint:gosec // overflow is handled by the cap above.
 }
 
 // handleCorrupt terminates a message that cannot be decoded and invokes the
@@ -922,7 +969,9 @@ func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 // allow the message to be processed successfully. Calling Term() removes the
 // message from the queue without waiting for MaxDeliver exhaustion.
 func (n *NATSReplayer) handleCorrupt(msg jetstream.Msg, err error) {
-	_ = msg.Term()
+	if termErr := msg.Term(); termErr != nil {
+		err = errors.Join(err, fmt.Errorf("helix: failed to terminate corrupt replay message: %w", termErr))
+	}
 	if n.config.OnCorruptMessage != nil {
 		n.config.OnCorruptMessage(err)
 	}

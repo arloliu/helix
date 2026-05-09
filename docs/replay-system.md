@@ -71,7 +71,16 @@ type Replayer interface {
 | Implementation | Durability | Use Case |
 |---------------|------------|----------|
 | `MemoryReplayer` | Volatile (lost on crash) | Development, testing |
-| `NATSReplayer` | Durable (persisted) | Production |
+| `NATSReplayer` | Durable within configured retention limits | Production |
+
+`NATSReplayer` is intentionally bounded by `MaxAge`, `MaxMsgs`, and
+`MaxBytes`. The default stream policy is availability-first: when the stream
+hits a size/count limit, JetStream discards older replay messages so newer
+partial writes can still be admitted. This keeps the service accepting writes
+and prioritizes convergence of recent data, but it means the replay recovery
+window is finite. Use `WithRejectNewOnLimit()` for backpressure-first behavior
+that preserves already-admitted replay messages and fails new enqueue attempts
+when the stream is full.
 
 ### Replay Worker (Consumer)
 
@@ -84,6 +93,9 @@ type ReplayWorker interface {
     IsRunning() bool
 }
 ```
+
+`Stop()` is terminal for a worker instance. After a worker has been stopped,
+construct a new worker rather than calling `Start()` again.
 
 **Implementations:**
 
@@ -552,6 +564,8 @@ If you need durable replay or more sophisticated retry semantics, use
 | `WithMaxAge(d)` | 24 hours | Message retention period |
 | `WithMaxMsgs(n)` | 1,000,000 | Maximum messages in stream |
 | `WithMaxBytes(n)` | 1 GB | Maximum stream size |
+| `WithDiscardPolicy(p)` | `jetstream.DiscardOld` | Stream-limit policy; default keeps newest replay window |
+| `WithRejectNewOnLimit()` | off | Use `DiscardNew` so full streams reject new replay messages instead of evicting old ones |
 | `WithReplicas(n)` | 1 | Replication factor (use 3 for production) |
 | `WithPublishTimeout(d)` | 5s | Publish timeout |
 | `WithMaxAckPending(n)` | 1000 | Max unacked messages per consumer (backpressure) |
@@ -616,7 +630,7 @@ nats stream info helix-replay
 nats stream info helix-replay --json | jq '.state.messages'
 ```
 
-### 3. Set Appropriate Retention
+### 3. Set Appropriate Retention and Overflow Policy
 
 Configure retention based on your recovery requirements:
 
@@ -626,6 +640,20 @@ replay.NewNATSReplayer(js,
     replay.WithMaxMsgs(1_000_000),      // Or max 1M messages
 )
 ```
+
+By default, Helix uses `DiscardOld` when `MaxMsgs` or `MaxBytes` is reached.
+That policy keeps new writes flowing and retains the newest repair window,
+which is usually the most valuable data during recovery. If your domain needs
+to preserve every accepted replay message even when that creates write-path
+pressure, opt into reject-new behavior:
+
+```go
+replay.NewNATSReplayer(js,
+    replay.WithRejectNewOnLimit(),
+)
+```
+
+In either mode, `MaxAge` still bounds replay durability by time.
 
 ### 4. Handle Poison Messages
 
@@ -719,6 +747,13 @@ The default ratio-based scheduling ensures low-priority messages are eventually 
 
 The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `helix.replay.low.B`), enabling independent monitoring and processing.
 
+When consuming manually, do not mix `Dequeue()` and `DequeueByPriority()` for
+the same stream/cluster. `Dequeue()` creates a broad durable consumer for all
+priorities on that cluster, while `DequeueByPriority()` creates separate high
+and low priority durable consumers. NATS work-queue streams require consumers
+for the same messages to be non-overlapping. The built-in `NATSWorker` uses
+`DequeueByPriority()` exclusively.
+
 ---
 
 ## Troubleshooting
@@ -728,6 +763,7 @@ The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `h
 1. **Check worker is running:**
    ```go
    if !worker.IsRunning() {
+       worker = replay.NewNATSWorker(replayer, executeFunc)
        worker.Start()
    }
    ```

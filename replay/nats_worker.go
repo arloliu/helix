@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -175,7 +176,7 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 			// in the batch. Each Nak is independent; an error on one does
 			// not block the others.
 			for j := i; j < len(msgs); j++ {
-				_ = msgs[j].Nak()
+				b.nakMessage(msgs[j], "shutdown")
 			}
 
 			return
@@ -197,20 +198,21 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 			if isLastAttempt {
 				// This is the last attempt - message will be dropped
 				// Use Term() to explicitly terminate, preventing any redelivery
-				_ = msg.Term()
-				b.config.Metrics.IncReplayDropped(msg.Payload.TargetCluster)
-				b.config.Logger.Error("replay execution failed, max retries exceeded, message dropped",
-					"cluster", b.clusterName(msg.Payload.TargetCluster),
-					"attempt", msg.DeliveryCount,
-					"maxDeliver", msg.MaxDeliver,
-					"error", err.Error(),
-				)
-				if b.config.OnDrop != nil {
-					b.config.OnDrop(msg.Payload, err)
+				if b.termMessage(msg, "max retries exceeded") {
+					b.config.Metrics.IncReplayDropped(msg.Payload.TargetCluster)
+					b.config.Logger.Error("replay execution failed, max retries exceeded, message dropped",
+						"cluster", b.clusterName(msg.Payload.TargetCluster),
+						"attempt", msg.DeliveryCount,
+						"maxDeliver", msg.MaxDeliver,
+						"error", err.Error(),
+					)
+					if b.config.OnDrop != nil {
+						b.config.OnDrop(msg.Payload, err)
+					}
 				}
 			} else {
 				// Nak for redelivery
-				_ = msg.Nak()
+				b.nakMessage(msg, "retry")
 				b.config.Logger.Warn("replay execution failed, will retry",
 					"cluster", b.clusterName(msg.Payload.TargetCluster),
 					"attempt", msg.DeliveryCount,
@@ -224,7 +226,15 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 			}
 		} else {
 			// Ack on success
-			_ = msg.Ack()
+			if ackErr := b.ackMessage(msg); ackErr != nil {
+				b.config.Metrics.IncReplayError(msg.Payload.TargetCluster)
+				b.config.Metrics.ObserveReplayDuration(msg.Payload.TargetCluster, elapsed)
+				if b.config.OnError != nil {
+					b.config.OnError(msg.Payload, ackErr, int(msg.DeliveryCount)) //nolint:gosec // safe conversion for small values
+				}
+
+				continue
+			}
 			b.config.Metrics.IncReplaySuccess(msg.Payload.TargetCluster)
 			b.config.Metrics.ObserveReplayDuration(msg.Payload.TargetCluster, elapsed)
 			if b.config.OnSuccess != nil {
@@ -232,6 +242,49 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 			}
 		}
 	}
+}
+
+func (b *natsBackend) ackMessage(msg ReplayMessage) error {
+	err := msg.Ack()
+	if err == nil {
+		return nil
+	}
+
+	wrapped := fmt.Errorf("helix: failed to ack replay message after successful execution: %w", err)
+	b.config.Logger.Error("failed to ack replay message after successful execution",
+		"cluster", b.clusterName(msg.Payload.TargetCluster),
+		"attempt", msg.DeliveryCount,
+		"error", err.Error(),
+	)
+
+	return wrapped
+}
+
+func (b *natsBackend) nakMessage(msg ReplayMessage, reason string) {
+	if err := msg.Nak(); err != nil {
+		b.config.Logger.Error("failed to nak replay message",
+			"cluster", b.clusterName(msg.Payload.TargetCluster),
+			"reason", reason,
+			"attempt", msg.DeliveryCount,
+			"error", err.Error(),
+		)
+	}
+}
+
+func (b *natsBackend) termMessage(msg ReplayMessage, reason string) bool {
+	if err := msg.Term(); err != nil {
+		b.config.Logger.Error("failed to terminate replay message",
+			"cluster", b.clusterName(msg.Payload.TargetCluster),
+			"reason", reason,
+			"attempt", msg.DeliveryCount,
+			"maxDeliver", msg.MaxDeliver,
+			"error", err.Error(),
+		)
+
+		return false
+	}
+
+	return true
 }
 
 // executeOnce executes a single replay attempt with timeout.
@@ -261,6 +314,7 @@ func NewNATSWorker(replayer *NATSReplayer, execute ExecuteFunc, opts ...WorkerOp
 	for _, opt := range opts {
 		opt(&config)
 	}
+	normalizeWorkerConfig(&config)
 
 	// Ensure metrics is never nil
 	if config.Metrics == nil {
@@ -273,9 +327,10 @@ func NewNATSWorker(replayer *NATSReplayer, execute ExecuteFunc, opts ...WorkerOp
 	}
 
 	w := &Worker{
-		config:  config,
-		execute: execute,
-		stopCh:  make(chan struct{}),
+		config:     config,
+		execute:    execute,
+		stopCh:     make(chan struct{}),
+		startupErr: validateWorkerInputs(replayer != nil, execute),
 	}
 
 	// Create and inject the NATS backend

@@ -46,6 +46,13 @@
 // JetStream. It is suitable for production deployments requiring durability
 // and multi-instance replay processing.
 //
+// By default, NATSReplayer uses JetStream's DiscardOld policy when MaxMsgs or
+// MaxBytes is reached. This is an availability-first bounded replay window:
+// new partial writes can continue to enqueue, and the newest replay work is
+// retained, but older unreplayed messages may be evicted under sustained
+// outage pressure. Use [WithRejectNewOnLimit] when preserving already-admitted
+// replay messages is more important than keeping enqueue calls successful.
+//
 // # Replay Worker
 //
 // The [Worker] type processes replay payloads automatically in the background.

@@ -67,6 +67,29 @@ func TestWorkerConfigOptions(t *testing.T) {
 	assert.True(t, called)
 }
 
+func TestWorkerConfigInvalidValuesAreNormalized(t *testing.T) {
+	replayer := NewMemoryReplayer(WithQueueCapacity(10))
+	defer replayer.Close()
+
+	worker := NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		WithBatchSize(0),
+		WithPollInterval(0),
+		WithRetryDelay(0),
+		WithMaxRetryDelay(time.Nanosecond),
+		WithExecuteTimeout(0),
+		WithMaxAttempts(0),
+	)
+
+	defaults := DefaultWorkerConfig()
+	assert.Equal(t, defaults.BatchSize, worker.config.BatchSize)
+	assert.Equal(t, defaults.PollInterval, worker.config.PollInterval)
+	assert.Equal(t, defaults.RetryDelay, worker.config.RetryDelay)
+	assert.Equal(t, defaults.RetryDelay, worker.config.MaxRetryDelay)
+	assert.Equal(t, defaults.ExecuteTimeout, worker.config.ExecuteTimeout)
+	assert.Equal(t, 1, worker.config.MaxAttempts)
+}
+
 // TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown verifies the
 // shutdown contract: when stopCh fires mid-batch, every unprocessed
 // message in the batch is Nak'd so the broker re-delivers them
@@ -200,3 +223,86 @@ func TestNATSBackend_ProcessMessages_NakErrorsAreNonBlocking(t *testing.T) {
 	assert.Equal(t, int32(3), nakedCount.Load(),
 		"every message in the batch must have its Nak attempted, errors don't abort the loop")
 }
+
+func TestNATSBackend_ProcessMessages_AckFailureIsReportedAsError(t *testing.T) {
+	logger := &recordingWorkerLogger{}
+	cfg := DefaultWorkerConfig()
+	cfg.Metrics = metrics.NewNopMetrics()
+	cfg.Logger = logger
+
+	var success atomic.Int32
+	var errorCount atomic.Int32
+	cfg.OnSuccess = func(_ types.ReplayPayload) { success.Add(1) }
+	cfg.OnError = func(_ types.ReplayPayload, err error, _ int) {
+		if errors.Is(err, errAckFailed) {
+			errorCount.Add(1)
+		}
+	}
+
+	msg := ReplayMessage{
+		Payload: types.ReplayPayload{TargetCluster: types.ClusterA},
+		ackFunc: func() error {
+			return errAckFailed
+		},
+		DeliveryCount: 1,
+		MaxDeliver:    5,
+	}
+
+	b := &natsBackend{
+		config:  &cfg,
+		execute: func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		stopCh:  make(chan struct{}),
+	}
+	b.processMessages([]ReplayMessage{msg})
+
+	assert.Equal(t, int32(0), success.Load(), "ack failure makes broker state uncertain; do not report success")
+	assert.Equal(t, int32(1), errorCount.Load())
+	assert.Equal(t, int32(1), logger.errorCount.Load())
+}
+
+func TestNATSBackend_ProcessMessages_TermFailureDoesNotReportDrop(t *testing.T) {
+	logger := &recordingWorkerLogger{}
+	cfg := DefaultWorkerConfig()
+	cfg.Metrics = metrics.NewNopMetrics()
+	cfg.Logger = logger
+
+	var dropped atomic.Int32
+	cfg.OnDrop = func(_ types.ReplayPayload, _ error) { dropped.Add(1) }
+
+	msg := ReplayMessage{
+		Payload: types.ReplayPayload{TargetCluster: types.ClusterA},
+		termFunc: func() error {
+			return errors.New("term failed")
+		},
+		DeliveryCount: 5,
+		MaxDeliver:    5,
+	}
+
+	b := &natsBackend{
+		config:  &cfg,
+		execute: func(_ context.Context, _ types.ReplayPayload) error { return errors.New("execute failed") },
+		stopCh:  make(chan struct{}),
+	}
+	b.processMessages([]ReplayMessage{msg})
+
+	assert.Equal(t, int32(0), dropped.Load(), "failed Term means the broker did not confirm the message was dropped")
+	assert.Equal(t, int32(1), logger.errorCount.Load())
+}
+
+var errAckFailed = errors.New("ack failed")
+
+type recordingWorkerLogger struct {
+	errorCount atomic.Int32
+}
+
+func (l *recordingWorkerLogger) Debug(_ string, _ ...any) {}
+
+func (l *recordingWorkerLogger) Info(_ string, _ ...any) {}
+
+func (l *recordingWorkerLogger) Warn(_ string, _ ...any) {}
+
+func (l *recordingWorkerLogger) Error(_ string, _ ...any) {
+	l.errorCount.Add(1)
+}
+
+func (l *recordingWorkerLogger) Fatal(_ string, _ ...any) {}

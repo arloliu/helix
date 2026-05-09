@@ -255,12 +255,14 @@ func WithWorkerClusterNames(names types.ClusterNames) WorkerOption {
 // The worker uses a backend strategy pattern to support different queue implementations.
 // It manages the lifecycle (Start/Stop) while delegating queue-specific processing to the backend.
 type Worker struct {
-	config  WorkerConfig
-	execute ExecuteFunc
-	backend workerBackend
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
-	running atomic.Bool
+	config     WorkerConfig
+	execute    ExecuteFunc
+	backend    workerBackend
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	startupErr error
+	running    atomic.Bool
+	stopped    atomic.Bool
 }
 
 // workerBackend abstracts queue-specific processing logic.
@@ -289,6 +291,15 @@ type workerBackend interface {
 // Returns:
 //   - error: ErrWorkerAlreadyRunning if already started
 func (w *Worker) Start() error {
+	if w.startupErr != nil {
+		return w.startupErr
+	}
+	if w.backend == nil {
+		return errors.New("helix: worker is not initialized")
+	}
+	if w.stopped.Load() {
+		return errors.New("helix: worker has been stopped")
+	}
 	if !w.running.CompareAndSwap(false, true) {
 		return errors.New("helix: worker already running")
 	}
@@ -317,6 +328,7 @@ func (w *Worker) Stop() {
 		return
 	}
 
+	w.stopped.Store(true)
 	close(w.stopCh)
 	w.wg.Wait()
 }

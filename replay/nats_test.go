@@ -424,6 +424,71 @@ func TestNATSReplayerConfigOptions(t *testing.T) {
 	assert.Equal(t, "test-config", replayer.StreamName())
 }
 
+func TestNATSReplayerDefaultDiscardPolicyIsDiscardOld(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	const streamName = "test-discard-default"
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName(streamName),
+		replay.WithSubjectPrefix("test.replay.discard.default"),
+	)
+	require.NoError(t, err)
+	defer replayer.Close()
+
+	stream, err := js.Stream(t.Context(), streamName)
+	require.NoError(t, err)
+
+	info, err := stream.Info(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, jetstream.DiscardOld, info.Config.Discard)
+}
+
+func TestNATSReplayerRejectNewOnLimitUsesDiscardNew(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	const streamName = "test-discard-new"
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName(streamName),
+		replay.WithSubjectPrefix("test.replay.discard.new"),
+		replay.WithRejectNewOnLimit(),
+	)
+	require.NoError(t, err)
+	defer replayer.Close()
+
+	stream, err := js.Stream(t.Context(), streamName)
+	require.NoError(t, err)
+
+	info, err := stream.Info(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, jetstream.DiscardNew, info.Config.Discard)
+}
+
+func TestNATSReplayerDequeueHonorsCanceledContext(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName("test-dequeue-canceled-context"),
+		replay.WithSubjectPrefix("test.replay.cancel"),
+	)
+	require.NoError(t, err)
+	defer replayer.Close()
+
+	// Prime the consumer cache. The canceled-context assertion below should
+	// exercise the Fetch path, not just consumer creation.
+	msgs, err := replayer.Dequeue(t.Context(), types.ClusterA, 1)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	start := time.Now()
+	msgs, err = replayer.Dequeue(ctx, types.ClusterA, 1)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Empty(t, msgs)
+	assert.Less(t, time.Since(start), 200*time.Millisecond)
+}
+
 func TestNATSReplayerArgsTypes(t *testing.T) {
 	js := testutil.StartEmbeddedNATS(t)
 

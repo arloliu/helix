@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -280,6 +281,7 @@ func NewMemoryWorker(replayer *MemoryReplayer, execute ExecuteFunc, opts ...Work
 	for _, opt := range opts {
 		opt(&config)
 	}
+	normalizeWorkerConfig(&config)
 
 	if config.Metrics == nil {
 		config.Metrics = metrics.NewNopMetrics()
@@ -289,9 +291,10 @@ func NewMemoryWorker(replayer *MemoryReplayer, execute ExecuteFunc, opts ...Work
 	}
 
 	w := &Worker{
-		config:  config,
-		execute: execute,
-		stopCh:  make(chan struct{}),
+		config:     config,
+		execute:    execute,
+		stopCh:     make(chan struct{}),
+		startupErr: validateWorkerInputs(replayer != nil, execute),
 	}
 
 	w.backend = &memoryBackend{
@@ -304,4 +307,40 @@ func NewMemoryWorker(replayer *MemoryReplayer, execute ExecuteFunc, opts ...Work
 	}
 
 	return w
+}
+
+func validateWorkerInputs(hasReplayer bool, execute ExecuteFunc) error {
+	if !hasReplayer {
+		return errors.New("helix: replay worker requires a non-nil replayer")
+	}
+	if execute == nil {
+		return errors.New("helix: replay worker requires a non-nil execute function")
+	}
+
+	return nil
+}
+
+func normalizeWorkerConfig(config *WorkerConfig) {
+	defaults := DefaultWorkerConfig()
+	if config.BatchSize <= 0 {
+		config.BatchSize = defaults.BatchSize
+	}
+	if config.PollInterval <= 0 {
+		config.PollInterval = defaults.PollInterval
+	}
+	if config.RetryDelay <= 0 {
+		config.RetryDelay = defaults.RetryDelay
+	}
+	if config.MaxRetryDelay <= 0 {
+		config.MaxRetryDelay = defaults.MaxRetryDelay
+	}
+	if config.MaxRetryDelay < config.RetryDelay {
+		config.MaxRetryDelay = config.RetryDelay
+	}
+	if config.ExecuteTimeout <= 0 {
+		config.ExecuteTimeout = defaults.ExecuteTimeout
+	}
+	if config.MaxAttempts <= 0 {
+		config.MaxAttempts = 1
+	}
 }
