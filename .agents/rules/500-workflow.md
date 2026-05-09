@@ -1,10 +1,11 @@
 # 500 - Development Workflow
 
 ## Before Commit
-1. Run `make lint` — Fix all issues.
-2. Run `make test` — All unit tests must pass with race detector.
-3. If replay message types changed, run `make generate` and commit generated files.
-4. Verify docs are updated if API changed.
+1. Run `go fix ./...` — Modernize deprecated API usage before anything else.
+2. Run `make lint` — Fix all issues.
+3. Run `make test` — All unit tests must pass with race detector.
+4. If replay message types changed, run `make generate` and commit generated files.
+5. Verify docs are updated if API changed.
 
 ## Git Conventions
 - **Branches:** `feat/`, `fix/`, `docs/`, `chore/`, `test/`.
@@ -35,5 +36,6 @@ make test-all          # Unit + integration
 make coverage          # Generate coverage report
 make generate          # Run go generate (msgp, etc.)
 make gomod-tidy        # Tidy go.mod/go.sum
+go fix ./...           # Modernize deprecated API usage (run before make lint)
 make ci                # Full CI pipeline (lint + vet + test-all + coverage)
 ```
