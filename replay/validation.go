@@ -3,16 +3,22 @@ package replay
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/arloliu/helix/types"
 )
 
 const (
 	memoryReplayerComponent = "replay.MemoryReplayer"
+	natsReplayerComponent   = "replay.NATSReplayer"
 	memoryWorkerComponent   = "replay.MemoryWorker"
 	natsWorkerComponent     = "replay.NATSWorker"
 )
+
+var natsTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 func newOptionError(component, option, reason string) error {
 	return &types.OptionError{Component: component, Option: option, Reason: reason}
@@ -96,4 +102,78 @@ func validateWorkerInputsForChecked(component string, hasReplayer bool, execute 
 	}
 
 	return joinValidationErrors(errList...)
+}
+
+func validateNATSReplayerConfigForChecked(config NATSReplayerConfig) error {
+	errList := make([]error, 0, 7)
+
+	if err := validateNATSStreamName(config.StreamName); err != nil {
+		errList = append(errList,
+			newOptionError(natsReplayerComponent, "WithStreamName", err.Error()),
+		)
+	}
+	if err := validateNATSSubjectPrefix(config.SubjectPrefix); err != nil {
+		errList = append(errList,
+			newOptionError(natsReplayerComponent, "WithSubjectPrefix", err.Error()),
+		)
+	}
+	if config.Replicas <= 0 {
+		errList = append(errList, optionErrPositiveInt(natsReplayerComponent, "WithReplicas"))
+	}
+	if config.PublishTimeout <= 0 {
+		errList = append(errList, optionErrPositiveDuration(natsReplayerComponent, "WithPublishTimeout"))
+	}
+	if config.MaxAckPending <= 0 {
+		errList = append(errList, optionErrPositiveInt(natsReplayerComponent, "WithMaxAckPending"))
+	}
+	if config.MaxRequestBatch <= 0 {
+		errList = append(errList, optionErrPositiveInt(natsReplayerComponent, "WithMaxRequestBatch"))
+	}
+	if config.AckWait <= 0 {
+		errList = append(errList, optionErrPositiveDuration(natsReplayerComponent, "WithAckWait"))
+	}
+	if config.MaxDeliver <= 0 {
+		errList = append(errList, optionErrPositiveInt(natsReplayerComponent, "WithMaxDeliver"))
+	}
+	if !isValidDiscardPolicy(config.DiscardPolicy) {
+		errList = append(errList,
+			newOptionError(natsReplayerComponent, "WithDiscardPolicy", "must be DiscardOld or DiscardNew"),
+		)
+	}
+
+	return joinValidationErrors(errList...)
+}
+
+func isValidDiscardPolicy(policy jetstream.DiscardPolicy) bool {
+	return policy == jetstream.DiscardOld || policy == jetstream.DiscardNew
+}
+
+func validateNATSStreamName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return errors.New("must be non-empty")
+	}
+	if !natsTokenPattern.MatchString(trimmed) {
+		return errors.New("must contain only letters, numbers, underscores, or hyphens")
+	}
+
+	return nil
+}
+
+func validateNATSSubjectPrefix(prefix string) error {
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		return errors.New("must be non-empty")
+	}
+	tokens := strings.Split(trimmed, ".")
+	for _, token := range tokens {
+		if token == "" {
+			return errors.New("must not contain empty subject tokens")
+		}
+		if !natsTokenPattern.MatchString(token) {
+			return errors.New("tokens must contain only letters, numbers, underscores, or hyphens")
+		}
+	}
+
+	return nil
 }

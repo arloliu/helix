@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -351,6 +352,9 @@ func NewNATSReplayer(js jetstream.JetStream, opts ...NATSReplayerOption) (*NATSR
 	config := DefaultNATSReplayerConfig()
 	for _, opt := range opts {
 		opt(&config)
+	}
+	if err := validateNATSReplayerConfigForChecked(config); err != nil {
+		return nil, err
 	}
 
 	// Create or update the stream
@@ -952,13 +956,13 @@ func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("helix: failed to get stream info: %w", err)
 	}
 
-	// Cap at max int to prevent overflow
-	msgs := info.State.Msgs
-	if msgs > uint64(^uint(0)>>1) {
-		msgs = uint64(^uint(0) >> 1)
+	pending, convErr := strconv.Atoi(strconv.FormatUint(info.State.Msgs, 10))
+	if convErr != nil {
+		// Atoi reports range errors when Msgs exceeds local int width.
+		return int(^uint(0) >> 1), nil
 	}
 
-	return int(msgs), nil //nolint:gosec // overflow is handled by the cap above.
+	return pending, nil
 }
 
 // handleCorrupt terminates a message that cannot be decoded and invokes the

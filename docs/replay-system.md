@@ -79,6 +79,9 @@ type Replayer interface {
     Invalid capacity values are normalized to a safe minimum.
 - `NewMemoryReplayerChecked` returns `error`
     (joined `*types.OptionError`) when options are invalid.
+- `NewNATSReplayer` already returns `error` and now validates option
+    values at construction time, returning joined `*types.OptionError`
+    values for invalid configuration.
 
 ```go
 replayer, err := replay.NewMemoryReplayerChecked(

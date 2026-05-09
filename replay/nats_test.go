@@ -2,6 +2,7 @@ package replay_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,6 +14,56 @@ import (
 	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/types"
 )
+
+func TestNATSReplayerNewInvalidOptionsReturnJoinedErrors(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName(""),
+		replay.WithSubjectPrefix("test..replay"),
+		replay.WithReplicas(0),
+		replay.WithPublishTimeout(0),
+		replay.WithMaxAckPending(0),
+		replay.WithMaxRequestBatch(0),
+		replay.WithAckWait(0),
+		replay.WithMaxDeliver(0),
+		replay.WithDiscardPolicy(jetstream.DiscardPolicy(99)),
+	)
+	require.Nil(t, replayer)
+	require.Error(t, err)
+	require.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	require.Equal(t, "replay.NATSReplayer", optionErr.Component)
+	require.Contains(t, err.Error(), "WithStreamName")
+	require.Contains(t, err.Error(), "WithSubjectPrefix")
+	require.Contains(t, err.Error(), "WithReplicas")
+	require.Contains(t, err.Error(), "WithPublishTimeout")
+	require.Contains(t, err.Error(), "WithMaxAckPending")
+	require.Contains(t, err.Error(), "WithMaxRequestBatch")
+	require.Contains(t, err.Error(), "WithAckWait")
+	require.Contains(t, err.Error(), "WithMaxDeliver")
+	require.Contains(t, err.Error(), "WithDiscardPolicy")
+}
+
+func TestNATSReplayerNewValidStrictOptions(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName("test-valid-strict-options"),
+		replay.WithSubjectPrefix("test.replay.strict"),
+		replay.WithReplicas(1),
+		replay.WithPublishTimeout(2*time.Second),
+		replay.WithMaxAckPending(100),
+		replay.WithMaxRequestBatch(10),
+		replay.WithAckWait(5*time.Second),
+		replay.WithMaxDeliver(3),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, replayer)
+	t.Cleanup(func() { _ = replayer.Close() })
+}
 
 func TestNATSReplayerNewWithNilJetStream(t *testing.T) {
 	_, err := replay.NewNATSReplayer(nil)

@@ -68,6 +68,9 @@
 // JetStream. It is suitable for production deployments requiring durability
 // and multi-instance replay processing.
 //
+// [NewNATSReplayer] returns an error on invalid configuration and reports
+// option-value issues as joined [types.OptionError] values.
+//
 // By default, NATSReplayer uses JetStream's DiscardOld policy when MaxMsgs or
 // MaxBytes is reached. This is an availability-first bounded replay window:
 // new partial writes can continue to enqueue, and the newest replay work is
