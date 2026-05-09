@@ -17,7 +17,7 @@ linters:
     - gocritic
     - gocyclo
     - gomoddirectives
-    - gomodguard
+    - gomodguard_v2
     - goprintffuncname
     - gosec
     - loggercheck
@@ -77,21 +77,20 @@ linters:
           skipRecvDeref: false
     gocyclo:
       min-complexity: 30
-    gomodguard:
+    gomodguard_v2:
       blocked:
-        modules:
-          - github.com/golang/protobuf:
-              recommendations:
-                - google.golang.org/protobuf
-              reason: see https://developers.google.com/protocol-buffers/docs/reference/go/faq#modules
-          - github.com/satori/go.uuid:
-              recommendations:
-                - github.com/google/uuid
-              reason: satori's package is not maintained
-          - github.com/gofrs/uuid:
-              recommendations:
-                - github.com/google/uuid
-              reason: gofrs' package is not go module
+        - module: github.com/golang/protobuf
+          recommendations:
+            - google.golang.org/protobuf
+          reason: see https://developers.google.com/protocol-buffers/docs/reference/go/faq#modules
+        - module: github.com/satori/go.uuid
+          recommendations:
+            - github.com/google/uuid
+          reason: satori's package is not maintained
+        - module: github.com/gofrs/uuid
+          recommendations:
+            - github.com/google/uuid
+          reason: gofrs' package is not go module
     govet:
       disable:
         - fieldalignment
@@ -158,6 +157,8 @@ linters:
         - name: unused-parameter
           disabled: true
         - name: unused-receiver
+          disabled: true
+        - name: package-naming
           disabled: true
         - name: unchecked-type-assertion
           arguments:

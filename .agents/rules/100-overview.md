@@ -4,7 +4,7 @@
 - **Project:** Helix (dual-database HA client)
 - **Module:** `github.com/arloliu/helix`
 - **Language:** Go >=1.25.0
-- **Linting:** `golangci-lint` v2.5.0 (via `make lint`)
+- **Linting:** `golangci-lint` v2.12.2 (via `make lint`)
 
 ## What Helix Does
 Helix is a high-availability dual-database client library designed for "Shared Nothing" architecture. It performs active-active dual writes to two independent Cassandra/ScyllaDB clusters, routes reads with sticky affinity for cache efficiency, and asynchronously reconciles partial write failures via an in-memory or NATS JetStream replay system.

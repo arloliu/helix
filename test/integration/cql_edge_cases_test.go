@@ -226,19 +226,19 @@ func TestCQLTimestampConsistencyIntegration(t *testing.T) {
 	productID := gocql.TimeUUID()
 
 	// Insert with explicit timestamp
-	ts := time.Now().UnixMicro()
+	tsUs := time.Now().UnixMicro()
 	err = client.Query(
 		"INSERT INTO "+productsTable+" (id, name, price, stock) VALUES (?, ?, ?, ?)",
 		productID, "TimestampTest", 10.00, 100,
-	).WithTimestamp(ts).ExecContext(ctx)
+	).WithTimestamp(tsUs).ExecContext(ctx)
 	require.NoError(t, err)
 
 	// Update with later timestamp
-	ts2 := ts + 1000 // 1ms later
+	ts2Us := tsUs + 1000 // 1ms later
 	err = client.Query(
 		"UPDATE "+productsTable+" SET price = ? WHERE id = ?",
 		20.00, productID,
-	).WithTimestamp(ts2).ExecContext(ctx)
+	).WithTimestamp(ts2Us).ExecContext(ctx)
 	require.NoError(t, err)
 
 	// Both clusters should have the updated price

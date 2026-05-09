@@ -83,8 +83,8 @@ func (t *WriteTracker) Verify() error {
 func (t *WriteTracker) VerifyAndPrune(sessionA, sessionB cql.Session, minAge time.Duration) (int, error) {
 	// Step 1: collect and delete stale keys under the lock.
 	t.mu.Lock()
-	now := time.Now().UnixNano()
-	cutoffNano := now - minAge.Nanoseconds()
+	nowNs := time.Now().UnixNano()
+	cutoffNano := nowNs - minAge.Nanoseconds()
 	var toVerify []gocql.UUID
 	for key, ts := range t.writes {
 		if ts < cutoffNano {

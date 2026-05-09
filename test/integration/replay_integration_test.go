@@ -187,12 +187,12 @@ func TestCQLDefaultExecuteFuncRoutesSingleQueries(t *testing.T) {
 
 	// Create a payload targeting cluster A
 	orderID := gocql.TimeUUID()
-	ts := time.Now().UnixMicro()
+	tsUs := time.Now().UnixMicro()
 	payloadA := types.ReplayPayload{
 		TargetCluster: types.ClusterA,
 		Query:         "INSERT INTO " + ordersTable + " (id, user_id, total, status) VALUES (?, ?, ?, ?)",
 		Args:          []any{orderID, gocql.TimeUUID(), 50.0, "from_replay_a"},
-		Timestamp:     ts,
+		Timestamp:     tsUs,
 		Priority:      types.PriorityHigh,
 	}
 
@@ -212,7 +212,7 @@ func TestCQLDefaultExecuteFuncRoutesSingleQueries(t *testing.T) {
 		TargetCluster: types.ClusterB,
 		Query:         "INSERT INTO " + ordersTable + " (id, user_id, total, status) VALUES (?, ?, ?, ?)",
 		Args:          []any{orderIDB, gocql.TimeUUID(), 75.0, "from_replay_b"},
-		Timestamp:     ts,
+		Timestamp:     tsUs,
 		Priority:      types.PriorityHigh,
 	}
 
@@ -251,7 +251,7 @@ func TestCQLDefaultExecuteFuncHandlesBatchPayloads(t *testing.T) {
 
 	// Create batch payload targeting cluster A
 	orderIDs := []gocql.UUID{gocql.TimeUUID(), gocql.TimeUUID(), gocql.TimeUUID()}
-	ts := time.Now().UnixMicro()
+	tsUs := time.Now().UnixMicro()
 
 	batchStmts := make([]types.BatchStatement, 0, len(orderIDs))
 	for i, orderID := range orderIDs {
@@ -266,7 +266,7 @@ func TestCQLDefaultExecuteFuncHandlesBatchPayloads(t *testing.T) {
 		IsBatch:         true,
 		BatchType:       helix.UnloggedBatch,
 		BatchStatements: batchStmts,
-		Timestamp:       ts,
+		Timestamp:       tsUs,
 		Priority:        types.PriorityHigh,
 	}
 
@@ -308,12 +308,12 @@ func TestCQLDefaultExecuteFuncPreservesTimestamp(t *testing.T) {
 	orderID := gocql.TimeUUID()
 
 	// First insert with older timestamp
-	oldTs := time.Now().Add(-time.Hour).UnixMicro()
+	oldTsUs := time.Now().Add(-time.Hour).UnixMicro()
 	payloadOld := types.ReplayPayload{
 		TargetCluster: types.ClusterA,
 		Query:         "INSERT INTO " + ordersTable + " (id, user_id, total, status) VALUES (?, ?, ?, ?)",
 		Args:          []any{orderID, gocql.TimeUUID(), 100.0, "old_value"},
-		Timestamp:     oldTs,
+		Timestamp:     oldTsUs,
 		Priority:      types.PriorityHigh,
 	}
 
@@ -321,12 +321,12 @@ func TestCQLDefaultExecuteFuncPreservesTimestamp(t *testing.T) {
 	require.NoError(t, err)
 
 	// Second insert with newer timestamp (should win)
-	newTs := time.Now().UnixMicro()
+	newTsUs := time.Now().UnixMicro()
 	payloadNew := types.ReplayPayload{
 		TargetCluster: types.ClusterA,
 		Query:         "INSERT INTO " + ordersTable + " (id, user_id, total, status) VALUES (?, ?, ?, ?)",
 		Args:          []any{orderID, gocql.TimeUUID(), 200.0, "new_value"},
-		Timestamp:     newTs,
+		Timestamp:     newTsUs,
 		Priority:      types.PriorityHigh,
 	}
 
@@ -340,12 +340,12 @@ func TestCQLDefaultExecuteFuncPreservesTimestamp(t *testing.T) {
 	assert.Equal(t, "new_value", status)
 
 	// Now replay with even older timestamp (should not overwrite)
-	veryOldTs := time.Now().Add(-2 * time.Hour).UnixMicro()
+	veryOldTsUs := time.Now().Add(-2 * time.Hour).UnixMicro()
 	payloadVeryOld := types.ReplayPayload{
 		TargetCluster: types.ClusterA,
 		Query:         "INSERT INTO " + ordersTable + " (id, user_id, total, status) VALUES (?, ?, ?, ?)",
 		Args:          []any{orderID, gocql.TimeUUID(), 50.0, "very_old_value"},
-		Timestamp:     veryOldTs,
+		Timestamp:     veryOldTsUs,
 		Priority:      types.PriorityHigh,
 	}
 

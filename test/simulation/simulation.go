@@ -478,9 +478,9 @@ func (s *Simulation) doBatchWrite(_ context.Context, payloadSize int) {
 	err = batch.Exec()
 
 	if err == nil || errors.Is(err, htypes.ErrWriteAsync) {
-		ts := time.Now().UnixNano()
+		tsNs := time.Now().UnixNano()
 		for _, id := range ids {
-			s.env.Tracker.TrackWrite(id, ts)
+			s.env.Tracker.TrackWrite(id, tsNs)
 		}
 		s.env.Stats.WriteOK.Add(1)
 	} else {

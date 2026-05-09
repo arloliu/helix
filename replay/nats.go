@@ -808,7 +808,7 @@ func tryConvertToUUID(arg any) (UUID, bool) {
 		rv := reflect.ValueOf(arg)
 
 		// Handle pointers by dereferencing
-		if rv.Kind() == reflect.Ptr {
+		if rv.Kind() == reflect.Pointer {
 			if rv.IsNil() {
 				return UUID{}, false
 			}

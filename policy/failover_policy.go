@@ -397,14 +397,14 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 		return
 	}
 
-	now := time.Now().UnixNano()
+	nowNs := time.Now().UnixNano()
 	var newFailures int32
 	var justTripped bool
 
 	if cluster == types.ClusterA {
 		c.muA.Lock()
 		lastFailure := c.lastFailureA.Load()
-		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
+		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(nowNs-lastFailure) > c.resetTimeout {
 			// Half-open window expired without a recovery — counter resets
 			// to 1 AND the trip latch clears so a re-trip on this cycle
 			// fires IncCircuitBreakerTrip again. Without clearing trippedA,
@@ -419,7 +419,7 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 		} else {
 			newFailures = c.failuresA.Add(1)
 		}
-		c.lastFailureA.Store(now)
+		c.lastFailureA.Store(nowNs)
 		if int(newFailures) >= c.threshold && !c.trippedA {
 			c.trippedA = true
 			justTripped = true
@@ -428,14 +428,14 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 	} else {
 		c.muB.Lock()
 		lastFailure := c.lastFailureB.Load()
-		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(now-lastFailure) > c.resetTimeout {
+		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(nowNs-lastFailure) > c.resetTimeout {
 			c.failuresB.Store(1)
 			newFailures = 1
 			c.trippedB = false
 		} else {
 			newFailures = c.failuresB.Add(1)
 		}
-		c.lastFailureB.Store(now)
+		c.lastFailureB.Store(nowNs)
 		if int(newFailures) >= c.threshold && !c.trippedB {
 			c.trippedB = true
 			justTripped = true

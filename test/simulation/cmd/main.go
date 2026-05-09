@@ -25,20 +25,27 @@ import (
 	htypes "github.com/arloliu/helix/types"
 )
 
+var (
+	flagConfigPath = flag.String("config", "", "Path to configuration file (optional)")
+	flagProfile    = flag.String("profile", "quick", "Simulation profile (quick, comprehensive, soak, fallback)")
+	flagDuration   = flag.Duration("duration", 5*time.Minute, "Total simulation duration (for soak tests)")
+	flagSeed       = flag.Int64("seed", 0, "Random seed (default: current time)")
+)
+
 func main() {
+	flag.Parse()
+
+	// Apply default seed after parsing so time.Now() is evaluated at runtime.
+	if *flagSeed == 0 {
+		*flagSeed = time.Now().UnixNano()
+	}
+
 	if err := run(); err != nil {
 		os.Exit(1)
 	}
 }
 
 func run() error {
-	// Parse flags
-	configPath := flag.String("config", "", "Path to configuration file (optional)")
-	profile := flag.String("profile", "quick", "Simulation profile (quick, comprehensive, soak, fallback)")
-	duration := flag.Duration("duration", 5*time.Minute, "Total simulation duration (for soak tests)")
-	seed := flag.Int64("seed", time.Now().UnixNano(), "Random seed")
-	flag.Parse()
-
 	// Setup logger
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -46,26 +53,26 @@ func run() error {
 
 	// Load configuration if provided
 	var settings *config.Config
-	if *configPath != "" {
+	if *flagConfigPath != "" {
 		var err error
-		settings, err = config.Load(*configPath)
+		settings, err = config.Load(*flagConfigPath)
 		if err != nil {
-			logger.Error("Failed to load configuration", "path", *configPath, "error", err)
+			logger.Error("Failed to load configuration", "path", *flagConfigPath, "error", err)
 			return err
 		}
 		// Override flags with config values if present
 		if settings.Simulation.Duration > 0 {
-			*duration = settings.Simulation.Duration
+			*flagDuration = settings.Simulation.Duration
 		}
 		if settings.Simulation.Seed != 0 {
-			*seed = settings.Simulation.Seed
+			*flagSeed = settings.Simulation.Seed
 		}
 	}
 
 	logger.Info("Starting Helix Simulation",
-		"profile", *profile,
-		"seed", *seed,
-		"duration", *duration,
+		"profile", *flagProfile,
+		"seed", *flagSeed,
+		"duration", *flagDuration,
 	)
 
 	// Start pprof server
@@ -120,9 +127,9 @@ func run() error {
 
 	// Create simulation config
 	simConfig := simulation.Config{
-		Seed:     *seed,
-		Duration: *duration,
-		Profile:  *profile,
+		Seed:     *flagSeed,
+		Duration: *flagDuration,
+		Profile:  *flagProfile,
 		ClusterA: clusterA,
 		ClusterB: clusterB,
 		Settings: settings,
@@ -136,7 +143,7 @@ func run() error {
 	}
 
 	// Register scenarios based on profile
-	registerScenarios(sim, *profile)
+	registerScenarios(sim, *flagProfile)
 
 	// Run simulation
 	if err := sim.Run(ctx); err != nil {

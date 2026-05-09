@@ -299,9 +299,9 @@ func (e *Engine) dropOne(payload types.ReplayPayload, reason string) {
 	e.dropped.Add(1)
 	e.cfg.metrics.IncMirrorEnqueueDropped()
 
-	now := time.Now().UnixNano()
+	nowNs := time.Now().UnixNano()
 	last := e.lastDropLogNanos.Load()
-	if now-last >= int64(dropLogInterval) && e.lastDropLogNanos.CompareAndSwap(last, now) {
+	if nowNs-last >= int64(dropLogInterval) && e.lastDropLogNanos.CompareAndSwap(last, nowNs) {
 		e.cfg.logger.Warn("mirror capture dropped",
 			"reason", reason,
 			"isBatch", payload.IsBatch,
