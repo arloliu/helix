@@ -722,7 +722,9 @@ func TestStrict_RecoveryProbe_DefaultProbeRestoresCluster(t *testing.T) {
 
 			// Confirm the probe fired and failed against the degraded (paused) B before
 			// recovery — proves the probe loop ran, not just that recovery happened.
-			assert.Greater(t, mc.failureB.Load(), int32(0),
+			require.Eventually(t, func() bool {
+				return mc.failureB.Load() > 0
+			}, 5*time.Second, 50*time.Millisecond,
 				"[%s] recovery probe must have accumulated failures against paused B", d.name)
 
 			// Unpause B — the probe fires against the live session and credits recovery
@@ -849,11 +851,6 @@ func TestStrict_RecoveryProbe_StopAndStart_RestoresCluster(t *testing.T) {
 			// Start B. AutoRefresh detects the dead session and invokes the refresher;
 			// the recovery probe then fires against the rebuilt session.
 			require.NoError(t, b.Start(ctx))
-			// Rebuild the test-side session for direct verification reads.
-			// AutoRefresh will also call b.Reconnect concurrently via the refresher;
-			// both reconnects create independent gocql sessions pointing at the same
-			// node — functionally safe, as each session manages its own connection pool.
-			require.NoError(t, b.Reconnect(ctx), "[%s] test-side B session rebuild after Start", d.name)
 
 			// 1. AutoRefresh must detect the dead session and invoke the refresher.
 			require.Eventually(t, func() bool {
@@ -879,7 +876,7 @@ func TestStrict_RecoveryProbe_StopAndStart_RestoresCluster(t *testing.T) {
 			require.NoError(t, a.Session.Query(selectStmt, recoveryKey).Scan(&gotA),
 				"[%s] row must be on A after Stop+Start recovery", d.name)
 			assert.Equal(t, "recovered", gotA)
-			require.NoError(t, b.Session.Query(selectStmt, recoveryKey).Scan(&gotB),
+			require.NoError(t, client.SessionB().Query(selectStmt, recoveryKey).Scan(&gotB),
 				"[%s] row must be on B after Stop+Start recovery", d.name)
 			assert.Equal(t, "recovered", gotB)
 
