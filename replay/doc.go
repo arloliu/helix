@@ -4,6 +4,24 @@
 // When a dual-write operation partially fails (one cluster succeeds, one fails),
 // the failed operation is queued for later replay to maintain eventual consistency.
 //
+// # Replay Ordering and Idempotency
+//
+// Chronological execution order of replays is NOT guaranteed. Priority queues,
+// concurrent background retries, and network unreliability (e.g., JetStream Naks)
+// can cause failed writes to be replayed out of order.
+//
+// To prevent older replays from overwriting newer data, you MUST configure
+// [helix.WithTimestampProvider] on your client. This injects client-side
+// timestamps into all writes, ensuring they remain idempotent regardless
+// of execution order.
+//
+// # CAS / LWT Safety
+//
+// Lightweight Transactions (CAS) are inherently replay-unsafe. The conditional
+// state of the cluster may drift during an outage, causing a blindly replayed
+// CAS statement to fail or behave incorrectly. Do not use Helix for CAS/LWT
+// operations.
+//
 // # Replayer Interface
 //
 // The public [helix.Replayer] interface is minimal, requiring only Enqueue:

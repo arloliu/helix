@@ -3,6 +3,7 @@ package replay
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -158,6 +159,9 @@ func NewMemoryReplayer(opts ...MemoryReplayerOption) *MemoryReplayer {
 //     ctx.Err() if ctx is already cancelled or is cancelled while waiting;
 //     [types.ErrReplayQueueFull] if the combined pending count is at capacity.
 func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload) error {
+	if m.highQueue == nil || m.lowQueue == nil {
+		return errors.New("helix: memory replayer not initialized, use NewMemoryReplayer")
+	}
 	if m.closed.Load() {
 		return types.ErrSessionClosed
 	}
@@ -206,6 +210,9 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 //   - types.ReplayPayload: The next payload to replay
 //   - bool: true if a payload was retrieved, false if cancelled/closed
 func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool) {
+	if m.highQueue == nil || m.lowQueue == nil {
+		return types.ReplayPayload{}, false
+	}
 	for {
 		// Check for stop condition first
 		select {
@@ -341,6 +348,9 @@ func (m *MemoryReplayer) tryDequeueWithPriority() (types.ReplayPayload, bool) {
 //   - types.ReplayPayload: The payload if available
 //   - bool: true if a payload was retrieved, false if queue is empty or closed
 func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
+	if m.highQueue == nil || m.lowQueue == nil {
+		return types.ReplayPayload{}, false
+	}
 	if m.closed.Load() && m.Len() == 0 {
 		return types.ReplayPayload{}, false
 	}
@@ -425,6 +435,9 @@ func (m *MemoryReplayer) IsClosed() bool {
 //   - []types.ReplayPayload: All pending replay payloads
 func (m *MemoryReplayer) DrainAll() []types.ReplayPayload {
 	var payloads []types.ReplayPayload
+	if m.highQueue == nil || m.lowQueue == nil {
+		return payloads
+	}
 
 	// Drain high priority first
 	for {
