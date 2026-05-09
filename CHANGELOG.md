@@ -7,38 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [1.4.0] — 2026-05-09
+
+### Bug Fixes
 
 - **TestS1 e2e flake — `MemoryReplayer.Len()==0` is not a "drain done"
-  signal**. The S1 happy-path drain test was using `memReplayer.Len()==0`
-  to decide when replay was complete; under sustained suite pressure
-  AdaptiveDualWrite did not always degrade and every Exec ran sync
-  against paused A (~2s gocql timeout each), producing a long tail of
-  retries. The worker holds payloads in flight between attempts —
-  outside the queue but still actively retrying — so Len() can
-  transiently report 0 while ~70 items remain to retry. The drain
-  check passed prematurely, the test exited, and only ~28 of 100 rows
-  reached cluster A. Diagnostic worker callbacks confirmed
-  `success=8, error=98, dropped=0` with MaxAttempts=1000 — proving
-  the issue was check semantics, not retry exhaustion. The test now
-  uses row-count convergence (the authoritative downstream signal),
-  and `MemoryReplayer.Len()` carries a Godoc note explaining the gotcha
-  so future users avoid the same trap.
+  signal**: The S1 happy-path drain test used `memReplayer.Len()==0` to decide
+  when replay was complete. Under sustained suite pressure AdaptiveDualWrite
+  did not always degrade and every Exec ran sync against a paused cluster (~2 s
+  gocql timeout each), producing a long tail of retries. The worker holds
+  payloads in flight between attempts — outside the queue but still actively
+  retrying — so `Len()` can transiently report 0 while items remain. The drain
+  check passed prematurely and only a fraction of rows reached cluster A.
+  The test now uses row-count convergence (the authoritative downstream signal),
+  and `MemoryReplayer.Len()` carries a Godoc note explaining the gotcha.
 
-- **FailoverPolicy metrics and logger auto-injection** — surfaced while
-  writing the plain-`CircuitBreaker` e2e test. `NewCQLClient`'s
-  `autoInjectMetricsAndLogger` walked `ReplayWorker` and `WriteStrategy`
-  but not `FailoverPolicy`, so users wiring `helix.WithMetrics(collector)`
-  + `helix.WithFailoverPolicy(policy.NewCircuitBreaker(...))` saw zero
-  `IncCircuitBreakerTrip` events in their dashboard — they had to also
-  pass `policy.WithCircuitBreakerMetrics(collector)` redundantly.
-  `CircuitBreaker` (and `LatencyCircuitBreaker` via embedding) now
-  satisfy the same `metricsAware` / `loggerAware` interfaces as
-  `AdaptiveDualWrite` and `replay.Worker`, and the auto-inject pass
-  walks `FailoverPolicy` too. Caller-supplied `WithCircuitBreakerMetrics`
-  / `WithLatencyMetrics` / `WithCircuitBreakerLogger` /
-  `WithLatencyLogger` still win on conflict (last-write-wins via
-  the `metricsExplicit` / `loggerExplicit` guard).
+- **FailoverPolicy metrics and logger auto-injection**: `NewCQLClient`'s
+  `autoInjectMetricsAndLogger` walked `ReplayWorker` and `WriteStrategy` but
+  not `FailoverPolicy`, so users wiring `helix.WithMetrics(collector)` +
+  `helix.WithFailoverPolicy(policy.NewCircuitBreaker(...))` saw zero
+  `IncCircuitBreakerTrip` events — they had to also pass
+  `policy.WithCircuitBreakerMetrics(collector)` redundantly. `CircuitBreaker`
+  (and `LatencyCircuitBreaker` via embedding) now satisfy the same
+  `metricsAware` / `loggerAware` interfaces as `AdaptiveDualWrite` and
+  `replay.Worker`, and the auto-inject pass walks `FailoverPolicy` too.
+  Caller-supplied `WithCircuitBreakerMetrics` / `WithLatencyMetrics` /
+  `WithCircuitBreakerLogger` / `WithLatencyLogger` still win on conflict
+  (last-write-wins via the `metricsExplicit` / `loggerExplicit` guard).
 
 ### Added
 
@@ -79,226 +74,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ErrStrictMirrorUnsupported`, `AsPartialWriteError`, and `IsPartialWrite` are
   now accessible directly from the `helix` package without importing `types`.
 
-- **e2e final-pass: plain CB, FallbackRead, Mirror+drain (v1.4.0)**:
-  three more combinations from the audit gap list:
-  - `TestS_PlainCircuitBreaker_TripAndClose` — counter-based
-    `CircuitBreaker` (vs LCB which already had S3 coverage). Pause A,
-    accumulate failures past threshold, verify trip + reset-timeout
-    half-open + close after Unpause + successful probe. Wires
-    `WithCircuitBreakerMetrics` explicitly because FailoverPolicy is
-    not auto-injected by helix.
+- **Async mirror writes** (`Mirror()` per-statement option): per-statement
+  opt-in mirroring of writes to a second helix dual-cluster pair, designed for
+  seamless Cassandra cluster migrations.
+  - `Query.Mirror()` / `Batch.Mirror()`: fluent opt-in. Always async,
+    fire-and-forget; the mirror leg never surfaces an error to the caller.
+    The original client-generated timestamp is preserved so server-side
+    `WRITETIME`, LWW, TTL, and tombstone semantics match the primary cluster.
+    Bound `[]any` args are deep-copied synchronously before Exec returns so
+    caller-side buffer reuse cannot corrupt mirror payloads.
+  - `helix.WithMirror(target, opts...)`: configures the mirror destination (a
+    second `*CQLClient`). Mirroring fires only after primary write success
+    (any-cluster ack); total primary failure suppresses the mirror. `WithMirror(nil)`
+    and `WithMirrorPublisher(nil)` reject at construction with
+    `types.ErrNilMirrorTarget` / `types.ErrNilMirrorPublisher`.
+  - `helix.WithMirrorReplayer(replayer, workerOpts...)`: failed mirror writes are
+    durably retried via the existing replay system. The auto-built worker uses the
+    same execute function as the mirror engine, preserving timestamps, dual-write
+    strategy, and per-cluster routing on retry. When a mirror enqueue fails (queue
+    saturated), the existing `WithOnReplayDropped` callback fires — mirror and
+    primary replay share one alerting path.
+  - `helix.WithMirrorPublisher(publisher, opts...)` + `helix.NewMirrorWorker(...)`:
+    out-of-process mode for production migrations. The app publishes captures to a
+    `Replayer` (typically `replay.NATSReplayer`); a separate consumer binary
+    performs the writes. Mutually exclusive with `WithMirror` — `NewCQLClient`
+    returns `types.ErrMirrorModeConflict` if both are set.
+  - Mirror metrics via optional `types.MirrorMetrics` interface:
+    `mirror_enqueue_success_total`, `mirror_enqueue_dropped_total`,
+    `mirror_exec_success_total`, `mirror_exec_errors_total`,
+    `mirror_exec_duration_seconds` (histogram), `mirror_queue_depth` (gauge),
+    `mirror_enabled` (gauge). Auto-wired when the configured `MetricsCollector`
+    implements `MirrorMetrics`. Mirror payloads carry `TargetCluster = ClusterA`
+    for NATS subject routing.
+  - `*CQLClient.Mirror()`: runtime control — `Enable`, `Disable` (drains
+    in-flight queue), `Enabled`, and a `Stats` snapshot. `client.Close()`
+    drains the in-flight mirror queue before returning.
+  - `docs/mirror.md` user guide covering target / publisher modes, semantics,
+    runtime control, observability, and known parity gaps.
+    `examples/mirror/` runnable wiring examples for both modes.
+
+- **e2e coverage expansion**: New e2e tests covering previously untested
+  production paths, each parameterized over v1 and v2 adapters:
+  - `TestS_NetworkDisconnect_StickyReadFailover` — real network partition via
+    Docker network detach (vs `Pause` which keeps TCP open). First test in the
+    repo to exercise `testutil.NetworkDisconnect`.
+  - `TestS1b_PauseA_NATSReplayerDrain` — companion to S1 using the production
+    `NATSReplayer` + `NATSWorker` durability backend rather than `MemoryReplayer`.
+  - `TestS2b_PauseB_StickyReadFailover` — symmetry counterpart to S2 verifying
+    identical behavior when B is the failing cluster.
+  - `TestS_SequentialFailures_AThenB` — cascading failure: pause A (failover to
+    B), unpause A, pause B (failover back to A). Proves per-cluster health state
+    resets on recovery and failover metric records every transition.
+  - `TestS_PlainCircuitBreaker_TripAndClose` — counter-based `CircuitBreaker`
+    trip + half-open + close cycle.
   - `TestS_FallbackRead_RowMissingOnPreferredButPresentOnOther` and
-    `TestS_FallbackRead_AlternativeUnreachable_ReturnsNotFound` —
-    real-cluster coverage for `FallbackRead`. Verifies the lag-recovery
-    path (row only on B, FallbackRead recovers it) and the
-    "alternative unreachable returns ErrNotFound, not network error"
-    contract.
-  - `TestMirror_PrimaryClusterDraining_MirrorStillFires` — mirror +
-    topology drain mode. With cluster A in drain, writes are skipped
-    on A, B succeeds, primary returns nil via any-cluster-ack, mirror
-    must still fire. Real migration scenario.
+    `TestS_FallbackRead_AlternativeUnreachable_ReturnsNotFound` — real-cluster
+    `FallbackRead` coverage: lag-recovery path and "alternative unreachable
+    returns ErrNotFound, not network error" contract.
+  - Mirror e2e: `TestMirror_DestinationPausedAndRecovered`,
+    `TestMirror_BothPrimaryClustersPaused_NoMirrorFire`,
+    `TestMirror_PrimaryPartialOutage_MirrorStillFires`,
+    `TestMirror_PrimaryClusterDraining_MirrorStillFires`,
+    `TestMirror_WithAdaptiveDualWritePrimary` — mirror with real cluster
+    lifecycle (`Pause`, `Unpause`) and `AdaptiveDualWrite` as primary strategy.
+    `TestMirror_DestinationStopAndStart_AutoRefreshRecovers` and
+    `TestMirror_DestinationKilled_AutoRefreshRecovers` — `Stop`/`Start` and
+    `Kill` (SIGKILL) scenarios pairing the mirror engine with `AutoRefresh` +
+    `SessionRefresher` recovery (Scylla-only).
 
-- **e2e suite hardening (v1.4.0 follow-up)**: combination-coverage audit
-  flagged five real production scenarios with zero e2e coverage. Added
-  five new e2e tests, each parameterized over v1 and v2 drivers:
-  - `TestMirror_WithAdaptiveDualWritePrimary` — proves the v1.4.0 plan's
-    central orthogonality claim under real outage. Pause primary cluster
-    A, AdaptiveDualWrite degrades, primary returns nil via any-cluster-ack,
-    mirror dispatch fires regardless of write strategy state.
-  - `TestS_NetworkDisconnect_StickyReadFailover` — first test in the
-    repo to exercise `testutil.NetworkDisconnect`. Real network partition
-    via Docker network detach, StickyRead fails over from A to B, failover
-    metric increments. Closest reproducible analog to a real cloud blip
-    (different from `Pause` which keeps TCP open).
-  - `TestS1b_PauseA_NATSReplayerDrain` — companion to S1 exercising the
-    production `NATSReplayer` + `NATSWorker` durability backend rather
-    than `MemoryReplayer`. Pause A, drive writes, replays land in NATS
-    JetStream, Unpause, NATSWorker drains and both clusters converge.
-  - `TestS2b_PauseB_StickyReadFailover` — symmetry counterpart to S2
-    (which always paused cluster A). Verifies different gocql session,
-    different driver state, different ports behave symmetrically when B
-    is the failing cluster.
-  - `TestS_SequentialFailures_AThenB` — cascading failure path. Pause A
-    (failover to B), Unpause A, Pause B (failover back to A). Proves
-    helix's per-cluster health state is reset on recovery and the
-    failover metric records every transition, not just the first.
+### Documentation
 
-- **Mirror e2e Stop+Start and Kill scenarios (v1.4.0 follow-up)**:
-  combination-coverage audit found the original mirror e2e suite covered
-  only `Pause` (graceful TCP-open hang). Real migrations also see
-  graceful container halts and process crashes — different gocql code
-  paths. Added two more e2e tests pairing the mirror engine with helix's
-  existing `AutoRefresh` + `SessionRefresher` machinery:
-  - `TestMirror_DestinationStopAndStart_AutoRefreshRecovers` — `Stop`
-    the mirror cluster mid-write, `Start` it back. AutoRefresh on the
-    mirror client detects the dead session, refreshes via the
-    SessionRefresher, and the auto-built replay worker drains the
-    backlog. Scylla-only.
-  - `TestMirror_DestinationKilled_AutoRefreshRecovers` — `Kill`
-    (SIGKILL) the mirror destination, `Start` it back. Same recovery
-    path, exercising the harder RST-on-existing-connection failure mode.
-    Scylla-only.
-
-  Both run against v1 and v2 adapters. Total mirror e2e: 5 tests × 2
-  drivers = 10 subtests, ~55s wall-clock.
-
-- **Mirror e2e tests with real cluster lifecycle (v1.4.0 follow-up)**: the
-  Phase 5 integration tests fake destination outages with mock-session
-  `execErr` fields. The repo's `test/e2e/cql/` harness already supports
-  real container lifecycle (`Pause`, `Unpause`, `Stop`, `Start`, `Kill`,
-  `NetworkDisconnect`) but no mirror test used it. Added `mirror_test.go`
-  under that build tag covering:
-  - `TestMirror_DestinationPausedAndRecovered` — pause the mirror
-    destination cluster while the app keeps writing, verify failures land
-    in the auto-built replay worker and catch up after `Unpause`. Uses
-    real gocql session timeouts and reconnects.
-  - `TestMirror_BothPrimaryClustersPaused_NoMirrorFire` — answers the
-    "did we test A and B both down, not just A or B?" question. With both
-    primary clusters paused, `Mirror()` returns `DualClusterError` and
-    the engine queue stays empty (no `IncMirrorEnqueueSuccess` call).
-  - `TestMirror_PrimaryPartialOutage_MirrorStillFires` — pause one
-    primary cluster, verify any-cluster-ack returns nil and mirror
-    dispatch fires against the live destination (real CQL roundtrip,
-    not mocked).
-
-  Each test runs against both v1 and v2 adapters (6 subtests total). All
-  green against ScyllaDB.
-
-- **Mirror test gap closures (v1.4.0 follow-up)**: a critical pass through
-  the mirror feature surface flagged real coverage holes. Closing them:
-  - Dual-cluster primary + Mirror() trigger conditions now tested:
-    both-success fires, partial-success (any-cluster-ack returns nil)
-    fires, total-failure (DualClusterError) suppresses.
-  - `WithMirror(nil)` and `WithMirrorPublisher(nil)` now reject at
-    construction with `types.ErrNilMirrorTarget` /
-    `types.ErrNilMirrorPublisher` instead of silently disabling
-    mirroring (added internal `mirrorTargetSet` / `mirrorPublisherSet`
-    config flags to distinguish "passed nil" from "never called").
-  - Caller-supplied `Query.WithTimestamp()` is preserved through mirror
-    dispatch (regression test against future refactors).
-  - `client.Close()` drains the in-flight mirror queue before returning.
-  - Auto-built NATS replay worker path (`WithMirrorReplayer` +
-    `*replay.NATSReplayer`) end-to-end test against embedded NATS +
-    real CQL — previously only the `MemoryReplayer` branch was covered.
-  - `docs/mirror.md`: added "Per-query consistency is not preserved on
-    mirror exec" to the Known Parity Gaps section. Matches the existing
-    primary-replay omission.
-
-- **Mirror docs, examples, and integration tests (v1.4.0 Phase 5)**:
-  - `docs/mirror.md` — user guide covering target / publisher modes,
-    semantics, runtime control, observability, known parity gaps, and
-    failure observability paths.
-  - `examples/mirror/` — runnable wiring example for both modes
-    (target via `WithMirror` + optional `WithMirrorReplayer`, and the
-    publisher / consumer split via `WithMirrorPublisher` + `NewMirrorWorker`).
-  - `test/integration/mirror_integration_test.go` — end-to-end integration
-    tests against shared CQL clusters (and an embedded NATS JetStream
-    server for publisher mode) covering target-mode dispatch, durable
-    retry via `WithMirrorReplayer`, publisher / consumer split, and
-    server-side timestamp parity (`WRITETIME` matches across
-    primary / mirror).
-
-### Changed
-
-- **Mirror payload routing**: dispatched mirror payloads now carry
-  `TargetCluster = ClusterA` so transports that route by cluster (NATS
-  subjects use `{prefix}.{priority}.{cluster}`) deliver mirror messages
-  to the consumer. Mirror writes target the mirror destination as a
-  single logical sink — the destination's own write strategy handles
-  per-cluster fan-out internally — so the conventional ClusterA tag has
-  no real per-cluster meaning at the source.
-
-- **Mirror metrics (v1.4.0 Phase 4)**: dedicated `helix_mirror_*` metric
-  surface for the async mirror engine.
-  - New optional interface `types.MirrorMetrics` (paralleling
-    `types.SessionRefreshMetrics`). Implementations may opt in by adding
-    the methods; bundled collectors (`internal/metrics.NopMetrics` and
-    `contrib/metrics/vm.Collector`) implement it directly.
-  - Metric set: `mirror_enqueue_success_total`,
-    `mirror_enqueue_dropped_total`, `mirror_exec_success_total`,
-    `mirror_exec_errors_total`, `mirror_exec_duration_seconds`
-    (histogram), `mirror_queue_depth` (gauge), `mirror_enabled` (gauge).
-    Mirror metrics are not cluster-scoped — per-cluster routing on the
-    mirror destination is recorded against that destination's own
-    metrics namespace.
-  - `mirror.WithMetrics(types.MirrorMetrics)` option. Helix's CQLClient
-    auto-wires the mirror engine when the configured `MetricsCollector`
-    also satisfies `MirrorMetrics`, so passing a bundled collector to
-    `helix.WithMetrics` enables mirror observability without extra
-    plumbing.
-
-- **Mirror publisher mode (v1.4.0 Phase 3)**: out-of-process mirroring for
-  production cluster migrations. The app publishes captured mirror writes
-  to a [Replayer] (typically [replay.NATSReplayer]) instead of writing
-  them in-process; a separate consumer binary performs the actual writes
-  against the mirror clusters.
-  - `helix.WithMirrorPublisher(publisher Replayer, opts ...mirror.Option)`:
-    configures publisher mode. Captures pass through helix's bounded
-    in-memory ring buffer (the same engine queue used in target mode)
-    before reaching the publisher; queue overflow is dropped per the
-    engine's drop-on-full policy. Mutually exclusive with `WithMirror` —
-    NewCQLClient returns `types.ErrMirrorModeConflict` if both are set.
-    Pair with `mirror.WithOnError` to observe `publisher.Enqueue`
-    failures (e.g., NATS publish errors).
-  - `helix.NewMirrorWorker(replayer, target, opts ...replay.WorkerOption)`:
-    constructor for the consumer-side worker. Type-switches on the
-    replayer's concrete type (`*replay.MemoryReplayer` or
-    `*replay.NATSReplayer`) and binds the worker to the same execute
-    path the in-process mirror engine uses, so timestamps and dual-write
-    behavior on the mirror destination are preserved across modes. No
-    metrics auto-injection — the consumer binary owns its observability
-    stack and passes options explicitly.
-  - New sentinel errors: `types.ErrMirrorModeConflict`,
-    `types.ErrNilMirrorTarget`.
-
-- **Mirror replay durability (v1.4.0 Phase 2)**: failed mirror writes are
-  now durably retried via the existing replay system.
-  - `helix.WithMirrorReplayer(replayer, workerOpts...)`: configures a
-    [Replayer] that receives any mirror write whose execute returned an
-    error. When the replayer's concrete type is `*replay.MemoryReplayer`
-    or `*replay.NATSReplayer` an appropriate `ReplayWorker` is auto-built
-    and bound to the same execute function the mirror engine uses, so
-    timestamps, dual-write strategy, and per-cluster routing on the
-    mirror destination are preserved on retry. The worker is started
-    during `NewCQLClient` and stopped during `Close`.
-  - `mirror.WithOnError(handler)`: generic per-execute-error hook on the
-    mirror engine. Helix uses it internally to route failures to the
-    configured `MirrorReplayer`; custom integrations (alerting, alternate
-    durability stores) can install their own.
-  - `mirror.ExecuteFunc` is now a type alias for `replay.ExecuteFunc` so
-    the same function is used for the mirror engine's initial dispatch
-    and the auto-built replay worker.
-  - When a mirror enqueue itself fails (e.g., replayer queue saturated),
-    the existing `WithOnReplayDropped` callback fires — mirror and primary
-    replay share one alerting path.
-
-- **Async mirror writes (v1.4.0 Phase 1)**: per-statement opt-in mirroring of
-  writes to a second helix dual-cluster pair, designed for seamless Cassandra
-  cluster migrations where the application needs N days of write history on
-  the new clusters before cutover.
-  - `Query.Mirror()` / `Batch.Mirror()`: fluent opt-in on a single statement
-    or batch. Always async, fire-and-forget; the mirror leg never surfaces
-    an error to the caller. The original client-generated timestamp is
-    preserved on the mirror exec so server-side `WRITETIME`, LWW, TTL, and
-    tombstone semantics match the primary cluster.
-  - `helix.WithMirror(target, opts...)`: configures the mirror destination
-    (a second helix `*CQLClient`) and engine options. Mirroring fires only
-    after the primary write succeeds (any-cluster ack); total primary
-    failure suppresses the mirror.
-  - `mirror.Engine`: bounded in-memory queue + worker pool with non-blocking
-    enqueue and drop-on-full policy. Drop logs are rate-limited; an optional
-    `mirror.WithOnDrop` callback receives every dropped capture.
-  - `*CQLClient.Mirror()`: runtime control surface — `Enable`, `Disable`
-    (drains in-flight queue), `Enabled`, and a `Stats` snapshot
-    (Enqueued / Dropped / Success / Error / QueueDepth).
-  - Bound `[]any` args (and batch statement args) are deep-copied
-    synchronously before Exec returns, so caller-side buffer reuse / pooling
-    cannot corrupt mirror payloads.
-
-  Phase 1 ships in-memory dispatch only; failed mirror writes are logged and
-  counted but not retried. Phase 2 will integrate the existing replay system
-  for durability; Phase 3 adds an out-of-process NATS publisher mode. See
-  `docs/plans/v1.4.0-async-mirror.md` for the full plan.
+- **Strict Write Guide** (`docs/strict-write.md`): when to use `Strict()`,
+  behavior table, error types, `PartialWriteError` helpers, recovery probe
+  configuration, drain-mode interaction, FallbackRead pairing after partial
+  writes, and custom `StrictWriter` implementation guide.
 
 ## [1.3.0] — 2026-05-08
 

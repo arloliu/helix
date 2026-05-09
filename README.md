@@ -28,6 +28,7 @@ If one strand snaps, the other keeps the organism alive. It's 4 billion years of
 - **Sticky Read Routing** - Per-client sticky reads to maximize cache hits across clusters
 - **Active Failover** - Immediate failover to secondary cluster on read failures
 - **Replay System** - Asynchronous reconciliation via in-memory queue or NATS JetStream
+- **Strict Writes** - Per-statement opt-in for replay-unsafe writes (counters, list/set append) that surfaces partial failures immediately — see [Strict Write Guide](docs/strict-write.md)
 - **Session Refresh** - Manual or automatic recovery from permanently-dead sessions (cluster restart with port reassignment, DNS rotation) without rebuilding the client — see [Session Refresh Guide](docs/session-refresh.md)
 - **Drop-in Replacement** - Interface-based design mirrors `gocql` API for minimal migration effort
 
@@ -299,6 +300,7 @@ See the [examples](examples/) directory:
 - [Auto-Recovery Guide](docs/auto-recovery.md) - Recovery lifecycle, operator workflow, and best practices
 - [Session Refresh Guide](docs/session-refresh.md) - Recover from permanently-dead sessions (cluster restart, DNS rotation) without rebuilding the client
 - [FallbackRead Guide](docs/fallback-read.md) - Best-effort dual-cluster reads for critical data
+- [Strict Write Guide](docs/strict-write.md) - Replay-unsafe writes: counters, list/set append, tombstone races
 - [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) - Latency-aware write strategy tuning
 - [Replay System](docs/replay-system.md) - Replay patterns and best practices
 - [Strategy & Policy](docs/strategy-policy.md) - Read/write strategies and failover policies

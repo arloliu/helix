@@ -425,8 +425,99 @@ policy.WithAdaptiveFireForgetLimit(50)
 policy.WithAdaptiveFireForgetTimeout(10 * time.Second)
 ```
 
+---
+
+## Strict Writes and the Recovery Probe
+
+`AdaptiveDualWrite` implements `StrictWriter`, so it supports the `Query.Strict()` /
+`Batch.Strict()` per-statement flag. Under strict semantics, degraded clusters are **skipped**
+rather than receiving a fire-and-forget goroutine:
+
+| Normal write (default) | Strict write |
+|------------------------|--------------|
+| Degraded cluster → fire-and-forget goroutine dispatched; `ErrWriteAsync` returned for that slot | Degraded cluster → write skipped; `*PartialWriteError{Cause: ErrClusterDegraded}` returned to caller |
+| Partial failure → enqueued for replay | Partial failure → no replay; caller receives error |
+
+Because strict-only workloads skip degraded clusters entirely, they do not produce the live
+dual-writes that normally advance the recovery counter. The **background recovery probe**
+fills this gap.
+
+### Recovery Probe
+
+`CQLClient` starts one probe goroutine per cluster when `AdaptiveDualWrite` is detected. The
+probe is **default-on**; no extra configuration is required:
+
+```go
+// Default: system.local read probe, 2s interval, 1s timeout
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    // Recovery probe starts automatically
+)
+```
+
+While a cluster is degraded, the probe fires at each interval and calls
+`AdaptiveDualWrite.RecordProbeSuccess` on a nil (success) result. After `recoveryThreshold`
+consecutive successes the cluster returns to healthy — the same counter used by live
+background writes.
+
+The default probe reads a single cell from `system.local`. This is intentionally read-only:
+it proves the driver/connection path without schema dependencies or write traffic. If the
+cluster still has a write-path-specific problem after recovery, the next strict write fails
+visibly and `AdaptiveDualWrite` marks it degraded again.
+
+**Configuration options:**
+
+```go
+// Custom interval and timeout
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithRecoveryProbe(helix.RecoveryProbe{
+        Interval: 5 * time.Second,
+        Timeout:  2 * time.Second,
+    }),
+)
+
+// Write-path probe for environments with write-only failure modes
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithRecoveryProbe(helix.RecoveryProbe{
+        Probe: func(ctx context.Context, session cql.Session) error {
+            return session.Query(
+                "INSERT INTO probe_table (id, ts) VALUES (?, ?)",
+                "probe", time.Now().UnixMicro(),
+            ).ExecContext(ctx)
+        },
+        Interval: 5 * time.Second,
+        Timeout:  2 * time.Second,
+    }),
+)
+
+// Disable probe — manual ForceRecover() only
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+    helix.WithRecoveryProbeDisabled(),
+)
+```
+
+The probe is idle when both clusters are healthy. It only starts probing a cluster when
+`IsDegraded` returns true.
+
+### Cluster Never Recovers (Strict-Only Workloads)
+
+If all writes are strict and the probe is disabled, a degraded cluster will never receive the
+live writes that advance the recovery counter, so it will stay degraded indefinitely. Choose one:
+
+1. Keep the default probe enabled (recommended).
+2. Call `strategy.ForceRecover(cluster)` manually once the cluster is confirmed healthy.
+3. Use `WithRecoveryProbe` with a custom probe function.
+
+For a full discussion of strict write semantics, see the [Strict Write Guide](strict-write.md).
+
+---
+
 ## See Also
 
+- [Strict Write Guide](strict-write.md) - Replay-unsafe writes: counters, list/set append, tombstone races
 - [Auto-Recovery Guide](auto-recovery.md) - End-to-end recovery lifecycle and operator workflow
 - [Strategy & Policy Overview](strategy-policy.md) - How read/write strategies interact
 - [Replay System](replay-system.md) - How failed writes are reconciled

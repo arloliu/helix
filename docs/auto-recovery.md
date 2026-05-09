@@ -9,6 +9,7 @@ Helix has multiple recovery mechanisms that work at different levels. Short blip
 | **FailoverPolicy** (read) | Per-read routing | Yes | Single successful read resets CircuitBreaker |
 | **ReadStrategy** (read) | Sticky cluster preference | Partial | `PrimaryOnlyRead`: recovery timeout probes succeed. `StickyRead`: does NOT auto-recover — preferred only changes on a new failure of the current preferred. |
 | **AdaptiveDualWrite** (write) | Per-write mode | Yes | `recoveryThreshold` consecutive fast background writes |
+| **Recovery probe** (write) | Degraded-cluster healing for strict workloads | Yes (default-on with AdaptiveDualWrite) | Periodic `system.local` probe advances recovery counter when live strict writes cannot |
 | **Replay** (write) | Data consistency | Yes (queue processing) | Worker drains the backlog |
 | **AllowedClusters** (read) | Operator override | No — manual | Operator removes the override |
 | **ForceDegrade / ForceRecover** (write) | Operator override | No — manual | Operator calls `ForceRecover` |
@@ -32,6 +33,13 @@ A recovers
   → Reads route per the configured strategy (see below)
   → Replay worker drains remaining queue
 ```
+
+For workloads that use only `Strict()` writes, live background writes to the degraded cluster
+are not dispatched, so the recovery counter does not advance naturally. The **background recovery
+probe** (default-on for `AdaptiveDualWrite`) compensates: it periodically checks the degraded
+cluster and calls `RecordProbeSuccess` on each success, driving the same counter until the
+cluster is restored. See the [Strict Write Guide](strict-write.md#recovery-probe-and-adaptivedualwrite)
+for probe configuration options.
 
 > **Read-side recovery depends on the strategy.** With `PrimaryOnlyRead`,
 > reads probe back to A once the recovery timeout elapses. With

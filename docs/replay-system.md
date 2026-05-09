@@ -763,6 +763,9 @@ The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `h
 
 ## Strict Writes (Bypass Replay)
 
+> For the complete guide — error types, batch support, recovery probe configuration, drain-mode
+> interaction, and custom strategy support — see the dedicated [Strict Write Guide](strict-write.md).
+
 `Strict()` is a per-statement option that opts a single write out of the replay
 system entirely. When one cluster fails, the caller receives the error immediately
 rather than waiting for async reconciliation.
