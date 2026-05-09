@@ -588,14 +588,13 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.NowProvider = DefaultNowProvider
 	}
 
-	// Sanitize auto-refresh tuning. Per-knob option setters (e.g.
-	// WithAutoRefreshCheckInterval) blindly store whatever the caller
-	// passes; non-positive values either panic (CheckInterval feeds
-	// time.NewTicker) or produce nonsensical refresh behavior
-	// (RefreshTimeout <= 0 starts every attempt with a dead context;
-	// FailureThreshold <= 0 fires on every check). Replace bad values
-	// with the documented defaults and log a warning so the misuse is
-	// visible in production logs.
+	if err := validateNewCQLClientConfig(config); err != nil {
+		return nil, err
+	}
+
+	// Keep a defensive auto-refresh sanitizer even after strict
+	// constructor validation so custom/untyped options cannot leave the
+	// goroutine with panic-prone ticker settings.
 	if config.AutoRefresh.Enabled {
 		sanitizeAutoRefreshConfig(&config.AutoRefresh, config.Logger)
 	}

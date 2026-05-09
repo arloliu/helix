@@ -401,6 +401,26 @@ func TestNewCQLClientNilSession(t *testing.T) {
 	require.True(t, client.IsSingleCluster())
 }
 
+func TestNewCQLClientRejectsInvalidClusterNames(t *testing.T) {
+	_, err := NewCQLClient(newMockSession(), nil, WithClusterNames("", "valid"))
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+	assert.ErrorContains(t, err, "WithClusterNames")
+}
+
+func TestNewCQLClientJoinsMultipleInvalidRootOptions(t *testing.T) {
+	_, err := NewCQLClient(newMockSession(), nil,
+		WithClusterNames("", "valid"),
+		WithAutoRefresh(
+			WithAutoRefreshFailureThreshold(0),
+		),
+	)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+	assert.ErrorContains(t, err, "WithClusterNames")
+	assert.ErrorContains(t, err, "WithAutoRefreshFailureThreshold")
+}
+
 func TestCQLClientSingleClusterMode(t *testing.T) {
 	t.Run("write goes to single session", func(t *testing.T) {
 		session := newMockSession()

@@ -14,6 +14,7 @@ import (
 	"github.com/arloliu/helix"
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/test/testutil"
+	"github.com/arloliu/helix/types"
 )
 
 // Tests for the auto-refresh detector.
@@ -635,17 +636,13 @@ func TestAutoRefresh_IteratorFailureThreadsLastErrToRefresher(t *testing.T) {
 		"refresher's lastErr must reflect the iterator failure")
 }
 
-func TestNewCQLClient_SanitizesInvalidAutoRefreshKnobs(t *testing.T) {
-	// Regression: WithAutoRefreshCheckInterval(0) used to panic
-	// time.NewTicker inside the auto-refresh goroutine. NewCQLClient
-	// must replace non-positive tuning values with the documented
-	// defaults so the goroutine starts safely.
+func TestNewCQLClient_RejectsInvalidAutoRefreshKnobs(t *testing.T) {
 	mockA := newFailingMock()
 	refresher := func(_ context.Context, _ helix.ClusterID, _ error) (cql.Session, error) {
 		return newFailingMock(), nil
 	}
 
-	client, err := helix.NewCQLClient(mockA, nil,
+	_, err := helix.NewCQLClient(mockA, nil,
 		helix.WithSessionRefresher(refresher),
 		helix.WithAutoRefresh(
 			helix.WithAutoRefreshCheckInterval(0),
@@ -655,14 +652,11 @@ func TestNewCQLClient_SanitizesInvalidAutoRefreshKnobs(t *testing.T) {
 			helix.WithAutoRefreshFailureThreshold(0),
 		),
 	)
-	require.NoError(t, err)
-	t.Cleanup(client.Close)
-
-	cfg := client.Config().AutoRefresh
-	defaults := helix.DefaultAutoRefreshConfig()
-	assert.Equal(t, defaults.CheckInterval, cfg.CheckInterval)
-	assert.Equal(t, defaults.RefreshTimeout, cfg.RefreshTimeout)
-	assert.Equal(t, defaults.MinRetryInterval, cfg.MinRetryInterval)
-	assert.Equal(t, defaults.SustainedFailureWindow, cfg.SustainedFailureWindow)
-	assert.Equal(t, defaults.FailureThreshold, cfg.FailureThreshold)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+	assert.ErrorContains(t, err, "WithAutoRefreshCheckInterval")
+	assert.ErrorContains(t, err, "WithAutoRefreshRefreshTimeout")
+	assert.ErrorContains(t, err, "WithAutoRefreshMinRetryInterval")
+	assert.ErrorContains(t, err, "WithAutoRefreshSustainedFailureWindow")
+	assert.ErrorContains(t, err, "WithAutoRefreshFailureThreshold")
 }

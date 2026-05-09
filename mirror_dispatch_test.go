@@ -580,6 +580,7 @@ func TestMirrorPublisherAndTargetMutuallyExclusive(t *testing.T) {
 		WithMirrorPublisher(pub),
 	)
 	require.ErrorIs(t, err, types.ErrMirrorModeConflict)
+	require.True(t, types.IsOptionError(err))
 }
 
 func TestNewMirrorWorkerForMemoryReplayer(t *testing.T) {
@@ -615,12 +616,14 @@ func TestWithMirrorNilTargetRejected(t *testing.T) {
 	_, err := NewCQLClient(newMockSession(), nil, WithMirror(nil))
 	require.ErrorIs(t, err, types.ErrNilMirrorTarget,
 		"WithMirror(nil) must surface a clear construction-time error rather than silently disabling mirror")
+	require.True(t, types.IsOptionError(err))
 }
 
 func TestWithMirrorPublisherNilRejected(t *testing.T) {
 	_, err := NewCQLClient(newMockSession(), nil, WithMirrorPublisher(nil))
 	require.ErrorIs(t, err, types.ErrNilMirrorPublisher,
 		"WithMirrorPublisher(nil) must surface a clear construction-time error rather than silently disabling mirror")
+	require.True(t, types.IsOptionError(err))
 }
 
 // TestMirrorPublisherEndToEndConsumerLandsWrites verifies the publisher /
