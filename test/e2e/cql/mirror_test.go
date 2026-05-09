@@ -91,18 +91,15 @@ func TestMirror_DestinationPausedAndRecovered(t *testing.T) {
 			// retry against the now-live destination.
 			require.NoError(t, b.Unpause(ctx))
 
-			deadline := time.Now().Add(30 * time.Second)
-			for time.Now().Before(deadline) {
+			require.Eventually(t, func() bool {
 				var got string
 				err := b.Session.Query(
 					fmt.Sprintf("SELECT value FROM %s WHERE key = ?", table),
 					"k_during_outage").Scan(&got)
-				if err == nil && got == "v1" {
-					return // success — replayer caught up
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-			t.Fatalf("[%s] mirror replay did not catch up after destination recovered (stats=%+v)",
+
+				return err == nil && got == "v1"
+			}, 30*time.Second, 100*time.Millisecond,
+				"[%s] mirror replay did not catch up after destination recovered (stats=%+v)",
 				d.name, primary.Mirror().Stats())
 		})
 	}
@@ -166,8 +163,10 @@ func TestMirror_BothPrimaryClustersPaused_NoMirrorFire(t *testing.T) {
 			assert.True(t, errors.As(err, &dual),
 				"[%s] expected DualClusterError, got %T: %v", d.name, err, err)
 
-			// Give the engine a moment to demonstrate it did NOT fire.
-			time.Sleep(200 * time.Millisecond)
+			require.Never(t, func() bool {
+				return primary.Mirror().Stats().Enqueued != before.Enqueued
+			}, 200*time.Millisecond, 50*time.Millisecond,
+				"[%s] mirror engine must not enqueue any capture when primary write failed", d.name)
 
 			after := primary.Mirror().Stats()
 			assert.Equal(t, before.Enqueued, after.Enqueued,
@@ -256,28 +255,20 @@ func TestMirror_DestinationStopAndStart_AutoRefreshRecovers(t *testing.T) {
 					"primary write should still succeed during mirror outage")
 			}
 
-			// Phase 2: bring B back and rebuild the test-side session for
-			// verification. AutoRefresh on the mirror client must
-			// independently detect the dead session and invoke the
-			// refresher; the replay worker then drains.
+			// Phase 2: bring B back. AutoRefresh on the mirror client must
+			// independently detect the dead session, invoke the refresher, and
+			// replay through the refreshed client-owned session.
 			require.NoError(t, b.Start(ctx))
-			require.NoError(t, b.Reconnect(ctx),
-				"test-side reconnect to verify rows landed on B")
 
-			deadline := time.Now().Add(60 * time.Second)
-			for time.Now().Before(deadline) {
+			require.Eventually(t, func() bool {
 				var got string
-				err := b.Session.Query(
+				err := mirrorClient.SessionA().Query(
 					fmt.Sprintf("SELECT value FROM %s WHERE key = ?", table),
 					"k_stop_4").Scan(&got)
-				if err == nil && got == "v" {
-					require.GreaterOrEqual(t, refresherCalls.Load(), int32(1),
-						"AutoRefresh must have called the refresher")
-					return
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-			t.Fatalf("[%s] mirror replay never caught up after Stop+Start; refresherCalls=%d, mirror stats=%+v",
+
+				return err == nil && got == "v" && refresherCalls.Load() >= 1
+			}, 60*time.Second, 200*time.Millisecond,
+				"[%s] mirror replay never caught up after Stop+Start; refresherCalls=%d, mirror stats=%+v",
 				d.name, refresherCalls.Load(), primary.Mirror().Stats())
 		})
 	}
@@ -355,27 +346,19 @@ func TestMirror_DestinationKilled_AutoRefreshRecovers(t *testing.T) {
 					"primary write should still succeed during mirror destination crash")
 			}
 
-			// Restart B; rebuild the test-side session for verification.
-			// AutoRefresh on the mirror client must independently detect
-			// the dead session and refresh.
+			// Restart B. AutoRefresh on the mirror client must independently
+			// detect the dead session and refresh before replay drains.
 			require.NoError(t, b.Start(ctx))
-			require.NoError(t, b.Reconnect(ctx),
-				"test-side reconnect to verify rows landed on B")
 
-			deadline := time.Now().Add(60 * time.Second)
-			for time.Now().Before(deadline) {
+			require.Eventually(t, func() bool {
 				var got string
-				err := b.Session.Query(
+				err := mirrorClient.SessionA().Query(
 					fmt.Sprintf("SELECT value FROM %s WHERE key = ?", table),
 					"k_kill_4").Scan(&got)
-				if err == nil && got == "v" {
-					require.GreaterOrEqual(t, refresherCalls.Load(), int32(1),
-						"AutoRefresh must have called the refresher after Kill")
-					return
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-			t.Fatalf("[%s] mirror replay never caught up after Kill+Start; refresherCalls=%d, stats=%+v",
+
+				return err == nil && got == "v" && refresherCalls.Load() >= 1
+			}, 60*time.Second, 200*time.Millisecond,
+				"[%s] mirror replay never caught up after Kill+Start; refresherCalls=%d, stats=%+v",
 				d.name, refresherCalls.Load(), primary.Mirror().Stats())
 		})
 	}
@@ -444,7 +427,6 @@ func TestMirror_WithAdaptiveDualWritePrimary(t *testing.T) {
 				if err != nil && !errors.Is(err, htypes.ErrWriteAsync) {
 					t.Logf("[%s] write %d returned: %v", d.name, i, err)
 				}
-				time.Sleep(50 * time.Millisecond)
 			}
 
 			// AdaptiveDualWrite should have degraded A by now.
@@ -454,14 +436,10 @@ func TestMirror_WithAdaptiveDualWritePrimary(t *testing.T) {
 			// Mirror engine must have dispatched the writes (some count >=
 			// half of total — exact count depends on degradation timing,
 			// but orthogonality means mirror is unaffected by ADW state).
-			deadline := time.Now().Add(10 * time.Second)
-			for time.Now().Before(deadline) {
-				if primary.Mirror().Stats().Success >= writes/2 {
-					return
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-			t.Fatalf("[%s] mirror dispatch did not fire under AdaptiveDualWrite degradation; stats=%+v",
+			require.Eventually(t, func() bool {
+				return primary.Mirror().Stats().Success >= writes/2
+			}, 10*time.Second, 100*time.Millisecond,
+				"[%s] mirror dispatch did not fire under AdaptiveDualWrite degradation; stats=%+v",
 				d.name, primary.Mirror().Stats())
 		})
 	}
@@ -530,14 +508,10 @@ func TestMirror_PrimaryClusterDraining_MirrorStillFires(t *testing.T) {
 			// write — orthogonality: drain on the source should not
 			// suppress mirror dispatch when the write reached at least
 			// one cluster.
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				if primary.Mirror().Stats().Success >= writes {
-					return
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			t.Fatalf("[%s] mirror dispatch did not fire under drain mode; stats=%+v",
+			require.Eventually(t, func() bool {
+				return primary.Mirror().Stats().Success >= writes
+			}, 5*time.Second, 50*time.Millisecond,
+				"[%s] mirror dispatch did not fire under drain mode; stats=%+v",
 				d.name, primary.Mirror().Stats())
 		})
 	}
@@ -588,14 +562,10 @@ func TestMirror_PrimaryPartialOutage_MirrorStillFires(t *testing.T) {
 
 			// Mirror engine should record a successful exec against
 			// cluster A (the mirror destination).
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				if primary.Mirror().Stats().Success >= 1 {
-					return
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			t.Fatalf("[%s] mirror engine did not record a successful exec; stats=%+v",
+			require.Eventually(t, func() bool {
+				return primary.Mirror().Stats().Success >= 1
+			}, 5*time.Second, 50*time.Millisecond,
+				"[%s] mirror engine did not record a successful exec; stats=%+v",
 				d.name, primary.Mirror().Stats())
 		})
 	}
