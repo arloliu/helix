@@ -116,7 +116,7 @@ func TestLocalMultipleClusters(t *testing.T) {
 
 	// Collect updates
 	received := make(map[types.ClusterID]helix.TopologyUpdate)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case update := <-updates:
 			received[update.Cluster] = update

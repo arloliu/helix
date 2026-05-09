@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"github.com/arloliu/helix"
@@ -278,9 +279,7 @@ func (m *MockQuery) MapScan(dest map[string]any) error {
 		return m.scanErr
 	}
 
-	for k, v := range m.mapData {
-		dest[k] = v
-	}
+	maps.Copy(dest, m.mapData)
 
 	return nil
 }
@@ -601,9 +600,7 @@ func (m *MockIter) MapScan(dest map[string]any) bool {
 	}
 
 	row := m.mapRows[m.index]
-	for k, v := range row {
-		dest[k] = v
-	}
+	maps.Copy(dest, row)
 	m.index++
 
 	return true

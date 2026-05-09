@@ -65,7 +65,7 @@ func TestReplayDrop_QueueOverflow_IsObservable(t *testing.T) {
 
 	ctx := context.Background()
 	var execErrs int
-	for i := 0; i < totalWrites; i++ {
+	for i := range totalWrites {
 		if err := client.Query("INSERT INTO t (k, v) VALUES (?, ?)", i, "v").ExecContext(ctx); err != nil {
 			execErrs++
 		}

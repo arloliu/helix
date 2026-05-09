@@ -157,7 +157,7 @@ func TestAdaptiveDualWrite_AbsoluteCapDegradation(t *testing.T) {
 	ctx := t.Context()
 
 	// Simulate slow cluster A (exceeds absolute max)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(60 * time.Millisecond) // Exceeds 50ms
@@ -184,7 +184,7 @@ func TestAdaptiveDualWrite_RelativeDeltaDegradation(t *testing.T) {
 	ctx := t.Context()
 
 	// Simulate cluster B consistently slower by > 50ms
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(30 * time.Millisecond)
@@ -210,7 +210,7 @@ func TestAdaptiveDualWrite_MinFloorIgnoresDelta(t *testing.T) {
 	ctx := t.Context()
 
 	// Both are fast (< minFloor), even though delta > threshold
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(5 * time.Millisecond)
@@ -404,7 +404,7 @@ func TestAdaptiveDualWrite_Recovery(t *testing.T) {
 
 	// Simulate recovery via external health probe reporting fast writes
 	// In production, this would be called by a health check mechanism
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		a.RecordFastWrite(types.ClusterA)
 	}
 
@@ -422,7 +422,7 @@ func TestAdaptiveDualWrite_RecoveryViaFastWrites(t *testing.T) {
 	ctx := t.Context()
 
 	// First degrade cluster A via slow writes (150ms vs 10ms = 140ms delta > 50ms threshold)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(150 * time.Millisecond) // Slow
@@ -441,7 +441,7 @@ func TestAdaptiveDualWrite_RecoveryViaFastWrites(t *testing.T) {
 	require.False(t, a.IsDegraded(types.ClusterA))
 
 	// Now execute fast writes - both clusters healthy, both fast
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(10 * time.Millisecond) // Fast
@@ -543,7 +543,7 @@ func TestAdaptiveDualWrite_ErrorCountsAsStrike(t *testing.T) {
 	testErr := assert.AnError
 
 	// Simulate cluster A failing
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				return testErr
@@ -579,7 +579,7 @@ func TestAdaptiveDualWrite_AutomaticRecoveryViaDegradedWrites(t *testing.T) {
 	ctx := t.Context()
 
 	// Step 1: Degrade cluster A via slow writes
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		_, _ = a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(150 * time.Millisecond) // Exceeds 100ms absoluteMax
@@ -599,7 +599,7 @@ func TestAdaptiveDualWrite_AutomaticRecoveryViaDegradedWrites(t *testing.T) {
 	asyncCount := 0
 	syncCount := 0
 
-	for i := 0; i < 10; i++ { // Execute several writes
+	for range 10 { // Execute several writes
 		errA, errB := a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(10 * time.Millisecond) // Fast - should trigger recovery
@@ -978,7 +978,7 @@ func TestAdaptiveDualWrite_Concurrent_RecoveryThreshold(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
 			a.recordFast(&a.stateA)
@@ -1008,7 +1008,7 @@ func TestAdaptiveDualWrite_Concurrent_StrikeAndRecover(t *testing.T) {
 	wg.Add(goroutines * 2)
 
 	// Half the goroutines record strikes on A; half record fast recoveries on B.
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
 			a.recordStrike(&a.stateA)

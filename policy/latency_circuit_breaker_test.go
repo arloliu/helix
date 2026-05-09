@@ -32,7 +32,7 @@ func TestLatencyCircuitBreaker_CustomOptions(t *testing.T) {
 
 	assert.Equal(t, 500*time.Millisecond, lcb.AbsoluteMax())
 	// Verify custom threshold: should NOT fail over until 5 failures
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		lcb.RecordFailure(types.ClusterA)
 	}
 	assert.False(t, lcb.ShouldFailover(types.ClusterA, nil), "should not failover before threshold=5")

@@ -91,7 +91,7 @@ func StartCassandra(ctx context.Context, t *testing.T, opts *CassandraOptions) (
 	// Wait for Cassandra to be ready and connect to system keyspace
 	cluster.Keyspace = "system"
 	var session *gocql.Session
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		session, err = cluster.CreateSession()
 		if err == nil {
 			break

@@ -1,6 +1,7 @@
 package topology
 
 import (
+	"slices"
 	"time"
 
 	"github.com/arloliu/helix/types"
@@ -28,12 +29,7 @@ type DrainConfig struct {
 // Returns:
 //   - bool: true if the cluster is being drained
 func (d *DrainConfig) ContainsCluster(cluster types.ClusterID) bool {
-	for _, c := range d.Drain {
-		if c == cluster {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(d.Drain, cluster)
 }
 
 // WatcherConfig holds configuration for topology watchers.

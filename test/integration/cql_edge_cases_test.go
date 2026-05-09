@@ -666,7 +666,7 @@ func TestCQLAdaptiveDualWriteIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Execute several writes - both clusters healthy
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		orderID := gocql.TimeUUID()
 		err = client.Query(
 			"INSERT INTO "+ordersTable+" (id, user_id, total, status) VALUES (?, ?, ?, ?)",
@@ -756,7 +756,7 @@ func TestCQLAdaptiveDualWriteRecoveryIntegration(t *testing.T) {
 	require.True(t, adaptiveWrite.IsDegraded(types.ClusterA))
 
 	// Simulate recovery by recording fast writes
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		adaptiveWrite.RecordFastWrite(types.ClusterA)
 	}
 
@@ -995,7 +995,7 @@ func TestCQLAdaptiveDualWriteNaturalDegradationIntegration(t *testing.T) {
 	assert.False(t, adaptiveWrite.IsDegraded(types.ClusterB), "B should start healthy")
 
 	// Execute writes - B will be slow and accumulate strikes
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		orderID := gocql.TimeUUID()
 		err = client.Query(
 			"INSERT INTO "+ordersTable+" (id, user_id, total, status) VALUES (?, ?, ?, ?)",

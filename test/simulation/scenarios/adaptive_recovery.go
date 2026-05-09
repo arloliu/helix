@@ -27,7 +27,7 @@ func (s *AdaptiveRecovery) Run(ctx context.Context, env *types.Environment) erro
 
 	// Flap Cluster B — keep each down phase long enough for the adaptive write
 	// strategy to accumulate its strike threshold (default 3).
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

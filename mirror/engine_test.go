@@ -67,7 +67,7 @@ func TestEngineEnqueueAndExecute(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "INSERT", Timestamp: int64(i)}))
 	}
 
@@ -153,7 +153,7 @@ func TestEngineDisableMidFlightDrainsQueue(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "drain"}))
 	}
 	e.Disable()
@@ -168,7 +168,7 @@ func TestEngineStopDrainsQueue(t *testing.T) {
 	e := NewEngine(rec.fn(), WithWorkers(1), WithQueueSize(16))
 	e.Start()
 
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "stop"}))
 	}
 
@@ -386,9 +386,9 @@ func TestEngineConcurrentEnqueue(t *testing.T) {
 	defer e.Stop()
 
 	var wg sync.WaitGroup
-	for w := 0; w < 8; w++ {
+	for range 8 {
 		wg.Go(func() {
-			for i := 0; i < 100; i++ {
+			for range 100 {
 				e.TryEnqueue(types.ReplayPayload{Query: "concurrent"})
 			}
 		})

@@ -291,7 +291,7 @@ func TestCQLIteratorIntegration(t *testing.T) {
 
 	// Insert multiple users
 	userIDs := make([]gocql.UUID, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		userIDs[i] = gocql.TimeUUID()
 		err = client.Query(
 			"INSERT INTO "+usersTable+" (id, name, email, created_at) VALUES (?, ?, ?, ?)",
@@ -344,7 +344,7 @@ func TestCQLRoundRobinReadIntegration(t *testing.T) {
 
 	// Multiple reads should alternate (we can't easily verify which cluster was used,
 	// but we can verify reads succeed)
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		var name string
 		err = client.Query(
 			"SELECT name FROM "+usersTable+" WHERE id = ?", userID,
@@ -410,7 +410,7 @@ func TestCQLMultipleWritesIntegration(t *testing.T) {
 	// Insert many rows
 	numRows := 20
 	userIDs := make([]gocql.UUID, numRows)
-	for i := 0; i < numRows; i++ {
+	for i := range numRows {
 		userIDs[i] = gocql.TimeUUID()
 		err = client.Query(
 			"INSERT INTO "+usersTable+" (id, name, email, created_at) VALUES (?, ?, ?, ?)",
@@ -446,7 +446,7 @@ func TestCQLClientLifecycleIntegration(t *testing.T) {
 	// Note: We do NOT call client.Close() because that would close the shared
 	// underlying gocql sessions which are reused across all integration tests.
 	// Close behavior is tested separately in unit tests.
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		client, err := helix.NewCQLClient(helixSessionA, helixSessionB)
 		require.NoError(t, err)
 		require.NotNil(t, client)
@@ -473,7 +473,7 @@ func TestCQLPaginationIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Insert 10 users for pagination test
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		err = client.Query(
 			"INSERT INTO "+usersTable+" (id, name, email, created_at) VALUES (?, ?, ?, ?)",
 			gocql.TimeUUID(), "PageUser", "page@example.com", time.Now(),
@@ -551,7 +551,7 @@ func TestCQLSliceMapIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Insert 3 users
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		err = client.Query(
 			"INSERT INTO "+usersTable+" (id, name, email, created_at) VALUES (?, ?, ?, ?)",
 			gocql.TimeUUID(), "SliceMapUser", "slicemap@example.com", time.Now(),
@@ -617,7 +617,7 @@ func TestCQLIteratorMapScanIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Insert 3 users
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		err = client.Query(
 			"INSERT INTO "+usersTable+" (id, name, email, created_at) VALUES (?, ?, ?, ?)",
 			gocql.TimeUUID(), "IterMapUser", "itermap@example.com", time.Now(),
@@ -976,7 +976,7 @@ func TestCQLQueryConfigPropagation(t *testing.T) {
 		const totalRows = 25
 		const partitionKey = 1
 
-		for i := 0; i < totalRows; i++ {
+		for i := range totalRows {
 			err := client.Query(
 				"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
 				partitionKey, i, "data-"+string(rune('A'+i%26)),
@@ -1017,7 +1017,7 @@ func TestCQLQueryConfigPropagation(t *testing.T) {
 		const totalRows = 25
 		const partitionKey = 2 // Use different partition to isolate tests
 
-		for i := 0; i < totalRows; i++ {
+		for i := range totalRows {
 			err := client.Query(
 				"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
 				partitionKey, i, "data-"+string(rune('A'+i%26)),
@@ -1115,7 +1115,7 @@ func TestCQLQueryConfigPropagation(t *testing.T) {
 		const pageSize = 5
 
 		// Insert rows
-		for i := 0; i < totalRows; i++ {
+		for i := range totalRows {
 			err := client.Query(
 				"INSERT INTO "+paginationTable+" (partition_key, row_id, data) VALUES (?, ?, ?)",
 				partitionKey, i, "row-data",

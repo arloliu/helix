@@ -172,14 +172,12 @@ func sendUpdate(ch chan<- helix.TopologyUpdate, wg *sync.WaitGroup, done <-chan 
 	select {
 	case ch <- update:
 	default:
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case ch <- update:
 			case <-done:
 			}
-		}()
+		})
 	}
 }
 

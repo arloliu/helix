@@ -317,10 +317,10 @@ func TestSwapSession_ConcurrentSwapAndQuery(t *testing.T) {
 	stop := make(chan struct{})
 
 	// Query workers.
-	for i := 0; i < queryGoroutines; i++ {
+	for range queryGoroutines {
 		wg.Go(func() {
 			ctx := context.Background()
-			for j := 0; j < opsPerWorker; j++ {
+			for j := range opsPerWorker {
 				select {
 				case <-stop:
 					return
@@ -332,9 +332,9 @@ func TestSwapSession_ConcurrentSwapAndQuery(t *testing.T) {
 	}
 
 	// Swap workers.
-	for i := 0; i < swapGoroutines; i++ {
+	for range swapGoroutines {
 		wg.Go(func() {
-			for j := 0; j < opsPerWorker/10; j++ {
+			for j := range opsPerWorker / 10 {
 				cluster := helix.ClusterA
 				if j%2 == 0 {
 					cluster = helix.ClusterB

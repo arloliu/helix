@@ -265,7 +265,7 @@ func TestMirrorClientCloseDrainsInFlightItems(t *testing.T) {
 		return rec.execute()(ctx, p)
 	}, mirror.WithWorkers(1), mirror.WithQueueSize(64))
 
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		require.NoError(t, client.Query("INSERT", i).Mirror().ExecContext(context.Background()))
 	}
 

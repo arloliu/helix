@@ -819,7 +819,7 @@ func tryConvertToUUID(arg any) (UUID, bool) {
 		if rv.Kind() == reflect.Array && rv.Type().Len() == 16 && rv.Type().Elem().Kind() == reflect.Uint8 {
 			// Create a new UUID and copy bytes
 			var u UUID
-			byteType := reflect.TypeOf(byte(0))
+			byteType := reflect.TypeFor[byte]()
 			// We can't directly cast, so we copy
 			// reflect.Copy requires both to be slices or arrays, but we can iterate
 			// or use Unsafe, but iteration is safer and fast enough for 16 bytes
@@ -858,7 +858,7 @@ func decodeArgs(raw msgp.Raw) ([]any, error) {
 	}
 
 	args := make([]any, sz)
-	for i := uint32(0); i < sz; i++ {
+	for i := range sz {
 		var val any
 		val, buf, err = msgp.ReadIntfBytes(buf)
 		if err != nil {

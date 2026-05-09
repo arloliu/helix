@@ -41,7 +41,7 @@ func TestRoundRobinRead_FailoverMetric_FiresOnFailedClusterRead(t *testing.T) {
 	t.Cleanup(client.Close)
 
 	ctx := context.Background()
-	for i := 0; i < reads; i++ {
+	for i := range reads {
 		var got string
 		_ = client.Query("SELECT v FROM t WHERE k = ?", i).ScanContext(ctx, &got)
 	}

@@ -188,7 +188,7 @@ func fastAutoRefreshOpts() []helix.AutoRefreshOption {
 // outcome is determined by whether the underlying mock has fail=true.
 func driveOps(t *testing.T, c *helix.CQLClient, n int) {
 	t.Helper()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// Explicitly use ExecContext to take the documented exec path.
 		_ = c.Query("INSERT INTO t (k,v) VALUES (?, ?)", i, "v").ExecContext(context.Background())
 	}
@@ -303,7 +303,7 @@ func TestAutoRefresh_DoesNotFireOnSporadicFailures(t *testing.T) {
 	// Alternate: 3 failures, 1 success, repeat. Each success resets
 	// consecutiveFailures and updates lastSuccess so the predicates
 	// never both hold.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		mockA.fail.Store(true)
 		driveOps(t, client, 3)
 		mockA.fail.Store(false)
@@ -557,7 +557,7 @@ func TestAutoRefresh_StopsOnClose(t *testing.T) {
 // auto-refresh detector.
 func driveIters(t *testing.T, c *helix.CQLClient, n int) {
 	t.Helper()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		_ = c.Query("SELECT * FROM t WHERE k = ?", i).IterContext(context.Background()).Close()
 	}
 }

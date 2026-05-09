@@ -171,8 +171,8 @@ func validateNATSSubjectPrefix(prefix string) error {
 	if trimmed != prefix {
 		return errors.New("must not have leading or trailing whitespace")
 	}
-	tokens := strings.Split(trimmed, ".")
-	for _, token := range tokens {
+	tokens := strings.SplitSeq(trimmed, ".")
+	for token := range tokens {
 		if token == "" {
 			return errors.New("must not contain empty subject tokens")
 		}
