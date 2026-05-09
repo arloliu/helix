@@ -10,6 +10,11 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+const (
+	defaultMemoryQueueCapacity    = 10000
+	defaultMemoryHighPriorityRate = 10
+)
+
 // MemoryReplayer implements an in-memory replay queue using priority-based buffered channels.
 //
 // # Priority Support
@@ -123,24 +128,74 @@ func WithMemoryStrictPriority(strict bool) MemoryReplayerOption {
 //
 // Returns:
 //   - *MemoryReplayer: A new memory replayer
+//
+// For production configuration that should fail fast on invalid option values,
+// use [NewMemoryReplayerChecked].
 func NewMemoryReplayer(opts ...MemoryReplayerOption) *MemoryReplayer {
-	m := &MemoryReplayer{
-		capacity:          10000,
-		highPriorityRatio: 10, // Default 10:1 ratio
+	m := newMemoryReplayerWithDefaults()
+	applyMemoryReplayerOptions(m, opts...)
+	normalizeMemoryReplayerForLegacy(m)
+	initializeMemoryReplayerQueues(m)
+
+	return m
+}
+
+// NewMemoryReplayerChecked creates a new in-memory replayer and returns a
+// validation error when any option value is invalid.
+//
+// Parameters:
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *MemoryReplayer: A new memory replayer
+//   - error: Joined [types.OptionError] values when one or more options are invalid
+func NewMemoryReplayerChecked(opts ...MemoryReplayerOption) (*MemoryReplayer, error) {
+	m := newMemoryReplayerWithDefaults()
+	applyMemoryReplayerOptions(m, opts...)
+	if err := validateMemoryReplayerForChecked(m); err != nil {
+		return nil, err
+	}
+	initializeMemoryReplayerQueues(m)
+
+	return m, nil
+}
+
+func newMemoryReplayerWithDefaults() *MemoryReplayer {
+	return &MemoryReplayer{
+		capacity:          defaultMemoryQueueCapacity,
+		highPriorityRatio: defaultMemoryHighPriorityRate,
 		strictPriority:    false,
 	}
+}
 
+func applyMemoryReplayerOptions(m *MemoryReplayer, opts ...MemoryReplayerOption) {
 	for _, opt := range opts {
 		opt(m)
 	}
+}
 
+func validateMemoryReplayerForChecked(m *MemoryReplayer) error {
+	errList := make([]error, 0, 2)
+
+	if m.capacity <= 0 {
+		errList = append(errList, optionErrPositiveInt(memoryReplayerComponent, "WithQueueCapacity"))
+	}
+	if m.highPriorityRatio < 0 {
+		errList = append(errList, optionErrNonNegativeInt(memoryReplayerComponent, "WithMemoryHighPriorityRatio"))
+	}
+
+	return joinValidationErrors(errList...)
+}
+
+func normalizeMemoryReplayerForLegacy(m *MemoryReplayer) {
 	if m.capacity < 1 {
 		m.capacity = 1
 	}
+}
+
+func initializeMemoryReplayerQueues(m *MemoryReplayer) {
 	m.highQueue = make(chan types.ReplayPayload, m.capacity)
 	m.lowQueue = make(chan types.ReplayPayload, m.capacity)
-
-	return m
 }
 
 // Enqueue adds a failed write to the replay queue.

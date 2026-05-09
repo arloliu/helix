@@ -2,12 +2,44 @@ package replay
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMemoryReplayerCheckedInvalidOptionsReturnJoinedErrors(t *testing.T) {
+	replayer, err := NewMemoryReplayerChecked(
+		WithQueueCapacity(0),
+		WithMemoryHighPriorityRatio(-1),
+	)
+
+	require.Nil(t, replayer)
+	require.Error(t, err)
+	require.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	require.Equal(t, memoryReplayerComponent, optionErr.Component)
+	require.Contains(t, err.Error(), "WithQueueCapacity")
+	require.Contains(t, err.Error(), "WithMemoryHighPriorityRatio")
+}
+
+func TestMemoryReplayerCheckedValidOptions(t *testing.T) {
+	replayer, err := NewMemoryReplayerChecked(
+		WithQueueCapacity(8),
+		WithMemoryHighPriorityRatio(0),
+		WithMemoryStrictPriority(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, replayer)
+	t.Cleanup(replayer.Close)
+
+	require.Equal(t, 8, replayer.Cap())
+	require.True(t, replayer.strictPriority)
+}
 
 func TestMemoryReplayerEnqueue(t *testing.T) {
 	replayer := NewMemoryReplayer(WithQueueCapacity(10))

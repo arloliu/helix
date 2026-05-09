@@ -58,6 +58,10 @@
 // The memory replayer is bounded and will return [types.ErrReplayQueueFull]
 // when capacity is reached.
 //
+// For fail-fast configuration validation, use
+// [NewMemoryReplayerChecked], which returns joined [types.OptionError]
+// values when options are invalid.
+//
 // # NATS JetStream Replayer
 //
 // [NATSReplayer] provides a durable, distributed replay queue backed by NATS
@@ -84,4 +88,7 @@
 //	    helix.WithReplayer(replayer),
 //	    helix.WithReplayWorker(worker),
 //	)
+//
+// For fail-fast worker configuration validation, use
+// [NewMemoryWorkerChecked] or [NewNATSWorkerChecked].
 package replay

@@ -276,25 +276,55 @@ func (b *memoryBackend) clusterName(cluster types.ClusterID) string {
 //
 // Returns:
 //   - *Worker: A new worker instance
+//
+// For production configuration that should fail fast on invalid inputs,
+// use [NewMemoryWorkerChecked].
 func NewMemoryWorker(replayer *MemoryReplayer, execute ExecuteFunc, opts ...WorkerOption) *Worker {
-	config := DefaultWorkerConfig()
-	for _, opt := range opts {
-		opt(&config)
-	}
+	config := buildWorkerConfig(opts...)
 	normalizeWorkerConfig(&config)
+	finalizeWorkerConfig(&config)
 
-	if config.Metrics == nil {
-		config.Metrics = metrics.NewNopMetrics()
-	}
-	if config.Logger == nil {
-		config.Logger = logging.NewNopLogger()
-	}
+	return newMemoryWorkerWithConfig(config, replayer, execute,
+		validateWorkerInputs(replayer != nil, execute))
+}
 
+// NewMemoryWorkerChecked creates a worker that processes messages from a
+// MemoryReplayer and returns a validation error when constructor inputs or
+// option values are invalid.
+//
+// Parameters:
+//   - replayer: The memory replayer to consume from
+//   - execute: Function to execute replay payloads
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *Worker: A new worker instance
+//   - error: Joined [types.OptionError] values when one or more inputs are invalid
+func NewMemoryWorkerChecked(replayer *MemoryReplayer, execute ExecuteFunc, opts ...WorkerOption) (*Worker, error) {
+	config := buildWorkerConfig(opts...)
+	validationErr := joinValidationErrors(
+		validateWorkerInputsForChecked(memoryWorkerComponent, replayer != nil, execute),
+		validateWorkerConfigForChecked(config, memoryWorkerComponent),
+	)
+	if validationErr != nil {
+		return nil, validationErr
+	}
+	finalizeWorkerConfig(&config)
+
+	return newMemoryWorkerWithConfig(config, replayer, execute, nil), nil
+}
+
+func newMemoryWorkerWithConfig(
+	config WorkerConfig,
+	replayer *MemoryReplayer,
+	execute ExecuteFunc,
+	startupErr error,
+) *Worker {
 	w := &Worker{
 		config:     config,
 		execute:    execute,
 		stopCh:     make(chan struct{}),
-		startupErr: validateWorkerInputs(replayer != nil, execute),
+		startupErr: startupErr,
 	}
 
 	w.backend = &memoryBackend{
@@ -307,6 +337,24 @@ func NewMemoryWorker(replayer *MemoryReplayer, execute ExecuteFunc, opts ...Work
 	}
 
 	return w
+}
+
+func buildWorkerConfig(opts ...WorkerOption) WorkerConfig {
+	config := DefaultWorkerConfig()
+	for _, opt := range opts {
+		opt(&config)
+	}
+
+	return config
+}
+
+func finalizeWorkerConfig(config *WorkerConfig) {
+	if config.Metrics == nil {
+		config.Metrics = metrics.NewNopMetrics()
+	}
+	if config.Logger == nil {
+		config.Logger = logging.NewNopLogger()
+	}
 }
 
 func validateWorkerInputs(hasReplayer bool, execute ExecuteFunc) error {

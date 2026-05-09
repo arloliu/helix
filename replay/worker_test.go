@@ -83,6 +83,94 @@ func TestMemoryWorkerStartRejectsNilInputs(t *testing.T) {
 	assert.Contains(t, err.Error(), "non-nil execute")
 }
 
+func TestMemoryWorkerCheckedInvalidInputsReturnJoinedErrors(t *testing.T) {
+	worker, err := replay.NewMemoryWorkerChecked(nil, nil,
+		replay.WithBatchSize(0),
+		replay.WithPollInterval(0),
+		replay.WithRetryDelay(0),
+		replay.WithMaxRetryDelay(0),
+		replay.WithExecuteTimeout(0),
+		replay.WithMaxAttempts(0),
+		replay.WithHighPriorityRatio(-1),
+		replay.WithWorkerClusterNames(types.ClusterNames{A: "", B: "valid"}),
+	)
+
+	require.Nil(t, worker)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Contains(t, err.Error(), "replayer")
+	assert.Contains(t, err.Error(), "execute")
+	assert.Contains(t, err.Error(), "WithBatchSize")
+	assert.Contains(t, err.Error(), "WithHighPriorityRatio")
+	assert.Contains(t, err.Error(), "WithWorkerClusterNames")
+}
+
+func TestMemoryWorkerCheckedValidConfig(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(100))
+	defer replayer.Close()
+
+	worker, err := replay.NewMemoryWorkerChecked(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		replay.WithBatchSize(10),
+		replay.WithPollInterval(10*time.Millisecond),
+		replay.WithRetryDelay(20*time.Millisecond),
+		replay.WithMaxRetryDelay(40*time.Millisecond),
+		replay.WithExecuteTimeout(2*time.Second),
+		replay.WithMaxAttempts(2),
+		replay.WithHighPriorityRatio(0),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, worker)
+
+	require.NoError(t, worker.Start())
+	worker.Stop()
+}
+
+func TestNATSWorkerCheckedInvalidInputsReturnJoinedErrors(t *testing.T) {
+	worker, err := replay.NewNATSWorkerChecked(nil, nil,
+		replay.WithBatchSize(0),
+		replay.WithPollInterval(0),
+		replay.WithRetryDelay(0),
+		replay.WithExecuteTimeout(0),
+	)
+
+	require.Nil(t, worker)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+	assert.Contains(t, err.Error(), "replayer")
+	assert.Contains(t, err.Error(), "execute")
+	assert.Contains(t, err.Error(), "WithBatchSize")
+}
+
+func TestNATSWorkerCheckedValidConfig(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName("test-worker-checked"),
+		replay.WithSubjectPrefix("test.worker.checked"),
+	)
+	require.NoError(t, err)
+	defer replayer.Close()
+
+	worker, err := replay.NewNATSWorkerChecked(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		replay.WithBatchSize(10),
+		replay.WithPollInterval(10*time.Millisecond),
+		replay.WithRetryDelay(10*time.Millisecond),
+		replay.WithMaxRetryDelay(20*time.Millisecond),
+		replay.WithExecuteTimeout(2*time.Second),
+		replay.WithMaxAttempts(2),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, worker)
+
+	require.NoError(t, worker.Start())
+	worker.Stop()
+}
+
 func TestWorkerStartRejectsZeroValue(t *testing.T) {
 	var worker replay.Worker
 

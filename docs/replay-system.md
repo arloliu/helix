@@ -73,6 +73,23 @@ type Replayer interface {
 | `MemoryReplayer` | Volatile (lost on crash) | Development, testing |
 | `NATSReplayer` | Durable within configured retention limits | Production |
 
+**Configuration validation:**
+
+- `NewMemoryReplayer` is the compatibility constructor.
+    Invalid capacity values are normalized to a safe minimum.
+- `NewMemoryReplayerChecked` returns `error`
+    (joined `*types.OptionError`) when options are invalid.
+
+```go
+replayer, err := replay.NewMemoryReplayerChecked(
+        replay.WithQueueCapacity(10000),
+        replay.WithMemoryHighPriorityRatio(10),
+)
+if err != nil {
+        return fmt.Errorf("configure memory replayer: %w", err)
+}
+```
+
 `NATSReplayer` is intentionally bounded by `MaxAge`, `MaxMsgs`, and
 `MaxBytes`. The default stream policy is availability-first: when the stream
 hits a size/count limit, JetStream discards older replay messages so newer
@@ -103,6 +120,14 @@ construct a new worker rather than calling `Start()` again.
 |---------------|------------------|----------|
 | `MemoryWorker` | Single dequeue goroutine + bounded retry pool | Paired with MemoryReplayer |
 | `NATSWorker` | One dequeue goroutine per cluster | Paired with NATSReplayer |
+
+**Configuration validation:**
+
+- `NewMemoryWorker` and `NewNATSWorker` are compatibility constructors.
+    Invalid numeric options are normalized to defaults.
+- `NewMemoryWorkerChecked` and `NewNATSWorkerChecked`
+    return `error` (joined `*types.OptionError`) when constructor inputs
+    or options are invalid.
 
 The memory worker dequeues sequentially but dispatches retry attempts to a
 bounded goroutine pool (default 100), so a single permanently-failing

@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/arloliu/helix/internal/logging"
-	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/types"
 )
 
@@ -309,28 +307,55 @@ func (b *natsBackend) clusterName(cluster types.ClusterID) string {
 //
 // Returns:
 //   - *Worker: A new worker instance
+//
+// For production configuration that should fail fast on invalid inputs,
+// use [NewNATSWorkerChecked].
 func NewNATSWorker(replayer *NATSReplayer, execute ExecuteFunc, opts ...WorkerOption) *Worker {
-	config := DefaultWorkerConfig()
-	for _, opt := range opts {
-		opt(&config)
-	}
+	config := buildWorkerConfig(opts...)
 	normalizeWorkerConfig(&config)
+	finalizeWorkerConfig(&config)
 
-	// Ensure metrics is never nil
-	if config.Metrics == nil {
-		config.Metrics = metrics.NewNopMetrics()
+	return newNATSWorkerWithConfig(config, replayer, execute,
+		validateWorkerInputs(replayer != nil, execute))
+}
+
+// NewNATSWorkerChecked creates a worker that processes messages from a
+// NATSReplayer and returns a validation error when constructor inputs or
+// option values are invalid.
+//
+// Parameters:
+//   - replayer: The NATS replayer to consume from
+//   - execute: Function to execute replay payloads
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *Worker: A new worker instance
+//   - error: Joined [types.OptionError] values when one or more inputs are invalid
+func NewNATSWorkerChecked(replayer *NATSReplayer, execute ExecuteFunc, opts ...WorkerOption) (*Worker, error) {
+	config := buildWorkerConfig(opts...)
+	validationErr := joinValidationErrors(
+		validateWorkerInputsForChecked(natsWorkerComponent, replayer != nil, execute),
+		validateWorkerConfigForChecked(config, natsWorkerComponent),
+	)
+	if validationErr != nil {
+		return nil, validationErr
 	}
+	finalizeWorkerConfig(&config)
 
-	// Ensure logger is never nil
-	if config.Logger == nil {
-		config.Logger = logging.NewNopLogger()
-	}
+	return newNATSWorkerWithConfig(config, replayer, execute, nil), nil
+}
 
+func newNATSWorkerWithConfig(
+	config WorkerConfig,
+	replayer *NATSReplayer,
+	execute ExecuteFunc,
+	startupErr error,
+) *Worker {
 	w := &Worker{
 		config:     config,
 		execute:    execute,
 		stopCh:     make(chan struct{}),
-		startupErr: validateWorkerInputs(replayer != nil, execute),
+		startupErr: startupErr,
 	}
 
 	// Create and inject the NATS backend
