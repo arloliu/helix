@@ -21,6 +21,16 @@ func TestStickyReadSelect(t *testing.T) {
 	}
 }
 
+func TestStickyRead_InvalidOptionsPreserveDefaults(t *testing.T) {
+	strategy := NewStickyRead(
+		WithPreferredCluster(types.ClusterID("C")),
+		WithStickyReadCooldown(-time.Second),
+	)
+
+	assertKnownCluster(t, strategy.Preferred())
+	require.Equal(t, 5*time.Minute, strategy.failoverCooldown)
+}
+
 func TestStickyReadFailover(t *testing.T) {
 	strategy := NewStickyRead(
 		WithPreferredCluster(types.ClusterA),
@@ -115,6 +125,20 @@ func TestRoundRobinReadFailover(t *testing.T) {
 	alt, shouldFailover = strategy.OnFailure(types.ClusterB, nil)
 	require.True(t, shouldFailover)
 	require.Equal(t, types.ClusterA, alt)
+}
+
+func TestRoundRobinRead_InvalidClusterDoesNotFailover(t *testing.T) {
+	strategy := NewRoundRobinRead()
+
+	alt, shouldFailover := strategy.OnFailure(types.ClusterID("C"), nil)
+	require.False(t, shouldFailover)
+	require.Empty(t, alt)
+}
+
+func assertKnownCluster(t *testing.T, cluster types.ClusterID) {
+	t.Helper()
+	require.True(t, cluster == types.ClusterA || cluster == types.ClusterB,
+		"cluster %q must be one of the known Helix clusters", cluster)
 }
 
 // TestPrimaryOnlyRead_AutoRecovery_ReturnsToA verifies that after the recovery

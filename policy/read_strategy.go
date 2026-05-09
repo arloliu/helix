@@ -45,6 +45,9 @@ type StickyReadOption func(*StickyRead)
 //   - StickyReadOption: Configuration option
 func WithStickyReadCooldown(d time.Duration) StickyReadOption {
 	return func(s *StickyRead) {
+		if d < 0 {
+			return
+		}
 		s.failoverCooldown = d
 	}
 }
@@ -58,6 +61,9 @@ func WithStickyReadCooldown(d time.Duration) StickyReadOption {
 //   - StickyReadOption: Configuration option
 func WithPreferredCluster(cluster types.ClusterID) StickyReadOption {
 	return func(s *StickyRead) {
+		if !isKnownCluster(cluster) {
+			return
+		}
 		s.preferred.Store(cluster)
 	}
 }
@@ -388,6 +394,9 @@ func (r *RoundRobinRead) OnSuccess(_ types.ClusterID) {
 func (r *RoundRobinRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterID, bool) {
 	if cluster == types.ClusterA {
 		return types.ClusterB, true
+	}
+	if cluster != types.ClusterB {
+		return "", false
 	}
 	return types.ClusterA, true
 }

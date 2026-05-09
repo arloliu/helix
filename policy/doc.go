@@ -28,7 +28,11 @@
 // All strategies implement the WriteStrategy interface:
 //
 //	type WriteStrategy interface {
-//	    Execute(ctx context.Context, writeFunc WriteFunc) (errA, errB error)
+//	    Execute(
+//	        ctx context.Context,
+//	        writeA func(context.Context) error,
+//	        writeB func(context.Context) error,
+//	    ) (errA, errB error)
 //	}
 //
 // Available strategies:
@@ -58,9 +62,9 @@
 // All policies implement the FailoverPolicy interface:
 //
 //	type FailoverPolicy interface {
-//	    ShouldFailover(ctx context.Context, cluster types.ClusterID, err error) bool
-//	    RecordSuccess(ctx context.Context, cluster types.ClusterID)
-//	    RecordFailure(ctx context.Context, cluster types.ClusterID, err error)
+//	    ShouldFailover(cluster types.ClusterID, err error) bool
+//	    RecordSuccess(cluster types.ClusterID)
+//	    RecordFailure(cluster types.ClusterID)
 //	}
 //
 // Available policies:
