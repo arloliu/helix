@@ -29,6 +29,7 @@ If one strand snaps, the other keeps the organism alive. It's 4 billion years of
 - **Active Failover** - Immediate failover to secondary cluster on read failures
 - **Replay System** - Asynchronous reconciliation via in-memory queue or NATS JetStream
 - **Strict Writes** - Per-statement opt-in for replay-unsafe writes (counters, list/set append) that surfaces partial failures immediately — see [Strict Write Guide](docs/strict-write.md)
+- **Async Mirror Writes** - Per-statement `Mirror()` opt-in for seamless cluster migrations; async fire-and-forget with durable replay retry and optional out-of-process publisher mode — see [Mirror Guide](docs/mirror.md)
 - **Session Refresh** - Manual or automatic recovery from permanently-dead sessions (cluster restart with port reassignment, DNS rotation) without rebuilding the client — see [Session Refresh Guide](docs/session-refresh.md)
 - **Drop-in Replacement** - Interface-based design mirrors `gocql` API for minimal migration effort
 
@@ -274,6 +275,18 @@ helix.NewCQLClient(sessionA, sessionB,
         return time.Now().UnixMicro()
     }),
 
+    // Mirror — async per-statement mirroring to a second cluster pair (cluster migrations)
+    helix.WithMirror(mirrorClient),
+    helix.WithMirrorReplayer(replayer),           // durable retry for failed mirror writes
+    // helix.WithMirrorPublisher(natsReplayer),   // out-of-process publisher mode
+
+    // Recovery probe — auto-heal degraded clusters (default-on with AdaptiveDualWrite)
+    helix.WithRecoveryProbe(helix.RecoveryProbe{
+        Interval: 5 * time.Second,
+        Timeout:  2 * time.Second,
+    }),
+    // helix.WithRecoveryProbeDisabled(),  // opt out; use ForceRecover() manually
+
     // Session refresh — recover from permanently-dead sessions
     // (cluster restart with port reassignment, DNS rotation) without
     // rebuilding the client. See docs/session-refresh.md.
@@ -294,16 +307,19 @@ See the [examples](examples/) directory:
 - [failover](examples/failover/) - Failover behavior demonstration
 - [custom-strategy](examples/custom-strategy/) - Creating custom strategies
 - [replay](examples/replay/) - Replay system usage
+- [mirror](examples/mirror/) - Async mirror write wiring for cluster migrations
 
 ## Documentation
 
-- [Auto-Recovery Guide](docs/auto-recovery.md) - Recovery lifecycle, operator workflow, and best practices
-- [Session Refresh Guide](docs/session-refresh.md) - Recover from permanently-dead sessions (cluster restart, DNS rotation) without rebuilding the client
-- [FallbackRead Guide](docs/fallback-read.md) - Best-effort dual-cluster reads for critical data
-- [Strict Write Guide](docs/strict-write.md) - Replay-unsafe writes: counters, list/set append, tombstone races
-- [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) - Latency-aware write strategy tuning
-- [Replay System](docs/replay-system.md) - Replay patterns and best practices
-- [Strategy & Policy](docs/strategy-policy.md) - Read/write strategies and failover policies
+- [Strategy & Policy](docs/strategy-policy.md) — Read/write strategies, failover policies, and `AllowedClusters` operator override
+- [Replay System](docs/replay-system.md) — Queue implementations, replay patterns, and worker configuration
+- [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) — Latency-aware write strategy: degradation thresholds, fire-and-forget, and recovery probe
+- [FallbackRead Guide](docs/fallback-read.md) — Best-effort dual-cluster reads for critical read-after-write scenarios
+- [Strict Write Guide](docs/strict-write.md) — Replay-unsafe writes: counters, list/set append, tombstone races
+- [Mirror Guide](docs/mirror.md) — Async per-statement mirroring for seamless cluster migrations
+- [Auto-Recovery Guide](docs/auto-recovery.md) — Recovery lifecycle, coordinated drain / re-enable workflow, and operator best practices
+- [Session Refresh Guide](docs/session-refresh.md) — Recover from permanently-dead sessions without rebuilding the client
+- [Simulation Guide](docs/simulation_guide.md) — Behavioral test harness for multi-cluster failure scenarios
 
 ## Requirements
 
