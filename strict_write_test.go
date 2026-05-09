@@ -41,29 +41,58 @@ func newDualClient(t *testing.T, sessionA, sessionB *mockSession, opts ...Option
 	return client
 }
 
-// TestStrict_MirrorConflict_Query verifies that Strict().Mirror() on a query
-// returns ErrStrictMirrorUnsupported before any write is attempted.
+// TestStrict_MirrorConflict_Query verifies that both Strict().Mirror() and
+// Mirror().Strict() orderings on a query return ErrStrictMirrorUnsupported
+// before any write is attempted.
 func TestStrict_MirrorConflict_Query(t *testing.T) {
-	sa, sb := newMockSession(), newMockSession()
-	client := newDualClient(t, sa, sb)
+	t.Run("Strict then Mirror", func(t *testing.T) {
+		sa, sb := newMockSession(), newMockSession()
+		client := newDualClient(t, sa, sb)
 
-	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().Mirror().ExecContext(t.Context())
+		err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().Mirror().ExecContext(t.Context())
 
-	require.ErrorIs(t, err, types.ErrStrictMirrorUnsupported)
-	require.Empty(t, sa.queries, "no write must reach cluster A")
-	require.Empty(t, sb.queries, "no write must reach cluster B")
+		require.ErrorIs(t, err, types.ErrStrictMirrorUnsupported)
+		require.Empty(t, sa.queries, "no write must reach cluster A")
+		require.Empty(t, sb.queries, "no write must reach cluster B")
+	})
+
+	t.Run("Mirror then Strict", func(t *testing.T) {
+		sa, sb := newMockSession(), newMockSession()
+		client := newDualClient(t, sa, sb)
+
+		err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Mirror().Strict().ExecContext(t.Context())
+
+		require.ErrorIs(t, err, types.ErrStrictMirrorUnsupported)
+		require.Empty(t, sa.queries, "no write must reach cluster A")
+		require.Empty(t, sb.queries, "no write must reach cluster B")
+	})
 }
 
-// TestStrict_MirrorConflict_Batch verifies the same for batches.
+// TestStrict_MirrorConflict_Batch verifies that both Strict().Mirror() and
+// Mirror().Strict() orderings on a batch return ErrStrictMirrorUnsupported
+// before any write is attempted.
 func TestStrict_MirrorConflict_Batch(t *testing.T) {
-	sa, sb := newMockSession(), newMockSession()
-	client := newDualClient(t, sa, sb)
+	t.Run("Strict then Mirror", func(t *testing.T) {
+		sa, sb := newMockSession(), newMockSession()
+		client := newDualClient(t, sa, sb)
 
-	err := client.Batch(LoggedBatch).Query("INSERT INTO t (k) VALUES (?)", "x").Strict().Mirror().ExecContext(t.Context())
+		err := client.Batch(LoggedBatch).Query("INSERT INTO t (k) VALUES (?)", "x").Strict().Mirror().ExecContext(t.Context())
 
-	require.ErrorIs(t, err, types.ErrStrictMirrorUnsupported)
-	require.Empty(t, sa.queries, "no write must reach cluster A")
-	require.Empty(t, sb.queries, "no write must reach cluster B")
+		require.ErrorIs(t, err, types.ErrStrictMirrorUnsupported)
+		require.Empty(t, sa.queries, "no write must reach cluster A")
+		require.Empty(t, sb.queries, "no write must reach cluster B")
+	})
+
+	t.Run("Mirror then Strict", func(t *testing.T) {
+		sa, sb := newMockSession(), newMockSession()
+		client := newDualClient(t, sa, sb)
+
+		err := client.Batch(LoggedBatch).Query("INSERT INTO t (k) VALUES (?)", "x").Mirror().Strict().ExecContext(t.Context())
+
+		require.ErrorIs(t, err, types.ErrStrictMirrorUnsupported)
+		require.Empty(t, sa.queries, "no write must reach cluster A")
+		require.Empty(t, sb.queries, "no write must reach cluster B")
+	})
 }
 
 // noStrictWriter is a WriteStrategy that intentionally omits ExecuteStrict to

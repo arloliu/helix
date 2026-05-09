@@ -512,7 +512,8 @@ func TestStrict_BothDrainingReturnsDualClusterError(t *testing.T) {
 
 // TestStrict_Mirror_PreflightRejection_NoSideEffects verifies that combining
 // Strict() and Mirror() is rejected with ErrStrictMirrorUnsupported before any
-// network I/O occurs: no rows appear on any cluster and the mirror engine does
+// network I/O occurs regardless of call order (Strict().Mirror() or
+// Mirror().Strict()): no rows appear on any cluster and the mirror engine does
 // not enqueue.
 func TestStrict_Mirror_PreflightRejection_NoSideEffects(t *testing.T) {
 	a, b := sharedClusters(t)
@@ -537,35 +538,53 @@ func TestStrict_Mirror_PreflightRejection_NoSideEffects(t *testing.T) {
 
 			ctx := context.Background()
 			keyQ := fmt.Sprintf("strict_mirror_q_%s", d.name)
+			keyQR := fmt.Sprintf("strict_mirror_qr_%s", d.name) // Mirror().Strict() ordering
 			keyB := fmt.Sprintf("strict_mirror_b_%s", d.name)
+			keyBR := fmt.Sprintf("strict_mirror_br_%s", d.name) // Mirror().Strict() ordering
 			stmt := fmt.Sprintf("INSERT INTO %s (key, value) VALUES (?, ?)", table)
 			selectStmt := fmt.Sprintf("SELECT value FROM %s WHERE key = ?", table)
 
 			beforeStats := client.Mirror().Stats()
 
-			// Query: Strict()+Mirror() must be rejected before any write reaches either cluster.
+			// Query: Strict().Mirror() must be rejected before any write reaches either cluster.
 			err = client.Query(stmt, keyQ, "v").Strict().Mirror().ExecContext(ctx)
 			assert.ErrorIs(t, err, htypes.ErrStrictMirrorUnsupported,
-				"[%s] query: expected ErrStrictMirrorUnsupported", d.name)
+				"[%s] query Strict().Mirror(): expected ErrStrictMirrorUnsupported", d.name)
+
+			// Query: Mirror().Strict() must be rejected identically (call order must not matter).
+			err = client.Query(stmt, keyQR, "v").Mirror().Strict().ExecContext(ctx)
+			assert.ErrorIs(t, err, htypes.ErrStrictMirrorUnsupported,
+				"[%s] query Mirror().Strict(): expected ErrStrictMirrorUnsupported", d.name)
 
 			var notFound string
 			assert.Error(t, a.Session.Query(selectStmt, keyQ).Scan(&notFound),
 				"[%s] keyQ must not exist on A after preflight rejection", d.name)
 			assert.Error(t, b.Session.Query(selectStmt, keyQ).Scan(&notFound),
 				"[%s] keyQ must not exist on B after preflight rejection", d.name)
+			assert.Error(t, a.Session.Query(selectStmt, keyQR).Scan(&notFound),
+				"[%s] keyQR must not exist on A after Mirror().Strict() rejection", d.name)
+			assert.Error(t, b.Session.Query(selectStmt, keyQR).Scan(&notFound),
+				"[%s] keyQR must not exist on B after Mirror().Strict() rejection", d.name)
 
-			// Batch: Strict()+Mirror() must also be rejected.
+			// Batch: Strict().Mirror() must also be rejected.
 			err = client.Batch(helix.LoggedBatch).
 				Query(stmt, keyB, "v").
 				Strict().Mirror().ExecContext(ctx)
 			assert.ErrorIs(t, err, htypes.ErrStrictMirrorUnsupported,
-				"[%s] batch: expected ErrStrictMirrorUnsupported", d.name)
+				"[%s] batch Strict().Mirror(): expected ErrStrictMirrorUnsupported", d.name)
+
+			// Batch: Mirror().Strict() must be rejected identically.
+			err = client.Batch(helix.LoggedBatch).
+				Query(stmt, keyBR, "v").
+				Mirror().Strict().ExecContext(ctx)
+			assert.ErrorIs(t, err, htypes.ErrStrictMirrorUnsupported,
+				"[%s] batch Mirror().Strict(): expected ErrStrictMirrorUnsupported", d.name)
 
 			// Preflight rejection is synchronous — no async work is in flight;
 			// confirm the engine did not enqueue.
 			afterStats := client.Mirror().Stats()
 			assert.Equal(t, beforeStats.Enqueued, afterStats.Enqueued,
-				"[%s] mirror engine must not enqueue on Strict()+Mirror() rejection", d.name)
+				"[%s] mirror engine must not enqueue on any Strict()+Mirror() combination", d.name)
 		})
 	}
 }
