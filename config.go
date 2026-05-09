@@ -342,8 +342,9 @@ func WithSessionRefresher(fn SessionRefresher) Option {
 //
 // The probe is called on each Interval against a degraded cluster's live session.
 // A nil return credits one recovery point; a non-nil return leaves the cluster
-// degraded. Interval and Timeout must both be positive; zero values are replaced
-// with the defaults from [DefaultRecoveryProbe].
+// degraded. Zero Interval or Timeout values are replaced with the defaults from
+// [DefaultRecoveryProbe]; negative values are invalid and cause [NewCQLClient]
+// to return a [types.OptionError].
 //
 // When not set, a default probe (system.local read, 2s interval, 1s timeout) runs
 // automatically for any client whose WriteStrategy is [policy.AdaptiveDualWrite].

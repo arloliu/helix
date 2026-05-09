@@ -548,7 +548,12 @@ func (c *CQLClient) shouldLogOverrideErr() bool {
 //
 // Returns:
 //   - *CQLClient: A new CQL client
-//   - error: ErrNilSession if sessionA is nil, or error from worker start
+//   - error: [types.ErrNilSession] if sessionA is nil, joined
+//     [types.OptionError] values for invalid options, sentinel errors such as
+//     [types.ErrMirrorModeConflict], [types.ErrNilMirrorTarget], or
+//     [types.ErrNilMirrorPublisher] for invalid mirror configuration, or an
+//     error from starting configured background components such as replay
+//     workers or topology watchers
 func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, error) {
 	if sessionA == nil {
 		return nil, types.ErrNilSession

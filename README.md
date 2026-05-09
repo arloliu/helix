@@ -257,6 +257,12 @@ client, err := helix.NewCQLClient(
 
 ### All Configuration Options
 
+`NewCQLClient` validates root options before starting background components or
+mutating caller-owned strategies, policies, and workers. Invalid root options
+return joined `*types.OptionError` values that can be checked with
+`types.IsOptionError` or `errors.As`; mirror mode conflicts also wrap the
+relevant sentinel error such as `types.ErrMirrorModeConflict`.
+
 ```go
 helix.NewCQLClient(sessionA, sessionB,
     // Strategies

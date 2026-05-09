@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/assert"
@@ -67,6 +68,7 @@ func (q *mockQuery) Consistency(c cql.Consistency) cql.Query {
 	q.consistency = &c
 	return q
 }
+
 func (q *mockQuery) SerialConsistency(c cql.Consistency) cql.Query {
 	q.serialConsistency = &c
 	return q
@@ -1171,17 +1173,15 @@ func TestCQLClient_DrainMode(t *testing.T) {
 
 // ExampleNewCQLClient demonstrates creating a Helix CQL client with custom strategies.
 func ExampleNewCQLClient() {
-	// Note: This example uses nil sessions for illustration purposes.
 	// In real code, create proper gocql sessions wrapped with v1.NewSession() or v2.NewSession().
-
-	// Simulating session creation (replace with actual gocql sessions in real code)
-	var sessionA, sessionB cql.Session // would be v1.NewSession(gocqlSession)
+	sessionA := newMockSession()
+	sessionB := newMockSession()
 
 	// Create Helix client with custom strategies
 	client, err := NewCQLClient(sessionA, sessionB,
-		WithReadStrategy(nil),   // e.g., policy.NewStickyRead()
-		WithWriteStrategy(nil),  // e.g., policy.NewConcurrentDualWrite()
-		WithFailoverPolicy(nil), // e.g., policy.NewActiveFailover()
+		WithReadStrategy(policy.NewStickyRead()),
+		WithWriteStrategy(policy.NewConcurrentDualWrite()),
+		WithFailoverPolicy(policy.NewActiveFailover()),
 	)
 	if err != nil {
 		// Handle error
@@ -1195,11 +1195,17 @@ func ExampleNewCQLClient() {
 
 // ExampleCQLClient_Query demonstrates basic query operations with dual-cluster client.
 func ExampleCQLClient_Query() {
-	// Note: Assumes client is already created (see ExampleNewCQLClient)
-	var client *CQLClient
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	client, err := NewCQLClient(sessionA, sessionB)
+	if err != nil {
+		// Handle error
+		return
+	}
+	defer client.Close()
 
 	// Write operation - triggers dual-write to both clusters
-	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").Exec()
+	err = client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").Exec()
 	if err != nil {
 		// Both clusters failed
 		return
@@ -1218,10 +1224,20 @@ func ExampleCQLClient_Query() {
 
 // Example_errorHandling demonstrates inspecting DualClusterError when both clusters fail.
 func Example_errorHandling() {
-	var client *CQLClient
+	sessionA := newMockSession()
+	sessionA.execErr = errors.New("cluster A unavailable")
+	sessionB := newMockSession()
+	sessionB.execErr = errors.New("cluster B unavailable")
+
+	client, err := NewCQLClient(sessionA, sessionB)
+	if err != nil {
+		// Handle construction error
+		return
+	}
+	defer client.Close()
 
 	// Perform a write operation
-	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").Exec()
+	err = client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").Exec()
 	// Check if both clusters failed
 	if err != nil {
 		var dualErr *types.DualClusterError
@@ -1578,11 +1594,19 @@ func (r *mockReplayer) Enqueue(_ context.Context, p types.ReplayPayload) error {
 
 // Example_contextUsage demonstrates context handling in queries.
 func Example_contextUsage() {
-	var client *CQLClient
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	client, err := NewCQLClient(sessionA, sessionB)
+	if err != nil {
+		// Handle construction error
+		return
+	}
+	defer client.Close()
+
 	ctx := context.Background()
 
 	// Use *Context methods to pass context directly.
-	err := client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").
+	err = client.Query("INSERT INTO users (id, name) VALUES (?, ?)", "user-1", "Alice").
 		ExecContext(ctx)
 	_ = err
 
