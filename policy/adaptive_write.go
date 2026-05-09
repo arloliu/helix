@@ -16,6 +16,16 @@ import (
 // maxInt32 is the maximum value for int32, used for bounds checking.
 const maxInt32 = math.MaxInt32
 
+const (
+	defaultAdaptiveDeltaThreshold    = 300 * time.Millisecond
+	defaultAdaptiveAbsoluteMax       = 2 * time.Second
+	defaultAdaptiveMinFloor          = 100 * time.Millisecond
+	defaultAdaptiveStrikeThreshold   = int32(3)
+	defaultAdaptiveRecoveryThreshold = int32(5)
+	defaultAdaptiveFireForgetTimeout = 30 * time.Second
+	defaultAdaptiveFireForgetLimit   = int32(100)
+)
+
 // AdaptiveDualWrite implements a latency-aware concurrent dual-write strategy.
 //
 // This strategy monitors the relative performance of both clusters and adapts
@@ -156,9 +166,11 @@ func WithAdaptiveMinFloor(d time.Duration) AdaptiveDualWriteOption {
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveStrikeThreshold(n int) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
-		if n > 0 && n <= maxInt32 {
-			a.strikeThreshold = int32(n)
+		if n <= 0 || n > maxInt32 {
+			a.strikeThreshold = 0
+			return
 		}
+		a.strikeThreshold = int32(n)
 	}
 }
 
@@ -176,9 +188,11 @@ func WithAdaptiveStrikeThreshold(n int) AdaptiveDualWriteOption {
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveRecoveryThreshold(n int) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
-		if n > 0 && n <= maxInt32 {
-			a.recoveryThreshold = int32(n)
+		if n <= 0 || n > maxInt32 {
+			a.recoveryThreshold = 0
+			return
 		}
+		a.recoveryThreshold = int32(n)
 	}
 }
 
@@ -212,6 +226,9 @@ func WithAdaptiveFireForgetTimeout(d time.Duration) AdaptiveDualWriteOption {
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveMetrics(m types.MetricsCollector) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
+		if m == nil {
+			return
+		}
 		a.metrics = m
 		a.metricsExplicit = true
 	}
@@ -269,9 +286,11 @@ func WithAdaptiveClusterNames(names types.ClusterNames) AdaptiveDualWriteOption 
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveFireForgetLimit(n int) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
-		if n > 0 && n <= maxInt32 {
-			a.fireForgetLimit = int32(n)
+		if n <= 0 || n > maxInt32 {
+			a.fireForgetLimit = 0
+			return
 		}
+		a.fireForgetLimit = int32(n)
 	}
 }
 
@@ -292,37 +311,129 @@ func WithAdaptiveFireForgetLimit(n int) AdaptiveDualWriteOption {
 //
 // Returns:
 //   - *AdaptiveDualWrite: A new adaptive dual-write strategy
+//
+// For production configuration that should fail fast on invalid option values,
+// use [NewAdaptiveDualWriteChecked].
 func NewAdaptiveDualWrite(opts ...AdaptiveDualWriteOption) *AdaptiveDualWrite {
+	a := newAdaptiveDualWriteWithDefaults()
+	applyAdaptiveDualWriteOptions(a, opts...)
+	normalizeAdaptiveDualWriteForLegacy(a)
+	finalizeAdaptiveDualWrite(a)
+
+	return a
+}
+
+// NewAdaptiveDualWriteChecked creates a new AdaptiveDualWrite strategy and
+// returns a validation error when any option value is invalid.
+//
+// Parameters:
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *AdaptiveDualWrite: A new adaptive dual-write strategy
+//   - error: Joined [types.OptionError] values when one or more options are invalid
+func NewAdaptiveDualWriteChecked(opts ...AdaptiveDualWriteOption) (*AdaptiveDualWrite, error) {
+	a := newAdaptiveDualWriteWithDefaults()
+	applyAdaptiveDualWriteOptions(a, opts...)
+	if err := validateAdaptiveDualWrite(a); err != nil {
+		return nil, err
+	}
+	finalizeAdaptiveDualWrite(a)
+
+	return a, nil
+}
+
+func newAdaptiveDualWriteWithDefaults() *AdaptiveDualWrite {
 	a := &AdaptiveDualWrite{
-		deltaThreshold:    300 * time.Millisecond,
-		absoluteMax:       2 * time.Second,
-		minFloor:          100 * time.Millisecond,
-		strikeThreshold:   3,
-		recoveryThreshold: 5,
-		fireForgetTimeout: 30 * time.Second,
-		fireForgetLimit:   100,
+		deltaThreshold:    defaultAdaptiveDeltaThreshold,
+		absoluteMax:       defaultAdaptiveAbsoluteMax,
+		minFloor:          defaultAdaptiveMinFloor,
+		strikeThreshold:   defaultAdaptiveStrikeThreshold,
+		recoveryThreshold: defaultAdaptiveRecoveryThreshold,
+		fireForgetTimeout: defaultAdaptiveFireForgetTimeout,
+		fireForgetLimit:   defaultAdaptiveFireForgetLimit,
 	}
 	defaultNames := types.DefaultClusterNames()
 	a.clusterNames.Store(&defaultNames)
 
+	return a
+}
+
+func applyAdaptiveDualWriteOptions(a *AdaptiveDualWrite, opts ...AdaptiveDualWriteOption) {
 	for _, opt := range opts {
 		opt(a)
 	}
+}
 
-	// Ensure metrics and logger are never nil — fireAndForget calls them
-	// from a background goroutine and a nil deref there would crash the
-	// process under load.
+func validateAdaptiveDualWrite(a *AdaptiveDualWrite) error {
+	errList := make([]error, 0, 8)
+
+	if a.deltaThreshold <= 0 {
+		errList = append(errList, optionErrPositiveDuration(adaptiveDualWriteComponent, "WithAdaptiveDeltaThreshold"))
+	}
+	if a.absoluteMax <= 0 {
+		errList = append(errList, optionErrPositiveDuration(adaptiveDualWriteComponent, "WithAdaptiveAbsoluteMax"))
+	}
+	if a.minFloor < 0 {
+		errList = append(errList, optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveMinFloor"))
+	}
+	if a.strikeThreshold <= 0 {
+		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveStrikeThreshold"))
+	}
+	if a.recoveryThreshold <= 0 {
+		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveRecoveryThreshold"))
+	}
+	if a.fireForgetTimeout <= 0 {
+		errList = append(errList, optionErrPositiveDuration(adaptiveDualWriteComponent, "WithAdaptiveFireForgetTimeout"))
+	}
+	if a.fireForgetLimit <= 0 {
+		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveFireForgetLimit"))
+	}
+	if names := a.clusterNames.Load(); names == nil {
+		errList = append(errList, newOptionError(adaptiveDualWriteComponent, "WithAdaptiveClusterNames", "cluster names cannot be nil"))
+	} else if err := names.Validate(); err != nil {
+		errList = append(errList, optionErrReasonFromErr(adaptiveDualWriteComponent, "WithAdaptiveClusterNames", err))
+	}
+
+	return joinValidationErrors(errList)
+}
+
+func normalizeAdaptiveDualWriteForLegacy(a *AdaptiveDualWrite) {
+	if a.deltaThreshold <= 0 {
+		a.deltaThreshold = defaultAdaptiveDeltaThreshold
+	}
+	if a.absoluteMax <= 0 {
+		a.absoluteMax = defaultAdaptiveAbsoluteMax
+	}
+	if a.minFloor < 0 {
+		a.minFloor = defaultAdaptiveMinFloor
+	}
+	if a.strikeThreshold <= 0 {
+		a.strikeThreshold = defaultAdaptiveStrikeThreshold
+	}
+	if a.recoveryThreshold <= 0 {
+		a.recoveryThreshold = defaultAdaptiveRecoveryThreshold
+	}
+	if a.fireForgetTimeout <= 0 {
+		a.fireForgetTimeout = defaultAdaptiveFireForgetTimeout
+	}
+	if a.fireForgetLimit <= 0 {
+		a.fireForgetLimit = defaultAdaptiveFireForgetLimit
+	}
+	if names := a.clusterNames.Load(); names == nil || names.Validate() != nil {
+		defaultNames := types.DefaultClusterNames()
+		a.clusterNames.Store(&defaultNames)
+	}
+}
+
+func finalizeAdaptiveDualWrite(a *AdaptiveDualWrite) {
 	if a.metrics == nil {
 		a.metrics = metrics.NewNopMetrics()
 	}
 	if a.logger == nil {
 		a.logger = logging.NewNopLogger()
 	}
-
-	// Initialize semaphore after options are applied
-	a.fireForgetSem = make(chan struct{}, a.fireForgetLimit)
-
-	return a
+	a.fireForgetSem = make(chan struct{}, int(a.fireForgetLimit))
 }
 
 // SetClusterNames implements [types.ClusterNamer] so the helix client can
@@ -709,6 +820,9 @@ func (a *AdaptiveDualWrite) IsDegraded(cluster types.ClusterID) bool {
 	if cluster == types.ClusterA {
 		return a.stateA.isDegraded.Load()
 	}
+	if cluster != types.ClusterB {
+		return false
+	}
 	return a.stateB.isDegraded.Load()
 }
 
@@ -720,12 +834,14 @@ func (a *AdaptiveDualWrite) Reset() {
 	a.stateA.slowStrikes = 0
 	a.stateA.fastStrikes = 0
 	a.stateA.isDegraded.Store(false)
+	a.stateA.lastLatency.Store(0)
 	a.stateA.mu.Unlock()
 
 	a.stateB.mu.Lock()
 	a.stateB.slowStrikes = 0
 	a.stateB.fastStrikes = 0
 	a.stateB.isDegraded.Store(false)
+	a.stateB.lastLatency.Store(0)
 	a.stateB.mu.Unlock()
 }
 
@@ -739,12 +855,13 @@ func (a *AdaptiveDualWrite) Reset() {
 // Parameters:
 //   - cluster: The cluster to degrade
 func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
-	if cluster == types.ClusterA {
+	switch cluster {
+	case types.ClusterA:
 		a.stateA.mu.Lock()
 		a.stateA.fastStrikes = 0
 		a.stateA.isDegraded.Store(true)
 		a.stateA.mu.Unlock()
-	} else {
+	case types.ClusterB:
 		a.stateB.mu.Lock()
 		a.stateB.fastStrikes = 0
 		a.stateB.isDegraded.Store(true)
@@ -760,17 +877,20 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 // Parameters:
 //   - cluster: The cluster to recover
 func (a *AdaptiveDualWrite) ForceRecover(cluster types.ClusterID) {
-	if cluster == types.ClusterA {
+	switch cluster {
+	case types.ClusterA:
 		a.stateA.mu.Lock()
 		a.stateA.isDegraded.Store(false)
 		a.stateA.slowStrikes = 0
 		a.stateA.fastStrikes = 0
+		a.stateA.lastLatency.Store(0)
 		a.stateA.mu.Unlock()
-	} else {
+	case types.ClusterB:
 		a.stateB.mu.Lock()
 		a.stateB.isDegraded.Store(false)
 		a.stateB.slowStrikes = 0
 		a.stateB.fastStrikes = 0
+		a.stateB.lastLatency.Store(0)
 		a.stateB.mu.Unlock()
 	}
 }
@@ -861,9 +981,10 @@ func (a *AdaptiveDualWrite) RecordProbeSuccess(cluster types.ClusterID) {
 // Parameters:
 //   - cluster: The cluster to record the fast write for
 func (a *AdaptiveDualWrite) RecordFastWrite(cluster types.ClusterID) {
-	if cluster == types.ClusterA {
+	switch cluster {
+	case types.ClusterA:
 		a.recordFast(&a.stateA)
-	} else {
+	case types.ClusterB:
 		a.recordFast(&a.stateB)
 	}
 }

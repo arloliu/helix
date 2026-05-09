@@ -154,6 +154,67 @@ func TestIsPartialWrite(t *testing.T) {
 	assert.False(t, IsPartialWrite(nil))
 }
 
+func TestOptionError(t *testing.T) {
+	err := &OptionError{
+		Component: "policy.AdaptiveDualWrite",
+		Option:    "WithAdaptiveStrikeThreshold",
+		Reason:    "must be positive",
+	}
+
+	assert.Contains(t, err.Error(), "policy.AdaptiveDualWrite.WithAdaptiveStrikeThreshold")
+	assert.Contains(t, err.Error(), "must be positive")
+}
+
+func TestOptionError_DefaultMessageParts(t *testing.T) {
+	err := &OptionError{}
+
+	assert.Contains(t, err.Error(), "unknown")
+	assert.Contains(t, err.Error(), "invalid value")
+}
+
+func TestAsOptionError(t *testing.T) {
+	optErr := &OptionError{
+		Component: "policy.CircuitBreaker",
+		Option:    "WithThreshold",
+		Reason:    "must be between 1 and 2147483647",
+	}
+
+	got, ok := AsOptionError(optErr)
+	require.True(t, ok)
+	assert.Equal(t, optErr, got)
+
+	wrapped := fmt.Errorf("context: %w", optErr)
+	got, ok = AsOptionError(wrapped)
+	require.True(t, ok)
+	assert.Equal(t, optErr, got)
+
+	joined := errors.Join(
+		errors.New("irrelevant"),
+		fmt.Errorf("wrapped: %w", optErr),
+	)
+	got, ok = AsOptionError(joined)
+	require.True(t, ok)
+	assert.Equal(t, optErr, got)
+
+	got, ok = AsOptionError(errors.New("no option error"))
+	assert.False(t, ok)
+	assert.Nil(t, got)
+
+	got, ok = AsOptionError(nil)
+	assert.False(t, ok)
+	assert.Nil(t, got)
+}
+
+func TestIsOptionError(t *testing.T) {
+	optErr := &OptionError{Component: "x", Option: "y", Reason: "z"}
+
+	assert.True(t, IsOptionError(optErr))
+	assert.True(t, IsOptionError(fmt.Errorf("wrapped: %w", optErr)))
+	assert.True(t, IsOptionError(errors.Join(errors.New("other"), optErr)))
+	assert.False(t, IsOptionError(errors.New("unrelated")))
+	assert.False(t, IsOptionError(nil))
+}
+
 func TestSentinelErrors(t *testing.T) {
 	tests := []struct {
 		name string

@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,78 @@ func TestCircuitBreakerThreshold(t *testing.T) {
 	policy.RecordFailure(types.ClusterA)
 	require.Equal(t, 3, policy.Failures(types.ClusterA))
 	require.True(t, policy.ShouldFailover(types.ClusterA, nil))
+}
+
+func TestCircuitBreaker_InvalidOptionsPreserveDefaults(t *testing.T) {
+	policy := NewCircuitBreaker(
+		WithThreshold(0),
+		WithResetTimeout(-time.Second),
+		WithCircuitBreakerMetrics(nil),
+		WithCircuitBreakerLogger(nil),
+		WithCircuitBreakerClusterNames(types.ClusterNames{A: "same", B: "same"}),
+	)
+
+	assert.Equal(t, 3, policy.threshold)
+	assert.Equal(t, 30*time.Second, policy.resetTimeout)
+	assert.False(t, policy.MetricsConfigured())
+	assert.False(t, policy.LoggerConfigured())
+	assert.Equal(t, "A", policy.clusterNames.Load().Name(types.ClusterA))
+
+	policy.RecordFailure(types.ClusterA)
+	policy.RecordFailure(types.ClusterA)
+	assert.False(t, policy.ShouldFailover(types.ClusterA, nil),
+		"invalid threshold must not turn CircuitBreaker into immediate failover")
+}
+
+func TestCircuitBreakerChecked_InvalidOptionsReturnJoinedErrors(t *testing.T) {
+	policy, err := NewCircuitBreakerChecked(
+		WithThreshold(0),
+		WithResetTimeout(-time.Second),
+		WithCircuitBreakerClusterNames(types.ClusterNames{A: "same", B: "same"}),
+	)
+
+	require.Nil(t, policy)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, circuitBreakerComponent, optionErr.Component)
+
+	assert.Contains(t, err.Error(), "WithThreshold")
+	assert.Contains(t, err.Error(), "WithResetTimeout")
+	assert.Contains(t, err.Error(), "WithCircuitBreakerClusterNames")
+}
+
+func TestCircuitBreakerChecked_ValidOptions(t *testing.T) {
+	policy, err := NewCircuitBreakerChecked(
+		WithThreshold(5),
+		WithResetTimeout(2*time.Minute),
+		WithCircuitBreakerClusterNames(types.ClusterNames{A: "primary", B: "secondary"}),
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, policy)
+	assert.Equal(t, 5, policy.threshold)
+	assert.Equal(t, 2*time.Minute, policy.resetTimeout)
+	assert.Equal(t, "primary", policy.clusterNames.Load().Name(types.ClusterA))
+}
+
+func TestCircuitBreaker_InvalidClusterNoop(t *testing.T) {
+	policy := NewCircuitBreaker(WithThreshold(1))
+	invalid := types.ClusterID("C")
+
+	policy.RecordFailure(invalid)
+	assert.Equal(t, 0, policy.Failures(types.ClusterA))
+	assert.Equal(t, 0, policy.Failures(types.ClusterB))
+	assert.Equal(t, 0, policy.Failures(invalid))
+	assert.False(t, policy.ShouldFailover(invalid, nil))
+
+	policy.RecordFailure(types.ClusterA)
+	require.True(t, policy.ShouldFailover(types.ClusterA, nil))
+	policy.RecordSuccess(invalid)
+	assert.True(t, policy.ShouldFailover(types.ClusterA, nil),
+		"invalid success must not close a real cluster's circuit")
 }
 
 func TestCircuitBreakerSuccessResets(t *testing.T) {

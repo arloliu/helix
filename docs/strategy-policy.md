@@ -180,6 +180,21 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveFireForgetTimeout` | 30s | Timeout applied to each background (fire-and-forget) write |
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent background writes; excess returns `ErrWriteDropped` |
 
+**Configuration validation:**
+
+- `NewAdaptiveDualWrite` is the compatibility constructor. Invalid values fall back to defaults.
+- `NewAdaptiveDualWriteChecked` returns `error` (joined `*types.OptionError`) when any option value is invalid.
+
+```go
+strategy, err := policy.NewAdaptiveDualWriteChecked(
+    policy.WithAdaptiveStrikeThreshold(3),
+    policy.WithAdaptiveFireForgetTimeout(30 * time.Second),
+)
+if err != nil {
+    return fmt.Errorf("configure adaptive strategy: %w", err)
+}
+```
+
 **State machine (per cluster):**
 
 ```
@@ -408,6 +423,21 @@ breaker := policy.NewCircuitBreaker(
 | `WithCircuitBreakerMetrics` | no-op | Metrics collector for trip events and state changes |
 | `WithCircuitBreakerClusterNames` | "A"/"B" | Display names used in log and metric labels |
 
+**Configuration validation:**
+
+- `NewCircuitBreaker` is the compatibility constructor. Invalid values fall back to defaults.
+- `NewCircuitBreakerChecked` returns `error` (joined `*types.OptionError`) when any option value is invalid.
+
+```go
+breaker, err := policy.NewCircuitBreakerChecked(
+    policy.WithThreshold(3),
+    policy.WithResetTimeout(30*time.Second),
+)
+if err != nil {
+    return fmt.Errorf("configure circuit breaker: %w", err)
+}
+```
+
 > **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence." The counter does not reset automatically over time — it resets to 1 only when the *next* failure arrives after a `resetTimeout`-long gap. If a cluster stays broken, the counter keeps incrementing; `resetTimeout` only protects against counting a failure from *last week* against today's blip. The only way to close an open circuit is a successful read (`RecordSuccess`).
 
 **What triggers `RecordFailure` vs `RecordSuccess`:**
@@ -480,6 +510,21 @@ breaker := policy.NewLatencyCircuitBreaker(
 | `WithLatencyResetTimeout` | 30s | Inherited from `CircuitBreaker` |
 | `WithLatencyLogger` | no-op | Structured logger |
 | `WithLatencyMetrics` | no-op | Metrics collector |
+
+**Configuration validation:**
+
+- `NewLatencyCircuitBreaker` is the compatibility constructor. Invalid values fall back to defaults.
+- `NewLatencyCircuitBreakerChecked` returns `error` (joined `*types.OptionError`) when any option value is invalid.
+
+```go
+breaker, err := policy.NewLatencyCircuitBreakerChecked(
+    policy.WithLatencyAbsoluteMax(2*time.Second),
+    policy.WithLatencyThreshold(3),
+)
+if err != nil {
+    return fmt.Errorf("configure latency circuit breaker: %w", err)
+}
+```
 
 **What triggers `RecordFailure` vs `RecordSuccess`:**
 - Hard error from driver → `RecordFailure()` directly (same as `CircuitBreaker`)

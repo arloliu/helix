@@ -10,6 +10,11 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+const (
+	defaultCircuitBreakerThreshold    = 3
+	defaultCircuitBreakerResetTimeout = 30 * time.Second
+)
+
 // ActiveFailover implements an aggressive failover policy.
 //
 // On any failure, immediately attempts failover to the secondary cluster.
@@ -114,6 +119,10 @@ type CircuitBreakerOption func(*CircuitBreaker)
 //   - CircuitBreakerOption: Configuration option
 func WithThreshold(n int) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
+		if n > maxInt32 {
+			c.threshold = 0
+			return
+		}
 		c.threshold = n
 	}
 }
@@ -140,6 +149,9 @@ func WithResetTimeout(d time.Duration) CircuitBreakerOption {
 //   - CircuitBreakerOption: Configuration option
 func WithCircuitBreakerMetrics(m types.MetricsCollector) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
+		if m == nil {
+			return
+		}
 		c.metrics = m
 		c.metricsExplicit = true
 	}
@@ -154,6 +166,9 @@ func WithCircuitBreakerMetrics(m types.MetricsCollector) CircuitBreakerOption {
 //   - CircuitBreakerOption: Configuration option
 func WithCircuitBreakerLogger(l types.Logger) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
+		if l == nil {
+			return
+		}
 		c.logger = l
 		c.loggerExplicit = true
 	}
@@ -226,29 +241,93 @@ func WithCircuitBreakerClusterNames(names types.ClusterNames) CircuitBreakerOpti
 //
 // Returns:
 //   - *CircuitBreaker: A new circuit breaker policy
+//
+// For production configuration that should fail fast on invalid option values,
+// use [NewCircuitBreakerChecked].
 func NewCircuitBreaker(opts ...CircuitBreakerOption) *CircuitBreaker {
+	c := newCircuitBreakerWithDefaults()
+	applyCircuitBreakerOptions(c, opts...)
+	normalizeCircuitBreakerForLegacy(c)
+	finalizeCircuitBreaker(c)
+
+	return c
+}
+
+// NewCircuitBreakerChecked creates a new CircuitBreaker policy and returns a
+// validation error when any option value is invalid.
+//
+// Parameters:
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *CircuitBreaker: A new circuit breaker policy
+//   - error: Joined [types.OptionError] values when one or more options are invalid
+func NewCircuitBreakerChecked(opts ...CircuitBreakerOption) (*CircuitBreaker, error) {
+	c := newCircuitBreakerWithDefaults()
+	applyCircuitBreakerOptions(c, opts...)
+	if err := validateCircuitBreaker(c); err != nil {
+		return nil, err
+	}
+	finalizeCircuitBreaker(c)
+
+	return c, nil
+}
+
+func newCircuitBreakerWithDefaults() *CircuitBreaker {
 	c := &CircuitBreaker{
-		threshold:    3,
-		resetTimeout: 30 * time.Second,
+		threshold:    defaultCircuitBreakerThreshold,
+		resetTimeout: defaultCircuitBreakerResetTimeout,
 	}
 	defaultNames := types.DefaultClusterNames()
 	c.clusterNames.Store(&defaultNames)
 
+	return c
+}
+
+func applyCircuitBreakerOptions(c *CircuitBreaker, opts ...CircuitBreakerOption) {
 	for _, opt := range opts {
 		opt(c)
 	}
+}
 
-	// Ensure metrics is never nil
+func validateCircuitBreaker(c *CircuitBreaker) error {
+	errList := make([]error, 0, 3)
+
+	if c.threshold <= 0 || c.threshold > maxInt32 {
+		errList = append(errList, optionErrInt32Range(circuitBreakerComponent, "WithThreshold"))
+	}
+	if c.resetTimeout < 0 {
+		errList = append(errList, optionErrNonNegativeDuration(circuitBreakerComponent, "WithResetTimeout"))
+	}
+	if names := c.clusterNames.Load(); names == nil {
+		errList = append(errList, newOptionError(circuitBreakerComponent, "WithCircuitBreakerClusterNames", "cluster names cannot be nil"))
+	} else if err := names.Validate(); err != nil {
+		errList = append(errList, optionErrReasonFromErr(circuitBreakerComponent, "WithCircuitBreakerClusterNames", err))
+	}
+
+	return joinValidationErrors(errList)
+}
+
+func normalizeCircuitBreakerForLegacy(c *CircuitBreaker) {
+	if c.threshold <= 0 || c.threshold > maxInt32 {
+		c.threshold = defaultCircuitBreakerThreshold
+	}
+	if c.resetTimeout < 0 {
+		c.resetTimeout = defaultCircuitBreakerResetTimeout
+	}
+	if names := c.clusterNames.Load(); names == nil || names.Validate() != nil {
+		defaultNames := types.DefaultClusterNames()
+		c.clusterNames.Store(&defaultNames)
+	}
+}
+
+func finalizeCircuitBreaker(c *CircuitBreaker) {
 	if c.metrics == nil {
 		c.metrics = metrics.NewNopMetrics()
 	}
-
-	// Ensure logger is never nil
 	if c.logger == nil {
 		c.logger = logging.NewNopLogger()
 	}
-
-	return c
 }
 
 // ShouldFailover returns true if the failure threshold has been reached
@@ -276,6 +355,10 @@ func NewCircuitBreaker(opts ...CircuitBreakerOption) *CircuitBreaker {
 // Returns:
 //   - bool: true if failover should occur
 func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
+	if !isKnownCluster(cluster) {
+		return false
+	}
+
 	var failures int32
 	var lastFailure int64
 	if cluster == types.ClusterA {
@@ -310,6 +393,10 @@ func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
 // Parameters:
 //   - cluster: The cluster that failed
 func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
+	if !isKnownCluster(cluster) {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	var newFailures int32
 	var justTripped bool
@@ -371,6 +458,10 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 // Parameters:
 //   - cluster: The cluster that succeeded
 func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
+	if !isKnownCluster(cluster) {
+		return
+	}
+
 	var wasOpen bool
 
 	if cluster == types.ClusterA {
@@ -408,6 +499,9 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 func (c *CircuitBreaker) Failures(cluster types.ClusterID) int {
 	if cluster == types.ClusterA {
 		return int(c.failuresA.Load())
+	}
+	if cluster != types.ClusterB {
+		return 0
 	}
 	return int(c.failuresB.Load())
 }

@@ -245,6 +245,54 @@ func IsPartialWrite(err error) bool {
 	return ok
 }
 
+// OptionError reports an invalid functional-option value.
+type OptionError struct {
+	// Component identifies where the option is used (for example,
+	// "policy.AdaptiveDualWrite").
+	Component string
+
+	// Option is the option function name (for example,
+	// "WithAdaptiveStrikeThreshold").
+	Option string
+
+	// Reason describes why the value is invalid.
+	Reason string
+}
+
+// Error implements the error interface.
+func (e *OptionError) Error() string {
+	component := e.Component
+	if component == "" {
+		component = "unknown"
+	}
+
+	option := e.Option
+	if option == "" {
+		option = "unknown"
+	}
+
+	reason := e.Reason
+	if reason == "" {
+		reason = "invalid value"
+	}
+
+	return fmt.Sprintf("helix: invalid option %s.%s: %s", component, option, reason)
+}
+
+// AsOptionError extracts an OptionError from err using errors.As.
+// Returns the error and true if found, or nil and false otherwise.
+func AsOptionError(err error) (*OptionError, bool) {
+	var optionErr *OptionError
+	ok := errors.As(err, &optionErr)
+	return optionErr, ok
+}
+
+// IsOptionError reports whether err contains an OptionError.
+func IsOptionError(err error) bool {
+	_, ok := AsOptionError(err)
+	return ok
+}
+
 // Sentinel errors for common failure scenarios.
 var (
 	// ErrBothClustersFailed indicates that a write failed on both clusters.

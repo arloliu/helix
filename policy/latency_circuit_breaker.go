@@ -6,6 +6,8 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+const defaultLatencyAbsoluteMax = 2 * time.Second
+
 // LatencyCircuitBreaker extends CircuitBreaker with latency awareness.
 //
 // In addition to tracking consecutive errors, this policy also treats
@@ -67,6 +69,10 @@ func WithLatencyAbsoluteMax(d time.Duration) LatencyCircuitBreakerOption {
 //   - LatencyCircuitBreakerOption: Configuration option
 func WithLatencyThreshold(n int) LatencyCircuitBreakerOption {
 	return func(l *LatencyCircuitBreaker) {
+		if n > maxInt32 {
+			l.threshold = 0
+			return
+		}
 		l.threshold = n
 	}
 }
@@ -99,6 +105,9 @@ func WithLatencyResetTimeout(d time.Duration) LatencyCircuitBreakerOption {
 //   - LatencyCircuitBreakerOption: Configuration option
 func WithLatencyMetrics(m types.MetricsCollector) LatencyCircuitBreakerOption {
 	return func(l *LatencyCircuitBreaker) {
+		if m == nil {
+			return
+		}
 		l.metrics = m
 		l.metricsExplicit = true
 	}
@@ -116,6 +125,9 @@ func WithLatencyMetrics(m types.MetricsCollector) LatencyCircuitBreakerOption {
 //   - LatencyCircuitBreakerOption: Configuration option
 func WithLatencyLogger(log types.Logger) LatencyCircuitBreakerOption {
 	return func(l *LatencyCircuitBreaker) {
+		if log == nil {
+			return
+		}
 		l.logger = log
 		l.loggerExplicit = true
 	}
@@ -133,17 +145,73 @@ func WithLatencyLogger(log types.Logger) LatencyCircuitBreakerOption {
 //
 // Returns:
 //   - *LatencyCircuitBreaker: A new latency-aware circuit breaker policy
+//
+// For production configuration that should fail fast on invalid option values,
+// use [NewLatencyCircuitBreakerChecked].
 func NewLatencyCircuitBreaker(opts ...LatencyCircuitBreakerOption) *LatencyCircuitBreaker {
-	l := &LatencyCircuitBreaker{
-		CircuitBreaker: NewCircuitBreaker(),
-		absoluteMax:    2 * time.Second,
-	}
+	l := newLatencyCircuitBreakerWithDefaults()
+	applyLatencyCircuitBreakerOptions(l, opts...)
+	normalizeLatencyCircuitBreakerForLegacy(l)
+	finalizeCircuitBreaker(l.CircuitBreaker)
 
+	return l
+}
+
+// NewLatencyCircuitBreakerChecked creates a new LatencyCircuitBreaker policy
+// and returns a validation error when any option value is invalid.
+//
+// Parameters:
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *LatencyCircuitBreaker: A new latency-aware circuit breaker policy
+//   - error: Joined [types.OptionError] values when one or more options are invalid
+func NewLatencyCircuitBreakerChecked(opts ...LatencyCircuitBreakerOption) (*LatencyCircuitBreaker, error) {
+	l := newLatencyCircuitBreakerWithDefaults()
+	applyLatencyCircuitBreakerOptions(l, opts...)
+	if err := validateLatencyCircuitBreaker(l); err != nil {
+		return nil, err
+	}
+	finalizeCircuitBreaker(l.CircuitBreaker)
+
+	return l, nil
+}
+
+func newLatencyCircuitBreakerWithDefaults() *LatencyCircuitBreaker {
+	return &LatencyCircuitBreaker{
+		CircuitBreaker: newCircuitBreakerWithDefaults(),
+		absoluteMax:    defaultLatencyAbsoluteMax,
+	}
+}
+
+func applyLatencyCircuitBreakerOptions(l *LatencyCircuitBreaker, opts ...LatencyCircuitBreakerOption) {
 	for _, opt := range opts {
 		opt(l)
 	}
+}
 
-	return l
+func validateLatencyCircuitBreaker(l *LatencyCircuitBreaker) error {
+	errList := make([]error, 0, 3)
+
+	if l.absoluteMax <= 0 {
+		errList = append(errList, optionErrPositiveDuration(latencyCircuitComponent, "WithLatencyAbsoluteMax"))
+	}
+	if l.threshold <= 0 || l.threshold > maxInt32 {
+		errList = append(errList, optionErrInt32Range(latencyCircuitComponent, "WithLatencyThreshold"))
+	}
+	if l.resetTimeout < 0 {
+		errList = append(errList, optionErrNonNegativeDuration(latencyCircuitComponent, "WithLatencyResetTimeout"))
+	}
+
+	return joinValidationErrors(errList)
+}
+
+func normalizeLatencyCircuitBreakerForLegacy(l *LatencyCircuitBreaker) {
+	normalizeCircuitBreakerForLegacy(l.CircuitBreaker)
+
+	if l.absoluteMax <= 0 {
+		l.absoluteMax = defaultLatencyAbsoluteMax
+	}
 }
 
 // RecordLatency checks if the operation latency exceeds the absolute maximum.

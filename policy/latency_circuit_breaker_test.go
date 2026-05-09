@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -37,6 +38,66 @@ func TestLatencyCircuitBreaker_CustomOptions(t *testing.T) {
 	assert.False(t, lcb.ShouldFailover(types.ClusterA, nil), "should not failover before threshold=5")
 	lcb.RecordFailure(types.ClusterA)
 	assert.True(t, lcb.ShouldFailover(types.ClusterA, nil), "should failover after 5 failures")
+}
+
+func TestLatencyCircuitBreaker_InvalidOptionsPreserveDefaults(t *testing.T) {
+	lcb := NewLatencyCircuitBreaker(
+		WithLatencyAbsoluteMax(0),
+		WithLatencyThreshold(-1),
+		WithLatencyResetTimeout(-time.Second),
+		WithLatencyMetrics(nil),
+		WithLatencyLogger(nil),
+	)
+
+	assert.Equal(t, 2*time.Second, lcb.AbsoluteMax())
+	assert.Equal(t, 3, lcb.threshold)
+	assert.Equal(t, 30*time.Second, lcb.resetTimeout)
+	assert.False(t, lcb.MetricsConfigured())
+	assert.False(t, lcb.LoggerConfigured())
+
+	lcb.RecordLatency(types.ClusterA, 3*time.Second)
+	lcb.RecordLatency(types.ClusterA, 3*time.Second)
+	assert.False(t, lcb.ShouldFailover(types.ClusterA, nil),
+		"invalid threshold must not make latency breaker fail over early")
+
+	assert.NotPanics(t, func() {
+		lcb.RecordLatency(types.ClusterA, 3*time.Second)
+	})
+	assert.True(t, lcb.ShouldFailover(types.ClusterA, nil))
+}
+
+func TestLatencyCircuitBreakerChecked_InvalidOptionsReturnJoinedErrors(t *testing.T) {
+	lcb, err := NewLatencyCircuitBreakerChecked(
+		WithLatencyAbsoluteMax(0),
+		WithLatencyThreshold(0),
+		WithLatencyResetTimeout(-time.Second),
+	)
+
+	require.Nil(t, lcb)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, latencyCircuitComponent, optionErr.Component)
+
+	assert.Contains(t, err.Error(), "WithLatencyAbsoluteMax")
+	assert.Contains(t, err.Error(), "WithLatencyThreshold")
+	assert.Contains(t, err.Error(), "WithLatencyResetTimeout")
+}
+
+func TestLatencyCircuitBreakerChecked_ValidOptions(t *testing.T) {
+	lcb, err := NewLatencyCircuitBreakerChecked(
+		WithLatencyAbsoluteMax(500*time.Millisecond),
+		WithLatencyThreshold(4),
+		WithLatencyResetTimeout(10*time.Second),
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, lcb)
+	assert.Equal(t, 500*time.Millisecond, lcb.absoluteMax)
+	assert.Equal(t, 4, lcb.threshold)
+	assert.Equal(t, 10*time.Second, lcb.resetTimeout)
 }
 
 func TestLatencyCircuitBreaker_RecordLatency_BelowThreshold(t *testing.T) {

@@ -43,6 +43,85 @@ func TestAdaptiveDualWrite_CustomOptions(t *testing.T) {
 	assert.Equal(t, 1*time.Minute, a.fireForgetTimeout)
 }
 
+func TestAdaptiveDualWrite_InvalidOptionsPreserveDefaults(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveDeltaThreshold(0),
+		WithAdaptiveAbsoluteMax(-time.Second),
+		WithAdaptiveMinFloor(-time.Millisecond),
+		WithAdaptiveStrikeThreshold(0),
+		WithAdaptiveRecoveryThreshold(-1),
+		WithAdaptiveFireForgetTimeout(0),
+		WithAdaptiveFireForgetLimit(0),
+		WithAdaptiveMetrics(nil),
+		WithAdaptiveLogger(nil),
+		WithAdaptiveClusterNames(types.ClusterNames{A: "", B: "valid"}),
+	)
+
+	assert.Equal(t, 300*time.Millisecond, a.deltaThreshold)
+	assert.Equal(t, 2*time.Second, a.absoluteMax)
+	assert.Equal(t, 100*time.Millisecond, a.minFloor)
+	assert.Equal(t, int32(3), a.strikeThreshold)
+	assert.Equal(t, int32(5), a.recoveryThreshold)
+	assert.Equal(t, 30*time.Second, a.fireForgetTimeout)
+	assert.Equal(t, int32(100), a.fireForgetLimit)
+	assert.False(t, a.MetricsConfigured())
+	assert.False(t, a.LoggerConfigured())
+	assert.Equal(t, "A", a.clusterName(types.ClusterA))
+}
+
+func TestAdaptiveDualWriteChecked_InvalidOptionsReturnJoinedErrors(t *testing.T) {
+	a, err := NewAdaptiveDualWriteChecked(
+		WithAdaptiveDeltaThreshold(0),
+		WithAdaptiveAbsoluteMax(0),
+		WithAdaptiveMinFloor(-time.Millisecond),
+		WithAdaptiveStrikeThreshold(maxInt32+1),
+		WithAdaptiveRecoveryThreshold(0),
+		WithAdaptiveFireForgetTimeout(0),
+		WithAdaptiveFireForgetLimit(0),
+		WithAdaptiveClusterNames(types.ClusterNames{A: "", B: "valid"}),
+	)
+
+	require.Nil(t, a)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, adaptiveDualWriteComponent, optionErr.Component)
+
+	assert.Contains(t, err.Error(), "WithAdaptiveDeltaThreshold")
+	assert.Contains(t, err.Error(), "WithAdaptiveAbsoluteMax")
+	assert.Contains(t, err.Error(), "WithAdaptiveMinFloor")
+	assert.Contains(t, err.Error(), "WithAdaptiveStrikeThreshold")
+	assert.Contains(t, err.Error(), "WithAdaptiveRecoveryThreshold")
+	assert.Contains(t, err.Error(), "WithAdaptiveFireForgetTimeout")
+	assert.Contains(t, err.Error(), "WithAdaptiveFireForgetLimit")
+	assert.Contains(t, err.Error(), "WithAdaptiveClusterNames")
+}
+
+func TestAdaptiveDualWriteChecked_ValidOptions(t *testing.T) {
+	a, err := NewAdaptiveDualWriteChecked(
+		WithAdaptiveDeltaThreshold(200*time.Millisecond),
+		WithAdaptiveAbsoluteMax(3*time.Second),
+		WithAdaptiveMinFloor(0),
+		WithAdaptiveStrikeThreshold(4),
+		WithAdaptiveRecoveryThreshold(6),
+		WithAdaptiveFireForgetTimeout(45*time.Second),
+		WithAdaptiveFireForgetLimit(50),
+		WithAdaptiveClusterNames(types.ClusterNames{A: "primary", B: "secondary"}),
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, a)
+	assert.Equal(t, 200*time.Millisecond, a.deltaThreshold)
+	assert.Equal(t, 3*time.Second, a.absoluteMax)
+	assert.Equal(t, int32(4), a.strikeThreshold)
+	assert.Equal(t, int32(6), a.recoveryThreshold)
+	assert.Equal(t, 45*time.Second, a.fireForgetTimeout)
+	assert.Equal(t, int32(50), a.fireForgetLimit)
+	assert.Equal(t, "primary", a.clusterName(types.ClusterA))
+}
+
 func TestAdaptiveDualWrite_BothHealthy(t *testing.T) {
 	a := NewAdaptiveDualWrite()
 	ctx := t.Context()
@@ -424,6 +503,8 @@ func TestAdaptiveDualWrite_Reset(t *testing.T) {
 	// Force degrade both
 	a.ForceDegrade(types.ClusterA)
 	a.ForceDegrade(types.ClusterB)
+	a.stateA.lastLatency.Store((10 * time.Millisecond).Nanoseconds())
+	a.stateB.lastLatency.Store((20 * time.Millisecond).Nanoseconds())
 	require.True(t, a.IsDegraded(types.ClusterA))
 	require.True(t, a.IsDegraded(types.ClusterB))
 
@@ -432,6 +513,25 @@ func TestAdaptiveDualWrite_Reset(t *testing.T) {
 
 	assert.False(t, a.IsDegraded(types.ClusterA))
 	assert.False(t, a.IsDegraded(types.ClusterB))
+	assert.Equal(t, int64(0), a.stateA.lastLatency.Load())
+	assert.Equal(t, int64(0), a.stateB.lastLatency.Load())
+}
+
+func TestAdaptiveDualWrite_InvalidClusterNoop(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(1))
+	invalid := types.ClusterID("C")
+
+	a.ForceDegrade(invalid)
+	assert.False(t, a.IsDegraded(types.ClusterA))
+	assert.False(t, a.IsDegraded(types.ClusterB))
+	assert.False(t, a.IsDegraded(invalid))
+
+	a.ForceDegrade(types.ClusterA)
+	a.ForceRecover(invalid)
+	assert.True(t, a.IsDegraded(types.ClusterA))
+
+	a.RecordFastWrite(invalid)
+	assert.True(t, a.IsDegraded(types.ClusterA))
 }
 
 func TestAdaptiveDualWrite_ErrorCountsAsStrike(t *testing.T) {
