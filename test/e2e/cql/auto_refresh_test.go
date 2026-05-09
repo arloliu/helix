@@ -111,20 +111,18 @@ func TestS10_AutoRefresh_RecoversFromStopStartWithoutManualCall(t *testing.T) {
 			// time (errA=err, errB=nil → partial success) so A's
 			// consecutiveFailures climbs continuously, which is exactly the
 			// signal the detector watches.
-			deadline := time.Now().Add(15 * time.Second)
 			writeIdx := 0
-			for time.Now().Before(deadline) {
+			require.Eventually(t, func() bool {
 				wCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 				_ = client.Query("INSERT INTO "+table+" (key, value) VALUES (?, ?)",
 					fmt.Sprintf("auto-%d", writeIdx), "v").ExecContext(wCtx)
 				cancel()
 				writeIdx++
-				if mc.GetSessionRefreshAttempts(htypes.ClusterA) >= 1 &&
-					mc.GetSessionRefreshSuccesses(htypes.ClusterA) >= 1 {
-					break
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
+
+				return mc.GetSessionRefreshAttempts(htypes.ClusterA) >= 1 &&
+					mc.GetSessionRefreshSuccesses(htypes.ClusterA) >= 1
+			}, 15*time.Second, 200*time.Millisecond,
+				"[%s] auto-refresh must fire and rebuild cluster A", d.name)
 
 			t.Logf("auto-refresh: attempts=%d successes=%d errors=%d",
 				mc.GetSessionRefreshAttempts(htypes.ClusterA),
@@ -206,15 +204,23 @@ func TestS10_AutoRefresh_NoStormUnderPersistentFailure(t *testing.T) {
 			})
 
 			const testDuration = 12 * time.Second
-			deadline := time.Now().Add(testDuration)
+			deadline := time.NewTimer(testDuration)
+			defer deadline.Stop()
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
 			writeIdx := 0
-			for time.Now().Before(deadline) {
+			for done := false; !done; {
 				wCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 				_ = client.Query("INSERT INTO "+table+" (key, value) VALUES (?, ?)",
 					fmt.Sprintf("storm-%d", writeIdx), "v").ExecContext(wCtx)
 				cancel()
 				writeIdx++
-				time.Sleep(200 * time.Millisecond)
+
+				select {
+				case <-deadline.C:
+					done = true
+				case <-ticker.C:
+				}
 			}
 
 			attempts := mc.GetSessionRefreshAttempts(htypes.ClusterA)

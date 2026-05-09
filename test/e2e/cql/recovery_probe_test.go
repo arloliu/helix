@@ -76,16 +76,18 @@ func TestS5_LongOutageNoTraffic(t *testing.T) {
 
 			// Phase 2: idle for 30s with no traffic.
 			t.Logf("[%s] phase 2: idle 30s with no traffic…", d.name)
-			select {
-			case <-time.After(30 * time.Second):
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			}
+			require.Never(t, func() bool {
+				return rs.Preferred() != htypes.ClusterB
+			}, 30*time.Second, 500*time.Millisecond,
+				"[%s] StickyRead preference changed during idle period", d.name)
 
 			// Phase 3: unpause A, then idle another 5s — exceeds the 10s
 			// cooldown set above when combined with the 30s idle.
 			require.NoError(t, a.Unpause(ctx))
-			time.Sleep(5 * time.Second)
+			require.Never(t, func() bool {
+				return rs.Preferred() != htypes.ClusterB
+			}, 5*time.Second, 500*time.Millisecond,
+				"[%s] StickyRead preference changed after recovery without traffic", d.name)
 
 			// Phase 4: resume reads. StickyRead should continue using B —
 			// cooldown expiry alone does not trigger a passive probe back to A.

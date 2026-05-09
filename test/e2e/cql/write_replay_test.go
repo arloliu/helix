@@ -145,7 +145,6 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 						otherErrCnt.Add(1)
 					}
 				}
-				time.Sleep(50 * time.Millisecond)
 			}
 			t.Logf("[%s] writes: ok+async=%d async=%d dropped=%d dualErr=%d other=%d",
 				d.name, written.Load(), asyncCount.Load(), droppedCnt.Load(),
@@ -208,13 +207,23 @@ func countRows(t *testing.T, c *testutil.CQLCluster, table string) int {
 }
 
 func waitFor(timeout, interval time.Duration, condition func() bool) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	if condition() {
+		return true
+	}
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline.C:
+			return condition()
+		case <-ticker.C:
+		}
 		if condition() {
 			return true
 		}
-		time.Sleep(interval)
 	}
-
-	return condition()
 }

@@ -106,7 +106,6 @@ func TestS1b_PauseA_NATSReplayerDrain(t *testing.T) {
 						otherErrCnt.Add(1)
 					}
 				}
-				time.Sleep(50 * time.Millisecond)
 			}
 			t.Logf("[%s] writes: ok+async=%d async=%d dropped=%d dualErr=%d other=%d",
 				d.name, written.Load(), asyncCount.Load(), droppedCnt.Load(),

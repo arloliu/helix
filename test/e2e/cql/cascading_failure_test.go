@@ -82,7 +82,11 @@ func TestS_SequentialFailures_AThenB(t *testing.T) {
 			// Phase 2: unpause A; let the cooldown expire so the strategy
 			// can re-evaluate on the next failure.
 			require.NoError(t, a.Unpause(ctx))
-			time.Sleep(700 * time.Millisecond)
+			recoveredAt := time.Now()
+			require.Eventually(t, func() bool {
+				return time.Since(recoveredAt) >= 500*time.Millisecond && rs.Preferred() == htypes.ClusterB
+			}, 2*time.Second, 50*time.Millisecond,
+				"[%s] StickyRead cooldown must elapse while preference remains on B", d.name)
 
 			// Phase 3: pause B, drive reads. Helix must failover from B to A.
 			require.NoError(t, b.Pause(ctx))

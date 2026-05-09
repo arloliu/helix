@@ -163,41 +163,55 @@ func TestSpike_PauseUnpause(t *testing.T) {
 
 func measureReconnectV1(t *testing.T, s *gocql.Session, budget time.Duration) time.Duration {
 	t.Helper()
-	deadline := time.Now().Add(budget)
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
 	start := time.Now()
 	attempts := 0
-	for time.Now().Before(deadline) {
+	for {
 		attempts++
 		err := s.Query("SELECT key FROM system.local").Exec()
 		if err == nil {
 			t.Logf("v1 recovered after %d attempts in %s", attempts, time.Since(start))
 			return time.Since(start)
 		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	// Non-recovery is a documented finding for the spike, not a failure.
-	t.Logf("v1 did not recover within %s (attempts=%d)", budget, attempts)
 
-	return budget
+		select {
+		case <-deadline.C:
+			// Non-recovery is a documented finding for the spike, not a failure.
+			t.Logf("v1 did not recover within %s (attempts=%d)", budget, attempts)
+
+			return budget
+		case <-ticker.C:
+		}
+	}
 }
 
 func measureReconnectV2(t *testing.T, s *gocqlv2.Session, budget time.Duration) time.Duration {
 	t.Helper()
-	deadline := time.Now().Add(budget)
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
 	start := time.Now()
 	attempts := 0
-	for time.Now().Before(deadline) {
+	for {
 		attempts++
 		err := s.Query("SELECT key FROM system.local").Exec()
 		if err == nil {
 			t.Logf("v2 recovered after %d attempts in %s", attempts, time.Since(start))
 			return time.Since(start)
 		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	t.Logf("v2 did not recover within %s (attempts=%d)", budget, attempts)
 
-	return budget
+		select {
+		case <-deadline.C:
+			t.Logf("v2 did not recover within %s (attempts=%d)", budget, attempts)
+
+			return budget
+		case <-ticker.C:
+		}
+	}
 }
 
 func probeErrorV1(s *gocql.Session) error {

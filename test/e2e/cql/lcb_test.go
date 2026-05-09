@@ -91,12 +91,9 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 			// RecordLatency → RecordSuccess closes the breaker.
 			require.NoError(t, a.Unpause(ctx))
 
-			closeDeadline := time.Now().Add(15 * time.Second)
-			closed := false
-			for time.Now().Before(closeDeadline) {
+			require.Eventually(t, func() bool {
 				if !lcb.ShouldFailover(htypes.ClusterA, nil) {
-					closed = true
-					break
+					return true
 				}
 				// Drive a read; whichever cluster the policy selects, the
 				// successful latency record will eventually close the breaker.
@@ -105,9 +102,9 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 				_ = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
 					ScanContext(qCtx, &got)
 				cancel()
-				time.Sleep(200 * time.Millisecond)
-			}
-			assert.True(t, closed,
+
+				return !lcb.ShouldFailover(htypes.ClusterA, nil)
+			}, 15*time.Second, 200*time.Millisecond,
 				"[%s] LatencyCircuitBreaker did not close after Unpause + reset timeout "+
 					"(half-open probe should re-route to A and observe healthy latency)",
 				d.name)

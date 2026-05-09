@@ -77,12 +77,9 @@ func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 			// return false (half-open) allowing a probe.
 			require.NoError(t, a.Unpause(ctx))
 
-			closeDeadline := time.Now().Add(15 * time.Second)
-			closed := false
-			for time.Now().Before(closeDeadline) {
+			require.Eventually(t, func() bool {
 				if !cb.ShouldFailover(htypes.ClusterA, nil) {
-					closed = true
-					break
+					return true
 				}
 				// Drive a read to give the policy a probe attempt.
 				qCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -90,9 +87,9 @@ func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 				_ = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
 					ScanContext(qCtx, &got)
 				cancel()
-				time.Sleep(200 * time.Millisecond)
-			}
-			assert.True(t, closed,
+
+				return !cb.ShouldFailover(htypes.ClusterA, nil)
+			}, 15*time.Second, 200*time.Millisecond,
 				"[%s] CircuitBreaker did not return to closed/half-open after Unpause + reset timeout",
 				d.name)
 		})
