@@ -574,14 +574,6 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.TimestampProvider = DefaultTimestampProvider
 	}
 
-	// Propagate cluster names to components that support it
-	propagateClusterNames(config)
-
-	// Warn about missing Replayer in dual-cluster mode
-	if sessionB != nil && config.Replayer == nil && !config.AutoMemoryWorker {
-		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
-	}
-
 	// Ensure NowProvider is never nil — auto-refresh + stats helpers
 	// dereference it on every recorded op outcome.
 	if config.NowProvider == nil {
@@ -621,15 +613,30 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 			replay.WithQueueCapacity(config.AutoMemoryCapacity),
 		)
 		config.Replayer = memReplayer
-		opts := append(
+		workerOpts := append(
 			[]replay.WorkerOption{replay.WithWorkerMetrics(config.Metrics)},
 			config.AutoMemoryWorkerOpts...,
 		)
-		config.ReplayWorker = replay.NewMemoryWorker(
+		worker, workerErr := replay.NewMemoryWorkerChecked(
 			memReplayer,
 			client.DefaultExecuteFunc(),
-			opts...,
+			workerOpts...,
 		)
+		if workerErr != nil {
+			return nil, workerErr
+		}
+		config.ReplayWorker = worker
+	}
+
+	// Propagate cluster names to components that support it. This happens
+	// after strict constructor validation, including auto-created worker
+	// validation, so rejected configurations do not mutate caller-owned
+	// components.
+	propagateClusterNames(config)
+
+	// Warn about missing Replayer in dual-cluster mode
+	if sessionB != nil && config.Replayer == nil {
+		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
 
 	// Auto-inject client metrics/logger into components that opt in via

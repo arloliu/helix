@@ -153,6 +153,9 @@ func validateNATSStreamName(name string) error {
 	if trimmed == "" {
 		return errors.New("must be non-empty")
 	}
+	if trimmed != name {
+		return errors.New("must not have leading or trailing whitespace")
+	}
 	if !natsTokenPattern.MatchString(trimmed) {
 		return errors.New("must contain only letters, numbers, underscores, or hyphens")
 	}
@@ -164,6 +167,9 @@ func validateNATSSubjectPrefix(prefix string) error {
 	trimmed := strings.TrimSpace(prefix)
 	if trimmed == "" {
 		return errors.New("must be non-empty")
+	}
+	if trimmed != prefix {
+		return errors.New("must not have leading or trailing whitespace")
 	}
 	tokens := strings.Split(trimmed, ".")
 	for _, token := range tokens {

@@ -175,3 +175,20 @@ func TestNewCQLClient_AutoMemoryWorkerInheritsMetrics(t *testing.T) {
 	assert.True(t, worker.MetricsConfigured(),
 		"auto-memory worker should have metrics flagged as explicitly configured")
 }
+
+// TestNewCQLClientRejectsInvalidAutoMemoryWorkerOptions verifies that invalid
+// worker options nested under WithAutoMemoryWorker are caught by the strict
+// constructor and returned as joined *types.OptionError values.
+func TestNewCQLClientRejectsInvalidAutoMemoryWorkerOptions(t *testing.T) {
+	_, err := helix.NewCQLClient(
+		newAlwaysOKMock(), newAlwaysOKMock(),
+		helix.WithAutoMemoryWorker(100,
+			replay.WithBatchSize(0),
+			replay.WithHighPriorityRatio(-1),
+		),
+	)
+	require.Error(t, err)
+	require.True(t, types.IsOptionError(err))
+	require.ErrorContains(t, err, "WithBatchSize")
+	require.ErrorContains(t, err, "WithHighPriorityRatio")
+}

@@ -71,6 +71,20 @@ func TestNATSReplayerNewWithNilJetStream(t *testing.T) {
 	assert.Contains(t, err.Error(), "JetStream context is nil")
 }
 
+func TestNATSReplayerRejectsWhitespaceInStreamNameAndSubjectPrefix(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+
+	replayer, err := replay.NewNATSReplayer(js,
+		replay.WithStreamName(" helix-replay "),
+		replay.WithSubjectPrefix(" helix.replay "),
+	)
+	require.Nil(t, replayer)
+	require.Error(t, err)
+	require.True(t, types.IsOptionError(err))
+	require.ErrorContains(t, err, "WithStreamName")
+	require.ErrorContains(t, err, "WithSubjectPrefix")
+}
+
 func TestNATSReplayerEnqueue(t *testing.T) {
 	js := testutil.StartEmbeddedNATS(t)
 

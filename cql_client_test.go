@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -259,6 +260,24 @@ func (w *mockReplayWorker) IsRunning() bool {
 	return w.running.Load()
 }
 
+// recordingWriteStrategy implements WriteStrategy and types.ClusterNamer to
+// detect whether propagateClusterNames was called on a rejected constructor.
+type recordingWriteStrategy struct {
+	called bool
+}
+
+func (s *recordingWriteStrategy) Execute(
+	ctx context.Context,
+	writeA func(context.Context) error,
+	_ func(context.Context) error,
+) (resultA, resultB error) {
+	return writeA(ctx), nil
+}
+
+func (s *recordingWriteStrategy) SetClusterNames(_ types.ClusterNames) {
+	s.called = true
+}
+
 // mockTopologyWatcher implements TopologyWatcher for testing.
 type mockTopologyWatcher struct {
 	mu      sync.RWMutex
@@ -419,6 +438,31 @@ func TestNewCQLClientJoinsMultipleInvalidRootOptions(t *testing.T) {
 	assert.True(t, types.IsOptionError(err))
 	assert.ErrorContains(t, err, "WithClusterNames")
 	assert.ErrorContains(t, err, "WithAutoRefreshFailureThreshold")
+}
+
+func TestNewCQLClientDoesNotPropagateNamesToStrategyOnValidationFailure(t *testing.T) {
+	strategy := &recordingWriteStrategy{}
+
+	_, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(strategy),
+		WithClusterNames("", "valid"),
+	)
+	require.Error(t, err)
+	require.False(t, strategy.called, "SetClusterNames must not be called when the constructor rejects the config")
+}
+
+func TestNewCQLClientDoesNotPropagateNamesOnAutoWorkerValidationFailure(t *testing.T) {
+	strategy := &recordingWriteStrategy{}
+
+	_, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(strategy),
+		WithClusterNames("primary", "secondary"),
+		WithAutoMemoryWorker(100, replay.WithBatchSize(0)),
+	)
+	require.Error(t, err)
+	require.True(t, types.IsOptionError(err))
+	require.ErrorContains(t, err, "WithBatchSize")
+	require.False(t, strategy.called, "SetClusterNames must not be called when nested auto-worker validation fails")
 }
 
 func TestCQLClientSingleClusterMode(t *testing.T) {
