@@ -7,147 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.0] — 2026-05-09
-
-### Bug Fixes
-
-- **TestS1 e2e flake — `MemoryReplayer.Len()==0` is not a "drain done"
-  signal**: The S1 happy-path drain test used `memReplayer.Len()==0` to decide
-  when replay was complete. Under sustained suite pressure AdaptiveDualWrite
-  did not always degrade and every Exec ran sync against a paused cluster (~2 s
-  gocql timeout each), producing a long tail of retries. The worker holds
-  payloads in flight between attempts — outside the queue but still actively
-  retrying — so `Len()` can transiently report 0 while items remain. The drain
-  check passed prematurely and only a fraction of rows reached cluster A.
-  The test now uses row-count convergence (the authoritative downstream signal),
-  and `MemoryReplayer.Len()` carries a Godoc note explaining the gotcha.
-
-- **FailoverPolicy metrics and logger auto-injection**: `NewCQLClient`'s
-  `autoInjectMetricsAndLogger` walked `ReplayWorker` and `WriteStrategy` but
-  not `FailoverPolicy`, so users wiring `helix.WithMetrics(collector)` +
-  `helix.WithFailoverPolicy(policy.NewCircuitBreaker(...))` saw zero
-  `IncCircuitBreakerTrip` events — they had to also pass
-  `policy.WithCircuitBreakerMetrics(collector)` redundantly. `CircuitBreaker`
-  (and `LatencyCircuitBreaker` via embedding) now satisfy the same
-  `metricsAware` / `loggerAware` interfaces as `AdaptiveDualWrite` and
-  `replay.Worker`, and the auto-inject pass walks `FailoverPolicy` too.
-  Caller-supplied `WithCircuitBreakerMetrics` / `WithLatencyMetrics` /
-  `WithCircuitBreakerLogger` / `WithLatencyLogger` still win on conflict
-  (last-write-wins via the `metricsExplicit` / `loggerExplicit` guard).
+## [1.4.0] — 2026-05-10
 
 ### Added
 
-- **Strict writes** (`Strict()` per-statement option): A query or batch marked
-  `Strict()` bypasses replay and fire-and-forget. On partial failure the caller
-  receives `*types.PartialWriteError{Acknowledged, Unacknowledged, Cause}`
-  immediately — the `Replayer` is never invoked. Both-cluster failure returns
-  `*types.DualClusterError`. Drain-path: the draining cluster is skipped and
-  named as `Unacknowledged` with `Cause: ErrClusterDraining`.
-  `Strict().Mirror()` returns `ErrStrictMirrorUnsupported` before any write
-  attempt. Single-cluster mode and CAS/LWT are no-ops (Strict is ignored).
-
-- **`StrictWriter` interface** (`helix` package): Optional interface for write
-  strategies that support `Strict()` semantics. `ConcurrentDualWrite`,
-  `SyncDualWrite`, and `AdaptiveDualWrite` all implement `ExecuteStrict`.
-  `AdaptiveDualWrite.ExecuteStrict` fast-fails degraded clusters with
-  `ErrClusterDegraded` instead of fire-and-forgetting; `RecordProbeSuccess`
-  advances the recovery counter so the cluster can self-heal.
-
-- **Background recovery probe** for `AdaptiveDualWrite`: A configurable
-  background goroutine probes degraded clusters at a tunable interval (default
-  2 s), credits recovery via `RecordProbeSuccess`, and automatically restores
-  degraded clusters — no operator action required, no live dual-write needed.
-  Configure with `WithRecoveryProbe(cfg)` or opt out with
-  `WithRecoveryProbeDisabled()`. Goroutines stop cleanly on `Close()`.
-
-- **`StrictMetrics` optional interface** (`types` package): Adds
-  `IncWriteSkipped(cluster)` so metrics collectors can distinguish writes
-  skipped due to degraded/draining state from genuine write errors, without
-  breaking existing `MetricsCollector` implementors.
-
-- **`RecoveryProbeMetrics` optional interface** (`types` package):
-  `IncRecoveryProbeSuccess` and `IncRecoveryProbeFailure` counters for probe
-  observability.
-
-- **Root re-exports** (`helix` package): `PartialWriteError`, `DualClusterError`,
+- **Strict writes** (`Strict()` per-query/batch option): bypasses replay and
+  fire-and-forget. Partial failure returns `*types.PartialWriteError` immediately;
+  full failure returns `*types.DualClusterError`. Draining clusters are skipped
+  and reported as unacknowledged. `Strict().Mirror()` is rejected before any
+  write. No-op in single-cluster and CAS/LWT mode.
+- **`StrictWriter` interface** (`helix`): optional interface for write strategies
+  supporting strict semantics. Implemented by `ConcurrentDualWrite`,
+  `SyncDualWrite`, and `AdaptiveDualWrite`. `AdaptiveDualWrite.ExecuteStrict`
+  fast-fails degraded clusters with `ErrClusterDegraded`; `RecordProbeSuccess`
+  advances the recovery counter.
+- **Background recovery probe** for `AdaptiveDualWrite`: background goroutine
+  probes degraded clusters (default 2 s interval) and restores them without
+  operator action. Configure with `WithRecoveryProbe(cfg)` or disable with
+  `WithRecoveryProbeDisabled()`. Stops cleanly on `Close()`.
+- **Async mirror writes** (`Mirror()` per-query/batch option): fire-and-forget
+  writes to a second `*CQLClient` for zero-downtime Cassandra migrations. Fires
+  only after primary write success; preserves original timestamps for
+  WRITETIME/LWW/TTL correctness; deep-copies args before return. Two modes:
+  in-process (`helix.WithMirror(target)`) and out-of-process
+  (`helix.WithMirrorPublisher(publisher)` + `helix.NewMirrorWorker`). Mutually
+  exclusive — `NewCQLClient` returns `types.ErrMirrorModeConflict` if both are
+  set. Failed mirror writes retry via `helix.WithMirrorReplayer`. Runtime
+  control via `*CQLClient.Mirror()` (`Enable`, `Disable`, `Enabled`, `Stats`).
+  Optional `types.MirrorMetrics` interface auto-wired from the client's
+  `MetricsCollector`.
+- **New optional metrics interfaces** (`types`): `StrictMetrics` adds
+  `IncWriteSkipped(cluster)`; `RecoveryProbeMetrics` adds
+  `IncRecoveryProbeSuccess` / `IncRecoveryProbeFailure`. Neither breaks existing
+  `MetricsCollector` implementations.
+- **Root re-exports** (`helix`): `PartialWriteError`, `DualClusterError`,
   `ErrClusterDegraded`, `ErrClusterDraining`, `ErrStrictUnsupported`,
-  `ErrStrictMirrorUnsupported`, `AsPartialWriteError`, and `IsPartialWrite` are
-  now accessible directly from the `helix` package without importing `types`.
+  `ErrStrictMirrorUnsupported`, `AsPartialWriteError`, `IsPartialWrite` —
+  accessible without importing `types`.
+- **e2e coverage expansion**: new parameterized e2e tests covering network
+  disconnect failover, NATSReplayer drain, cascading A→B→A failures,
+  `CircuitBreaker` trip/half-open/close cycle, `FallbackRead` real-cluster paths,
+  and mirror scenarios with `Pause`/`Unpause`, `AdaptiveDualWrite`, `Stop`/`Start`,
+  and SIGKILL + `AutoRefresh` recovery.
+- **Strict option validation**: `types.OptionError` and `types.IsOptionError` for
+  structured constructor error handling. Checked constructors —
+  `policy.NewAdaptiveDualWriteChecked`, `policy.NewCircuitBreakerChecked`,
+  `policy.NewLatencyCircuitBreakerChecked` — return joined `*types.OptionError`
+  on invalid inputs. `NewNATSReplayer` validates all option fields at
+  construction. `NewCQLClient` validates root options (auto-refresh knobs,
+  recovery probe, mirror mode conflicts) before any side effects on
+  caller-supplied strategies, policies, or workers; invalid `WithAutoMemoryWorker`
+  options also surface as construction errors.
 
-- **Async mirror writes** (`Mirror()` per-statement option): per-statement
-  opt-in mirroring of writes to a second helix dual-cluster pair, designed for
-  seamless Cassandra cluster migrations.
-  - `Query.Mirror()` / `Batch.Mirror()`: fluent opt-in. Always async,
-    fire-and-forget; the mirror leg never surfaces an error to the caller.
-    The original client-generated timestamp is preserved so server-side
-    `WRITETIME`, LWW, TTL, and tombstone semantics match the primary cluster.
-    Bound `[]any` args are deep-copied synchronously before Exec returns so
-    caller-side buffer reuse cannot corrupt mirror payloads.
-  - `helix.WithMirror(target, opts...)`: configures the mirror destination (a
-    second `*CQLClient`). Mirroring fires only after primary write success
-    (any-cluster ack); total primary failure suppresses the mirror. `WithMirror(nil)`
-    and `WithMirrorPublisher(nil)` reject at construction with
-    `types.ErrNilMirrorTarget` / `types.ErrNilMirrorPublisher`.
-  - `helix.WithMirrorReplayer(replayer, workerOpts...)`: failed mirror writes are
-    durably retried via the existing replay system. The auto-built worker uses the
-    same execute function as the mirror engine, preserving timestamps, dual-write
-    strategy, and per-cluster routing on retry. When a mirror enqueue fails (queue
-    saturated), the existing `WithOnReplayDropped` callback fires — mirror and
-    primary replay share one alerting path.
-  - `helix.WithMirrorPublisher(publisher, opts...)` + `helix.NewMirrorWorker(...)`:
-    out-of-process mode for production migrations. The app publishes captures to a
-    `Replayer` (typically `replay.NATSReplayer`); a separate consumer binary
-    performs the writes. Mutually exclusive with `WithMirror` — `NewCQLClient`
-    returns `types.ErrMirrorModeConflict` if both are set.
-  - Mirror metrics via optional `types.MirrorMetrics` interface:
-    `mirror_enqueue_success_total`, `mirror_enqueue_dropped_total`,
-    `mirror_exec_success_total`, `mirror_exec_errors_total`,
-    `mirror_exec_duration_seconds` (histogram), `mirror_queue_depth` (gauge),
-    `mirror_enabled` (gauge). Auto-wired when the configured `MetricsCollector`
-    implements `MirrorMetrics`. Mirror payloads carry `TargetCluster = ClusterA`
-    for NATS subject routing.
-  - `*CQLClient.Mirror()`: runtime control — `Enable`, `Disable` (drains
-    in-flight queue), `Enabled`, and a `Stats` snapshot. `client.Close()`
-    drains the in-flight mirror queue before returning.
-  - `docs/mirror.md` user guide covering target / publisher modes, semantics,
-    runtime control, observability, and known parity gaps.
-    `examples/mirror/` runnable wiring examples for both modes.
+### Bug Fixes
 
-- **e2e coverage expansion**: New e2e tests covering previously untested
-  production paths, each parameterized over v1 and v2 adapters:
-  - `TestS_NetworkDisconnect_StickyReadFailover` — real network partition via
-    Docker network detach (vs `Pause` which keeps TCP open). First test in the
-    repo to exercise `testutil.NetworkDisconnect`.
-  - `TestS1b_PauseA_NATSReplayerDrain` — companion to S1 using the production
-    `NATSReplayer` + `NATSWorker` durability backend rather than `MemoryReplayer`.
-  - `TestS2b_PauseB_StickyReadFailover` — symmetry counterpart to S2 verifying
-    identical behavior when B is the failing cluster.
-  - `TestS_SequentialFailures_AThenB` — cascading failure: pause A (failover to
-    B), unpause A, pause B (failover back to A). Proves per-cluster health state
-    resets on recovery and failover metric records every transition.
-  - `TestS_PlainCircuitBreaker_TripAndClose` — counter-based `CircuitBreaker`
-    trip + half-open + close cycle.
-  - `TestS_FallbackRead_RowMissingOnPreferredButPresentOnOther` and
-    `TestS_FallbackRead_AlternativeUnreachable_ReturnsNotFound` — real-cluster
-    `FallbackRead` coverage: lag-recovery path and "alternative unreachable
-    returns ErrNotFound, not network error" contract.
-  - Mirror e2e: `TestMirror_DestinationPausedAndRecovered`,
-    `TestMirror_BothPrimaryClustersPaused_NoMirrorFire`,
-    `TestMirror_PrimaryPartialOutage_MirrorStillFires`,
-    `TestMirror_PrimaryClusterDraining_MirrorStillFires`,
-    `TestMirror_WithAdaptiveDualWritePrimary` — mirror with real cluster
-    lifecycle (`Pause`, `Unpause`) and `AdaptiveDualWrite` as primary strategy.
-    `TestMirror_DestinationStopAndStart_AutoRefreshRecovers` and
-    `TestMirror_DestinationKilled_AutoRefreshRecovers` — `Stop`/`Start` and
-    `Kill` (SIGKILL) scenarios pairing the mirror engine with `AutoRefresh` +
-    `SessionRefresher` recovery (Scylla-only).
+- **`FailoverPolicy` metrics/logger not auto-injected**: `CircuitBreaker` and
+  `LatencyCircuitBreaker` now implement `metricsAware`/`loggerAware` so
+  `helix.WithMetrics(collector)` auto-wires failover policy observability.
+  Explicit `WithCircuitBreakerMetrics` / `WithLatencyMetrics` calls still win.
+- **`MemoryReplayer.Len()` is not a drain-done signal**: payloads in-flight
+  between retry attempts are outside the queue, so `Len()` can transiently
+  report 0 while work remains. Added Godoc note; the S1 e2e test now uses
+  row-count convergence as the authoritative drain signal.
+- **NATS replay worker hardening**: `Stop` is now terminal (restarting returns an
+  error). Invalid startup options are rejected rather than silently normalized.
+  Dequeue correctly honours context cancellation. Broker ack, nak, and term
+  failures are surfaced instead of being swallowed as uncertain success or silent
+  drop. NATS stream names and subject prefixes with surrounding whitespace are
+  rejected (`strings.TrimSpace(input) != input`).
+- **`StickyRead` / `RoundRobinRead` input validation**: `StickyRead` rejects
+  negative cooldown durations and unknown preferred-cluster IDs. `RoundRobinRead`
+  fails closed for unknown cluster IDs.
+- **`NewCQLClient` side-effect atomicity**: `propagateClusterNames` and the
+  missing-`Replayer` warning now run only after all validation passes — rejected
+  configurations no longer mutate caller-supplied components.
 
 ### Documentation
 
-- **Strict Write Guide** (`docs/strict-write.md`): when to use `Strict()`,
-  behavior table, error types, `PartialWriteError` helpers, recovery probe
-  configuration, drain-mode interaction, FallbackRead pairing after partial
-  writes, and custom `StrictWriter` implementation guide.
+- `docs/strict-write.md`: usage, behavior table, error types, `PartialWriteError`
+  helpers, recovery probe configuration, drain interaction, and `StrictWriter`
+  implementation guide.
+- `docs/mirror.md`: target/publisher modes, semantics, runtime control,
+  observability, and known parity gaps. `examples/mirror/` runnable examples.
 
 ## [1.3.0] — 2026-05-08
 
