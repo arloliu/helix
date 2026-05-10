@@ -49,11 +49,11 @@ Best for: dev, test, small deployments, low-write-volume migrations.
 
 ```go
 mirrorTarget, _ := helix.NewCQLClient(newA, newB,
-    helix.WithWriteStrategy(helix.ConcurrentDualWrite),
+    helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
 )
 
 client, _ := helix.NewCQLClient(currentA, currentB,
-    helix.WithWriteStrategy(helix.ConcurrentDualWrite),
+    helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
     helix.WithMirror(mirrorTarget,
         mirror.WithQueueSize(8192),
         mirror.WithWorkers(4),
@@ -81,7 +81,7 @@ mirroring.
 **App side:**
 
 ```go
-natsReplayer, _ := replay.NewNATSReplayer(ctx, replay.NATSReplayerConfig{ ... })
+natsReplayer, _ := replay.NewNATSReplayer(js, replay.WithStreamName("helix-mirror"))
 
 client, _ := helix.NewCQLClient(currentA, currentB,
     helix.WithMirrorPublisher(natsReplayer,
@@ -98,7 +98,7 @@ err := session.Query(...).Mirror().ExecContext(ctx)
 
 ```go
 mirrorTarget, _ := helix.NewCQLClient(newA, newB,
-    helix.WithWriteStrategy(helix.ConcurrentDualWrite),
+    helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
 )
 
 worker, err := helix.NewMirrorWorker(natsReplayer, mirrorTarget,

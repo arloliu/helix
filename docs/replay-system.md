@@ -194,9 +194,12 @@ func main() {
         replay.WithExecuteTimeout(30*time.Second),
     )
 
-    // Attach worker to client for automatic lifecycle management
-    client.SetReplayWorker(worker)
-    defer client.Close() // Stops worker and closes sessions
+    // Start the worker; stop it before closing the client.
+    if err := worker.Start(); err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+    defer worker.Stop()
 
     // Use client normally
     err = client.Query("INSERT INTO users (id, name) VALUES (?, ?)",
@@ -306,9 +309,12 @@ func main() {
         }),
     )
 
-    // Attach worker to client
-    client.SetReplayWorker(worker)
+    // Start the worker; stop it before closing the client.
+    if err := worker.Start(); err != nil {
+        log.Fatal(err)
+    }
     defer client.Close()
+    defer worker.Stop()
 
     // Use client...
 }
@@ -920,6 +926,4 @@ cannot provide the acknowledgement guarantees that `Strict()` requires.
 ## See Also
 
 - [Auto-Recovery Guide](auto-recovery.md) - End-to-end recovery lifecycle and operator workflow
-- [High Level Design](high_level_design.md) - Overall Helix architecture
-- [Design Plan](design_plan.md) - Implementation phases
 - [NATS JetStream Documentation](https://docs.nats.io/nats-concepts/jetstream)

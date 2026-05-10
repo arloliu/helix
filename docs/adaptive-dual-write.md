@@ -41,9 +41,10 @@ import (
 )
 
 // Basic usage with defaults
+natsReplayer, _ := replay.NewNATSReplayer(js) // js is jetstream.JetStream
 client, _ := helix.NewCQLClient(sessionA, sessionB,
     helix.WithWriteStrategy(policy.NewAdaptiveDualWrite()),
-    helix.WithReplayer(replay.NewNATSReplayer(nc, js)), // Required for fire-and-forget
+    helix.WithReplayer(natsReplayer), // Required for fire-and-forget
 )
 ```
 
