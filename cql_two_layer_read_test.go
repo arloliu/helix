@@ -358,3 +358,50 @@ func TestRecordFailure_ExactlyOnce_NoFailoverPath(t *testing.T) {
 	require.Len(t, policy.RecordFailureCalls, 1,
 		"executeReadNoFailover must call RecordFailure exactly once — not zero, not twice")
 }
+
+// TestSingleClusterSuccess_DoesNotCallStrategyOnSuccess_NorPolicyRecordSuccess
+// is a regression assertion that the v1.5.0 two-layer refactor does NOT
+// start firing ReadStrategy.OnSuccess or FailoverPolicy.RecordSuccess on
+// successful single-cluster reads. Pre-refactor, the single-cluster fast
+// path inside executeRead bypassed recordReadSuccess entirely; without an
+// explicit !IsSingleCluster() gate the shared success branch would fire
+// these on every successful Scan / MapScan, which is observable for users
+// who configure a strategy or failover policy for telemetry purposes.
+func TestSingleClusterSuccess_DoesNotCallStrategyOnSuccess_NorPolicyRecordSuccess(t *testing.T) {
+	sessionA := newMockSession()
+	sessionA.scanValues = []any{"hello"}
+
+	strategy := &trackingReadStrategy{}
+	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
+
+	client, err := NewCQLClient(sessionA, nil,
+		WithReadStrategy(strategy),
+		WithFailoverPolicy(policy),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	t.Run("Scan", func(t *testing.T) {
+		var s string
+		err := client.Query("SELECT 1").Scan(&s)
+		require.NoError(t, err)
+	})
+
+	t.Run("MapScan", func(t *testing.T) {
+		err := client.Query("SELECT 1").MapScan(map[string]any{})
+		require.NoError(t, err)
+	})
+
+	t.Run("executeReadNoFailover", func(t *testing.T) {
+		err := client.executeReadNoFailover(context.Background(), readOptions{},
+			func(_ context.Context, _ cql.Session) error { return nil })
+		require.NoError(t, err)
+	})
+
+	assert.Empty(t, strategy.OnSuccessCalls,
+		"single-cluster successful reads must not invoke ReadStrategy.OnSuccess")
+	assert.Empty(t, policy.RecordSuccessCalls,
+		"single-cluster successful reads must not invoke FailoverPolicy.RecordSuccess")
+	assert.Empty(t, policy.RecordFailureCalls,
+		"successful reads must not invoke FailoverPolicy.RecordFailure")
+}

@@ -2011,7 +2011,13 @@ func (c *CQLClient) executeRead(
 	}
 
 	if res.err == nil {
-		c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
+		// Single-cluster mode never invoked ReadStrategy.OnSuccess /
+		// FailoverPolicy.RecordSuccess pre-v1.5.0 — neither is meaningful
+		// without a second cluster, and configured policies must keep
+		// their pre-refactor activity.
+		if !c.IsSingleCluster() {
+			c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
+		}
 		c.recordOpOutcome(res.selected, nil)
 		return nil
 	}
@@ -2070,7 +2076,12 @@ func (c *CQLClient) executeReadNoFailover(
 	}
 
 	if res.err == nil {
-		c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
+		// Symmetric with executeRead's single-cluster gate: skip
+		// ReadStrategy.OnSuccess / FailoverPolicy.RecordSuccess in
+		// single-cluster mode where neither is meaningful.
+		if !c.IsSingleCluster() {
+			c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
+		}
 		c.recordOpOutcome(res.selected, nil)
 		return nil
 	}

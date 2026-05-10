@@ -65,10 +65,13 @@ func (m *readTestMetrics) SetClusterDraining(_ ClusterID, _ bool)       {}
 func (m *readTestMetrics) IncDrainModeEntered(_ ClusterID)              {}
 func (m *readTestMetrics) IncDrainModeExited(_ ClusterID)               {}
 
-// trackingFailoverPolicy records RecordFailure and OnFailure calls for assertions.
+// trackingFailoverPolicy records RecordFailure / RecordSuccess /
+// RecordLatency calls for assertions.
 type trackingFailoverPolicy struct {
 	sync.Mutex
 	RecordFailureCalls  []ClusterID
+	RecordSuccessCalls  []ClusterID
+	RecordLatencyCalls  []ClusterID
 	ShouldFailoverAllow bool // what ShouldFailover returns
 }
 
@@ -78,8 +81,17 @@ func (p *trackingFailoverPolicy) RecordFailure(cluster ClusterID) {
 	p.RecordFailureCalls = append(p.RecordFailureCalls, cluster)
 }
 
-func (p *trackingFailoverPolicy) RecordSuccess(_ ClusterID)        {}
-func (p *trackingFailoverPolicy) RecordLatency(_ ClusterID, _ any) {}
+func (p *trackingFailoverPolicy) RecordSuccess(cluster ClusterID) {
+	p.Lock()
+	defer p.Unlock()
+	p.RecordSuccessCalls = append(p.RecordSuccessCalls, cluster)
+}
+
+func (p *trackingFailoverPolicy) RecordLatency(cluster ClusterID, _ any) {
+	p.Lock()
+	defer p.Unlock()
+	p.RecordLatencyCalls = append(p.RecordLatencyCalls, cluster)
+}
 
 func (p *trackingFailoverPolicy) ShouldFailover(_ ClusterID, _ error) bool {
 	p.Lock()
