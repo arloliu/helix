@@ -403,14 +403,23 @@ func safeProbe(ctx context.Context, probe func(context.Context, cql.Session) err
 	return probe(ctx, session)
 }
 
+// isReadTerminalNonHealth reports whether err is a read-pipeline data
+// sentinel — [types.ErrNotFound] or [types.ErrRowLimitExceeded] — that
+// terminates the read but MUST NOT count as a cluster-health failure.
+func isReadTerminalNonHealth(err error) bool {
+	return errors.Is(err, types.ErrNotFound) ||
+		errors.Is(err, types.ErrRowLimitExceeded)
+}
+
 // recordOpOutcome updates the per-cluster stats based on a single op's
 // result for that cluster. Designed to be invoked PER cluster — never
 // gated on "all clusters succeeded" — so a dual-write where A succeeds
 // and B fails records success on A AND failure on B independently.
 //
-// err == nil counts as success. ErrWriteAsync, ErrWriteDropped, and
-// ErrNotFound are operational/data states (not health signals) and MUST
-// NOT count as failure. All other errors increment consecutiveFailures.
+// err == nil counts as success. ErrWriteAsync, ErrWriteDropped, ErrNotFound,
+// ErrRowLimitExceeded, ErrClusterDegraded, and ErrClusterDraining are
+// operational/data states (not health signals) and MUST NOT count as
+// failure. All other errors increment consecutiveFailures.
 //
 // The ErrNotFound exclusion depends on Helix's adapter normalization
 // contract: gocql v1's gocql.ErrNotFound and gocql v2's equivalent are
@@ -446,6 +455,7 @@ func (c *CQLClient) recordOpOutcomeAt(cluster ClusterID, err error, nowNano int6
 	case errors.Is(err, types.ErrWriteAsync),
 		errors.Is(err, types.ErrWriteDropped),
 		errors.Is(err, types.ErrNotFound),
+		errors.Is(err, types.ErrRowLimitExceeded),
 		errors.Is(err, types.ErrClusterDegraded),
 		errors.Is(err, types.ErrClusterDraining):
 		// Operational/data state; not a health signal.
@@ -1232,7 +1242,13 @@ func callAllowedClusters(fn AllowedClustersFunc) (raw []ClusterID, err error) {
 // resolveReadTarget is the single entry point for all read paths.
 // It returns the selected cluster and override snapshot as one unit.
 // Called exactly once per operation — no downstream function re-evaluates.
-func (c *CQLClient) resolveReadTarget(ctx context.Context) readTarget {
+//
+// When opts.preserveSelectedCluster is true, the dual-cluster override
+// path skips drain-filtering and returns the first known override entry
+// as-is; if it is currently draining, the resolver fails closed with
+// types.ErrNoValidClusters rather than shipping a paging cursor to a
+// different cluster.
+func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) readTarget {
 	fn := c.config.AllowedClusters
 	if fn == nil {
 		return readTarget{cluster: c.normalSelect(ctx)}
@@ -1274,6 +1290,13 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context) readTarget {
 			cluster: ClusterA,
 			snap:    overrideSnapshot{active: true, primary: ClusterA},
 		}
+	}
+
+	// Dual-cluster paged-slice path: take the first known override entry
+	// as-is, skip drain-filter fallback. Sending the next page's cursor to
+	// a different cluster is unsound regardless of what triggered the swap.
+	if opts.preserveSelectedCluster {
+		return c.resolveReadTargetPreserved(raw)
 	}
 
 	// Dual-cluster: iterate once, dedup + filter known IDs + apply drain
@@ -1323,6 +1346,51 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context) readTarget {
 	return readTarget{
 		cluster: primary,
 		snap:    overrideSnapshot{active: true, primary: primary, fallback: fallback},
+	}
+}
+
+// resolveReadTargetPreserved implements the preserveSelectedCluster=true
+// branch of resolveReadTarget: take the first known override entry as-is,
+// fail closed with ErrNoValidClusters if it is draining, and never fall
+// over to a different cluster. Used by paged slice reads where the next
+// page's cursor must stay on the cluster that issued it.
+func (c *CQLClient) resolveReadTargetPreserved(raw []ClusterID) readTarget {
+	var first ClusterID
+	for _, entry := range raw {
+		if entry == ClusterA || entry == ClusterB {
+			first = entry
+			break
+		}
+	}
+
+	if first == "" {
+		if c.shouldLogOverrideErr() {
+			c.config.Logger.Error("cluster override returned only unknown cluster IDs",
+				"overrideClusters", raw,
+			)
+		}
+
+		return readTarget{err: types.ErrInvalidClusterOverride}
+	}
+
+	drainA, drainB := c.getDrainStates()
+	if c.clusterIsDraining(first, drainA, drainB) {
+		if c.shouldLogOverrideErr() {
+			c.config.Logger.Error("cluster override first entry is draining; refusing to ship paging cursor to a different cluster",
+				"overrideClusters", raw,
+				"drainA", drainA,
+				"drainB", drainB,
+			)
+		}
+
+		return readTarget{err: types.ErrNoValidClusters}
+	}
+
+	c.overrideErrSeq.Store(0)
+
+	return readTarget{
+		cluster: first,
+		snap:    overrideSnapshot{active: true, primary: first},
 	}
 }
 
@@ -1787,8 +1855,15 @@ func (c *CQLClient) executeStrictDualWrite(
 
 // readOptions holds per-read options resolved from the three-level hierarchy:
 // per-query FallbackRead() > context WithFallbackRead(ctx) > client DefaultFallbackRead.
+//
+// preserveSelectedCluster suppresses every cluster-switching step a paged
+// slice read must avoid (PageState cursors are opaque per-cluster):
+// drain-aware initial rerouting and the AllowedClusters override drain-
+// filter fallback. The zero value preserves the pre-existing behavior for
+// non-slice callers.
 type readOptions struct {
-	fallbackRead bool
+	fallbackRead            bool
+	preserveSelectedCluster bool
 }
 
 func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOptions {
@@ -1818,6 +1893,96 @@ func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64, overri
 	}
 }
 
+// primaryAttemptResult captures the outcome of one primary-cluster read
+// attempt. It carries enough state for either the failover-enabled or the
+// no-failover wrapper to record terminal signals correctly without each
+// reimplementing the resolve-and-attempt sequence.
+//
+// attempted=false means no read was sent to any cluster (client closed,
+// resolveReadTarget failed, etc.); err carries the pre-attempt error and
+// wrappers MUST NOT emit cluster metrics or call cluster-health functions.
+// attempted=true means a read was sent and runPrimaryRead recorded
+// IncReadTotal + ObserveReadDuration; err is nil on success or the
+// cluster's error.
+type primaryAttemptResult struct {
+	attempted bool
+	target    readTarget
+	selected  ClusterID
+	elapsed   float64
+	err       error
+}
+
+// runPrimaryRead executes the single-attempt portion of a read: pre-
+// attempt fail-closed checks, cluster selection (drain-aware unless
+// opts.preserveSelectedCluster), and the once-per-attempt IncReadTotal /
+// ObserveReadDuration metrics.
+//
+// runPrimaryRead intentionally does NOT call IncReadError, recordOpOutcome,
+// recordReadSuccess, or FailoverPolicy.RecordFailure. Those terminal
+// signals are caller-owned so RecordFailure fires exactly once per primary
+// failure: executeRead delegates it to its failover branch;
+// executeReadNoFailover records it itself.
+func (c *CQLClient) runPrimaryRead(
+	ctx context.Context,
+	opts readOptions,
+	readFunc func(context.Context, cql.Session) error,
+) primaryAttemptResult {
+	if c.closed.Load() {
+		return primaryAttemptResult{err: types.ErrSessionClosed}
+	}
+
+	rt := c.resolveReadTarget(ctx, opts)
+	if rt.err != nil {
+		return primaryAttemptResult{err: rt.err, target: rt}
+	}
+
+	var selected ClusterID
+	var session cql.Session
+
+	if c.IsSingleCluster() {
+		// Single-cluster mode applies whether AllowedClusters is nil,
+		// returns nil/empty, or returns [ClusterA]. In all cases
+		// resolveReadTarget returns ClusterA; there is no second session.
+		selected = ClusterA
+		session = c.loadSessionA()
+	} else {
+		selected = rt.cluster
+
+		// Drain-aware re-selection: when override is NOT active, swap
+		// away from a draining selected cluster. Suppressed by
+		// preserveSelectedCluster so paged slice reads don't move the
+		// cursor across clusters before the readFunc runs.
+		if !rt.snap.active && !opts.preserveSelectedCluster {
+			drainA, drainB := c.getDrainStates()
+			if c.clusterIsDraining(selected, drainA, drainB) {
+				alt := c.alternativeCluster(selected)
+				if !c.clusterIsDraining(alt, drainA, drainB) {
+					selected = alt
+				}
+				// If both are draining, proceed with the original
+				// selection (best effort).
+			}
+		}
+
+		session = c.getSession(selected)
+	}
+
+	start := time.Now()
+	err := readFunc(ctx, session)
+	elapsed := time.Since(start).Seconds()
+
+	c.config.Metrics.IncReadTotal(selected)
+	c.config.Metrics.ObserveReadDuration(selected, elapsed)
+
+	return primaryAttemptResult{
+		attempted: true,
+		target:    rt,
+		selected:  selected,
+		elapsed:   elapsed,
+		err:       err,
+	}
+}
+
 // executeRead performs a read operation with optional sticky routing and failover.
 //
 // In single-cluster mode, the read is executed directly on sessionA.
@@ -1831,97 +1996,104 @@ func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64, overri
 // Not-found results (types.ErrNotFound) are never recorded as cluster failures.
 // If opts.fallbackRead is true and the selected cluster returns not-found,
 // executeFallbackRead silently tries the other cluster before returning not-found.
+//
+// types.ErrRowLimitExceeded is treated identically to ErrNotFound for health
+// purposes (no IncReadError, no RecordFailure) but never triggers
+// FallbackRead empty-retry — it propagates as-is.
 func (c *CQLClient) executeRead(
 	ctx context.Context,
 	opts readOptions,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	if c.closed.Load() {
-		return types.ErrSessionClosed
+	res := c.runPrimaryRead(ctx, opts, readFunc)
+	if !res.attempted {
+		return res.err
 	}
 
-	// Resolve cluster selection (override-aware).
-	// This must run before the single-cluster fast path so that fail-closed
-	// conditions (e.g., targeting ClusterB in single-cluster mode) are caught.
-	rt := c.resolveReadTarget(ctx)
-	if rt.err != nil {
-		return rt.err
-	}
-
-	// Single-cluster mode: direct execution, no failover or drain logic.
-	// This applies whether AllowedClusters is nil, returns nil/empty, or
-	// returns [ClusterA]. In all cases resolveReadTarget returns ClusterA;
-	// there is no second session to failover or FallbackRead to.
-	if c.IsSingleCluster() {
-		start := time.Now()
-		err := readFunc(ctx, c.loadSessionA())
-		elapsed := time.Since(start).Seconds()
-
-		c.config.Metrics.IncReadTotal(ClusterA)
-		c.config.Metrics.ObserveReadDuration(ClusterA, elapsed)
-		// Not-found is not a health signal; skip IncReadError for it.
-		// In single-cluster mode there is no alternative for FallbackRead.
-		if err != nil && !types.IsNotFound(err) {
-			c.config.Metrics.IncReadError(ClusterA)
-		}
-		// Auto-refresh outcome — recordOpOutcome internally excludes
-		// ErrNotFound so the not-found check is doubly safe here.
-		c.recordOpOutcome(ClusterA, err)
-
-		return err
-	}
-
-	// Dual-cluster mode below.
-
-	selectedCluster := rt.cluster
-
-	// When override is NOT active, apply drain-aware selection (existing behavior)
-	if !rt.snap.active {
-		drainA, drainB := c.getDrainStates()
-		if c.clusterIsDraining(selectedCluster, drainA, drainB) {
-			alt := c.alternativeCluster(selectedCluster)
-			if !c.clusterIsDraining(alt, drainA, drainB) {
-				selectedCluster = alt
-			}
-			// If both are draining, proceed with original selection (best effort)
-		}
-	}
-
-	// Try primary selection.
-	session := c.getSession(selectedCluster)
-	start := time.Now()
-	err := readFunc(ctx, session)
-	elapsed := time.Since(start).Seconds()
-
-	c.config.Metrics.IncReadTotal(selectedCluster)
-	c.config.Metrics.ObserveReadDuration(selectedCluster, elapsed)
-
-	if err == nil {
-		c.recordReadSuccess(selectedCluster, elapsed, rt.snap.active)
-		c.recordOpOutcome(selectedCluster, nil)
+	if res.err == nil {
+		c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
+		c.recordOpOutcome(res.selected, nil)
 		return nil
 	}
 
-	// Not-found is NOT a health signal — the cluster responded correctly.
-	if types.IsNotFound(err) {
-		// recordOpOutcome handles the ErrNotFound exclusion internally,
-		// but we don't actually need to call it here — not-found is
-		// neither success nor failure for auto-refresh purposes.
-		if opts.fallbackRead {
-			return c.executeFallbackRead(ctx, rt.snap, selectedCluster, readFunc)
+	// Data sentinels (ErrNotFound, ErrRowLimitExceeded) are not health
+	// signals — the cluster responded correctly. Only ErrNotFound triggers
+	// FallbackRead empty-retry, and only in dual-cluster mode (single-
+	// cluster has no alternative session).
+	if isReadTerminalNonHealth(res.err) {
+		if types.IsNotFound(res.err) && opts.fallbackRead && !c.IsSingleCluster() {
+			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc)
 		}
-		return err
+		return res.err
 	}
 
-	// Real error path: record failure and potentially failover.
-	c.config.Metrics.IncReadError(selectedCluster)
-	c.recordOpOutcome(selectedCluster, err)
+	// Real error path: record IncReadError + recordOpOutcome here, but
+	// leave RecordFailure to the failover branch so it is called exactly
+	// once across the two layers.
+	c.config.Metrics.IncReadError(res.selected)
+	c.recordOpOutcome(res.selected, res.err)
 
-	if rt.snap.active {
-		return c.executeOverrideFailover(ctx, rt, err, readFunc)
+	// Single-cluster real-error has no failover target; preserve today's
+	// fast-path behavior (return the error without calling RecordFailure).
+	if c.IsSingleCluster() {
+		return res.err
 	}
 
-	return c.executeNormalFailover(ctx, selectedCluster, err, readFunc)
+	if res.target.snap.active {
+		return c.executeOverrideFailover(ctx, res.target, res.err, readFunc)
+	}
+
+	return c.executeNormalFailover(ctx, res.selected, res.err, readFunc)
+}
+
+// executeReadNoFailover wraps runPrimaryRead with full terminal-signal
+// recording but never enters standard failover. Used by paged slice reads
+// where re-running the readFunc on the alternative would leak an opaque
+// PageState cursor or (for SliceScan) re-invoke the caller's scanFn after
+// partial accumulator mutation.
+//
+// On a real primary error, executeReadNoFailover records IncReadError,
+// recordOpOutcome, AND FailoverPolicy.RecordFailure (in dual-cluster mode)
+// so per-cluster health stays consistent with executeRead's failover path.
+// The returned error is the primary's error verbatim.
+//
+// opts.fallbackRead is honored; single-cluster mode skips the fallback
+// invocation and returns the primary error directly.
+func (c *CQLClient) executeReadNoFailover(
+	ctx context.Context,
+	opts readOptions,
+	readFunc func(context.Context, cql.Session) error,
+) error {
+	res := c.runPrimaryRead(ctx, opts, readFunc)
+	if !res.attempted {
+		return res.err
+	}
+
+	if res.err == nil {
+		c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
+		c.recordOpOutcome(res.selected, nil)
+		return nil
+	}
+
+	if isReadTerminalNonHealth(res.err) {
+		if types.IsNotFound(res.err) && opts.fallbackRead && !c.IsSingleCluster() {
+			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc)
+		}
+		return res.err
+	}
+
+	// Real error path: record ALL terminal signals here because there is
+	// no failover branch to claim ownership of RecordFailure. RecordFailure
+	// is gated on dual-cluster + a configured FailoverPolicy to preserve
+	// today's single-cluster behavior (no RecordFailure when there is no
+	// alternative cluster to fail over to).
+	c.config.Metrics.IncReadError(res.selected)
+	c.recordOpOutcome(res.selected, res.err)
+	if !c.IsSingleCluster() && c.config.FailoverPolicy != nil {
+		c.config.FailoverPolicy.RecordFailure(res.selected)
+	}
+
+	return res.err
 }
 
 // executeOverrideFailover handles failover when an AllowedClusters override is active.
@@ -2025,7 +2197,12 @@ func (c *CQLClient) tryFallbackCluster(
 		return nil
 	}
 
-	if types.IsNotFound(err) {
+	// Data sentinels (ErrNotFound, ErrRowLimitExceeded) propagate as-is —
+	// neither describes a cluster fault, so we do not record health and we
+	// do not wrap them in DualClusterError. ErrRowLimitExceeded reaching
+	// this site means the failover cluster also exceeded the application
+	// cap; the caller wants to see that, not a wrapped two-cluster error.
+	if isReadTerminalNonHealth(err) {
 		return err
 	}
 
@@ -2101,6 +2278,16 @@ func (c *CQLClient) executeFallbackRead(
 		c.config.Logger.Debug("fallback read: alternative cluster also returned not-found",
 			"cluster", c.clusterName(alternativeCluster),
 		)
+		return err
+	}
+
+	// ErrRowLimitExceeded is an application-level cap, not a cluster fault.
+	// Propagate as-is: no IncReadError, no recordOpOutcome failure, no
+	// RecordFailure. Suppressing it to ErrNotFound would silently truncate
+	// when the partition genuinely contains more rows than MaxRows. The
+	// primary's empty-result already triggered fallback, so the alt is the
+	// one that overflowed — surface it.
+	if errors.Is(err, types.ErrRowLimitExceeded) {
 		return err
 	}
 
@@ -2330,7 +2517,7 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 		return &errorIter{err: types.ErrSessionClosed}
 	}
 
-	rt := q.client.resolveReadTarget(ctx)
+	rt := q.client.resolveReadTarget(ctx, readOptions{})
 	if rt.err != nil {
 		return &errorIter{err: rt.err}
 	}
@@ -2579,7 +2766,7 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 
 	ts := b.getTimestamp()
 
-	rt := b.client.resolveReadTarget(ctx)
+	rt := b.client.resolveReadTarget(ctx, readOptions{})
 	if rt.err != nil {
 		return &errorIter{err: rt.err}
 	}

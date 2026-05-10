@@ -2418,7 +2418,7 @@ func BenchmarkResolveReadTarget_OverrideActive(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		rt := client.resolveReadTarget(ctx)
+		rt := client.resolveReadTarget(ctx, readOptions{})
 		if rt.err != nil {
 			b.Fatal(rt.err)
 		}
@@ -2441,7 +2441,7 @@ func BenchmarkResolveReadTarget_NoOverride(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		rt := client.resolveReadTarget(ctx)
+		rt := client.resolveReadTarget(ctx, readOptions{})
 		if rt.err != nil {
 			b.Fatal(rt.err)
 		}

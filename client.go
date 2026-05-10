@@ -55,6 +55,18 @@ const (
 
 var ErrNotFound = types.ErrNotFound
 
+// ErrRowLimitExceeded is the sentinel returned by bounded multi-row reads
+// (SliceMap / SliceScan with MaxRows or Config.DefaultMaxRows) when the
+// underlying iterator yields more rows than the configured cap.
+//
+// Like [ErrNotFound], it is application-level, not a cluster fault: Helix
+// never records it as a read error, never advances circuit-breaker /
+// auto-refresh state, and never triggers FallbackRead empty-retry. The error
+// is propagated to the caller as-is across both clusters.
+//
+// See [types.ErrRowLimitExceeded].
+var ErrRowLimitExceeded = types.ErrRowLimitExceeded
+
 // Sentinel errors for strict write paths.
 var (
 	// ErrClusterDegraded is returned by a Strict() write when a cluster is
@@ -103,6 +115,13 @@ func IsPartialWrite(err error) bool {
 // See [types.IsNotFound] for details.
 func IsNotFound(err error) bool {
 	return types.IsNotFound(err)
+}
+
+// IsRowLimitExceeded reports whether err represents a row-limit-exceeded
+// result from a bounded multi-row read. See [types.IsRowLimitExceeded] for
+// details.
+func IsRowLimitExceeded(err error) bool {
+	return types.IsRowLimitExceeded(err)
 }
 
 type fallbackReadKey struct{}

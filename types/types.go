@@ -394,6 +394,19 @@ var (
 	//
 	// Use [IsNotFound] to check for this error, or errors.Is(err, ErrNotFound).
 	ErrNotFound = errors.New("helix: not found")
+
+	// ErrRowLimitExceeded indicates that a bounded multi-row read exceeded
+	// its row limit (per-query MaxRows or Config.DefaultMaxRows).
+	//
+	// This is an application-level cap, not a cluster fault. Like [ErrNotFound],
+	// it is NOT treated as a cluster health failure: Helix never records it
+	// as a read error, never advances circuit-breaker / auto-refresh state,
+	// and never triggers FallbackRead empty-retry. It is propagated to the
+	// caller as-is across both clusters, including the FallbackRead alt path.
+	//
+	// Use [IsRowLimitExceeded] to check for this error, or
+	// errors.Is(err, ErrRowLimitExceeded).
+	ErrRowLimitExceeded = errors.New("helix: row limit exceeded")
 )
 
 // IsNotFound reports whether err is a "not found" result.
@@ -403,6 +416,13 @@ var (
 // maps the driver-specific error to this sentinel.
 func IsNotFound(err error) bool {
 	return errors.Is(err, ErrNotFound)
+}
+
+// IsRowLimitExceeded reports whether err is a row-limit-exceeded result.
+//
+// Returns true for [ErrRowLimitExceeded] and any error wrapping it.
+func IsRowLimitExceeded(err error) bool {
+	return errors.Is(err, ErrRowLimitExceeded)
 }
 
 // ClusterError wraps an error from a specific cluster.
