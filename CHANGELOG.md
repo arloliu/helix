@@ -1,4 +1,4 @@
-# Changelog
+#
 
 All notable changes to this project will be documented in this file.
 
@@ -6,6 +6,126 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.5.0] — 2026-05-11
+
+### Breaking Changes
+
+#### Interface additions (compile-time)
+
+The following methods were added to exported interfaces. **Custom implementations
+must be updated to compile.**
+
+| Interface | New methods | Purpose |
+|---|---|---|
+| `helix.Query` / `adapter/cql.Query` | `MaxRows(n int) Query` | Per-query row cap for slice methods |
+| `helix.Query` / `adapter/cql.Query` | `SliceMap() ([]map[string]any, error)` | Bounded multi-row read into maps |
+| `helix.Query` / `adapter/cql.Query` | `SliceMapContext(ctx) ([]map[string]any, error)` | Context-aware variant of `SliceMap` |
+| `helix.Query` / `adapter/cql.Query` | `SliceScan(fn func(RowScanner) error) (int, error)` | Bounded multi-row read via callback |
+| `helix.Query` / `adapter/cql.Query` | `SliceScanContext(ctx, fn func(RowScanner) error) (int, error)` | Context-aware variant of `SliceScan` |
+
+**Migration for `helix.Query` / `adapter/cql.Query` implementors**: Add the
+five new methods. The `testutil.MockQuery` already implements them. For custom
+mocks or decorators, wire through the delegate or return `nil, 0, nil` as a
+no-op stub while migrating.
+
+### Added
+
+- **Slice read methods** (`SliceMap`, `SliceMapContext`, `SliceScan`,
+  `SliceScanContext`) on `Query` and `adapter/cql.Query`: bounded multi-row
+  reads that materialize results into memory before returning. Unlike `Iter`
+  (streaming cursor), slice methods drain the full result set — up to the
+  configured row cap — and support `FallbackRead` empty-retry for recovering
+  partitions lagging behind on one cluster.
+  - `SliceMap` / `SliceMapContext`: returns `[]map[string]any`, one map per row
+    keyed by column name. Zero-row result: `(nil, nil)`.
+  - `SliceScan` / `SliceScanContext`: invokes a callback once per row with a
+    `RowScanner`; returns `(rowCount int, err error)`. Zero-row result:
+    `(0, nil)`. Does not participate in the standard failover path
+    (primary-error → retry secondary); `FallbackRead` empty-retry still applies.
+- **`RowScanner` interface** (`helix`): narrow scan surface passed to
+  `SliceScan` callbacks. Exposes only `Scan(dest ...any) error` — callbacks
+  cannot accidentally advance or close the underlying iterator.
+- **`MaxRows(n int) Query`** method on `Query`: per-query row cap for slice
+  methods. When the (N+1)th row is read, the method aborts with
+  `ErrRowLimitExceeded` and discards the partial accumulator. `MaxRows(0)` on a
+  query clears the per-query override and falls back to `Config.DefaultMaxRows`.
+  Has no effect on `Scan`, `MapScan`, `Iter`, `Exec`, or CAS operations.
+- **`Config.DefaultMaxRows`** and **`WithDefaultMaxRows(n)`**: client-wide
+  default row cap for all slice methods. Unset (0) means no cap — drain is
+  unbounded. Per-query `MaxRows(n>0)` always wins over the client default.
+- **`ErrRowLimitExceeded`** sentinel (root package and `types`) and
+  **`IsRowLimitExceeded`** helper (root package): application-level cap signal,
+  not a cluster fault. Helix never records it as a read error, never advances
+  circuit-breaker / auto-refresh state, and never triggers `FallbackRead`
+  empty-retry. Check with `helix.IsRowLimitExceeded(err)` or
+  `errors.Is(err, helix.ErrRowLimitExceeded)`.
+- **`SliceScanAs[T]`** generic free function (root package): typed helper
+  layered over `SliceScanContext` that returns `[]T` instead of using a
+  side-effecting accumulator. Returns `(nil, nil)` on empty drain; returns
+  `(nil, err)` on any error without exposing the partial accumulator. All
+  `Query` options — `FallbackRead`, `MaxRows`, `PageState`, etc. — apply
+  transparently through the underlying `SliceScanContext` call. Use `SliceScan`
+  directly when partial results on error are required.
+- **FallbackRead extended to slice methods**: `FallbackRead()` on
+  `SliceMap`/`SliceScan` retries the query against the alternative cluster when
+  the primary returns zero rows. Slice-specific behaviors differ from
+  `Scan`/`MapScan`: zero-row results return `(nil, nil)` / `(0, nil)` rather
+  than `ErrNotFound`; when the alternative cluster is draining, the fallback
+  attempt is skipped rather than reading from a cluster in transition.
+- **Page-size clamp**: when `MaxRows` is active, Helix clamps the gocql page
+  size to `min(pageSize, maxRows)` before issuing the first request, preventing
+  over-fetching on large partitions with small caps.
+
+### Bug Fixes
+
+- **User-callback `ErrNotFound` incorrectly treated as slice empty-signal**: A
+  `SliceScan` callback that deliberately returns `types.ErrNotFound` (e.g., to
+  signal a malformed row) was misinterpreted by the FallbackRead pipeline as an
+  empty-drain signal, triggering a spurious retry against the alternative
+  cluster. The callback's `ErrNotFound` is now propagated as a real error and
+  never treated as an empty-row indicator.
+- **Single-cluster success-path policy gating regression**: A pre-refactor guard
+  that invoked `OnSuccess` / `OnFailure` on the read strategy only for
+  dual-cluster reads was accidentally dropped during the slice-read
+  restructuring. Single-cluster reads now correctly advance strategy state on
+  both success and failure paths.
+
+### Documentation
+
+- `docs/slice-read.md`: new guide covering all four slice methods, `MaxRows`
+  semantics, page-size clamping, `FallbackRead` integration, `SliceScanAs[T]`,
+  error handling table, and a method-selection guide.
+- `docs/fallback-read.md`: updated to document slice-method integration —
+  empty-result shape, drain-aware skip, and the full availability table for all
+  affected read methods.
+- Stale API references in `docs/mirror.md`, `docs/adaptive-dual-write.md`, and
+  `docs/replay-system.md` corrected to match current exported symbols.
+
+### Tests
+
+- 94 unit tests across 6 test files covering slice method correctness, `MaxRows`
+  bounding, page-size clamping, FallbackRead empty-retry on slice paths,
+  drain-skip, `ErrRowLimitExceeded` classification (no failover, no health
+  impact), `SliceScanAs[T]`, and nil-callback guards.
+- 7 integration tests in `test/integration/cql_slice_read_integration_test.go`
+  against real Cassandra clusters: `SliceMap`, `SliceScan`, `SliceScanAs`,
+  `MaxRows` cap enforcement, `FallbackRead` multi-row recovery, `DefaultMaxRows`
+  inheritance, and both-empty short-circuit.
+- 5 e2e tests in `test/e2e/cql/slice_read_test.go`: container-level chaos
+  covering slice read under partial cluster failure, `FallbackRead` divergence
+  recovery, and `MaxRows` propagation through real gocql page boundaries.
+
+### Internal
+
+- **Two-layer read helper extracted**: the shared coordinator for primary-read
+  then optional FallbackRead empty-retry was factored out of the single-row
+  (`Scan`/`MapScan`) path to serve both the single-row and slice paths without
+  duplication.
+- **`go fix` modernizations**: applied `go fix` across the entire codebase to
+  adopt current Go idioms (loop-variable capture, `any` aliases, etc.).
+- **golangci-lint v2.12.2 compatibility**: lint errors for the updated linter
+  version resolved; additional valuable rules enabled post-audit.
 
 ## [1.4.0] — 2026-05-10
 
