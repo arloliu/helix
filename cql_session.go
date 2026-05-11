@@ -191,10 +191,11 @@ type Query interface {
 	// of whether FallbackRead is set. FallbackRead only controls whether
 	// a second cluster is attempted after a not-found.
 	//
-	// FallbackRead only applies to Scan, ScanContext, MapScan, and MapScanContext.
-	// It has no effect on Iter, Exec, or CAS operations. Iter returns a streaming
-	// cursor where "no rows" is an empty iteration with nil error — there is no
-	// not-found signal to trigger a fallback.
+	// FallbackRead applies to Scan, ScanContext, MapScan, MapScanContext, SliceMap,
+	// SliceMapContext, SliceScan, and SliceScanContext. It has no effect on Iter,
+	// Exec, or CAS operations. Iter returns a streaming cursor where "no rows" is
+	// an empty iteration with nil error — there is no not-found signal to trigger
+	// a fallback.
 	//
 	// Circuit-breaker note: a cluster that consistently lags behind (replay
 	// backlog) will produce many not-found results that are silently recovered

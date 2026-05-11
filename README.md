@@ -195,6 +195,15 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 
 Use `helix.IsNotFound(err)` to check results. See [FallbackRead Guide](docs/fallback-read.md) for availability semantics, activation levels, and best practices.
 
+**Multi-row reads** — `SliceMap`, `SliceScan`, and `SliceScanAs[T]` collect all rows into memory and also participate in FallbackRead:
+
+```go
+rows, err := client.Query("SELECT * FROM orders WHERE user = ?", userID).
+    FallbackRead().MaxRows(1_000).SliceMapContext(ctx)
+```
+
+See [Slice Read Guide](docs/slice-read.md) for all methods, `MaxRows` configuration, the typed `SliceScanAs[T]` helper, and performance notes.
+
 ## Replay System
 
 Helix provides two replay implementations for handling partial write failures:
@@ -320,6 +329,7 @@ See the [examples](examples/) directory:
 - [Strategy & Policy](docs/strategy-policy.md) — Read/write strategies, failover policies, and `AllowedClusters` operator override
 - [Replay System](docs/replay-system.md) — Queue implementations, replay patterns, and worker configuration
 - [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) — Latency-aware write strategy: degradation thresholds, fire-and-forget, and recovery probe
+- [Slice Read Guide](docs/slice-read.md) — Bounded multi-row reads: `SliceMap`, `SliceScan`, `MaxRows`, and `SliceScanAs[T]`
 - [FallbackRead Guide](docs/fallback-read.md) — Best-effort dual-cluster reads for critical read-after-write scenarios
 - [Strict Write Guide](docs/strict-write.md) — Replay-unsafe writes: counters, list/set append, tombstone races
 - [Mirror Guide](docs/mirror.md) — Async per-statement mirroring for seamless cluster migrations

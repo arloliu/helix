@@ -115,9 +115,9 @@ type ClientConfig struct {
 	// See [AllowedClustersFunc] for return-value semantics.
 	AllowedClusters AllowedClustersFunc
 
-	// DefaultFallbackRead enables FallbackRead for every Scan and MapScan query
-	// on this client when true. Equivalent to calling [Query.FallbackRead] on
-	// every query.
+	// DefaultFallbackRead enables FallbackRead for every eligible query on this
+	// client when true. Equivalent to calling [Query.FallbackRead] on every query.
+	// See [Query.FallbackRead] for the full list of eligible methods.
 	//
 	// FallbackRead is best-effort: if the alternative cluster is unreachable,
 	// callers receive [ErrNotFound] (not the network error). See
@@ -820,8 +820,9 @@ func WithAllowedClusters(fn AllowedClustersFunc) Option {
 	}
 }
 
-// WithDefaultFallbackRead enables FallbackRead for all Scan and MapScan queries
-// on this client when enabled is true.
+// WithDefaultFallbackRead enables FallbackRead for all eligible queries on this
+// client when enabled is true. See [Query.FallbackRead] for the full list of
+// eligible methods and per-method semantics.
 //
 // When true, every query executed on this client behaves as if [Query.FallbackRead]
 // was called on it: a not-found result on the selected cluster triggers a silent

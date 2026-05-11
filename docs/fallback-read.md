@@ -22,12 +22,14 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
 ## How It Works
 
 ```
-           ┌──────────────────────────┐
-           │  Query.FallbackRead()    │
-           │  .Scan(&dest)            │
-           └────────────┬─────────────┘
-                        │
-                        ▼
+           ┌─────────────────────────────────────────────┐
+           │  Query.FallbackRead()                       │
+           │  .Scan(&dest)  /  .SliceMapContext(ctx)     │
+           │                /  .SliceScanContext(ctx, fn)│
+           │                   (and non-Context variants)│
+           └──────────────────┬──────────────────────────┘
+                              │
+                              ▼
            ┌──────────────────────────┐
            │  ReadStrategy.Select()   │
            │  → selectedCluster (A)   │
@@ -40,38 +42,96 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
                         │
               ┌─────────┼─────────┐
               │         │         │
-           success   not-found   error
+           success   empty†    error
               │         │         │
               ▼         ▼         ▼
            return    try B     normal failover
            nil       (below)   path (no change)
                         │
                         ▼
-           ┌──────────────────────────┐
-           │  Read from cluster B     │
-           │  (bypasses drain state)  │
-           └────────────┬─────────────┘
+           ┌──────────────────────────────────────────┐
+           │  Read from cluster B                     │
+           │  (bypasses drain state; SliceMap /       │
+           │   SliceScan skip if alt is draining)     │
+           └────────────┬─────────────────────────────┘
                         │
               ┌─────────┼─────────┐
               │         │         │
-           success   not-found   error
+           success   empty†    error
               │         │         │
               ▼         ▼         ▼
            return    return    return
-           nil +     ErrNot-   ErrNotFound
-           diverge   Found     (primary's
+           nil +     empty†    ErrNotFound
+           diverge   result    (primary's
            metric              healthy answer)
 ```
+
+† *Empty signal by method:* `Scan`/`MapScan` emit `ErrNotFound`; `SliceMap`/`SliceScan` return zero rows with nil error. See "Slice Methods" for the full both-empty result shapes.
 
 **Key behaviors:**
 
 - FallbackRead is CQL-only. It is exposed on `helix.Query` returned by `helix.CQLClient`; raw adapter sessions do not support it.
-- FallbackRead only applies to `Scan`, `ScanContext`, `MapScan`, and `MapScanContext`. It has no effect on `Iter` (streaming cursors have no not-found signal) or `Exec` (write operations).
+- FallbackRead applies to `Scan`, `ScanContext`, `MapScan`, `MapScanContext`, `SliceMap`, `SliceMapContext`, `SliceScan`, and `SliceScanContext`. It has no effect on `Iter` (streaming cursors have no not-found signal) or `Exec` (write operations).
 - Not-found is never treated as a cluster failure. It never triggers `IncReadError`, `RecordFailure`, or failover — regardless of whether FallbackRead is enabled.
 - When the primary returns a real error (timeout, connection refused), the normal failover path handles it. FallbackRead only activates on not-found.
 - FallbackRead bypasses drain state: the caller opted in to checking both clusters, and a draining cluster may still hold the data.
 - The fallback attempt reuses the same statement, bound values, and query options on the alternative cluster.
 - Both attempts share the same context and deadline. FallbackRead does not create a fresh timeout for the second read.
+
+## Slice Methods
+
+> For general slice-method usage, MaxRows configuration, `SliceScanAs[T]`, and performance notes, see the [Slice Read Guide](slice-read.md). This section covers only the FallbackRead-specific behaviors.
+
+FallbackRead works with all four bounded multi-row read methods — `SliceMap`, `SliceMapContext`, `SliceScan`, and `SliceScanContext` — with two behavioral differences from `Scan`/`MapScan`:
+
+**Empty-result shape.** When both clusters return zero rows, slice methods return a clean empty rather than `ErrNotFound`:
+
+| Method | Both-empty result |
+|--------|-------------------|
+| `Scan` / `MapScan` | `ErrNotFound` |
+| `SliceMap` / `SliceMapContext` | `(nil, nil)` |
+| `SliceScan` / `SliceScanContext` | `(0, nil)` |
+
+**Drain-aware skip on alt.** When the alternative cluster is currently draining, `Scan`/`MapScan` still attempt it. Slice methods skip the alternative: a draining cluster cannot provide a consistent paged result, so falling back would risk returning a partial page from the wrong origin.
+
+### MaxRows and overflow
+
+`MaxRows` (or `Config.DefaultMaxRows`) caps the number of rows admitted by slice methods. When the (N+1)th row is read, the method aborts with `ErrRowLimitExceeded` and discards the partial accumulator. FallbackRead does not retry on `ErrRowLimitExceeded` — the limit was hit on the primary, which successfully returned data.
+
+```go
+rows, err := client.Query("SELECT * FROM users WHERE org = ?", orgID).
+    FallbackRead().
+    MaxRows(10_000).
+    SliceMapContext(ctx)
+if helix.IsRowLimitExceeded(err) {
+    // Primary returned > 10,000 rows — partition too large for one call.
+    // Paginate or narrow the query.
+}
+```
+
+### When to use which read method
+
+| Scenario | Method | Why |
+|----------|--------|-----|
+| Single-row lookup | `Scan` / `MapScan` | Simple; `ErrNotFound` when absent |
+| Bounded multi-row, fallback wanted | `SliceMap` / `SliceScan` | Collects all rows; FallbackRead recovers missing partitions |
+| Strongly-typed slice | `SliceScanAs[T]` | Generic wrapper over `SliceScan`; all options apply transparently |
+| Streaming or unbounded | `Iter` | No FallbackRead; use when missing rows are tolerable |
+
+### Not-found on slice methods
+
+`errors.Is(err, helix.ErrNotFound)` will never return `true` for slice methods. An empty result is `(nil, nil)` / `(0, nil)`, not an error. Check for an empty slice or zero row count instead:
+
+```go
+rows, err := client.Query("SELECT * FROM orders WHERE user = ?", userID).
+    FallbackRead().SliceMapContext(ctx)
+if err != nil {
+    return nil, fmt.Errorf("read failed: %w", err)
+}
+if len(rows) == 0 {
+    return nil, ErrOrderNotFound  // no rows on either cluster
+}
+```
 
 ## Activation Levels
 
@@ -183,6 +243,12 @@ If the primary cluster has an older version of the row (e.g., `status = 'pending
 
 FallbackRead also does **not** repair the stale or missing cluster on read. A fallback hit emits a divergence metric, but convergence still depends on the replay system.
 
+### Partial-replication blind spot
+
+For slice methods, FallbackRead only recovers the **entire-partition-missing** case: the primary returned zero rows and the alternative has the full partition. It does not recover row-level partial state. If the primary has *some* rows for a partition (e.g., 40 out of 50) and the alternative has the complete set, the primary's partial result is returned — FallbackRead does not activate because the primary's result was non-empty.
+
+If row-level completeness is critical, the replay system must converge the clusters before the read rather than relying on FallbackRead to compensate at read time.
+
 ## Best Practices
 
 1. **Separate clients for different data tiers.** Create one client with `WithDefaultFallbackRead(true)` for critical data (user profiles, orders, sessions) and another without it for bulk data (events, metrics, logs). This is cleaner than per-query opt-in when entire services operate on one data tier.
@@ -191,7 +257,7 @@ FallbackRead also does **not** repair the stale or missing cluster on read. A fa
 
 3. **FallbackRead does not replace the replay system.** FallbackRead is a read-time safety net; replay is the write-time convergence mechanism. Without replay, FallbackRead may recover reads temporarily but the clusters will not converge.
 
-4. **Do not use FallbackRead with `Iter`.** Iterators return a streaming cursor where "no rows" is an empty iteration with nil error — there is no not-found signal to trigger a fallback. For multi-row queries where completeness matters, query both clusters explicitly.
+4. **Do not use FallbackRead with `Iter`.** Iterators return a streaming cursor where "no rows" is an empty iteration with nil error — there is no not-found signal to trigger a fallback. For bounded multi-row queries where completeness matters, use `SliceMap` or `SliceScan` instead — they collect all rows (up to MaxRows) into memory and participate in FallbackRead.
 
 5. **Understand the partial-outage trade-off.** When one cluster is down and the other says not-found, FallbackRead returns `ErrNotFound` to preserve availability. In the common case the row genuinely doesn't exist. In the rare case where the row exists only on the unreachable cluster, this is a false negative. If this is unacceptable for your use case, implement application-level retry with backoff — the down cluster may recover between attempts.
 

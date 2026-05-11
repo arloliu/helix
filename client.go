@@ -126,8 +126,9 @@ func IsRowLimitExceeded(err error) bool {
 
 type fallbackReadKey struct{}
 
-// WithFallbackRead returns a context that enables FallbackRead for all Scan
-// and MapScan queries executed with this context.
+// WithFallbackRead returns a context that enables FallbackRead for all eligible
+// queries executed with this context. See [Query.FallbackRead] for the full
+// list of eligible methods and per-method semantics.
 //
 // Per-query FallbackRead() takes precedence over context-level enabling.
 // Client-level WithDefaultFallbackRead(true) is overridden by either.
