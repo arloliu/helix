@@ -174,6 +174,7 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 			//
 			// Use the authoritative signal — A's row count — instead.
 			require.NoError(t, a.Unpause(ctx))
+			waitForReconnect(t, a, d.name)
 
 			converged := waitFor(60*time.Second, 200*time.Millisecond, func() bool {
 				return countRows(t, a, table) == int(written.Load())
