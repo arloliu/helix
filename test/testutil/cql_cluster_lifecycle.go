@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"time"
 
+	gocqlv2 "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/gocql/gocql"
 	"github.com/moby/moby/client"
 	"github.com/testcontainers/testcontainers-go"
 )
+
+const reconnectRetryInterval = 500 * time.Millisecond
 
 // container returns the underlying testcontainers.Container, abstracting over
 // the Scylla and Cassandra module wrappers.
@@ -215,19 +219,52 @@ func (c *CQLCluster) Reconnect(ctx context.Context) error {
 		c.SessionV2 = nil
 	}
 
-	session, err := createCQLSession(host, c.keyspace, c.sessionTimeout, c.connectTimeout, c.reconnectInterval)
+	session, sessionV2, err := c.rebuildSessionsWithRetry(ctx, host)
 	if err != nil {
-		return fmt.Errorf("rebuild v1 session: %w", err)
-	}
-	sessionV2, err := createCQLSessionV2(host, c.keyspace, c.sessionTimeout, c.connectTimeout)
-	if err != nil {
-		session.Close()
-		return fmt.Errorf("rebuild v2 session: %w", err)
+		return err
 	}
 	c.Session = session
 	c.SessionV2 = sessionV2
 
 	return nil
+}
+
+func (c *CQLCluster) rebuildSessionsWithRetry(
+	ctx context.Context,
+	host string,
+) (*gocql.Session, *gocqlv2.Session, error) {
+	var lastErr error
+
+	for {
+		session, err := createCQLSession(host, c.keyspace, c.sessionTimeout, c.connectTimeout, c.reconnectInterval)
+		if err == nil {
+			sessionV2, v2Err := createCQLSessionV2(host, c.keyspace, c.sessionTimeout, c.connectTimeout)
+			if v2Err == nil {
+				return session, sessionV2, nil
+			}
+
+			session.Close()
+			lastErr = fmt.Errorf("rebuild v2 session: %w", v2Err)
+		} else {
+			lastErr = fmt.Errorf("rebuild v1 session: %w", err)
+		}
+
+		if waitErr := waitForRetry(ctx, reconnectRetryInterval); waitErr != nil {
+			return nil, nil, fmt.Errorf("%w: %w", lastErr, waitErr)
+		}
+	}
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // RefreshHost re-resolves the container's connection host. If the testcontainers
