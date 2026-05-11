@@ -2400,6 +2400,24 @@ func (c *CQLClient) executeFallbackRead(
 // recoverable runtime condition.
 var errNilSliceScanFn = errors.New("helix: scanFn must not be nil")
 
+// scanFnNotFoundShieldError wraps a user-returned types.ErrNotFound (or any error
+// wrapping it) so the read-pipeline wrappers cannot misclassify it as the
+// synthetic "drained 0 rows" signal. Without this shield, types.IsNotFound
+// at executeRead / executeReadNoFailover (cql_client.go:2031, :2098) would
+// trigger an empty-retry against the alt session, and the SliceScanContext
+// boundary translation (cql_client.go:2949) would silently translate the
+// caller's error to (0, nil).
+//
+// Deliberately omits Unwrap/Is — that breaks errors.Is(shield, ErrNotFound)
+// throughout the internal pipeline. SliceScanContext unwraps the shield
+// before returning, so callers' errors.Is(err, types.ErrNotFound) checks
+// still match.
+type scanFnNotFoundShieldError struct {
+	err error
+}
+
+func (e *scanFnNotFoundShieldError) Error() string { return e.err.Error() }
+
 // rowScannerAdapter narrows a driver [cql.Scanner] down to the public
 // [RowScanner] surface (Scan only). Helix's counted-drain loop owns Next()
 // and Err()/Close(); exposing them through the user callback would let a
@@ -2914,7 +2932,16 @@ func (q *cqlQuery) SliceScanContext(
 	var scanFnInvokedOnAlt bool
 	wrapped := func(r RowScanner) error {
 		scanFnInvokedOnAlt = true
-		return scanFn(r)
+		cberr := scanFn(r)
+		// Shield a user-returned types.ErrNotFound (and any error wrapping it)
+		// from the read-pipeline's empty-retry classification — otherwise the
+		// caller's intentional ErrNotFound would be mistaken for the synthetic
+		// "drained 0 rows" signal and silently translated to (0, nil).
+		if cberr != nil && types.IsNotFound(cberr) {
+			return &scanFnNotFoundShieldError{err: cberr}
+		}
+
+		return cberr
 	}
 	readFunc := func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
@@ -2948,6 +2975,13 @@ func (q *cqlQuery) SliceScanContext(
 	}
 
 	err := q.client.executeReadNoFailover(ctx, opts, readFunc)
+	var shielded *scanFnNotFoundShieldError
+	if errors.As(err, &shielded) {
+		// Unwrap the user-callback ErrNotFound the shield carried through
+		// the pipeline. Caller's errors.Is(err, types.ErrNotFound) matches
+		// the unwrapped value.
+		return rowCount, shielded.err
+	}
 	if err != nil && types.IsNotFound(err) {
 		// rowCount is zero by construction: synthetic ErrNotFound only
 		// fires when the drain produced no rows, and executeFallbackRead

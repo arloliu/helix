@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/arloliu/helix/types"
@@ -363,6 +364,136 @@ func TestSliceScan_PrimaryEmpty_AltDraining_SkipsAltAndReturnsZeroNil(t *testing
 
 	assert.Equal(t, int32(0), sb.iterCtxCalls.Load(), "alt MUST NOT be contacted when draining")
 	assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterB))
+}
+
+// ─────────────────────────────────────────────
+// Phase 4 fix: user-callback ErrNotFound must not be misclassified as the
+// synthetic "drained 0 rows" signal. Without the scanFnNotFoundShieldError, the
+// pipeline would silently translate the caller's intentional ErrNotFound
+// to (0, nil) (single-cluster) or invoke fallback (dual-cluster).
+// ─────────────────────────────────────────────
+
+func TestSliceScan_ScanFnReturnsErrNotFound_PropagatesToCallerSingleCluster(t *testing.T) {
+	spec := &sliceSpec{cols: []string{"id"}, rows: rowsOf([]any{1})}
+	met := newReadTestMetrics()
+	client, _ := newSingleSliceClient(t, spec)
+	_ = met // single-cluster has no failover policy
+
+	rowCount, err := client.Query("SELECT id FROM t").SliceScanContext(
+		context.Background(), func(_ RowScanner) error { return types.ErrNotFound })
+	require.ErrorIs(t, err, types.ErrNotFound,
+		"user scanFn returning ErrNotFound must reach the caller, NOT be silently swallowed to (0, nil)")
+	assert.Zero(t, rowCount)
+}
+
+func TestSliceScan_ScanFnReturnsWrappedErrNotFound_PropagatesToCaller(t *testing.T) {
+	spec := &sliceSpec{cols: []string{"id"}, rows: rowsOf([]any{1})}
+	client, _ := newSingleSliceClient(t, spec)
+
+	wrapped := fmt.Errorf("custom message: %w", types.ErrNotFound)
+	rowCount, err := client.Query("SELECT id FROM t").SliceScanContext(
+		context.Background(), func(_ RowScanner) error { return wrapped })
+	require.ErrorIs(t, err, types.ErrNotFound,
+		"wrapped ErrNotFound (errors.Is match in chain) must also be shielded and propagated")
+	assert.Contains(t, err.Error(), "custom message",
+		"the caller's wrapped error including its custom message must survive the shield round-trip")
+	assert.Zero(t, rowCount)
+}
+
+func TestSliceScan_ScanFnReturnsErrNotFound_DualCluster_DoesNotInvokeAlt(t *testing.T) {
+	specA := &sliceSpec{cols: []string{"id"}, rows: rowsOf([]any{1})}
+	specB := &sliceSpec{cols: []string{"id"}, rows: rowsOf([]any{9})}
+	met := newReadTestMetrics()
+	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
+	client, _, sb := newSliceClient(t, specA, specB,
+		WithMetrics(met),
+		WithFailoverPolicy(policy),
+	)
+
+	rowCount, err := client.Query("SELECT id FROM t").FallbackRead().SliceScanContext(
+		context.Background(), func(_ RowScanner) error { return types.ErrNotFound })
+	require.ErrorIs(t, err, types.ErrNotFound,
+		"user-callback ErrNotFound is a real scanFn error, not the empty signal — must propagate")
+	assert.Zero(t, rowCount)
+
+	assert.Equal(t, int32(0), sb.iterCtxCalls.Load(),
+		"shield prevents the wrapper from misclassifying the user error as the empty signal; alt must NOT be contacted")
+	assert.Equal(t, int64(1), met.get(met.ReadErrors, ClusterA),
+		"scanFn-returned errors record health on the primary (plan §1547-1549)")
+}
+
+func TestSliceScan_AltScanFnReturnsErrNotFound_PropagatesViaShield(t *testing.T) {
+	specA := &sliceSpec{cols: []string{"id"}} // primary empty → triggers empty-retry
+	specB := &sliceSpec{cols: []string{"id"}, rows: rowsOf([]any{9})}
+	met := newReadTestMetrics()
+	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
+	client, _, _ := newSliceClient(t, specA, specB,
+		WithMetrics(met),
+		WithFailoverPolicy(policy),
+	)
+
+	rowCount, err := client.Query("SELECT id FROM t").FallbackRead().SliceScanContext(
+		context.Background(), func(_ RowScanner) error { return types.ErrNotFound })
+	require.ErrorIs(t, err, types.ErrNotFound,
+		"alt-leg user-callback ErrNotFound must propagate even when scanFnInvokedOnAlt is the trigger")
+	assert.Zero(t, rowCount, "rowCount counts only successful callbacks; the ErrNotFound was returned on the first row")
+
+	assert.Equal(t, int64(1), met.get(met.ReadErrors, ClusterB),
+		"scanFn errors on alt record health on alt (plan §1547-1549)")
+}
+
+// ─────────────────────────────────────────────
+// Phase 4 LOWs from GPT review: single-cluster bypass + SliceScan row-limit
+// ─────────────────────────────────────────────
+
+func TestSliceMap_SingleCluster_FallbackRead_NoOp(t *testing.T) {
+	spec := &sliceSpec{cols: []string{"id"}}
+	client, sa := newSingleSliceClient(t, spec)
+
+	rows, err := client.Query("SELECT id FROM t").FallbackRead().SliceMapContext(context.Background())
+	require.NoError(t, err, "single-cluster empty must return (nil, nil) without trying to fall back")
+	assert.Nil(t, rows)
+	assert.Equal(t, int32(1), sa.iterCtxCalls.Load(), "primary attempted exactly once")
+}
+
+func TestSliceScan_SingleCluster_FallbackRead_NoOp(t *testing.T) {
+	spec := &sliceSpec{cols: []string{"id"}}
+	client, sa := newSingleSliceClient(t, spec)
+
+	rowCount, err := client.Query("SELECT id FROM t").FallbackRead().SliceScanContext(
+		context.Background(), func(_ RowScanner) error {
+			t.Fatal("scanFn must not be invoked")
+			return nil
+		})
+	require.NoError(t, err)
+	assert.Zero(t, rowCount)
+	assert.Equal(t, int32(1), sa.iterCtxCalls.Load())
+}
+
+func TestSliceScan_AltRowLimitExceeded_PropagatesAsIs(t *testing.T) {
+	specA := &sliceSpec{cols: []string{"id"}} // primary empty → triggers empty-retry
+	specB := &sliceSpec{cols: []string{"id"}, rows: rowsOf([]any{1}, []any{2}, []any{3})}
+	met := newReadTestMetrics()
+	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
+	client, _, _ := newSliceClient(t, specA, specB,
+		WithMetrics(met),
+		WithFailoverPolicy(policy),
+	)
+
+	rowCount, err := client.Query("SELECT id FROM t").
+		FallbackRead().
+		MaxRows(2).
+		SliceScanContext(context.Background(), func(r RowScanner) error {
+			var v int
+			return r.Scan(&v)
+		})
+	require.ErrorIs(t, err, types.ErrRowLimitExceeded,
+		"alt's MaxRows overflow propagates unchanged — pre-real-error branch wins over propagateAltErr predicate")
+	assert.Equal(t, 2, rowCount, "rowCount holds the bounded count from alt before the (N+1)th detection")
+
+	assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterB),
+		"row-limit is a data sentinel — no IncReadError on alt")
+	assert.Empty(t, policy.RecordFailureCalls)
 }
 
 // ─────────────────────────────────────────────
