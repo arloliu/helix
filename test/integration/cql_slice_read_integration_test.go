@@ -17,7 +17,6 @@ package integration_test
 
 import (
 	"fmt"
-	"slices"
 	"testing"
 	"time"
 
@@ -26,6 +25,7 @@ import (
 
 	"github.com/arloliu/helix"
 	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
+	cqlv2 "github.com/arloliu/helix/adapter/cql/v2"
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/topology"
@@ -42,6 +42,33 @@ const sliceSeqSchema = `
 		PRIMARY KEY ((bucket), seq)
 	)
 `
+
+// intSliceDriver parameterizes pagination-sensitive tests over the v1 and v2
+// gocql adapters. Data seeding always uses v1 (getSharedSessions); only the
+// helix client session layer differs between drivers.
+type intSliceDriver struct {
+	name       string
+	makeClient func(t *testing.T, opts ...helix.Option) (*helix.CQLClient, error)
+}
+
+var intSliceDrivers = []intSliceDriver{
+	{
+		name: "v1",
+		makeClient: func(t *testing.T, opts ...helix.Option) (*helix.CQLClient, error) {
+			t.Helper()
+			sA, sB := getSharedSessions(t)
+			return helix.NewCQLClient(cqlv1.WrapSession(sA), cqlv1.WrapSession(sB), opts...)
+		},
+	},
+	{
+		name: "v2",
+		makeClient: func(t *testing.T, opts ...helix.Option) (*helix.CQLClient, error) {
+			t.Helper()
+			sA, sB := getSharedSessionsV2(t)
+			return helix.NewCQLClient(cqlv2.NewSession(sA), cqlv2.NewSession(sB), opts...)
+		},
+	},
+}
 
 // =============================================================================
 // FallbackRead: primary empty → alt rows returned
@@ -151,12 +178,14 @@ func TestFallback_SliceMap_BothEmpty_ReturnsNilNil(t *testing.T) {
 	ctx := t.Context()
 	table := createTestTableOnBoth(t, "sr_fb_empty", configTableCQLSchema)
 
+	mc := testutil.NewTestMetricsCollector()
 	client, err := helix.NewCQLClient(
 		cqlv1.WrapSession(sessionA),
 		cqlv1.WrapSession(sessionB),
 		helix.WithReadStrategy(policy.NewStickyRead(
 			policy.WithPreferredCluster(types.ClusterA),
 		)),
+		helix.WithMetrics(mc),
 	)
 	require.NoError(t, err)
 	// Do NOT call client.Close() — shared gocql sessions.
@@ -167,6 +196,11 @@ func TestFallback_SliceMap_BothEmpty_ReturnsNilNil(t *testing.T) {
 
 	require.NoError(t, err, "both clusters empty: must return nil error, not ErrNotFound")
 	assert.Nil(t, rows, "both clusters empty: must return nil slice")
+
+	// Both clusters must have been contacted — proves the fallback leg ran, not
+	// just that the primary happened to return empty without trying the alt.
+	assert.Equal(t, int64(1), mc.ReadTotal[types.ClusterA], "primary must be attempted once")
+	assert.Equal(t, int64(1), mc.ReadTotal[types.ClusterB], "alt must be attempted when primary empty")
 }
 
 // =============================================================================
@@ -178,7 +212,7 @@ func TestSliceMap_MaxRows_Overflow(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	sessionA, sessionB := getSharedSessions(t)
+	sessionA, _ := getSharedSessions(t)
 	ctx := t.Context()
 	table := createTestTableOnBoth(t, "sr_maxrows_overflow", configTableCQLSchema)
 
@@ -189,33 +223,39 @@ func TestSliceMap_MaxRows_Overflow(t *testing.T) {
 				fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)).Exec())
 	}
 
-	client, err := helix.NewCQLClient(
-		cqlv1.WrapSession(sessionA),
-		cqlv1.WrapSession(sessionB),
-	)
-	require.NoError(t, err)
-	// Do NOT call client.Close() — shared gocql sessions.
+	for _, d := range intSliceDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			client, err := d.makeClient(t,
+				helix.WithReadStrategy(policy.NewStickyRead(
+					policy.WithPreferredCluster(types.ClusterA),
+				)),
+			)
+			require.NoError(t, err)
+			// Do NOT call client.Close() — shared gocql sessions.
 
-	rows, err := client.Query(fmt.Sprintf("SELECT key, value FROM %s", table)).
-		MaxRows(3).
-		SliceMapContext(ctx)
+			rows, err := client.Query(fmt.Sprintf("SELECT key, value FROM %s", table)).
+				MaxRows(3).
+				SliceMapContext(ctx)
 
-	assert.Nil(t, rows, "on overflow the partial slice must not be exposed")
-	require.Error(t, err)
-	assert.True(t, helix.IsRowLimitExceeded(err),
-		"must return ErrRowLimitExceeded; got: %v", err)
+			assert.Nil(t, rows, "on overflow the partial slice must not be exposed")
+			require.Error(t, err)
+			assert.True(t, helix.IsRowLimitExceeded(err),
+				"must return ErrRowLimitExceeded; got: %v", err)
+		})
+	}
 }
 
-// TestSliceMap_MaxRows_LargePageSize_StillEnforced verifies that setting a
-// PageSize larger than MaxRows does not bypass the row cap.  The page-size
-// clamp (min(userPageSize, MaxRows+1)) means the driver receives a bounded
-// fetch request, but MaxRows is still enforced end-to-end.
+// TestSliceMap_MaxRows_LargePageSize_StillEnforced verifies end-to-end MaxRows
+// enforcement when a caller sets PageSize larger than MaxRows.  This test does
+// not verify the internal page-size clamp mechanism (which would require a
+// driver-level spy); it verifies only that the overflow contract holds
+// regardless of the PageSize value supplied by the caller.
 func TestSliceMap_MaxRows_LargePageSize_StillEnforced(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	sessionA, sessionB := getSharedSessions(t)
+	sessionA, _ := getSharedSessions(t)
 	ctx := t.Context()
 	table := createTestTableOnBoth(t, "sr_maxrows_clamp", configTableCQLSchema)
 
@@ -225,24 +265,27 @@ func TestSliceMap_MaxRows_LargePageSize_StillEnforced(t *testing.T) {
 				fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)).Exec())
 	}
 
-	client, err := helix.NewCQLClient(
-		cqlv1.WrapSession(sessionA),
-		cqlv1.WrapSession(sessionB),
-	)
-	require.NoError(t, err)
-	// Do NOT call client.Close() — shared gocql sessions.
+	for _, d := range intSliceDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			client, err := d.makeClient(t,
+				helix.WithReadStrategy(policy.NewStickyRead(
+					policy.WithPreferredCluster(types.ClusterA),
+				)),
+			)
+			require.NoError(t, err)
+			// Do NOT call client.Close() — shared gocql sessions.
 
-	// PageSize(1000) is much larger than MaxRows(3).  The clamp prevents the
-	// driver from allocating a huge page, while MaxRows is still enforced.
-	rows, err := client.Query(fmt.Sprintf("SELECT key, value FROM %s", table)).
-		MaxRows(3).
-		PageSize(1000).
-		SliceMapContext(ctx)
+			rows, err := client.Query(fmt.Sprintf("SELECT key, value FROM %s", table)).
+				MaxRows(3).
+				PageSize(1000).
+				SliceMapContext(ctx)
 
-	assert.Nil(t, rows)
-	require.Error(t, err)
-	assert.True(t, helix.IsRowLimitExceeded(err),
-		"large PageSize must not bypass MaxRows; got: %v", err)
+			assert.Nil(t, rows)
+			require.Error(t, err)
+			assert.True(t, helix.IsRowLimitExceeded(err),
+				"[%s] large PageSize must not bypass MaxRows; got: %v", d.name, err)
+		})
+	}
 }
 
 // =============================================================================
@@ -312,95 +355,103 @@ func TestFallback_SliceMap_AltDraining_SkipsAlt(t *testing.T) {
 // Setup:
 //   - 10 rows are seeded on A only; B has none.
 //   - Page 1 is fetched via helix Iter (PageSize=5) to obtain a real pageState.
-//   - Page 2 is fetched via SliceMapContext with that pageState + FallbackRead.
+//   - The rows that would appear on page 2 are deleted from A (so A returns
+//     empty for the continuation), and B is seeded with rows.
+//   - Page 2 is fetched via SliceMapContext with pageState + FallbackRead.
 //
-// Because A has rows on page 2, the metrics assertion (B ReadTotal == 0) is the
-// load-bearing check: it proves FallbackRead was suppressed by the pageState
-// guard, not merely "not needed".
+// With the pageState guard active, FallbackRead is suppressed even though A
+// returns empty and B has rows.  The load-bearing assertions are:
+//   - rows == nil  (A empty, guard prevents B fallback → (nil, nil))
+//   - ReadTotal[B] unchanged  (B was never contacted)
+//
+// If the guard were absent, FallbackRead would fire and B's rows would be
+// returned, causing both assertions to fail.
 func TestSliceMap_PageState_FallbackNotFired(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
 	sessionA, sessionB := getSharedSessions(t)
-	ctx := t.Context()
-	table := createTestTableOnBoth(t, "sr_pagestate", sliceSeqSchema)
 
 	const bucket = 1
 	const total = 10
 	const pageSize = 5
 
-	for i := range total {
-		require.NoError(t,
-			sessionA.Query(
-				fmt.Sprintf("INSERT INTO %s (bucket, seq, val) VALUES (?, ?, ?)", table),
-				bucket, i, fmt.Sprintf("v%d", i),
-			).Exec())
+	for _, d := range intSliceDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			ctx := t.Context()
+			// Each driver gets its own table so per-driver data mutations don't interfere.
+			table := createTestTableOnBoth(t, "sr_pagestate_"+d.name, sliceSeqSchema)
+			stmt := fmt.Sprintf("SELECT seq, val FROM %s WHERE bucket = ?", table)
+
+			// Seed 10 rows on A only; B has none.
+			for i := range total {
+				require.NoError(t,
+					sessionA.Query(
+						fmt.Sprintf("INSERT INTO %s (bucket, seq, val) VALUES (?, ?, ?)", table),
+						bucket, i, fmt.Sprintf("v%d", i),
+					).Exec())
+			}
+
+			mc := testutil.NewTestMetricsCollector()
+			client, err := d.makeClient(t,
+				helix.WithReadStrategy(policy.NewStickyRead(
+					policy.WithPreferredCluster(types.ClusterA),
+				)),
+				helix.WithMetrics(mc),
+			)
+			require.NoError(t, err)
+			// Do NOT call client.Close() — shared gocql sessions.
+
+			// Page 1: consume exactly one page of rows and capture the continuation token.
+			iter := client.Query(stmt, bucket).PageSize(pageSize).IterContext(ctx)
+			var seq int
+			var val string
+			var page1Seqs []int
+			for len(page1Seqs) < pageSize && iter.Scan(&seq, &val) {
+				page1Seqs = append(page1Seqs, seq)
+			}
+			pageState := iter.PageState()
+			require.NoError(t, iter.Close())
+			require.Len(t, page1Seqs, pageSize)
+			require.NotEmpty(t, pageState,
+				"must obtain a non-nil pageState after page 1 (%d rows, PageSize %d)", total, pageSize)
+
+			// Delete the rows that would appear on page 2 from A, so the continuation
+			// query returns empty.  Seed B with rows so that a broken guard would
+			// surface them via FallbackRead.
+			for i := pageSize; i < total; i++ {
+				require.NoError(t,
+					sessionA.Query(
+						fmt.Sprintf("DELETE FROM %s WHERE bucket = ? AND seq = ?", table),
+						bucket, i,
+					).Exec())
+			}
+			for i := range 3 {
+				require.NoError(t,
+					sessionB.Query(
+						fmt.Sprintf("INSERT INTO %s (bucket, seq, val) VALUES (?, ?, ?)", table),
+						bucket, 100+i, fmt.Sprintf("b%d", i),
+					).Exec())
+			}
+
+			prePage2B := mc.ReadTotal[types.ClusterB]
+
+			// Page 2: A returns empty (rows deleted); pageState guard must suppress
+			// FallbackRead → (nil, nil).  If the guard were broken, B's rows would
+			// be returned and the assertions below would fail.
+			rows, err := client.Query(stmt, bucket).
+				PageSize(pageSize).
+				PageState(pageState).
+				FallbackRead().
+				SliceMapContext(ctx)
+
+			require.NoError(t, err)
+			assert.Nil(t, rows,
+				"[%s] pageState guard must suppress FallbackRead; A empty on continuation, B rows must not be returned",
+				d.name)
+			assert.Equal(t, prePage2B, mc.ReadTotal[types.ClusterB],
+				"[%s] pageState guard must prevent alt contact during continuation query", d.name)
+		})
 	}
-
-	mc := testutil.NewTestMetricsCollector()
-	client, err := helix.NewCQLClient(
-		cqlv1.WrapSession(sessionA),
-		cqlv1.WrapSession(sessionB),
-		helix.WithReadStrategy(policy.NewStickyRead(
-			policy.WithPreferredCluster(types.ClusterA),
-		)),
-		helix.WithMetrics(mc),
-	)
-	require.NoError(t, err)
-	// Do NOT call client.Close() — shared gocql sessions.
-
-	stmt := fmt.Sprintf("SELECT seq, val FROM %s WHERE bucket = ?", table)
-
-	// Page 1: consume exactly one page of rows and capture the continuation token.
-	iter := client.Query(stmt, bucket).PageSize(pageSize).IterContext(ctx)
-	var seq int
-	var val string
-	var page1Seqs []int
-	for len(page1Seqs) < pageSize && iter.Scan(&seq, &val) {
-		page1Seqs = append(page1Seqs, seq)
-	}
-	pageState := iter.PageState()
-	require.NoError(t, iter.Close())
-	require.Len(t, page1Seqs, pageSize)
-	require.NotEmpty(t, pageState,
-		"must obtain a non-nil pageState after page 1 (%d rows, PageSize %d)", total, pageSize)
-
-	// Reset metrics snapshot before the page-2 query.
-	prePage2B := mc.ReadTotal[types.ClusterB]
-
-	// Page 2: SliceMapContext with pageState + FallbackRead.
-	rows, err := client.Query(stmt, bucket).
-		PageSize(pageSize).
-		PageState(pageState).
-		FallbackRead().
-		SliceMapContext(ctx)
-
-	require.NoError(t, err)
-	require.NotEmpty(t, rows, "page 2 must return the remaining rows from A")
-
-	var page2Seqs []int
-	for _, row := range rows {
-		if s, ok := row["seq"].(int); ok {
-			page2Seqs = append(page2Seqs, s)
-		}
-	}
-	slices.Sort(page1Seqs)
-	slices.Sort(page2Seqs)
-
-	// Page 1 and page 2 must be disjoint.
-	seenOnPage1 := make(map[int]bool, len(page1Seqs))
-	for _, s := range page1Seqs {
-		seenOnPage1[s] = true
-	}
-	for _, s := range page2Seqs {
-		assert.False(t, seenOnPage1[s],
-			"seq %d appeared on both page 1 and page 2 — pagination not advancing", s)
-	}
-	assert.Equal(t, total, len(page1Seqs)+len(page2Seqs),
-		"page 1 + page 2 must cover all %d rows exactly once", total)
-
-	// B must not have been contacted during the page-2 query.
-	assert.Equal(t, prePage2B, mc.ReadTotal[types.ClusterB],
-		"pageState guard must prevent alt contact during continuation query")
 }
