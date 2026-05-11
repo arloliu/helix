@@ -1862,9 +1862,16 @@ func (c *CQLClient) executeStrictDualWrite(
 // drain-aware initial rerouting and the AllowedClusters override drain-
 // filter fallback. The zero value preserves the pre-existing behavior for
 // non-slice callers.
+//
+// fallbackOpts customizes the executeFallbackRead alt-leg semantics for
+// slice reads (drain-skip on alt, ctx-error propagation, ctx-error health
+// suppression). The zero value reproduces today's Scan / MapScan behavior:
+// no drain skip, suppress all real alt errors to ErrNotFound, record health
+// on all real alt errors. See fallbackReadOptions.
 type readOptions struct {
 	fallbackRead            bool
 	preserveSelectedCluster bool
+	fallbackOpts            fallbackReadOptions
 }
 
 func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOptions {
@@ -2029,7 +2036,7 @@ func (c *CQLClient) executeRead(
 	// cluster has no alternative session).
 	if isReadTerminalNonHealth(res.err) {
 		if types.IsNotFound(res.err) && opts.fallbackRead && !c.IsSingleCluster() {
-			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc)
+			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
 		}
 		return res.err
 	}
@@ -2089,7 +2096,7 @@ func (c *CQLClient) executeReadNoFailover(
 
 	if isReadTerminalNonHealth(res.err) {
 		if types.IsNotFound(res.err) && opts.fallbackRead && !c.IsSingleCluster() {
-			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc)
+			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
 		}
 		return res.err
 	}
@@ -2231,12 +2238,52 @@ func (c *CQLClient) tryFallbackCluster(
 	return &types.DualClusterError{ErrorA: err, ErrorB: primaryErr}
 }
 
+// isCtxErr reports whether err originated from caller-side context
+// cancellation or deadline expiry. Slice methods use this in both
+// fallbackReadOptions predicates: ctx errors propagate to the caller AND
+// skip per-cluster health recording, because long-running drains see a
+// disproportionate rate of caller-driven cancellation that would otherwise
+// poison the failover-policy view of cluster health.
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// fallbackReadOptions customizes executeFallbackRead's alt-leg semantics.
+// The zero value reproduces Scan / MapScan behavior — no drain skip, suppress
+// real alt errors to ErrNotFound, record health on every real alt error. Slice
+// methods pass non-zero values to opt into drain-aware skip, ctx-error
+// propagation, and ctx-error health suppression.
+//
+//   - skipDrainingAlt: when true, executeFallbackRead returns ErrNotFound
+//     immediately without contacting the alt session if the alt is draining
+//     — no IncReadTotal, no ObserveReadDuration, no health calls. Required by
+//     slice methods: multi-row reads on a draining cluster can return partial
+//     state, and a "try harder" empty-retry must not introduce that risk.
+//   - propagateAltErr: when non-nil and it returns true for a given alt
+//     error, executeFallbackRead returns that error to the caller instead of
+//     suppressing it to ErrNotFound. Health classification is governed
+//     independently by nonHealthAltErr — propagating an error does NOT skip
+//     health recording on its own.
+//   - nonHealthAltErr: when non-nil and it returns true for a given alt
+//     error, executeFallbackRead skips IncReadError + recordOpOutcome +
+//     RecordFailure on the alt for that error. Layered above the existing
+//     isReadTerminalNonHealth filter (which already excludes ErrNotFound and
+//     ErrRowLimitExceeded). Slice methods use this to mark ctx errors as
+//     caller-driven rather than cluster faults.
+type fallbackReadOptions struct {
+	skipDrainingAlt bool
+	propagateAltErr func(error) bool
+	nonHealthAltErr func(error) bool
+}
+
 // executeFallbackRead attempts a single silent read on the alternative cluster
 // after the selected cluster returned not-found.
 //
 // This is a one-shot check — it does NOT re-enter the main failover sequence.
-// When override is not active, drain state is bypassed: the caller explicitly
-// asked to check both clusters, and a draining cluster may still hold the data.
+// When override is not active, drain state is bypassed by default: the caller
+// explicitly asked to check both clusters, and a draining cluster may still
+// hold the data. Slice callers opt out of this drain bypass via
+// opts.skipDrainingAlt (see fallbackReadOptions).
 //
 // When override IS active, the alternative must be in the allowed set.
 // If the alternative is fenced off, ErrNotFound is returned immediately.
@@ -2244,14 +2291,16 @@ func (c *CQLClient) tryFallbackCluster(
 // Returns:
 //   - nil when the alternative cluster has the data (divergence metric emitted)
 //   - types.ErrNotFound when both clusters confirm the row is absent, OR when
-//     the alternative cluster is unreachable (health metrics are still recorded
-//     on the unreachable cluster, but the caller receives the primary's healthy
-//     not-found to preserve availability)
+//     the alternative cluster is unreachable AND opts.propagateAltErr did not
+//     opt into propagation (health metrics are still recorded on the
+//     unreachable cluster unless opts.nonHealthAltErr suppresses them)
+//   - the alt's error verbatim when opts.propagateAltErr returns true
 func (c *CQLClient) executeFallbackRead(
 	ctx context.Context,
 	snap overrideSnapshot,
 	selectedCluster ClusterID,
 	readFunc func(context.Context, cql.Session) error,
+	opts fallbackReadOptions,
 ) error {
 	alternativeCluster := c.alternativeCluster(selectedCluster)
 
@@ -2260,12 +2309,21 @@ func (c *CQLClient) executeFallbackRead(
 		return types.ErrNotFound
 	}
 
+	// Drain-skip (slice methods only): a draining alt cannot be read for
+	// multi-row results without exposing partial state. Skip without any
+	// alt-side telemetry — this is a routing decision, not a fault.
+	if opts.skipDrainingAlt {
+		drainA, drainB := c.getDrainStates()
+		if c.clusterIsDraining(alternativeCluster, drainA, drainB) {
+			return types.ErrNotFound
+		}
+	}
+
 	c.config.Logger.Debug("fallback read: selected cluster returned not-found, trying alternative",
 		"fromCluster", c.clusterName(selectedCluster),
 		"toCluster", c.clusterName(alternativeCluster),
 	)
 
-	// Bypass drain state: the caller opted in with FallbackRead.
 	alternativeSession := c.getSession(alternativeCluster)
 	start := time.Now()
 	err := readFunc(ctx, alternativeSession)
@@ -2303,17 +2361,31 @@ func (c *CQLClient) executeFallbackRead(
 		return err
 	}
 
-	// Alternative returned a real error — record the health impact but return
-	// not-found to the caller. The primary (healthy) cluster already confirmed
-	// the row is absent. Returning the alternative's error would make FallbackRead
-	// decrease availability versus not using it: without FallbackRead, the
-	// primary's not-found would have been returned cleanly. A "try harder"
-	// feature must not make things worse.
-	c.config.Metrics.IncReadError(alternativeCluster)
-	c.recordOpOutcome(alternativeCluster, err)
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
+	// Alternative returned a real error. Health classification is gated by
+	// opts.nonHealthAltErr: slice callers may mark ctx errors as caller-driven
+	// (no health impact). All other real errors record health on alt as
+	// today's Scan / MapScan behavior.
+	if opts.nonHealthAltErr == nil || !opts.nonHealthAltErr(err) {
+		c.config.Metrics.IncReadError(alternativeCluster)
+		c.recordOpOutcome(alternativeCluster, err)
+		if c.config.FailoverPolicy != nil {
+			c.config.FailoverPolicy.RecordFailure(alternativeCluster)
+		}
 	}
+
+	// Propagation is governed independently: opts.propagateAltErr lets slice
+	// callers surface ctx errors / ErrRowLimitExceeded / "scanFn was invoked
+	// on alt" to the caller. Default (nil) preserves today's Scan / MapScan
+	// suppression to ErrNotFound — primary already returned a healthy
+	// not-found, so the fallback must not decrease availability.
+	if opts.propagateAltErr != nil && opts.propagateAltErr(err) {
+		c.config.Logger.Warn("fallback read: alternative cluster returned error, propagating to caller",
+			"cluster", c.clusterName(alternativeCluster),
+			"error", err.Error(),
+		)
+		return err
+	}
+
 	c.config.Logger.Warn("fallback read: alternative cluster returned error, returning primary not-found",
 		"cluster", c.clusterName(alternativeCluster),
 		"error", err.Error(),
@@ -2751,6 +2823,7 @@ func (q *cqlQuery) SliceMap() ([]map[string]any, error) {
 // See [Query.SliceMap] for the caller-facing contract.
 func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error) {
 	opts, useNoFailover := q.sliceReadOpts(ctx)
+	opts.fallbackOpts = sliceMapFallbackOpts
 	limit := q.effectiveMaxRows()
 
 	var rows []map[string]any
@@ -2760,8 +2833,16 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 		query = q.applyMaxRowsClamp(query, limit)
 		iter := query.IterContext(ctx)
 
-		var derr error
-		rows, derr = drainIterToSliceMapWithLimit(iter, limit)
+		drained, derr := drainIterToSliceMapWithLimit(iter, limit)
+		rows = drained
+
+		// Synthesize ErrNotFound on a successful empty drain so executeRead /
+		// executeReadNoFailover route through executeFallbackRead exactly the
+		// same way a single-row Scan returning ErrNotFound does. The public
+		// method translates this back to (nil, nil) before returning.
+		if derr == nil && drained == nil {
+			return types.ErrNotFound
+		}
 
 		return derr
 	}
@@ -2773,6 +2854,13 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 		err = q.client.executeRead(ctx, opts, readFunc)
 	}
 	if err != nil {
+		// ErrNotFound here means primary drained empty AND (FallbackRead was
+		// off OR alt also drained empty OR alt was draining-and-skipped OR
+		// PageState suppressed the empty-retry). All of those collapse to
+		// the "empty but successful" return shape for callers.
+		if types.IsNotFound(err) {
+			return nil, nil
+		}
 		// drainIterToSliceMapWithLimit's discard-on-error contract already nils
 		// rows whenever readFunc returned an error; this also covers
 		// pre-attempt fail-closed paths where readFunc never ran at all.
@@ -2780,6 +2868,19 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 	}
 
 	return rows, nil
+}
+
+// sliceMapFallbackOpts is the executeFallbackRead policy for SliceMap. It
+// is stateless (no closure capture), so a package-level value avoids the
+// per-call allocation that building it inline would incur.
+//
+// ErrRowLimitExceeded is intentionally NOT listed in propagateAltErr: the
+// pre-real-error branch in executeFallbackRead already propagates it
+// before the predicate is consulted (cql_client.go ~line 2362).
+var sliceMapFallbackOpts = fallbackReadOptions{
+	skipDrainingAlt: true,
+	propagateAltErr: isCtxErr,
+	nonHealthAltErr: isCtxErr,
 }
 
 func (q *cqlQuery) SliceScan(scanFn func(r RowScanner) error) (int, error) {
@@ -2801,20 +2902,58 @@ func (q *cqlQuery) SliceScanContext(
 	opts, _ := q.sliceReadOpts(ctx)
 	limit := q.effectiveMaxRows()
 
+	// scanFnInvokedOnAlt: shared via closure capture between readFunc (which
+	// runs against the primary, then again against the alt inside
+	// executeFallbackRead) and propagateAltErr (evaluated only on the alt
+	// leg). The primary leg only reaches executeFallbackRead when its drain
+	// returned 0 rows; in that case the for-loop never iterates and the
+	// flag stays false through the primary's run. Alt's drain then sets it
+	// on each row, so the flag at predicate-evaluation time reflects the
+	// alt exclusively.
 	var rowCount int
+	var scanFnInvokedOnAlt bool
+	wrapped := func(r RowScanner) error {
+		scanFnInvokedOnAlt = true
+		return scanFn(r)
+	}
 	readFunc := func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 		query = q.applyMaxRowsClamp(query, limit)
 		iter := query.IterContext(ctx)
 
-		n, derr := drainIterScanWithLimit(iter, limit, scanFn)
+		n, derr := drainIterScanWithLimit(iter, limit, wrapped)
 		rowCount = n
+
+		// Synthesize ErrNotFound on a successful empty drain so the wrapper
+		// routes through executeFallbackRead the same way the single-row
+		// path does. Translated back to (0, nil) at the public boundary.
+		if derr == nil && n == 0 {
+			return types.ErrNotFound
+		}
 
 		return derr
 	}
 
+	opts.fallbackOpts = fallbackReadOptions{
+		skipDrainingAlt: true,
+		propagateAltErr: func(err error) bool {
+			// Any invocation of scanFn on the alt — successful or not —
+			// either mutated the caller's accumulator or surfaced a scanFn
+			// error that the public API contract requires to propagate.
+			// Suppression to ErrNotFound would silently hide either.
+			return scanFnInvokedOnAlt || isCtxErr(err)
+		},
+		nonHealthAltErr: isCtxErr,
+	}
+
 	err := q.client.executeReadNoFailover(ctx, opts, readFunc)
+	if err != nil && types.IsNotFound(err) {
+		// rowCount is zero by construction: synthetic ErrNotFound only
+		// fires when the drain produced no rows, and executeFallbackRead
+		// returns ErrNotFound only when alt also drained empty.
+		return 0, nil
+	}
 
 	return rowCount, err
 }
