@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -2517,17 +2518,39 @@ func (q *cqlQuery) MaxRows(n int) Query {
 		q.maxRows = nil
 		return q
 	}
+	if n < 0 || n >= math.MaxInt32 {
+		panic(fmt.Sprintf("helix: MaxRows(%d) out of range [0, math.MaxInt32-1]", n))
+	}
 	q.maxRows = &n
+
 	return q
 }
 
 // effectiveMaxRows returns the cap that the slice drain helpers enforce.
-// 0 means unbounded.
+// Precedence: per-query MaxRows > Config.DefaultMaxRows > 0 (unbounded).
 func (q *cqlQuery) effectiveMaxRows() int {
 	if q.maxRows != nil {
 		return *q.maxRows
 	}
+	if q.client.config.DefaultMaxRows > 0 {
+		return q.client.config.DefaultMaxRows
+	}
 	return 0
+}
+
+// applyMaxRowsClamp bounds the driver's per-page network fetch to limit+1 rows.
+// The +1 lets Helix detect the (limit+1)th row without fetching a second page.
+// When the user supplied a smaller page size, that constraint wins.
+func (q *cqlQuery) applyMaxRowsClamp(query cql.Query, limit int) cql.Query {
+	if limit <= 0 {
+		return query
+	}
+	clampedPageSize := limit + 1
+	if q.pageSize != nil {
+		clampedPageSize = min(*q.pageSize, clampedPageSize)
+	}
+
+	return query.PageSize(clampedPageSize)
 }
 
 // sliceReadOpts derives effective readOptions for the four slice methods and
@@ -2734,6 +2757,7 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 	readFunc := func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
+		query = q.applyMaxRowsClamp(query, limit)
 		iter := query.IterContext(ctx)
 
 		var derr error
@@ -2781,6 +2805,7 @@ func (q *cqlQuery) SliceScanContext(
 	readFunc := func(ctx context.Context, session cql.Session) error {
 		query := session.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
+		query = q.applyMaxRowsClamp(query, limit)
 		iter := query.IterContext(ctx)
 
 		n, derr := drainIterScanWithLimit(iter, limit, scanFn)

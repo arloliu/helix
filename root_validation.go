@@ -2,6 +2,7 @@ package helix
 
 import (
 	"errors"
+	"math"
 
 	"github.com/arloliu/helix/types"
 )
@@ -31,6 +32,7 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootClusterNames(config),
 		validateRootAutoRefresh(config),
 		validateRootMirrorMode(config),
+		validateRootDefaultMaxRows(config),
 	)
 }
 
@@ -65,6 +67,16 @@ func validateRootAutoRefresh(config *ClientConfig) error {
 	}
 
 	return joinRootValidationErrors(errList...)
+}
+
+func validateRootDefaultMaxRows(config *ClientConfig) error {
+	if config.DefaultMaxRows < 0 {
+		return newRootOptionError("WithDefaultMaxRows", "must be >= 0")
+	}
+	if config.DefaultMaxRows >= math.MaxInt32 {
+		return newRootOptionError("WithDefaultMaxRows", "must be < math.MaxInt32")
+	}
+	return nil
 }
 
 func validateRootMirrorMode(config *ClientConfig) error {

@@ -126,6 +126,20 @@ type ClientConfig struct {
 	// Default: false (opt-in per query or per context).
 	DefaultFallbackRead bool
 
+	// DefaultMaxRows is the client-wide row cap for [Query.SliceMap] and
+	// [Query.SliceScan] queries. A per-query [Query.MaxRows] override wins when
+	// non-zero; calling MaxRows(0) on a query clears the override and falls back
+	// to this default.
+	//
+	// When N > 0, each slice method aborts with [types.ErrRowLimitExceeded] upon
+	// detecting the (N+1)th row and clamps the underlying query page size to N+1
+	// to bound the driver's per-page network fetch.
+	//
+	// 0 means unbounded. Must be in [0, math.MaxInt32-1].
+	//
+	// Default: 0.
+	DefaultMaxRows int
+
 	// AutoMemoryWorker enables automatic in-process replay with MemoryReplayer.
 	// When true, a MemoryReplayer and Worker are created automatically.
 	AutoMemoryWorker bool
@@ -833,6 +847,32 @@ func WithAllowedClusters(fn AllowedClustersFunc) Option {
 func WithDefaultFallbackRead(enabled bool) Option {
 	return func(c *ClientConfig) {
 		c.DefaultFallbackRead = enabled
+	}
+}
+
+// WithDefaultMaxRows sets the client-wide row cap for [Query.SliceMap] and
+// [Query.SliceScan].
+//
+// When n > 0, each slice method aborts with [types.ErrRowLimitExceeded] upon
+// detecting the (n+1)th row and clamps the underlying query page size to n+1
+// to bound the driver's per-page network fetch.
+//
+// A per-query [Query.MaxRows] override wins when non-zero; calling MaxRows(0)
+// on a query clears the per-query override and falls back to this default.
+//
+// n must be in [0, math.MaxInt32-1]. Negative values and values ≥ math.MaxInt32
+// are rejected with an option error from [NewCQLClient].
+//
+// Default: 0 (unbounded).
+//
+// Parameters:
+//   - n: Row cap applied to all slice queries on this client. 0 means unbounded.
+//
+// Returns:
+//   - Option: Configuration option
+func WithDefaultMaxRows(n int) Option {
+	return func(c *ClientConfig) {
+		c.DefaultMaxRows = n
 	}
 }
 

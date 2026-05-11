@@ -32,30 +32,40 @@ type sliceSpec struct {
 // build two sliceTestSession values via newSliceClient.
 type sliceTestSession struct {
 	spec         *sliceSpec
-	iterCalls    atomic.Int32 // increments per Iter() call (must stay zero for slice methods)
-	iterCtxCalls atomic.Int32 // increments per IterContext() call
+	iterCalls    atomic.Int32    // increments per Iter() call (must stay zero for slice methods)
+	iterCtxCalls atomic.Int32    // increments per IterContext() call
+	lastQuery    *sliceTestQuery // last query built, for page-size clamp assertions
 }
 
 func (s *sliceTestSession) Query(stmt string, values ...any) cql.Query {
-	return &sliceTestQuery{
+	q := &sliceTestQuery{
 		session:   s,
 		statement: stmt,
 		values:    values,
 	}
+	s.lastQuery = q
+	return q
 }
 
 func (s *sliceTestSession) Batch(_ cql.BatchType) cql.Batch { return nil }
 func (s *sliceTestSession) Close()                          {}
 
 type sliceTestQuery struct {
-	session   *sliceTestSession
-	statement string
-	values    []any
+	session      *sliceTestSession
+	statement    string
+	values       []any
+	lastPageSize *int // records final applied page size for clamp assertions
 }
 
 func (q *sliceTestQuery) Consistency(_ cql.Consistency) cql.Query       { return q }
 func (q *sliceTestQuery) SerialConsistency(_ cql.Consistency) cql.Query { return q }
-func (q *sliceTestQuery) PageSize(_ int) cql.Query                      { return q }
+func (q *sliceTestQuery) PageSize(n int) cql.Query {
+	v := n
+	q.lastPageSize = &v
+
+	return q
+}
+
 func (q *sliceTestQuery) PageState(_ []byte) cql.Query                  { return q }
 func (q *sliceTestQuery) WithTimestamp(_ int64) cql.Query               { return q }
 func (q *sliceTestQuery) Exec() error                                   { return nil }
@@ -503,7 +513,7 @@ func TestSliceMap_PageState_PrimaryError_DoesNotInvokeAlt(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────
-// MaxRows setter shape (phase 2: store-only, no validation; phase 3 adds panics)
+// MaxRows setter shape
 // ─────────────────────────────────────────────
 
 func TestMaxRows_StoresPerQueryValue_ZeroClears(t *testing.T) {
