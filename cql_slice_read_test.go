@@ -34,7 +34,6 @@ type sliceTestSession struct {
 	spec         *sliceSpec
 	iterCalls    atomic.Int32 // increments per Iter() call (must stay zero for slice methods)
 	iterCtxCalls atomic.Int32 // increments per IterContext() call
-	cluster      ClusterID
 }
 
 func (s *sliceTestSession) Query(stmt string, values ...any) cql.Query {
@@ -204,8 +203,8 @@ func newSliceClient(
 	t *testing.T, specA, specB *sliceSpec, opts ...Option,
 ) (client *CQLClient, sessionA, sessionB *sliceTestSession) {
 	t.Helper()
-	sessionA = &sliceTestSession{spec: specA, cluster: ClusterA}
-	sessionB = &sliceTestSession{spec: specB, cluster: ClusterB}
+	sessionA = &sliceTestSession{spec: specA}
+	sessionB = &sliceTestSession{spec: specB}
 	client, err := NewCQLClient(sessionA, sessionB, opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
@@ -216,7 +215,7 @@ func newSliceClient(
 // newSingleSliceClient builds a single-cluster CQLClient.
 func newSingleSliceClient(t *testing.T, spec *sliceSpec) (*CQLClient, *sliceTestSession) {
 	t.Helper()
-	sa := &sliceTestSession{spec: spec, cluster: ClusterA}
+	sa := &sliceTestSession{spec: spec}
 	client, err := NewCQLClient(sa, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
@@ -550,9 +549,42 @@ func TestDrainIterScanWithLimit_ScannerErrPropagatesAfterDrain(t *testing.T) {
 	}}
 	rowCount, err := drainIterScanWithLimit(iter, 0, func(r RowScanner) error {
 		var v int
+
 		return r.Scan(&v)
 	})
 	require.ErrorIs(t, err, endErr,
 		"scanner.Err() captured at the page-iter close site is the right close-owner across page boundaries")
 	assert.Equal(t, 2, rowCount, "successful callbacks still counted")
+}
+
+// Off-by-one bound enforcement: phase 2 helpers admit up to limit rows and
+// abort with ErrRowLimitExceeded upon detecting the (limit+1)th. The
+// validation panic on negative / >= MaxInt32 land in phase 3 alongside the
+// page-size clamp; these tests lock the helper-level boundary spec early so
+// the contract cannot regress before phase 3's tests cover the broader matrix.
+
+func TestDrainIterToSliceMapWithLimit_LimitExceeded_DiscardsRowsAndReturnsSentinel(t *testing.T) {
+	iter := &sliceTestIter{spec: &sliceSpec{
+		cols: []string{"id"},
+		rows: rowsOf([]any{1}, []any{2}, []any{3}, []any{4}),
+	}}
+	rows, err := drainIterToSliceMapWithLimit(iter, 2)
+	require.ErrorIs(t, err, types.ErrRowLimitExceeded)
+	assert.Nil(t, rows, "materializing helper MUST discard the partial buffer on overflow")
+}
+
+func TestDrainIterScanWithLimit_LimitExceeded_ReturnsRowCountAndSentinel(t *testing.T) {
+	iter := &sliceTestIter{spec: &sliceSpec{
+		cols: []string{"id"},
+		rows: rowsOf([]any{1}, []any{2}, []any{3}, []any{4}),
+	}}
+	invoked := 0
+	rowCount, err := drainIterScanWithLimit(iter, 2, func(_ RowScanner) error {
+		invoked++
+
+		return nil
+	})
+	require.ErrorIs(t, err, types.ErrRowLimitExceeded)
+	assert.Equal(t, 2, rowCount, "rowCount reflects the limit, not the underlying row count")
+	assert.Equal(t, 2, invoked, "scanFn invoked exactly limit times; abort fires before invocation N+1")
 }
