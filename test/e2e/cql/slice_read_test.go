@@ -100,6 +100,21 @@ func TestS_SliceMap_FallbackRead_RowsMissingOnPreferred(t *testing.T) {
 			// Divergence fires on the stale primary (A).
 			assert.Equal(t, int64(1), mc.GetReadDivergence(htypes.ClusterA),
 				"[%s] divergence must fire on A (stale primary)", d.name)
+
+			// Verify content identity — Len(3) alone does not catch wrong-table or
+			// isolation issues.
+			wantKeys := make(map[string]bool, 3)
+			for i := range 3 {
+				wantKeys[fmt.Sprintf("%s_key_%d", d.name, i)] = true
+			}
+			gotKeys := make(map[string]bool, len(rows))
+			for _, row := range rows {
+				if k, ok := row["key"].(string); ok {
+					gotKeys[k] = true
+				}
+			}
+			assert.Equal(t, wantKeys, gotKeys,
+				"[%s] FallbackRead must return the exact 3 seeded keys from B", d.name)
 		})
 	}
 }
@@ -157,6 +172,16 @@ func TestS_SliceScan_FallbackRead_RowsMissingOnPreferred(t *testing.T) {
 				"[%s] rowCount must equal the number of B rows scanned", d.name)
 			assert.Len(t, got, 3,
 				"[%s] scan callback must have been invoked 3 times", d.name)
+
+			// Verify content identity — Len(3) alone does not catch wrong-table or
+			// isolation issues.
+			wantVals := map[string]bool{"v_0": true, "v_1": true, "v_2": true}
+			gotVals := make(map[string]bool, len(got))
+			for _, v := range got {
+				gotVals[v] = true
+			}
+			assert.Equal(t, wantVals, gotVals,
+				"[%s] scan callback must have received the exact 3 seeded values from B", d.name)
 		})
 	}
 }
@@ -175,23 +200,31 @@ func TestS_SliceScan_FallbackRead_RowsMissingOnPreferred(t *testing.T) {
 // the primary.
 func TestS_SliceMap_FallbackRead_AltUnreachable_ReturnsNilNil(t *testing.T) {
 	a, b := sharedClusters(t)
-	withRestoredCluster(t, b)
+	// Register table cleanup first so withRestoredCluster fires before table
+	// truncate in LIFO order, ensuring b is healthy before cleanup queries run.
 	table := createKVTableOnBoth(t, "sr_slicemap_alt_down")
+	withRestoredCluster(t, b)
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			mc := testutil.NewTestMetricsCollector()
 			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
 				helix.WithReadStrategy(policy.NewStickyRead(
 					policy.WithPreferredCluster(htypes.ClusterA),
 				)),
 				helix.WithFailoverPolicy(policy.NewActiveFailover()),
+				helix.WithMetrics(mc),
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
 
 			ctx := context.Background()
 			require.NoError(t, b.Pause(ctx))
-			defer func() { _ = b.Unpause(context.Background()) }()
+			t.Cleanup(func() {
+				unCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_ = b.Unpause(unCtx)
+			})
 
 			qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
@@ -206,6 +239,12 @@ func TestS_SliceMap_FallbackRead_AltUnreachable_ReturnsNilNil(t *testing.T) {
 				"[%s] unreachable alt must not surface a network error; got: %v", d.name, err)
 			assert.Nil(t, rows,
 				"[%s] unreachable alt must return nil slice, not an error", d.name)
+
+			// Proves the route taken: A attempted (empty), B attempted (fault suppressed).
+			assert.Equal(t, int64(1), mc.ReadTotal[htypes.ClusterA],
+				"[%s] primary must be attempted once", d.name)
+			assert.Equal(t, int64(1), mc.ReadTotal[htypes.ClusterB],
+				"[%s] alt must be attempted (fault suppressed, not skipped)", d.name)
 		})
 	}
 }
@@ -227,8 +266,10 @@ func TestS_SliceMap_FallbackRead_AltUnreachable_ReturnsNilNil(t *testing.T) {
 // of receiving an error signal.
 func TestS_SliceScan_PrimaryUnreachable_AltNotRetried(t *testing.T) {
 	a, b := sharedClusters(t)
-	withRestoredCluster(t, a)
+	// Register table cleanup first so withRestoredCluster fires before table
+	// truncate in LIFO order, ensuring a is healthy before cleanup queries run.
 	table := createKVTableOnBoth(t, "sr_slicescan_primary_down")
+	withRestoredCluster(t, a)
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
@@ -259,7 +300,11 @@ func TestS_SliceScan_PrimaryUnreachable_AltNotRetried(t *testing.T) {
 
 			ctx := context.Background()
 			require.NoError(t, a.Pause(ctx))
-			defer func() { _ = a.Unpause(context.Background()) }()
+			t.Cleanup(func() {
+				unCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_ = a.Unpause(unCtx)
+			})
 
 			qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
@@ -280,6 +325,88 @@ func TestS_SliceScan_PrimaryUnreachable_AltNotRetried(t *testing.T) {
 			// Alt (B) must NOT have been contacted — SliceScan never retries.
 			assert.Equal(t, int64(0), mc.ReadTotal[htypes.ClusterB],
 				"[%s] alt must not be contacted when SliceScan primary errors", d.name)
+			// Primary must have been attempted once — guards against routing
+			// failures that never reach the primary and still satisfy the above.
+			assert.Equal(t, int64(1), mc.ReadTotal[htypes.ClusterA],
+				"[%s] primary must be attempted once before the error is propagated", d.name)
+		})
+	}
+}
+
+// =============================================================================
+// SliceMap: primary unreachable → standard failover to alt
+// =============================================================================
+
+// TestS_SliceMap_PrimaryUnreachable_FailsOverToAlt verifies the standard
+// failover contract for SliceMap: when the primary is paused, executeRead
+// triggers failover to the alt cluster and returns the alt's rows.
+//
+// This is the complementary case to TestS_SliceScan_PrimaryUnreachable_AltNotRetried:
+// SliceMap uses executeRead (standard failover), while SliceScan uses
+// executeReadNoFailover.  Both tests must exist to lock the intentional
+// asymmetry between the two methods under a real network-level fault.
+//
+// Failure mode if regressed: the error from A propagates without contacting B
+// (SliceMap silently adopts SliceScan's no-retry contract), and rows from B
+// are never returned.
+func TestS_SliceMap_PrimaryUnreachable_FailsOverToAlt(t *testing.T) {
+	a, b := sharedClusters(t)
+	table := createKVTableOnBoth(t, "sr_slicemap_primary_failover")
+	withRestoredCluster(t, a)
+
+	for _, d := range allDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			// Seed B with 3 rows; A has none — failover must surface B's rows.
+			for i := range 3 {
+				key := fmt.Sprintf("%s_key_%d", d.name, i)
+				require.NoError(t,
+					b.Session.Query(fmt.Sprintf("INSERT INTO %s (key, value) VALUES (?, ?)", table),
+						key, fmt.Sprintf("v_%d", i)).Exec())
+			}
+			t.Cleanup(func() {
+				for i := range 3 {
+					key := fmt.Sprintf("%s_key_%d", d.name, i)
+					_ = b.Session.Query(fmt.Sprintf("DELETE FROM %s WHERE key = ?", table), key).Exec()
+				}
+			})
+
+			mc := testutil.NewTestMetricsCollector()
+			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
+				helix.WithReadStrategy(policy.NewStickyRead(
+					policy.WithPreferredCluster(htypes.ClusterA),
+				)),
+				helix.WithFailoverPolicy(policy.NewActiveFailover()),
+				helix.WithMetrics(mc),
+			)
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			ctx := context.Background()
+			require.NoError(t, a.Pause(ctx))
+			t.Cleanup(func() {
+				unCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_ = a.Unpause(unCtx)
+			})
+
+			qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+
+			// SliceMap uses executeRead: paused primary must trigger failover to B.
+			rows, err := client.Query(
+				fmt.Sprintf("SELECT key, value FROM %s", table),
+			).SliceMapContext(qCtx)
+
+			require.NoError(t, err,
+				"[%s] SliceMap must fail over to alt when primary is paused", d.name)
+			assert.Len(t, rows, 3,
+				"[%s] SliceMap must return all 3 rows from B after failover", d.name)
+
+			// Primary attempted once (failed), alt attempted once (succeeded).
+			assert.Equal(t, int64(1), mc.ReadTotal[htypes.ClusterA],
+				"[%s] primary must be attempted once before failover", d.name)
+			assert.Equal(t, int64(1), mc.ReadTotal[htypes.ClusterB],
+				"[%s] alt must be contacted exactly once after failover", d.name)
 		})
 	}
 }
