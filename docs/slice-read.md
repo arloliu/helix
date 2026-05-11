@@ -68,7 +68,7 @@ if helix.IsRowLimitExceeded(err) {
 
 ### Page-size clamp
 
-When `MaxRows` is active, Helix clamps the gocql page size to `min(pageSize, maxRows)` before issuing the first request. This prevents fetching more rows from the cluster than the cap allows, which matters for very large partitions.
+When `MaxRows` is active, Helix clamps the gocql page size to `min(pageSize, maxRows+1)` before issuing the first request. The `+1` lets Helix detect the overflow row without fetching a second page while still preventing large over-fetches on very large partitions.
 
 ---
 
@@ -170,6 +170,6 @@ See the [FallbackRead Guide — Slice Methods](fallback-read.md#slice-methods) f
 
 **Materialization.** All rows up to `MaxRows` are held in memory before the method returns. For large partitions, size `MaxRows` conservatively and paginate via `PageState` if needed.
 
-**Page-size clamp.** When `MaxRows` is set, the effective gocql page size is clamped to `maxRows`. For very small caps (e.g., `MaxRows(10)`), this avoids fetching a full page just to discard all but the first few rows.
+**Page-size clamp.** When `MaxRows` is set, the effective gocql page size is clamped to `maxRows+1` unless the caller already set a smaller page size. For very small caps (e.g., `MaxRows(10)`), this avoids fetching a full page just to discard all but the first few rows while still allowing Helix to detect overflow immediately.
 
 **FallbackRead latency.** When FallbackRead is enabled and the primary returns zero rows, a second sequential read is issued against the alternative. Budget for two round-trips in your deadline for queries on partitions that may be absent on the primary.

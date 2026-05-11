@@ -26,8 +26,10 @@ must be updated to compile.**
 
 **Migration for `helix.Query` / `adapter/cql.Query` implementors**: Add the
 five new methods. The `testutil.MockQuery` already implements them. For custom
-mocks or decorators, wire through the delegate or return `nil, 0, nil` as a
-no-op stub while migrating.
+mocks or decorators, wire through the delegate. Temporary compile-only stubs
+must match each method signature: `MaxRows` returns the receiver/delegate,
+`SliceMap` / `SliceMapContext` return `nil, nil`, and `SliceScan` /
+`SliceScanContext` return `0, nil` while migrating.
 
 ### Added
 
@@ -74,8 +76,9 @@ no-op stub while migrating.
   than `ErrNotFound`; when the alternative cluster is draining, the fallback
   attempt is skipped rather than reading from a cluster in transition.
 - **Page-size clamp**: when `MaxRows` is active, Helix clamps the gocql page
-  size to `min(pageSize, maxRows)` before issuing the first request, preventing
-  over-fetching on large partitions with small caps.
+  size to `min(pageSize, maxRows+1)` before issuing the first request. The
+  `+1` lets Helix detect the overflow row without fetching a second page,
+  preventing over-fetching on large partitions with small caps.
 
 ### Bug Fixes
 
