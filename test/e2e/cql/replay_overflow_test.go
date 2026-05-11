@@ -150,6 +150,7 @@ func TestS11_ReplayOverflow_ConservationLaw(t *testing.T) {
 	// mid-backoff for a payload that will be re-enqueued — hiding
 	// in-flight items from a naive check.
 	require.NoError(t, a.Unpause(ctx))
+	waitForReconnect(t, a, "s11-overflow")
 
 	// Wait for the replay queue to drain.
 	require.True(t, waitFor(60*time.Second, 200*time.Millisecond, func() bool {
@@ -180,8 +181,8 @@ func TestS11_ReplayOverflow_ConservationLaw(t *testing.T) {
 	// Phase 3: read final state. After the metric stabilization, we can
 	// trust the accounting numbers reflect every in-flight item's
 	// terminal disposition.
-	rowsOnA := countRows(t, a, table)
-	rowsOnB := countRows(t, b, table)
+	rowsOnA := countRowsEventually(t, a, table)
+	rowsOnB := countRowsEventually(t, b, table)
 
 	enqueued := mc.GetReplayEnqueued(htypes.ClusterA)
 	successes := mc.GetReplaySuccess(htypes.ClusterA)

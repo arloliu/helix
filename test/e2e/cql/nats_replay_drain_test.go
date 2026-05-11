@@ -116,13 +116,19 @@ func TestS1b_PauseA_NATSReplayerDrain(t *testing.T) {
 
 			// Unpause A and wait for B's row count to match A's via NATS replay.
 			require.NoError(t, a.Unpause(ctx))
+			waitForReconnect(t, a, d.name)
 
 			drained := waitFor(60*time.Second, 250*time.Millisecond, func() bool {
-				return countRows(t, a, table) == countRows(t, b, table)
+				countA, err := tryCountRows(a, table)
+				if err != nil {
+					return false
+				}
+				countB, err := tryCountRows(b, table)
+				return err == nil && countA == countB
 			})
 			assert.True(t, drained,
 				"[%s] NATS replay did not converge cluster A and B within 60s (A=%d B=%d)",
-				d.name, countRows(t, a, table), countRows(t, b, table))
+				d.name, countRowsEventually(t, a, table), countRowsEventually(t, b, table))
 		})
 	}
 }

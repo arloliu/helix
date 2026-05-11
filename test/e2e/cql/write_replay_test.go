@@ -177,17 +177,18 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 			waitForReconnect(t, a, d.name)
 
 			converged := waitFor(60*time.Second, 200*time.Millisecond, func() bool {
-				return countRows(t, a, table) == int(written.Load())
+				count, err := tryCountRows(a, table)
+				return err == nil && count == int(written.Load())
 			})
 			assert.True(t, converged,
 				"[%s] cluster A did not catch up to %d rows within 60s after Unpause "+
 					"(A=%d B=%d replayQueueLen=%d)",
-				d.name, written.Load(), countRows(t, a, table),
-				countRows(t, b, table), memReplayer.Len())
+				d.name, written.Load(), countRowsEventually(t, a, table),
+				countRowsEventually(t, b, table), memReplayer.Len())
 
 			// Final consistency: count rows on each cluster, expect equal.
-			countA := countRows(t, a, table)
-			countB := countRows(t, b, table)
+			countA := countRowsEventually(t, a, table)
+			countB := countRowsEventually(t, b, table)
 			t.Logf("[%s] worker callbacks: success=%d error=%d dropped=%d",
 				d.name, workerSuccess.Load(), workerError.Load(), workerDropped.Load())
 			t.Logf("[%s] post-drain row counts: A=%d B=%d", d.name, countA, countB)
@@ -197,14 +198,33 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 	}
 }
 
-func countRows(t *testing.T, c *testutil.CQLCluster, table string) int {
-	t.Helper()
+func tryCountRows(c *testutil.CQLCluster, table string) (int, error) {
 	var n int
 	err := c.Session.Query("SELECT COUNT(*) FROM " + table).Scan(&n)
 	if err != nil {
-		t.Fatalf("count rows: %v", err)
+		return 0, err
 	}
-	return n
+
+	return n, nil
+}
+
+func countRows(t *testing.T, c *testutil.CQLCluster, table string) int {
+	t.Helper()
+	return countRowsEventually(t, c, table)
+}
+
+func countRowsEventually(t *testing.T, c *testutil.CQLCluster, table string) int {
+	t.Helper()
+	var (
+		count   int
+		lastErr error
+	)
+	require.Eventually(t, func() bool {
+		count, lastErr = tryCountRows(c, table)
+		return lastErr == nil
+	}, 15*time.Second, 200*time.Millisecond, "count rows: %v", lastErr)
+
+	return count
 }
 
 func waitFor(timeout, interval time.Duration, condition func() bool) bool {
