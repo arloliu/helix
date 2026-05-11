@@ -61,6 +61,12 @@ func TestWithDefaultMaxRows_ValidPositive_Accepted(t *testing.T) {
 	client.Close()
 }
 
+func TestWithDefaultMaxRows_MaxInt32MinusOne_Accepted(t *testing.T) {
+	client, err := NewCQLClient(newMockSession(), nil, WithDefaultMaxRows(math.MaxInt32-1))
+	require.NoError(t, err)
+	client.Close()
+}
+
 // ─────────────────────────────────────────────
 // DefaultMaxRows precedence
 // ─────────────────────────────────────────────
@@ -85,20 +91,20 @@ func TestSliceMap_DefaultMaxRows_EnforcedWhenPerQueryZero(t *testing.T) {
 
 // TestSliceMap_PerQueryMaxRows_WinsOverDefault verifies that a per-query
 // MaxRows(N) takes precedence over Config.DefaultMaxRows.
+// DefaultMaxRows(10) admits all 3 rows on its own; only MaxRows(2) overflows.
 func TestSliceMap_PerQueryMaxRows_WinsOverDefault(t *testing.T) {
 	spec := &sliceSpec{
 		cols: []string{"id"},
-		// 5 rows: DefaultMaxRows(3) would allow all; MaxRows(2) aborts at row 3.
-		rows: rowsOf([]any{1}, []any{2}, []any{3}, []any{4}, []any{5}),
+		rows: rowsOf([]any{1}, []any{2}, []any{3}),
 	}
 	sa := &sliceTestSession{spec: spec}
-	client, err := NewCQLClient(sa, nil, WithDefaultMaxRows(3))
+	client, err := NewCQLClient(sa, nil, WithDefaultMaxRows(10))
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
 	rows, rerr := client.Query("SELECT id FROM t").MaxRows(2).SliceMapContext(context.Background())
 	require.ErrorIs(t, rerr, types.ErrRowLimitExceeded,
-		"per-query MaxRows(2) wins over DefaultMaxRows(3)")
+		"per-query MaxRows(2) must win; DefaultMaxRows(10) would admit all 3 rows")
 	assert.Nil(t, rows)
 }
 
@@ -201,6 +207,36 @@ func TestSliceScan_MaxRows_Overflow_ReturnsRowCountAndSentinel(t *testing.T) {
 	)
 	require.ErrorIs(t, err, types.ErrRowLimitExceeded)
 	assert.Equal(t, 2, rowCount, "rowCount = number of successful callbacks before abort")
+	assert.Equal(t, []int{1, 2}, got)
+}
+
+// TestSliceScan_DefaultMaxRows_EnforcedWhenPerQueryZero verifies that
+// Config.DefaultMaxRows bounds SliceScan when no per-query MaxRows is set.
+// Returns (N, ErrRowLimitExceeded) where N is the DefaultMaxRows bound.
+func TestSliceScan_DefaultMaxRows_EnforcedWhenPerQueryZero(t *testing.T) {
+	spec := &sliceSpec{
+		cols: []string{"id"},
+		rows: rowsOf([]any{1}, []any{2}, []any{3}, []any{4}),
+	}
+	sa := &sliceTestSession{spec: spec}
+	client, err := NewCQLClient(sa, nil, WithDefaultMaxRows(2))
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	var got []int
+	rowCount, rerr := client.Query("SELECT id FROM t").SliceScanContext(
+		context.Background(),
+		func(r RowScanner) error {
+			var v int
+			if e := r.Scan(&v); e != nil {
+				return e
+			}
+			got = append(got, v)
+			return nil
+		},
+	)
+	require.ErrorIs(t, rerr, types.ErrRowLimitExceeded)
+	assert.Equal(t, 2, rowCount, "rowCount = DefaultMaxRows (number of successful callbacks before abort)")
 	assert.Equal(t, []int{1, 2}, got)
 }
 
