@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"sync"
 
@@ -116,13 +117,16 @@ type MockQuery struct {
 	pageSize    int
 	pageState   []byte
 	timestamp   int64
+	maxRows     *int
 
 	// Return values
-	execErr  error
-	scanErr  error
-	scanData []any
-	iter     helix.Iter
-	mapData  map[string]any
+	execErr       error
+	scanErr       error
+	scanData      []any
+	iter          helix.Iter
+	mapData       map[string]any
+	sliceMapData  []map[string]any
+	sliceScanData [][]any
 }
 
 // Compile-time assertion that MockQuery implements helix.Query.
@@ -216,6 +220,70 @@ func (m *MockQuery) Mirror() helix.Query {
 // Strict marks this query for strict dual-write semantics (no-op in mock).
 func (m *MockQuery) Strict() helix.Query {
 	return m
+}
+
+// MaxRows records the per-query row cap (no enforcement in mock).
+func (m *MockQuery) MaxRows(n int) helix.Query {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if n == 0 {
+		m.maxRows = nil
+	} else {
+		m.maxRows = &n
+	}
+
+	return m
+}
+
+// SliceMap returns the configured slice-map rows.
+func (m *MockQuery) SliceMap() ([]map[string]any, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.scanErr != nil {
+		return nil, m.scanErr
+	}
+	return m.sliceMapData, nil
+}
+
+// SliceMapContext returns the configured slice-map rows with context.
+func (m *MockQuery) SliceMapContext(_ context.Context) ([]map[string]any, error) {
+	return m.SliceMap()
+}
+
+// SliceScan invokes scanFn once per configured slice-scan row.
+//
+// Errors that fire before any callback (nil scanFn) match the production
+// contract: no rows are consumed. After scanFn returns an error, iteration
+// aborts and the rowCount reflects only the prior successful invocations.
+func (m *MockQuery) SliceScan(scanFn func(r helix.RowScanner) error) (int, error) {
+	if scanFn == nil {
+		return 0, errors.New("helix mock: scanFn must not be nil")
+	}
+	m.mu.RLock()
+	rows := m.sliceScanData
+	scanErr := m.scanErr
+	m.mu.RUnlock()
+
+	if scanErr != nil {
+		return 0, scanErr
+	}
+
+	rowCount := 0
+	for i := range rows {
+		if err := scanFn(&mockRowScanner{values: rows[i]}); err != nil {
+			return rowCount, err
+		}
+		rowCount++
+	}
+
+	return rowCount, nil
+}
+
+// SliceScanContext invokes scanFn once per configured slice-scan row.
+func (m *MockQuery) SliceScanContext(_ context.Context, scanFn func(r helix.RowScanner) error) (int, error) {
+	return m.SliceScan(scanFn)
 }
 
 // Exec executes the query.
@@ -363,6 +431,41 @@ func (m *MockQuery) SetMapData(data map[string]any) *MockQuery {
 	m.mapData = data
 
 	return m
+}
+
+// SetSliceMapData configures the rows returned by SliceMap / SliceMapContext.
+func (m *MockQuery) SetSliceMapData(rows []map[string]any) *MockQuery {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sliceMapData = rows
+
+	return m
+}
+
+// SetSliceScanData configures the rows handed to scanFn by SliceScan /
+// SliceScanContext. Each inner slice is one row's column values, matching the
+// destination order the caller passes to RowScanner.Scan.
+func (m *MockQuery) SetSliceScanData(rows [][]any) *MockQuery {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sliceScanData = rows
+
+	return m
+}
+
+// mockRowScanner satisfies helix.RowScanner for tests by copying preset
+// column values into the caller's destination pointers via copyValue.
+type mockRowScanner struct {
+	values []any
+}
+
+func (s *mockRowScanner) Scan(dest ...any) error {
+	for i := 0; i < len(dest) && i < len(s.values); i++ {
+		copyValue(dest[i], s.values[i])
+	}
+	return nil
 }
 
 // MockBatch is a mock implementation of helix.Batch for testing.

@@ -2321,6 +2321,121 @@ func (c *CQLClient) executeFallbackRead(
 	return types.ErrNotFound
 }
 
+// errNilSliceScanFn is returned by [Query.SliceScan] / [Query.SliceScanContext]
+// when the caller passes a nil scan callback. Unexported: callers should not
+// branch on it via errors.Is; a nil callback is programmer error, not a
+// recoverable runtime condition.
+var errNilSliceScanFn = errors.New("helix: scanFn must not be nil")
+
+// rowScannerAdapter narrows a driver [cql.Scanner] down to the public
+// [RowScanner] surface (Scan only). Helix's counted-drain loop owns Next()
+// and Err()/Close(); exposing them through the user callback would let a
+// caller advance or close the iterator out from under the loop.
+//
+// The pointer receiver matters: drainIterScanWithLimit allocates one adapter
+// before the drain loop and pre-boxes it into a RowScanner interface so
+// per-row scanFn calls do not re-allocate. A value receiver would force the
+// compiler to re-box the value into the interface on every call site, adding
+// one allocation per row.
+type rowScannerAdapter struct {
+	scanner cql.Scanner
+}
+
+// Scan delegates to the underlying driver scanner. The destination types
+// follow the driver's unmarshalling conventions (custom UnmarshalCQL etc.).
+func (r *rowScannerAdapter) Scan(dest ...any) error {
+	return r.scanner.Scan(dest...)
+}
+
+// drainIterScanWithLimit drains iter row-by-row through scanFn, returning the
+// count of completed (nil-returning) scanFn invocations and the first error
+// observed.
+//
+// Ownership: the helper does NOT call iter.Close() directly — gocql's scanner
+// reassigns its internal iter pointer across page boundaries, so a deferred
+// close on the original iter would close an already-drained page-1 iter while
+// leaking the active later-page iter that the scanner holds. scanner.Err()
+// closes the scanner's currently-held iter, which is the correct close-owner
+// across page boundaries (verified against gocql v1 and cassandra-gocql-driver
+// v2). Error precedence: ErrRowLimitExceeded and scanFn errors win over the
+// deferred close error (the err == nil guard in the defer prevents overwrite).
+//
+// The wider PageState-aware / FallbackRead-aware decisions live in the public
+// methods and the read-pipeline wrappers; this helper is purely the counted
+// drain.
+func drainIterScanWithLimit(
+	iter cql.Iter, limit int, scanFn func(RowScanner) error,
+) (rowCount int, err error) {
+	if scanFn == nil { // defense-in-depth; public method has already screened
+		return 0, errNilSliceScanFn
+	}
+	scanner := iter.Scanner()
+	defer func() {
+		if cerr := scanner.Err(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	// Hoist + pre-box: one adapter allocation and one interface envelope shared
+	// across every row. A per-iteration scanFn(rowScannerAdapter{...}) would
+	// allocate once per row (escape analysis boxes the value into the
+	// RowScanner interface inside the loop). gocql's iterScanner.Next reassigns
+	// its internal iter pointer across page boundaries while the scanner
+	// value itself stays stable, so reuse is safe.
+	adapter := &rowScannerAdapter{scanner: scanner}
+	var rs RowScanner = adapter
+	for scanner.Next() {
+		if limit > 0 && rowCount >= limit {
+			return rowCount, types.ErrRowLimitExceeded
+		}
+		if cberr := scanFn(rs); cberr != nil {
+			return rowCount, cberr
+		}
+		rowCount++
+	}
+
+	return rowCount, nil
+}
+
+// drainIterToSliceMapWithLimit drains iter into a slice of column-name maps,
+// stopping when max > 0 is reached.
+//
+// Discard-on-any-error contract: on any non-nil err (overflow, mid-drain
+// MapScan error captured by iter.Close, anything), the returned rows slice
+// is forced to nil. The public method may capture rows through a readFunc
+// closure that runs twice (primary then alt via executeFallbackRead); the
+// discard contract prevents a partial primary buffer from leaking into the
+// caller's return value when the wrapper translates the err to ErrNotFound
+// or DualClusterError.
+//
+// iter.Close() is idempotent and is the correct close-owner for SliceMap's
+// page semantics: iter.MapScan does an in-place page replacement, so a
+// deferred close on the original iter always closes the active page
+// (verified against gocql v1 and cassandra-gocql-driver v2).
+func drainIterToSliceMapWithLimit(
+	iter cql.Iter, limit int,
+) (rows []map[string]any, err error) {
+	defer func() {
+		if cerr := iter.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		if err != nil {
+			rows = nil
+		}
+	}()
+	for {
+		m := map[string]any{}
+		if !iter.MapScan(m) {
+			break
+		}
+		if limit > 0 && len(rows) >= limit {
+			return nil, types.ErrRowLimitExceeded
+		}
+		rows = append(rows, m)
+	}
+
+	return rows, nil
+}
+
 // cqlQuery implements the Query interface for CQLClient.
 type cqlQuery struct {
 	client            *CQLClient
@@ -2333,6 +2448,7 @@ type cqlQuery struct {
 	pageState         []byte
 	timestamp         *int64
 	priority          *PriorityLevel
+	maxRows           *int
 	fallbackRead      bool
 	mirror            bool
 	strict            bool
@@ -2394,6 +2510,51 @@ func (q *cqlQuery) Mirror() Query {
 func (q *cqlQuery) Strict() Query {
 	q.strict = true
 	return q
+}
+
+func (q *cqlQuery) MaxRows(n int) Query {
+	if n == 0 {
+		q.maxRows = nil
+		return q
+	}
+	q.maxRows = &n
+	return q
+}
+
+// effectiveMaxRows returns the cap that the slice drain helpers enforce.
+// 0 means unbounded.
+func (q *cqlQuery) effectiveMaxRows() int {
+	if q.maxRows != nil {
+		return *q.maxRows
+	}
+	return 0
+}
+
+// sliceReadOpts derives effective readOptions for the four slice methods and
+// is the single source of truth for the PageState short-circuit.
+//
+// When q.pageState != nil, all four cluster-switching mechanisms must be
+// disabled together because an opaque cursor is unsound on the wrong cluster:
+//
+//   - opts.fallbackRead = false → wrapper's executeFallbackRead empty-retry
+//     gate stays closed.
+//   - opts.preserveSelectedCluster = true → runPrimaryRead skips drain-aware
+//     re-selection and resolveReadTarget skips the AllowedClusters override
+//     drain-filter fallback.
+//   - useNoFailover = true → caller routes through executeReadNoFailover,
+//     so standard executeRead failover is bypassed too.
+//
+// SliceScan ignores useNoFailover (its no-failover contract is unconditional),
+// but it still needs the fallbackRead / preserveSelectedCluster flags applied
+// here so the wrapper's behavior matches under PageState.
+func (q *cqlQuery) sliceReadOpts(ctx context.Context) (opts readOptions, useNoFailover bool) {
+	opts = q.client.resolveReadOptions(ctx, q)
+	if q.pageState != nil {
+		opts.fallbackRead = false
+		opts.preserveSelectedCluster = true
+		return opts, true
+	}
+	return opts, false
 }
 
 func (q *cqlQuery) getContext() context.Context {
@@ -2557,6 +2718,80 @@ func (q *cqlQuery) MapScanContext(ctx context.Context, m map[string]any) error {
 
 		return query.MapScanContext(ctx, m)
 	})
+}
+
+func (q *cqlQuery) SliceMap() ([]map[string]any, error) {
+	return q.SliceMapContext(q.getContext())
+}
+
+// SliceMapContext drains the query into a slice of column maps.
+// See [Query.SliceMap] for the caller-facing contract.
+func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error) {
+	opts, useNoFailover := q.sliceReadOpts(ctx)
+	limit := q.effectiveMaxRows()
+
+	var rows []map[string]any
+	readFunc := func(ctx context.Context, session cql.Session) error {
+		query := session.Query(q.statement, q.values...)
+		query = q.applyConfig(query)
+		iter := query.IterContext(ctx)
+
+		var derr error
+		rows, derr = drainIterToSliceMapWithLimit(iter, limit)
+
+		return derr
+	}
+
+	var err error
+	if useNoFailover {
+		err = q.client.executeReadNoFailover(ctx, opts, readFunc)
+	} else {
+		err = q.client.executeRead(ctx, opts, readFunc)
+	}
+	if err != nil {
+		// drainIterToSliceMapWithLimit's discard-on-error contract already nils
+		// rows whenever readFunc returned an error; this also covers
+		// pre-attempt fail-closed paths where readFunc never ran at all.
+		return nil, err
+	}
+
+	return rows, nil
+}
+
+func (q *cqlQuery) SliceScan(scanFn func(r RowScanner) error) (int, error) {
+	return q.SliceScanContext(q.getContext(), scanFn)
+}
+
+// SliceScanContext drains the query and invokes scanFn once per row.
+// See [Query.SliceScan] for the caller-facing contract.
+//
+// The nil-scanFn guard sits at this public boundary so the "no cluster
+// contact when scanFn is nil" promise holds mechanically — by the time the
+// drain helper has an iter, a session has already been selected.
+func (q *cqlQuery) SliceScanContext(
+	ctx context.Context, scanFn func(r RowScanner) error,
+) (int, error) {
+	if scanFn == nil {
+		return 0, errNilSliceScanFn
+	}
+	opts, _ := q.sliceReadOpts(ctx)
+	limit := q.effectiveMaxRows()
+
+	var rowCount int
+	readFunc := func(ctx context.Context, session cql.Session) error {
+		query := session.Query(q.statement, q.values...)
+		query = q.applyConfig(query)
+		iter := query.IterContext(ctx)
+
+		n, derr := drainIterScanWithLimit(iter, limit, scanFn)
+		rowCount = n
+
+		return derr
+	}
+
+	err := q.client.executeReadNoFailover(ctx, opts, readFunc)
+
+	return rowCount, err
 }
 
 // ScanCAS executes a lightweight transaction (IF clause) and scans the result.

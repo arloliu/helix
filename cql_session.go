@@ -336,6 +336,127 @@ type Query interface {
 	//   - applied: true if the CAS operation was applied
 	//   - err: error if the operation failed
 	MapScanCASContext(ctx context.Context, dest map[string]any) (applied bool, err error)
+
+	// MaxRows caps the number of rows admitted by [Query.SliceMap],
+	// [Query.SliceMapContext], [Query.SliceScan], and [Query.SliceScanContext].
+	//
+	// The (N+1)th row aborts the read with [ErrRowLimitExceeded]. The bound
+	// applies independently per cluster: if both clusters yield more than
+	// N rows, both reads abort with the same sentinel.
+	//
+	// Passing 0 clears the per-query override. A negative value is
+	// programmer error; see the implementation for the panic boundary
+	// introduced alongside Config.DefaultMaxRows.
+	//
+	// MaxRows has no effect on [Query.Scan], [Query.MapScan], [Query.Iter],
+	// or CAS methods.
+	//
+	// Returns:
+	//   - Query: The same query for chaining
+	MaxRows(n int) Query
+
+	// SliceMap drains the query into a slice of column-name → value maps.
+	//
+	// Semantics match Iter().SliceMap() except:
+	//   - Bounded by [Query.MaxRows] / Config.DefaultMaxRows. Exceeding the
+	//     bound returns (nil, [ErrRowLimitExceeded]) and discards the
+	//     partially materialized buffer.
+	//   - When [Query.FallbackRead] is enabled and the selected cluster
+	//     returns zero rows, Helix silently retries the drain on the
+	//     alternative cluster (best-effort; the alternative is skipped if
+	//     draining). Empty result on the alternative is returned as
+	//     (nil, nil).
+	//
+	// The full result set is materialized in memory. Use [Query.Iter] for
+	// unbounded or large result sets.
+	//
+	// Returns:
+	//   - []map[string]any: All rows up to the configured cap; nil on empty or error
+	//   - error: nil on success, [ErrRowLimitExceeded] on overflow, or a
+	//     cluster error
+	SliceMap() ([]map[string]any, error)
+
+	// SliceMapContext is the context-aware variant of [Query.SliceMap].
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout
+	//
+	// Returns:
+	//   - []map[string]any: All rows up to the configured cap; nil on empty or error
+	//   - error: nil on success, [ErrRowLimitExceeded] on overflow, ctx error
+	//     on cancellation, or a cluster error
+	SliceMapContext(ctx context.Context) ([]map[string]any, error)
+
+	// SliceScan drains the query and invokes scanFn once per row.
+	//
+	// scanFn receives a [RowScanner] positioned at the current row; the
+	// caller uses RowScanner.Scan(dest...) to copy column values via the
+	// driver's destination-driven unmarshalling path. Returning a non-nil
+	// error from scanFn aborts iteration and propagates the error. The
+	// RowScanner is valid only for the duration of the callback — do not
+	// retain it after scanFn returns.
+	//
+	// If scanFn is nil, SliceScan returns an error before any cluster
+	// contact — neither the primary nor the alternative cluster is queried.
+	//
+	// SliceScan does NOT participate in standard executeRead failover for
+	// selected-cluster errors. Any error from the selected cluster is
+	// returned to the caller with the number of completed scanFn
+	// invocations; the caller is expected to retry with a fresh
+	// accumulator. The conservative all-error rule prevents post-callback
+	// silent corruption: re-running on the alternative would invoke scanFn
+	// a second time on rows already mutated into the caller's accumulator
+	// from the failed primary. [Query.FallbackRead] empty-retry still
+	// applies — a selected cluster that returns zero rows triggers a
+	// single drain attempt on the alternative.
+	//
+	// Bounded by [Query.MaxRows] / Config.DefaultMaxRows. On overflow,
+	// SliceScan returns (N, [ErrRowLimitExceeded]) where N is the number
+	// of scanFn invocations that returned nil before the (N+1)th row was
+	// detected. The caller's accumulator state on err != nil is undefined
+	// per the failover contract above; rowCount is diagnostic-only.
+	//
+	// Parameters:
+	//   - scanFn: Callback invoked once per row with a narrow RowScanner
+	//
+	// Returns:
+	//   - rowCount: Number of successful scanFn invocations before return
+	//   - err: nil on success, [ErrRowLimitExceeded] on overflow, the
+	//     scanFn-returned error if non-nil, or a cluster error
+	SliceScan(scanFn func(r RowScanner) error) (rowCount int, err error)
+
+	// SliceScanContext is the context-aware variant of [Query.SliceScan].
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout
+	//   - scanFn: Callback invoked once per row with a narrow RowScanner
+	//
+	// Returns:
+	//   - rowCount: Number of successful scanFn invocations before return
+	//   - err: nil on success, [ErrRowLimitExceeded] on overflow, the
+	//     scanFn-returned error if non-nil, ctx error on cancellation,
+	//     or a cluster error
+	SliceScanContext(ctx context.Context, scanFn func(r RowScanner) error) (rowCount int, err error)
+}
+
+// RowScanner is the narrow scan surface presented to a [Query.SliceScan]
+// callback. It exposes only [RowScanner.Scan] so a callback cannot accidentally
+// advance or close the underlying iterator — both are owned by Helix's
+// counted-drain loop.
+//
+// The pointer types passed to Scan follow the same destination-driven
+// convention as [Query.Scan]: custom UnmarshalCQL, blob coercion, and any
+// other driver unmarshalling rules apply unchanged. The RowScanner is valid
+// only for the duration of a single scanFn invocation.
+type RowScanner interface {
+	// Scan reads the current row's columns into the destination pointers.
+	//
+	// Parameters:
+	//   - dest: Pointers to variables to receive column values
+	//
+	// Returns:
+	//   - error: Any error from the underlying driver scan
+	Scan(dest ...any) error
 }
 
 // Batch mirrors gocql.Batch for grouping multiple mutations.

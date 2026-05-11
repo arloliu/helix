@@ -160,7 +160,7 @@ func TestRecordOpOutcomeAt_ErrRowLimitExceeded_DoesNotPoisonHealth(t *testing.T)
 	defer client.Close()
 
 	// Drive several ErrRowLimitExceeded results.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_ = client.Query("SELECT 1").Scan()
 	}
 
