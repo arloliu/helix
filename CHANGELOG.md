@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] — 2026-07-12
+
+### Security
+
+- **Dependency upgrade resolving `GO-2026-5052`**:
+  `software.sslmate.com/src/go-pkcs12` 0.6.0 → 0.7.3 — reachable via
+  testcontainers' Cassandra module from `test/testutil`, not from any path a
+  library consumer's binary pulls in.
+- **Minimum Go version raised `1.25.0` → `1.26.0`**. Helix does not pin a
+  `toolchain` directive, so consumers build with whatever Go 1.26.x patch
+  they have installed — picking up upstream `crypto/tls`, `crypto/x509`,
+  `net`, and `net/http` CVE fixes shipped in later 1.26 patch releases is
+  the build environment's responsibility, not something this library forces.
+
+### Changed
+
+- **Dependency bumps** (direct): `VictoriaMetrics/metrics` 1.40.2 → 1.44.0,
+  `apache/cassandra-gocql-driver/v2` 2.0.0 → 2.1.2, `nats-server/v2` 2.12.6
+  → 2.14.3, `nats.go` 1.49.0 → 1.52.0, `testcontainers-go` (+ `cassandra` /
+  `scylladb` modules) 0.42.0 → 0.43.0, `moby/moby/client` 0.4.0 → 0.5.0,
+  `tinylib/msgp` 1.6.1 → 1.6.4.
+  - Transitive deps pulled forward by `go mod tidy`: `golang.org/x/crypto`,
+    `golang.org/x/sys`, `nats-io/jwt/v2`, `nats-io/nkeys`, `otel`,
+    `otel/metric`, `otel/trace`, `otel/contrib/otelhttp`,
+    `antithesishq/antithesis-sdk-go`, and others.
+  - No source changes — `go.mod`/`go.sum` only. Wire behavior and public
+    API are unaffected. Verified with `go build`, `make lint`, `make
+    vet`, `make test-unit` (race detector), and `make test-integration`
+    (real Cassandra/ScyllaDB containers via testcontainers).
+
 ## [1.5.2] — 2026-07-11
 
 ### Security
