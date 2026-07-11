@@ -530,26 +530,41 @@ func (a *AdaptiveDualWrite) Execute(
 	var latencyA, latencyB time.Duration
 	var errA, errB error
 
-	// Cluster A
-	if !degradedA {
-		wg.Go(func() {
-			start := time.Now()
-			errA = safeWrite(ctx, writeA, "A")
-			latencyA = time.Since(start)
-		})
-	} else {
-		errA = a.fireAndForget(types.ClusterA, writeA, &a.stateA, &a.stateB)
-	}
-
-	// Cluster B
-	if !degradedB {
+	if !degradedA && !degradedB {
+		// Both clusters healthy: spawn one goroutine for B and run A inline
+		// on the calling goroutine instead of spawning two goroutines for
+		// this common case. Both writes still execute concurrently.
 		wg.Go(func() {
 			start := time.Now()
 			errB = safeWrite(ctx, writeB, "B")
 			latencyB = time.Since(start)
 		})
+
+		start := time.Now()
+		errA = safeWrite(ctx, writeA, "A")
+		latencyA = time.Since(start)
 	} else {
-		errB = a.fireAndForget(types.ClusterB, writeB, &a.stateB, &a.stateA)
+		// Cluster A
+		if !degradedA {
+			wg.Go(func() {
+				start := time.Now()
+				errA = safeWrite(ctx, writeA, "A")
+				latencyA = time.Since(start)
+			})
+		} else {
+			errA = a.fireAndForget(types.ClusterA, writeA, &a.stateA, &a.stateB)
+		}
+
+		// Cluster B
+		if !degradedB {
+			wg.Go(func() {
+				start := time.Now()
+				errB = safeWrite(ctx, writeB, "B")
+				latencyB = time.Since(start)
+			})
+		} else {
+			errB = a.fireAndForget(types.ClusterB, writeB, &a.stateB, &a.stateA)
+		}
 	}
 
 	// Wait for healthy clusters to complete
@@ -946,24 +961,39 @@ func (a *AdaptiveDualWrite) ExecuteStrict(
 	var latencyA, latencyB time.Duration
 	var errA, errB error
 
-	if !degradedA {
-		wg.Go(func() {
-			start := time.Now()
-			errA = safeWrite(ctx, writeA, "A")
-			latencyA = time.Since(start)
-		})
-	} else {
-		errA = types.ErrClusterDegraded
-	}
-
-	if !degradedB {
+	if !degradedA && !degradedB {
+		// Both clusters healthy: spawn one goroutine for B and run A inline
+		// on the calling goroutine instead of spawning two goroutines for
+		// this common case. Both writes still execute concurrently.
 		wg.Go(func() {
 			start := time.Now()
 			errB = safeWrite(ctx, writeB, "B")
 			latencyB = time.Since(start)
 		})
+
+		start := time.Now()
+		errA = safeWrite(ctx, writeA, "A")
+		latencyA = time.Since(start)
 	} else {
-		errB = types.ErrClusterDegraded
+		if !degradedA {
+			wg.Go(func() {
+				start := time.Now()
+				errA = safeWrite(ctx, writeA, "A")
+				latencyA = time.Since(start)
+			})
+		} else {
+			errA = types.ErrClusterDegraded
+		}
+
+		if !degradedB {
+			wg.Go(func() {
+				start := time.Now()
+				errB = safeWrite(ctx, writeB, "B")
+				latencyB = time.Since(start)
+			})
+		} else {
+			errB = types.ErrClusterDegraded
+		}
 	}
 
 	wg.Wait()

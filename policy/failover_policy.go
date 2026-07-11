@@ -280,14 +280,24 @@ func NewCircuitBreakerChecked(opts ...CircuitBreakerOption) (*CircuitBreaker, er
 }
 
 func newCircuitBreakerWithDefaults() *CircuitBreaker {
-	c := &CircuitBreaker{
-		threshold:    defaultCircuitBreakerThreshold,
-		resetTimeout: defaultCircuitBreakerResetTimeout,
-	}
-	defaultNames := types.DefaultClusterNames()
-	c.clusterNames.Store(&defaultNames)
+	c := &CircuitBreaker{}
+	initCircuitBreakerDefaults(c)
 
 	return c
+}
+
+// initCircuitBreakerDefaults populates c's default field values in place.
+//
+// Initialization always happens through a pointer: CircuitBreaker holds
+// sync.Mutex fields, so constructing a standalone value and copying it in
+// would trip `go vet` copylocks. Any future caller that embeds
+// CircuitBreaker by value must likewise initialize through a pointer to the
+// embedded field rather than by assignment.
+func initCircuitBreakerDefaults(c *CircuitBreaker) {
+	c.threshold = defaultCircuitBreakerThreshold
+	c.resetTimeout = defaultCircuitBreakerResetTimeout
+	defaultNames := types.DefaultClusterNames()
+	c.clusterNames.Store(&defaultNames)
 }
 
 func applyCircuitBreakerOptions(c *CircuitBreaker, opts ...CircuitBreakerOption) {
@@ -374,7 +384,12 @@ func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
 		failures = c.failuresB.Load()
 		lastFailure = c.lastFailureB.Load()
 	}
-	if int(failures) < c.threshold {
+	// threshold <= 0 means "never configured" (zero-value CircuitBreaker) or
+	// an explicitly disabled breaker; either way it must never report a
+	// failover, matching RecordFailure's `c.threshold > 0` guard on the trip
+	// latch below — otherwise a zero-value breaker would report true here
+	// despite never having (or being able to) record a trip.
+	if c.threshold <= 0 || int(failures) < c.threshold {
 		return false
 	}
 	// Half-open: allow a probe after resetTimeout elapses. resetTimeout=0

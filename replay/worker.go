@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arloliu/helix/internal/typeutil"
 	"github.com/arloliu/helix/types"
 )
 
@@ -229,16 +230,32 @@ func WithOnDrop(fn func(types.ReplayPayload, error)) WorkerOption {
 // Marks the configuration as "metrics explicitly set" so a parent caller
 // (e.g. helix.NewCQLClient) does not auto-inject a different collector
 // later via [Worker.SetMetrics] / [Worker.MetricsConfigured].
+//
+// A typed-nil m (e.g. a nil `*myCollector` assigned to the
+// types.MetricsCollector variable) is treated the same as an untyped
+// nil: it is ignored so [finalizeWorkerConfig] can still install the
+// Nop fallback, instead of the config being left holding an interface
+// value that panics on first use.
 func WithWorkerMetrics(m types.MetricsCollector) WorkerOption {
 	return func(c *WorkerConfig) {
+		if typeutil.IsNilInterface(m) {
+			return
+		}
 		c.Metrics = m
 		c.metricsExplicit = true
 	}
 }
 
 // WithWorkerLogger sets the logger for the worker.
+//
+// A typed-nil l is ignored for the same reason described in
+// [WithWorkerMetrics]: it leaves the config free to fall back to the Nop
+// logger instead of storing an unusable interface value.
 func WithWorkerLogger(l types.Logger) WorkerOption {
 	return func(c *WorkerConfig) {
+		if typeutil.IsNilInterface(l) {
+			return
+		}
 		c.Logger = l
 	}
 }
@@ -380,7 +397,7 @@ func (w *Worker) SetMetrics(m types.MetricsCollector) {
 	if w.config.metricsExplicit {
 		return
 	}
-	if m == nil {
+	if typeutil.IsNilInterface(m) {
 		return
 	}
 	w.config.Metrics = m

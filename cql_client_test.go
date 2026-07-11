@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 type mockSession struct {
 	queries    []string
 	execErr    error
+	execPanic  any // if set, ExecContext panics with this value instead of returning execErr
 	scanErr    error
 	scanValues []any
 	closed     atomic.Bool
@@ -129,6 +131,9 @@ func (q *mockQuery) MapScan(m map[string]any) error {
 
 func (q *mockQuery) ExecContext(ctx context.Context) error {
 	q.ctx = ctx
+	if q.session.execPanic != nil {
+		panic(q.session.execPanic)
+	}
 	return q.session.execErr
 }
 
@@ -375,6 +380,153 @@ func (w *mockTopologyWatcher) SetDrain(cluster ClusterID, drain bool) {
 	}
 }
 
+// neverClosingTopologyWatcher reproduces a misbehaving/custom TopologyWatcher
+// whose Watch ignores ctx cancellation and never closes its returned
+// channel. Used to regression-test that watchTopology's goroutine still
+// exits via topologyCtx.Done() rather than blocking forever on `for range`.
+type neverClosingTopologyWatcher struct {
+	updates chan TopologyUpdate
+}
+
+func newNeverClosingTopologyWatcher() *neverClosingTopologyWatcher {
+	return &neverClosingTopologyWatcher{updates: make(chan TopologyUpdate)}
+}
+
+func (w *neverClosingTopologyWatcher) Watch(_ context.Context) <-chan TopologyUpdate {
+	return w.updates
+}
+
+// nilChanTopologyWatcher reproduces a TopologyWatcher whose Watch returns a
+// nil channel — ranging over it blocks forever identically to the
+// never-closing case above. invoked is closed synchronously inside Watch,
+// before the nil channel is returned, so a test can prove watchTopology's
+// goroutine actually started and reached the Watch() call — as opposed to
+// merely observing "not in the stack", which could pass trivially before
+// the goroutine is ever scheduled and would mask a real leak just as
+// easily as it proves an immediate return.
+type nilChanTopologyWatcher struct {
+	invoked chan struct{}
+}
+
+func newNilChanTopologyWatcher() *nilChanTopologyWatcher {
+	return &nilChanTopologyWatcher{invoked: make(chan struct{})}
+}
+
+func (w *nilChanTopologyWatcher) Watch(_ context.Context) <-chan TopologyUpdate {
+	close(w.invoked)
+	return nil
+}
+
+// finalUpdateThenCloseWatcher is a TopologyWatcher whose Watch returns a
+// buffered channel fully controlled by the test: the test sends updates and
+// closes the channel directly, independent of ctx cancellation. Used to
+// prove watchTopology's `case update, ok := <-updates` drain path applies a
+// final buffered update before returning on channel closure alone — as
+// opposed to via topologyCtx.Done() (covered separately).
+type finalUpdateThenCloseWatcher struct {
+	updates chan TopologyUpdate
+}
+
+func newFinalUpdateThenCloseWatcher() *finalUpdateThenCloseWatcher {
+	return &finalUpdateThenCloseWatcher{updates: make(chan TopologyUpdate, 1)}
+}
+
+func (w *finalUpdateThenCloseWatcher) Watch(_ context.Context) <-chan TopologyUpdate {
+	return w.updates
+}
+
+// watchTopologyGoroutineRunning reports whether watchTopology's goroutine
+// currently appears in any running goroutine's stack trace. Used to detect
+// whether it is still alive without requiring a dedicated WaitGroup/hook.
+func watchTopologyGoroutineRunning() bool {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+
+	return strings.Contains(string(buf[:n]), "CQLClient).watchTopology")
+}
+
+// TestWatchTopology_MisbehavingWatcherGoroutineExitsOnClose is a regression
+// test for cql_client.go:713 (nil-safety finding): watchTopology previously
+// had no select on topologyCtx.Done(), so a TopologyWatcher that ignores ctx
+// cancellation and never closes its channel would leak the goroutine forever
+// and make Close()'s cancellation of topologyCtx a no-op for it.
+func TestWatchTopology_MisbehavingWatcherGoroutineExitsOnClose(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	watcher := newNeverClosingTopologyWatcher()
+
+	client, err := NewCQLClient(sessionA, sessionB, WithTopologyWatcher(watcher))
+	require.NoError(t, err)
+
+	require.Eventually(t, watchTopologyGoroutineRunning, time.Second, 5*time.Millisecond,
+		"watchTopology goroutine must be running before Close()")
+
+	client.Close()
+
+	require.Eventually(t, func() bool {
+		return !watchTopologyGoroutineRunning()
+	}, time.Second, 5*time.Millisecond,
+		"watchTopology goroutine must exit after Close(), even though the misbehaving watcher never closes its update channel or observes ctx")
+}
+
+// TestWatchTopology_NilChannelReturnsImmediately is a regression test for the
+// nil-channel case of the same finding: a TopologyWatcher.Watch that returns
+// a nil channel must not block the goroutine forever.
+//
+// The invoked signal proves the watchTopology goroutine actually started and
+// called Watch() before we assert it has exited — a bare "not present in the
+// stack" check could otherwise pass trivially before the goroutine is ever
+// scheduled, without ever proving the immediate-return behavior under test.
+func TestWatchTopology_NilChannelReturnsImmediately(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	watcher := newNilChanTopologyWatcher()
+
+	client, err := NewCQLClient(sessionA, sessionB, WithTopologyWatcher(watcher))
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	select {
+	case <-watcher.invoked:
+	case <-time.After(time.Second):
+		t.Fatal("watchTopology goroutine must call Watch() — it never started")
+	}
+
+	require.Eventually(t, func() bool {
+		return !watchTopologyGoroutineRunning()
+	}, time.Second, 5*time.Millisecond, "watchTopology must return immediately for a nil update channel, not block on 'for range nil'")
+}
+
+// TestWatchTopology_FinalBufferedUpdateAppliedBeforeCloseReturn verifies the
+// select's `case update, ok := <-updates` drain path: when a well-behaved
+// watcher sends a final update and then closes its channel — WITHOUT the
+// client's topologyCtx ever being cancelled — watchTopology must still
+// receive and apply that buffered update before it observes ok == false and
+// returns, exactly like a plain (unselected) `for update := range updates`
+// would. Only client.Close() (in t.Cleanup) cancels topologyCtx, and it runs
+// after both assertions below.
+func TestWatchTopology_FinalBufferedUpdateAppliedBeforeCloseReturn(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	watcher := newFinalUpdateThenCloseWatcher()
+
+	client, err := NewCQLClient(sessionA, sessionB, WithTopologyWatcher(watcher))
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	watcher.updates <- TopologyUpdate{Cluster: ClusterA, Available: false, DrainMode: true}
+	close(watcher.updates)
+
+	require.Eventually(t, func() bool {
+		return client.IsDraining(ClusterA)
+	}, time.Second, 5*time.Millisecond,
+		"the final buffered update must be applied via the channel-close drain path, not dropped when ok becomes false")
+
+	require.Eventually(t, func() bool {
+		return !watchTopologyGoroutineRunning()
+	}, time.Second, 5*time.Millisecond, "watchTopology must return once the update channel is drained and closed")
+}
+
 func TestNewCQLClient(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
@@ -466,6 +618,55 @@ func TestNewCQLClientDoesNotPropagateNamesOnAutoWorkerValidationFailure(t *testi
 	require.True(t, types.IsOptionError(err))
 	require.ErrorContains(t, err, "WithBatchSize")
 	require.False(t, strategy.called, "SetClusterNames must not be called when nested auto-worker validation fails")
+}
+
+// ─────────────────────────────────────────────
+// Deprecated batch-compat shims: nil Batch guard
+// ─────────────────────────────────────────────
+
+func TestExecuteBatch_NilBatch_ReturnsErrNilBatch(t *testing.T) {
+	client, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	err = client.ExecuteBatch(nil)
+	require.ErrorIs(t, err, errNilBatch)
+}
+
+func TestExecuteBatchCAS_NilBatch_ReturnsErrNilBatch(t *testing.T) {
+	client, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	applied, iter, err := client.ExecuteBatchCAS(nil)
+	require.ErrorIs(t, err, errNilBatch)
+	assert.False(t, applied)
+	assert.Nil(t, iter)
+}
+
+func TestMapExecuteBatchCAS_NilBatch_ReturnsErrNilBatch(t *testing.T) {
+	client, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	applied, iter, err := client.MapExecuteBatchCAS(nil, map[string]any{})
+	require.ErrorIs(t, err, errNilBatch)
+	assert.False(t, applied)
+	assert.Nil(t, iter)
+}
+
+// TestExecuteBatch_NonNilBatch_StillWorks locks in that the nil guard did not
+// disturb the happy path for the deprecated shims.
+func TestExecuteBatch_NonNilBatch_StillWorks(t *testing.T) {
+	session := newMockSession()
+	client, err := NewCQLClient(session, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	batch := client.NewBatch(LoggedBatch)
+	batch.Query("INSERT INTO t (id) VALUES (?)", 1)
+
+	require.NoError(t, client.ExecuteBatch(batch))
 }
 
 func TestCQLClientSingleClusterMode(t *testing.T) {
@@ -1388,6 +1589,35 @@ func TestExecuteDualWrite_BothRealErrors(t *testing.T) {
 	require.ErrorIs(t, err, types.ErrBothClustersFailed)
 }
 
+// TestExecuteDualWrite_PanicInA_JoinsAndEnqueuesReplay is a regression test
+// for the default (nil WriteStrategy) dual-write path: a panic on cluster
+// A's write — which runs inline on the calling goroutine — must be
+// recovered by safeCQLWrite and converted into A's error rather than
+// unwinding out of executeDualWrite. Unwinding would skip wg.Wait (leaving
+// B's goroutine detached), metrics recording, and the replay-enqueue path
+// below. This proves the sibling write (B) is always joined — its query
+// reaches the session — and A's panic is classified exactly like any other
+// real error: partial success (nil to the caller) with replay enqueued for
+// the failed cluster only.
+func TestExecuteDualWrite_PanicInA_JoinsAndEnqueuesReplay(t *testing.T) {
+	sessionA := newMockSession()
+	sessionA.execPanic = "driver exploded"
+	sessionB := newMockSession()
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB, WithReplayer(replayer))
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).ExecContext(context.Background())
+	require.NoError(t, err, "partial success (A panicked, B succeeded) must not surface as an error")
+
+	require.Len(t, sessionB.queries, 1, "cluster B's write must still run — wg.Wait must join it despite A's panic")
+
+	require.Len(t, replayer.payloads, 1, "replay must be enqueued for the panicking cluster only")
+	assert.Equal(t, ClusterA, replayer.payloads[0].TargetCluster)
+}
+
 // TestExecuteDualWrite_AsyncDoesNotIncrementWriteError verifies that ErrWriteAsync
 // increments IncWriteAsync (not IncWriteError) in the metrics collector.
 func TestExecuteDualWrite_AsyncDoesNotIncrementWriteError(t *testing.T) {
@@ -1515,6 +1745,111 @@ func TestExecuteDualWrite_AsyncLogIsInfoNotWarn(t *testing.T) {
 			"ErrWriteAsync must not use the dropped-write log message")
 	}
 	assert.True(t, found, "expected an async info log message")
+}
+
+// blockingSession is a cql.Session whose Query().ExecContext blocks until
+// release is closed, recording entry via entered before blocking. Used to
+// prove that the default (no WriteStrategy) dual-write path still executes
+// both cluster writes concurrently after the alloc-perf fix at
+// cql_client.go:1602/:1623 (running writeA inline instead of in its own
+// goroutine).
+type blockingSession struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingSession() *blockingSession {
+	return &blockingSession{
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (s *blockingSession) Query(_ string, _ ...any) cql.Query { return &blockingQuery{session: s} }
+func (s *blockingSession) Batch(_ cql.BatchType) cql.Batch    { return nil }
+func (s *blockingSession) Close()                             {}
+
+type blockingQuery struct {
+	session *blockingSession
+}
+
+func (q *blockingQuery) Consistency(_ cql.Consistency) cql.Query       { return q }
+func (q *blockingQuery) SerialConsistency(_ cql.Consistency) cql.Query { return q }
+func (q *blockingQuery) PageSize(_ int) cql.Query                      { return q }
+func (q *blockingQuery) PageState(_ []byte) cql.Query                  { return q }
+func (q *blockingQuery) WithTimestamp(_ int64) cql.Query               { return q }
+func (q *blockingQuery) Statement() string                             { return "" }
+func (q *blockingQuery) Values() []any                                 { return nil }
+func (q *blockingQuery) Release()                                      {}
+func (q *blockingQuery) Exec() error                                   { return q.ExecContext(context.Background()) }
+func (q *blockingQuery) ExecContext(_ context.Context) error {
+	select {
+	case q.session.entered <- struct{}{}:
+	default:
+	}
+	<-q.session.release
+
+	return nil
+}
+func (q *blockingQuery) Scan(_ ...any) error                           { return nil }
+func (q *blockingQuery) ScanContext(_ context.Context, _ ...any) error { return nil }
+func (q *blockingQuery) Iter() cql.Iter                                { return &mockIter{} }
+func (q *blockingQuery) IterContext(_ context.Context) cql.Iter        { return &mockIter{} }
+func (q *blockingQuery) MapScan(_ map[string]any) error                { return nil }
+func (q *blockingQuery) MapScanContext(_ context.Context, _ map[string]any) error {
+	return nil
+}
+func (q *blockingQuery) ScanCAS(_ ...any) (bool, error) { return false, nil }
+func (q *blockingQuery) ScanCASContext(_ context.Context, _ ...any) (bool, error) {
+	return false, nil
+}
+func (q *blockingQuery) MapScanCAS(_ map[string]any) (bool, error) { return false, nil }
+func (q *blockingQuery) MapScanCASContext(_ context.Context, _ map[string]any) (bool, error) {
+	return false, nil
+}
+
+// TestExecuteDualWrite_DefaultPath_BothClustersRunConcurrently is a
+// regression test for the cql_client.go:1602/:1623 alloc-perf finding: the
+// fix runs writeA inline on the calling goroutine (instead of spawning a
+// second goroutine for it) while writeB still runs in a spawned goroutine.
+// This must not turn the writes sequential — both must still be in flight
+// at the same time. Proven here by blocking both sessions' ExecContext and
+// asserting BOTH report entry before either is released.
+func TestExecuteDualWrite_DefaultPath_BothClustersRunConcurrently(t *testing.T) {
+	sessionA := newBlockingSession()
+	sessionB := newBlockingSession()
+
+	client, err := NewCQLClient(sessionA, sessionB)
+	require.NoError(t, err)
+	defer client.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Query("INSERT INTO t (id) VALUES (?)", 1).ExecContext(context.Background())
+	}()
+
+	// Both sessions must report entry before either is released — if the
+	// writes ran sequentially, the second session would never enter until
+	// the first is released, and this would time out.
+	timeout := time.After(2 * time.Second)
+	for range 2 {
+		select {
+		case <-sessionA.entered:
+		case <-sessionB.entered:
+		case <-timeout:
+			t.Fatal("both clusters' writes must be in flight concurrently — timed out waiting for entry")
+		}
+	}
+
+	close(sessionA.release)
+	close(sessionB.release)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Exec did not return after both sessions were released")
+	}
 }
 
 // captureLogger records Info/Warn/Error messages for assertion in tests.

@@ -30,6 +30,21 @@ const defaultLatencyAbsoluteMax = 2 * time.Second
 //	    helix.WithFailoverPolicy(lcb),
 //	)
 //	// Latency is recorded automatically on each read!
+//
+// Zero value: a bare LatencyCircuitBreaker{} never panics — every method is
+// safe to call — but it is not functionally a circuit breaker: the embedded
+// *CircuitBreaker is nil until one of the constructors runs. CircuitBreaker
+// is embedded by pointer (not by value) so that copying a LatencyCircuitBreaker
+// value only copies the pointer, not CircuitBreaker's mutexes/atomics —
+// copying it, even before first use, would otherwise trip `go vet`
+// copylocks and break existing external composite literals/selectors that
+// depend on the pointer field shape. Because the embed can be nil, every
+// promoted-looking method below (ShouldFailover, RecordFailure,
+// RecordSuccess, Failures, SetClusterNames, MetricsConfigured, SetMetrics,
+// LoggerConfigured, SetLogger) is an explicit wrapper with a nil guard
+// rather than a compiler-promoted method — use one of the constructors
+// (NewLatencyCircuitBreaker / NewLatencyCircuitBreakerChecked) to get a
+// fully configured, functional LatencyCircuitBreaker.
 type LatencyCircuitBreaker struct {
 	*CircuitBreaker
 	absoluteMax time.Duration
@@ -240,4 +255,140 @@ func (l *LatencyCircuitBreaker) RecordLatency(cluster types.ClusterID, latency t
 //   - time.Duration: The absolute maximum latency threshold
 func (l *LatencyCircuitBreaker) AbsoluteMax() time.Duration {
 	return l.absoluteMax
+}
+
+// ShouldFailover returns true if the failure threshold has been reached
+// AND the reset timeout has not yet elapsed since the last failure. See
+// [CircuitBreaker.ShouldFailover] for the full half-open transition
+// semantics. A zero-value LatencyCircuitBreaker (nil embedded
+// *CircuitBreaker) safely returns false.
+//
+// Parameters:
+//   - cluster: The cluster that failed
+//   - err: The error (unused)
+//
+// Returns:
+//   - bool: true if failover should occur
+func (l *LatencyCircuitBreaker) ShouldFailover(cluster types.ClusterID, err error) bool {
+	if l.CircuitBreaker == nil {
+		return false
+	}
+
+	return l.CircuitBreaker.ShouldFailover(cluster, err)
+}
+
+// RecordFailure increments the failure counter for a cluster. See
+// [CircuitBreaker.RecordFailure]. A zero-value LatencyCircuitBreaker (nil
+// embedded *CircuitBreaker) safely no-ops.
+//
+// Parameters:
+//   - cluster: The cluster that failed
+func (l *LatencyCircuitBreaker) RecordFailure(cluster types.ClusterID) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.RecordFailure(cluster)
+}
+
+// RecordSuccess resets the failure counter for a cluster. See
+// [CircuitBreaker.RecordSuccess]. A zero-value LatencyCircuitBreaker (nil
+// embedded *CircuitBreaker) safely no-ops.
+//
+// Parameters:
+//   - cluster: The cluster that succeeded
+func (l *LatencyCircuitBreaker) RecordSuccess(cluster types.ClusterID) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.RecordSuccess(cluster)
+}
+
+// Failures returns the current failure count for a cluster. See
+// [CircuitBreaker.Failures]. A zero-value LatencyCircuitBreaker (nil
+// embedded *CircuitBreaker) safely returns 0.
+//
+// Parameters:
+//   - cluster: The cluster to check
+//
+// Returns:
+//   - int: Number of consecutive failures
+func (l *LatencyCircuitBreaker) Failures(cluster types.ClusterID) int {
+	if l.CircuitBreaker == nil {
+		return 0
+	}
+
+	return l.CircuitBreaker.Failures(cluster)
+}
+
+// SetClusterNames sets custom display names for clusters in log messages.
+// See [CircuitBreaker.SetClusterNames]. A zero-value LatencyCircuitBreaker
+// (nil embedded *CircuitBreaker) safely no-ops.
+//
+// Parameters:
+//   - names: The cluster names to use in log messages
+func (l *LatencyCircuitBreaker) SetClusterNames(names types.ClusterNames) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.SetClusterNames(names)
+}
+
+// MetricsConfigured reports whether the metrics collector was explicitly
+// set via [WithLatencyMetrics]. See [CircuitBreaker.MetricsConfigured]. A
+// zero-value LatencyCircuitBreaker (nil embedded *CircuitBreaker) safely
+// returns false.
+//
+// Returns:
+//   - bool: true if WithLatencyMetrics was called at construction time
+func (l *LatencyCircuitBreaker) MetricsConfigured() bool {
+	if l.CircuitBreaker == nil {
+		return false
+	}
+
+	return l.CircuitBreaker.MetricsConfigured()
+}
+
+// SetMetrics replaces the metrics collector. See
+// [CircuitBreaker.SetMetrics]. A zero-value LatencyCircuitBreaker (nil
+// embedded *CircuitBreaker) safely no-ops.
+//
+// Parameters:
+//   - m: The metrics collector to use
+func (l *LatencyCircuitBreaker) SetMetrics(m types.MetricsCollector) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.SetMetrics(m)
+}
+
+// LoggerConfigured reports whether the logger was explicitly set via
+// [WithLatencyLogger]. See [CircuitBreaker.LoggerConfigured]. A zero-value
+// LatencyCircuitBreaker (nil embedded *CircuitBreaker) safely returns false.
+//
+// Returns:
+//   - bool: true if WithLatencyLogger was called at construction time
+func (l *LatencyCircuitBreaker) LoggerConfigured() bool {
+	if l.CircuitBreaker == nil {
+		return false
+	}
+
+	return l.CircuitBreaker.LoggerConfigured()
+}
+
+// SetLogger replaces the logger. See [CircuitBreaker.SetLogger]. A
+// zero-value LatencyCircuitBreaker (nil embedded *CircuitBreaker) safely
+// no-ops.
+//
+// Parameters:
+//   - log: The logger to use
+func (l *LatencyCircuitBreaker) SetLogger(log types.Logger) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.SetLogger(log)
 }

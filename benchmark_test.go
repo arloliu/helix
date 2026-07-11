@@ -634,6 +634,29 @@ func BenchmarkCQLDualClusterExec(b *testing.B) {
 	}
 }
 
+// BenchmarkCQLDualClusterStrictExec measures the default (no StrictWriter
+// configured) strict dual-write path — cql_client.go's executeStrictDualWrite
+// — mirroring BenchmarkCQLDualClusterExec for the alloc-perf finding at
+// cql_client.go:1602/:1623 (goroutine count per write).
+func BenchmarkCQLDualClusterStrictExec(b *testing.B) {
+	mockA := &mockCQLSession{}
+	mockB := &mockCQLSession{}
+	client, err := helix.NewCQLClient(mockA, mockB)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for b.Loop() {
+		_ = client.Query("INSERT INTO t (id) VALUES (?)", 1).Strict().ExecContext(ctx)
+	}
+}
+
 // BenchmarkCQLDualClusterQuery measures dual-cluster read with StickyRead.
 func BenchmarkCQLDualClusterQuery(b *testing.B) {
 	mockA := &mockCQLSession{}

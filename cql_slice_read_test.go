@@ -573,6 +573,41 @@ func TestDrainIterScanWithLimit_ScannerErrPropagatesAfterDrain(t *testing.T) {
 // page-size clamp; these tests lock the helper-level boundary spec early so
 // the contract cannot regress before phase 3's tests cover the broader matrix.
 
+// TestDrainIterToSliceMapWithLimit_EmptyDrainWithLimit_ReturnsNilNotEmptySlice
+// is a regression test for the cql_client.go:2516 alloc-perf finding:
+// preallocating `rows` up front (before knowing whether the iterator yields
+// any rows at all) turns a zero-row drain into a non-nil-but-empty slice.
+// SliceMapContext's readFunc distinguishes "primary drained zero rows" from
+// "primary succeeded with data" via `drained == nil`, not len(drained) == 0,
+// to decide whether to synthesize ErrNotFound for the FallbackRead
+// empty-retry — so rows must stay nil here even when limit > 0.
+func TestDrainIterToSliceMapWithLimit_EmptyDrainWithLimit_ReturnsNilNotEmptySlice(t *testing.T) {
+	iter := &sliceTestIter{spec: &sliceSpec{cols: []string{"id"}}}
+	rows, err := drainIterToSliceMapWithLimit(iter, 100)
+	require.NoError(t, err)
+	assert.Nil(t, rows, "a zero-row drain must return a nil slice, not a preallocated empty one, even with limit > 0")
+}
+
+// TestDrainIterToSliceMapWithLimit_ClampsPreallocationForLargeLimit is a
+// regression test for the sliceMapPreallocCap clamp: limit is frequently a
+// generous safety cap (e.g. MaxRows(100_000)), not the expected row count,
+// so the lazy preallocation on the first row must cap at
+// sliceMapPreallocCap instead of preallocating to limit verbatim. Without
+// the min(limit, sliceMapPreallocCap) clamp, cap(rows) would equal limit
+// itself after the first row.
+func TestDrainIterToSliceMapWithLimit_ClampsPreallocationForLargeLimit(t *testing.T) {
+	const largeLimit = sliceMapPreallocCap * 10
+	iter := &sliceTestIter{spec: &sliceSpec{
+		cols: []string{"id"},
+		rows: rowsOf([]any{1}),
+	}}
+	rows, err := drainIterToSliceMapWithLimit(iter, largeLimit)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.LessOrEqual(t, cap(rows), sliceMapPreallocCap,
+		"preallocation must be clamped to sliceMapPreallocCap even when limit is far larger")
+}
+
 func TestDrainIterToSliceMapWithLimit_LimitExceeded_DiscardsRowsAndReturnsSentinel(t *testing.T) {
 	iter := &sliceTestIter{spec: &sliceSpec{
 		cols: []string{"id"},
@@ -597,4 +632,58 @@ func TestDrainIterScanWithLimit_LimitExceeded_ReturnsRowCountAndSentinel(t *test
 	require.ErrorIs(t, err, types.ErrRowLimitExceeded)
 	assert.Equal(t, 2, rowCount, "rowCount reflects the limit, not the underlying row count")
 	assert.Equal(t, 2, invoked, "scanFn invoked exactly limit times; abort fires before invocation N+1")
+}
+
+// BenchmarkSliceScanAs measures SliceScanAs's row accumulation (the
+// slice_helpers.go:74 alloc-perf finding: `out = append(out, v)` grows from
+// nil with no capacity hint).
+func BenchmarkSliceScanAs(b *testing.B) {
+	const numRows = 1000
+	rows := make([][]any, numRows)
+	for i := range rows {
+		rows[i] = []any{i}
+	}
+	spec := &sliceSpec{cols: []string{"id"}, rows: rows}
+	sa := &sliceTestSession{spec: spec}
+	client, err := NewCQLClient(sa, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		out, err := SliceScanAs(ctx, client.Query("SELECT id FROM t"),
+			func(r RowScanner, dst *int) error { return r.Scan(dst) })
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(out) != numRows {
+			b.Fatalf("expected %d rows, got %d", numRows, len(out))
+		}
+	}
+}
+
+// BenchmarkDrainIterToSliceMapWithLimit measures the SliceMap drain loop
+// (cql_client.go:2516 finding) with a bounded limit equal to the row count —
+// the common case a caller sizes MaxRows / DefaultMaxRows to — to quantify
+// the cost of growing `rows` via bare append with no capacity hint despite
+// the upper bound being known before the loop starts.
+func BenchmarkDrainIterToSliceMapWithLimit(b *testing.B) {
+	const numRows = 1000
+	rows := make([][]any, numRows)
+	for i := range rows {
+		rows[i] = []any{i}
+	}
+	spec := &sliceSpec{cols: []string{"id"}, rows: rows}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		iter := &sliceTestIter{spec: spec}
+		if _, err := drainIterToSliceMapWithLimit(iter, numRows); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

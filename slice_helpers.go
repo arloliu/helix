@@ -11,6 +11,12 @@ import (
 // callers should not branch on it via errors.Is.
 var errNilSliceScanAsDecode = errors.New("helix: SliceScanAs decode must not be nil")
 
+// errNilSliceScanAsQuery is returned by [SliceScanAs] when the caller passes
+// a nil Query. Without this guard, q.SliceScanContext would panic on a
+// nil-interface method call instead of returning a diagnosable error —
+// symmetric with the decode-nil guard above.
+var errNilSliceScanAsQuery = errors.New("helix: SliceScanAs query must not be nil")
+
 // SliceScanAs runs q.SliceScanContext and collects each decoded row into a
 // []T. The decode callback receives a [RowScanner] positioned at the current
 // row and a *T to populate.
@@ -33,9 +39,9 @@ var errNilSliceScanAsDecode = errors.New("helix: SliceScanAs decode must not be 
 //     should use [Query.SliceScan] directly and manage the accumulator
 //     themselves.
 //
-// If decode is nil, SliceScanAs returns an error before any cluster contact
-// — neither the primary nor the alternative cluster is queried. Symmetric
-// with [Query.SliceScan]'s nil-scanFn contract.
+// If decode or q is nil, SliceScanAs returns an error before any cluster
+// contact — neither the primary nor the alternative cluster is queried. The
+// decode-nil case is symmetric with [Query.SliceScan]'s nil-scanFn contract.
 //
 // Example:
 //
@@ -69,6 +75,9 @@ func SliceScanAs[T any](
 ) ([]T, error) {
 	if decode == nil {
 		return nil, errNilSliceScanAsDecode
+	}
+	if q == nil {
+		return nil, errNilSliceScanAsQuery
 	}
 
 	var out []T

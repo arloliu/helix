@@ -93,3 +93,30 @@ func TestCircuitBreaker_ShouldFailover_StaysTrueAfterResetTimeout(t *testing.T) 
 		"after probe-fail, failures reset to 1 (< threshold=3); breaker should "+
 			"be closed again until threshold is reached")
 }
+
+// TestLatencyCircuitBreaker_ExternalCompositeLiteral_PointerEmbedShape is a
+// compile-time and behavioral proof that LatencyCircuitBreaker's embedded
+// CircuitBreaker field is *CircuitBreaker (pointer), not CircuitBreaker
+// (value): the composite literal below only compiles because
+// policy.NewCircuitBreaker() returns *CircuitBreaker and the field expects
+// that exact pointer type — an external package building a
+// LatencyCircuitBreaker via the promoted field name would fail to compile
+// against a value-embedded field. Copying the resulting struct by value
+// then proves the runtime consequence of that shape: only the pointer is
+// copied, so the original and the copy share the same underlying breaker
+// state instead of forking it (which a value embed would do, and which
+// would also make `go vet`'s copylocks check fail on the embedded
+// mutexes/atomics after first use).
+func TestLatencyCircuitBreaker_ExternalCompositeLiteral_PointerEmbedShape(t *testing.T) {
+	original := policy.LatencyCircuitBreaker{
+		CircuitBreaker: policy.NewCircuitBreaker(policy.WithThreshold(1)),
+	}
+
+	valueCopy := original
+	valueCopy.RecordFailure(types.ClusterA)
+
+	assert.True(t, original.ShouldFailover(types.ClusterA, nil),
+		"a value copy of LatencyCircuitBreaker must share the same underlying "+
+			"*CircuitBreaker; a value-embedded CircuitBreaker would fork state "+
+			"on copy instead")
+}

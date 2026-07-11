@@ -44,8 +44,10 @@ func NewConcurrentDualWrite(opts ...ConcurrentDualWriteOption) *ConcurrentDualWr
 
 // Execute performs concurrent writes to both clusters.
 //
-// Spawns two goroutines to write concurrently and waits for both to complete.
-// Returns the errors from both clusters (nil if successful).
+// Spawns one goroutine to write to cluster B while cluster A's write runs
+// inline on the calling goroutine; both still execute concurrently, but only
+// one extra goroutine is spawned per call. Returns the errors from both
+// clusters (nil if successful).
 //
 // Parameters:
 //   - ctx: Context for the operation
@@ -63,12 +65,10 @@ func (c *ConcurrentDualWrite) Execute(
 	var wg sync.WaitGroup
 
 	wg.Go(func() {
-		resultA = safeWrite(ctx, writeA, "A")
-	})
-
-	wg.Go(func() {
 		resultB = safeWrite(ctx, writeB, "B")
 	})
+
+	resultA = safeWrite(ctx, writeA, "A")
 
 	wg.Wait()
 

@@ -3,6 +3,8 @@ package topology_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +38,167 @@ func createTestKV(t *testing.T, js jetstream.JetStream, bucket string) jetstream
 	require.NoError(t, err)
 
 	return kv
+}
+
+// watchFailKV is a jetstream.KeyValue test double that always fails Watch,
+// so tests can exercise the kv.Watch() error path without needing a real
+// NATS server misconfiguration. Get returns ErrKeyNotFound so fetchAndEmit's
+// initial fetch behaves like an unconfigured bucket. All other methods are
+// unused by the watcher and are left to panic via the nil embedded interface
+// if ever called.
+type watchFailKV struct {
+	jetstream.KeyValue
+	watchErr error
+}
+
+func (f *watchFailKV) Get(_ context.Context, _ string) (jetstream.KeyValueEntry, error) {
+	return nil, jetstream.ErrKeyNotFound
+}
+
+func (f *watchFailKV) Watch(_ context.Context, _ string, _ ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+	return nil, f.watchErr
+}
+
+// recordingLogger is a minimal types.Logger implementation that counts Warn
+// calls. Sufficient for verifying that a swallowed error path now logs.
+type recordingLogger struct {
+	mu    sync.Mutex
+	warns int
+}
+
+func (l *recordingLogger) Debug(_ string, _ ...any) {}
+func (l *recordingLogger) Info(_ string, _ ...any)  {}
+func (l *recordingLogger) Warn(_ string, _ ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns++
+}
+func (l *recordingLogger) Error(_ string, _ ...any) {}
+func (l *recordingLogger) Fatal(_ string, _ ...any) {}
+
+func (l *recordingLogger) warnCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.warns
+}
+
+// TestNATSWatchFailure_LogsAndFallsBackToPolling verifies the fix for the
+// swallowed kv.Watch() error: when establishing the watch fails, the
+// configured logger observes a Warn, and the watcher still falls back to
+// polling (IsDraining stays observable/false, no panic, no goroutine spin).
+func TestNATSWatchFailure_LogsAndFallsBackToPolling(t *testing.T) {
+	logger := &recordingLogger{}
+	kv := &watchFailKV{watchErr: errors.New("boom: watch unsupported")}
+
+	watcher, err := topology.NewNATS(kv,
+		topology.WithLogger(logger),
+		topology.WithPollInterval(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	updates := watcher.Watch(ctx)
+	defer drainUpdates(updates)
+
+	require.Eventually(t, func() bool {
+		return logger.warnCount() >= 1
+	}, time.Second, 10*time.Millisecond, "Watch() failure must be logged")
+
+	// Fallback polling loop must still be alive and not draining anything.
+	assert.False(t, watcher.IsDraining(types.ClusterA))
+	assert.False(t, watcher.IsDraining(types.ClusterB))
+}
+
+// TestNATSDefaultLogger_NoPanic verifies that a watcher constructed without
+// WithLogger uses a safe default and does not panic when the watch fails.
+func TestNATSDefaultLogger_NoPanic(t *testing.T) {
+	kv := &watchFailKV{watchErr: errors.New("boom: watch unsupported")}
+
+	watcher, err := topology.NewNATS(kv, topology.WithPollInterval(20*time.Millisecond))
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	updates := watcher.Watch(ctx)
+	defer drainUpdates(updates)
+
+	<-ctx.Done()
+	assert.False(t, watcher.IsDraining(types.ClusterA))
+}
+
+// TestNATSExplicitNilLogger_NoPanic verifies that passing WithLogger(nil)
+// explicitly — as opposed to never calling WithLogger — is normalized to
+// the safe no-op default, per WithLogger's documented "if not set (or set
+// to nil)" contract, rather than leaving config.Logger nil and panicking on
+// first use.
+func TestNATSExplicitNilLogger_NoPanic(t *testing.T) {
+	kv := &watchFailKV{watchErr: errors.New("boom: watch unsupported")}
+
+	watcher, err := topology.NewNATS(kv,
+		topology.WithLogger(nil),
+		topology.WithPollInterval(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	updates := watcher.Watch(ctx)
+	defer drainUpdates(updates)
+
+	// If WithLogger(nil) were not normalized, watchLoop's Logger.Warn call
+	// on the failed kv.Watch would panic on a nil interface, crashing this
+	// test (and the whole test binary, since panics in background
+	// goroutines are unrecoverable).
+	<-ctx.Done()
+	assert.False(t, watcher.IsDraining(types.ClusterA))
+}
+
+// fakeNilableLogger satisfies types.Logger purely by embedding the
+// interface, so a nil *fakeNilableLogger assigned to a types.Logger
+// parameter produces a typed-nil interface value (non-nil interface, nil
+// concrete pointer) rather than an untyped nil. Mirrors replay's
+// fakeNilableLogger (replay/worker_internal_test.go), used there for the
+// same class of bug via TestWorkerConfigRejectsTypedNilOptions.
+type fakeNilableLogger struct {
+	types.Logger
+}
+
+var _ types.Logger = (*fakeNilableLogger)(nil)
+
+// TestNATSTypedNilLogger_NoPanic verifies that a typed-nil logger (a
+// non-nil types.Logger interface value wrapping a nil concrete pointer)
+// passed via WithLogger is normalized to the safe no-op default, just like
+// an explicit literal nil (TestNATSExplicitNilLogger_NoPanic). Without the
+// fix, watchLoop's Logger.Warn call on the failed kv.Watch would panic on
+// the nil receiver, crashing the background goroutine — and the whole test
+// binary, since panics in background goroutines are unrecoverable.
+func TestNATSTypedNilLogger_NoPanic(t *testing.T) {
+	kv := &watchFailKV{watchErr: errors.New("boom: watch unsupported")}
+	var nilLogger *fakeNilableLogger
+
+	watcher, err := topology.NewNATS(kv,
+		topology.WithLogger(nilLogger),
+		topology.WithPollInterval(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	updates := watcher.Watch(ctx)
+	defer drainUpdates(updates)
+
+	<-ctx.Done()
+	assert.False(t, watcher.IsDraining(types.ClusterA))
 }
 
 func TestNewNATSNilKV(t *testing.T) {
@@ -258,7 +421,8 @@ func TestNATSInvalidJSON(t *testing.T) {
 	js := testutil.StartEmbeddedNATS(t)
 	kv := createTestKV(t, js, "test-invalid-json")
 
-	watcher, err := topology.NewNATS(kv)
+	logger := &recordingLogger{}
+	watcher, err := topology.NewNATS(kv, topology.WithLogger(logger))
 	require.NoError(t, err)
 	defer watcher.Close()
 
@@ -271,13 +435,16 @@ func TestNATSInvalidJSON(t *testing.T) {
 	_, err = kv.Put(ctx, "helix.topology.drain", []byte("not valid json"))
 	require.NoError(t, err)
 
-	// Wait for watcher to process. Starting from no-drain, malformed JSON
-	// must preserve the no-drain state (the same outcome as the previous
-	// "treat as no drain" behavior for this empty starting condition).
+	// Wait for the watcher to actually process the malformed entry (rather
+	// than the trivially-already-true "not draining" state below, which
+	// would race ahead of processEntry running).
 	require.Eventually(t, func() bool {
-		return !watcher.IsDraining(types.ClusterA) && !watcher.IsDraining(types.ClusterB)
-	}, 2*time.Second, 50*time.Millisecond)
+		return logger.warnCount() > 0
+	}, 2*time.Second, 50*time.Millisecond, "malformed JSON must be logged instead of silently swallowed")
 
+	// Starting from no-drain, malformed JSON must preserve the no-drain
+	// state (the same outcome as the previous "treat as no drain" behavior
+	// for this empty starting condition).
 	assert.False(t, watcher.IsDraining(types.ClusterA))
 	assert.False(t, watcher.IsDraining(types.ClusterB))
 }

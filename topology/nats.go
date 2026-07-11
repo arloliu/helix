@@ -10,6 +10,8 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/arloliu/helix"
+	"github.com/arloliu/helix/internal/logging"
+	"github.com/arloliu/helix/internal/typeutil"
 	"github.com/arloliu/helix/types"
 )
 
@@ -74,6 +76,14 @@ func NewNATS(kv jetstream.KeyValue, opts ...WatcherOption) (*NATS, error) {
 	config := DefaultWatcherConfig()
 	for _, opt := range opts {
 		opt(&config)
+	}
+	// Backstop for WatcherConfig values built directly (bypassing WithLogger,
+	// whose own typed-nil guard normally prevents this): catches both an
+	// untyped nil and a typed nil (e.g. a nil `*myLogger` stored in the
+	// Logger field), either of which would otherwise panic the first time a
+	// background watch/fetch/parse goroutine calls it.
+	if typeutil.IsNilInterface(config.Logger) {
+		config.Logger = logging.NewNopLogger()
 	}
 
 	return &NATS{
@@ -192,7 +202,17 @@ func (n *NATS) watchLoop(ctx context.Context) {
 	// Start watching
 	watcher, err := n.kv.Watch(ctx, n.config.Key)
 	if err != nil {
-		// Fall back to polling if watch fails
+		// Unlike fetchAndEmit/processEntry (which have their own fail-closed
+		// rationale for staying silent), there is no equivalent tradeoff here:
+		// falling back to polling degrades this watcher from real-time updates
+		// to a PollInterval cadence for its entire remaining lifetime, with no
+		// automatic retry back to watch mode. Log it so operators can detect
+		// the degradation instead of silently discovering slow drain updates.
+		n.config.Logger.Warn("helix/topology: NATS KV watch failed, falling back to polling",
+			"key", n.config.Key,
+			"poll_interval", n.config.PollInterval,
+			"error", err,
+		)
 		n.pollLoop(ctx)
 		return
 	}
@@ -256,10 +276,17 @@ func (n *NATS) fetchAndEmit(ctx context.Context) {
 			n.handleNoDrain()
 			return
 		}
-		// Transient error — preserve current drain state. Logging requires
-		// a logger, which the watcher does not currently take; surface via
+		// Transient error — preserve current drain state and surface via
 		// the next successful fetch so an operator inspecting GetDrainReason
-		// after the blip clears sees the latest authoritative state.
+		// after the blip clears sees the latest authoritative state. Logged
+		// at Debug since pollLoop retries on every tick and a single blip is
+		// expected/self-healing; escalate to Warn only if it starts
+		// recurring (visible via repeated log lines).
+		n.config.Logger.Debug("helix/topology: NATS KV fetch failed, preserving last-known drain state",
+			"key", n.config.Key,
+			"error", err,
+		)
+
 		return
 	}
 
@@ -282,6 +309,10 @@ func (n *NATS) processEntry(entry jetstream.KeyValueEntry) {
 	var config DrainConfig
 	if err := json.Unmarshal(entry.Value(), &config); err != nil {
 		// Invalid JSON — preserve last-known-good drain state.
+		n.config.Logger.Warn("helix/topology: malformed drain config JSON, preserving last-known drain state",
+			"key", n.config.Key,
+			"error", err,
+		)
 		return
 	}
 

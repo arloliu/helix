@@ -14,6 +14,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// BenchmarkAdaptiveDualWrite_Execute_BothHealthy measures goroutine-spawn
+// overhead for the common both-clusters-healthy path. Write funcs are no-ops
+// so the benchmark isolates Execute's own allocation/scheduling cost.
+func BenchmarkAdaptiveDualWrite_Execute_BothHealthy(b *testing.B) {
+	a := NewAdaptiveDualWrite()
+	ctx := context.Background()
+	noop := func(_ context.Context) error { return nil }
+
+	for b.Loop() {
+		_, _ = a.Execute(ctx, noop, noop)
+	}
+}
+
+// BenchmarkAdaptiveDualWrite_ExecuteStrict_BothHealthy is the ExecuteStrict
+// analogue of BenchmarkAdaptiveDualWrite_Execute_BothHealthy.
+func BenchmarkAdaptiveDualWrite_ExecuteStrict_BothHealthy(b *testing.B) {
+	a := NewAdaptiveDualWrite()
+	ctx := context.Background()
+	noop := func(_ context.Context) error { return nil }
+
+	for b.Loop() {
+		_, _ = a.ExecuteStrict(ctx, noop, noop)
+	}
+}
+
 func TestAdaptiveDualWrite_Defaults(t *testing.T) {
 	a := NewAdaptiveDualWrite()
 
@@ -232,6 +257,62 @@ func TestAdaptiveDualWrite_BothHealthy(t *testing.T) {
 	assert.NoError(t, errB)
 	assert.Equal(t, int32(1), callsA.Load())
 	assert.Equal(t, int32(1), callsB.Load())
+	assert.False(t, a.IsDegraded(types.ClusterA))
+	assert.False(t, a.IsDegraded(types.ClusterB))
+}
+
+// TestAdaptiveDualWrite_Execute_BothHealthyRunConcurrently is a regression
+// test for the adaptive_write.go alloc-perf finding: the both-healthy branch
+// of Execute now spawns a single goroutine for writeB and runs writeA inline
+// on the calling goroutine instead of spawning two goroutines. This must not
+// turn the writes sequential — both must still be in flight at the same
+// time, proven by blocking both write funcs and asserting BOTH report entry
+// before either is released.
+func TestAdaptiveDualWrite_Execute_BothHealthyRunConcurrently(t *testing.T) {
+	a := NewAdaptiveDualWrite()
+	ctx := t.Context()
+
+	enteredA := make(chan struct{}, 1)
+	enteredB := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	//nolint:unparam // must match the func(context.Context) error write-func signature Execute requires
+	writeA := func(_ context.Context) error {
+		enteredA <- struct{}{}
+		<-release
+		return nil
+	}
+	//nolint:unparam // must match the func(context.Context) error write-func signature Execute requires
+	writeB := func(_ context.Context) error {
+		enteredB <- struct{}{}
+		<-release
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = a.Execute(ctx, writeA, writeB)
+	}()
+
+	timeout := time.After(2 * time.Second)
+	for range 2 {
+		select {
+		case <-enteredA:
+		case <-enteredB:
+		case <-timeout:
+			t.Fatal("both writes must be in flight concurrently — timed out waiting for entry")
+		}
+	}
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute did not return after release")
+	}
+
 	assert.False(t, a.IsDegraded(types.ClusterA))
 	assert.False(t, a.IsDegraded(types.ClusterB))
 }

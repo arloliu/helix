@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tinylib/msgp/msgp"
 )
 
 // TestMsgpEncodeDecodeCQLTypes tests msgp encoding/decoding for all common CQL argument types.
@@ -591,4 +592,53 @@ func TestUUIDFromBytes(t *testing.T) {
 		_, ok := UUIDFromBytes(nil)
 		assert.False(t, ok)
 	})
+}
+
+// TestUUIDUnmarshalBinary verifies that UnmarshalBinary rejects payloads
+// that aren't exactly UUIDSize bytes instead of silently truncating or
+// zero-padding them, so corrupt wire data surfaces as a decode error.
+func TestUUIDUnmarshalBinary(t *testing.T) {
+	t.Run("exact 16 bytes succeeds", func(t *testing.T) {
+		data := []byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+		var u UUID
+		err := u.UnmarshalBinary(data)
+		require.NoError(t, err)
+		assert.Equal(t, data, u.Bytes())
+	})
+
+	t.Run("too short returns error", func(t *testing.T) {
+		var u UUID
+		err := u.UnmarshalBinary([]byte{0x01, 0x02, 0x03})
+		require.Error(t, err)
+	})
+
+	t.Run("too long returns error", func(t *testing.T) {
+		var u UUID
+		err := u.UnmarshalBinary(make([]byte, 32))
+		require.Error(t, err)
+	})
+
+	t.Run("empty returns error", func(t *testing.T) {
+		var u UUID
+		err := u.UnmarshalBinary(nil)
+		require.Error(t, err)
+	})
+}
+
+// TestUUIDExtensionDecodeRejectsWrongLengthPayload verifies that decodeArgs
+// surfaces a decode error (instead of silently accepting a truncated UUID)
+// when a wire-corrupted extension declares a payload length other than
+// UUIDSize for the UUID extension type. This exercises the full
+// msgp.ReadExtensionBytes -> UUID.UnmarshalBinary path used by
+// decodeArgs during NATS replay message decoding.
+func TestUUIDExtensionDecodeRejectsWrongLengthPayload(t *testing.T) {
+	// Hand-craft an 8-byte fixext MessagePack extension header (mfixext8 =
+	// 0xd7) declaring our UUID extension type (10), followed by only 8
+	// bytes of payload instead of the 16 UUID.Len() reports. This mirrors
+	// wire corruption (e.g. a flipped header byte turning a mfixext16 into
+	// a mfixext8) that a decoder must reject rather than silently accept.
+	raw := []byte{0xd7, byte(UUIDExtensionType), 1, 2, 3, 4, 5, 6, 7, 8}
+
+	_, err := msgp.ReadExtensionBytes(raw, new(UUID))
+	require.Error(t, err)
 }

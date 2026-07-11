@@ -1,6 +1,8 @@
 package replay
 
 import (
+	"fmt"
+
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -59,11 +61,18 @@ func (u *UUID) MarshalBinaryTo(b []byte) error {
 // UnmarshalBinary copies bytes from the source buffer into the UUID.
 //
 // Parameters:
-//   - b: Source buffer containing 16 bytes of UUID data
+//   - b: Source buffer containing exactly 16 bytes of UUID data
 //
 // Returns:
-//   - error: nil (never fails for valid input)
+//   - error: non-nil if len(b) != UUIDSize, so callers (e.g. msgp's
+//     extension decode path) can detect and reject malformed/corrupt
+//     wire data instead of silently accepting a truncated or zero-padded
+//     UUID
 func (u *UUID) UnmarshalBinary(b []byte) error {
+	if len(b) != UUIDSize {
+		return fmt.Errorf("helix: invalid UUID binary length: got %d bytes, want %d", len(b), UUIDSize)
+	}
+
 	copy(u[:], b)
 
 	return nil

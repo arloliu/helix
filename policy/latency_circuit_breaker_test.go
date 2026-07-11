@@ -252,6 +252,45 @@ func TestLatencyCircuitBreaker_ImplementsFailoverPolicy(t *testing.T) {
 	} = NewLatencyCircuitBreaker()
 }
 
+// TestLatencyCircuitBreaker_ZeroValueDoesNotPanic verifies that a
+// LatencyCircuitBreaker built without NewLatencyCircuitBreaker (leaving the
+// embedded *CircuitBreaker nil) is safe to call — mirroring the zero-value
+// safety guarantee documented on CircuitBreaker itself.
+func TestLatencyCircuitBreaker_ZeroValueDoesNotPanic(t *testing.T) {
+	lcb := &LatencyCircuitBreaker{}
+
+	assert.NotPanics(t, func() {
+		lcb.RecordLatency(types.ClusterA, 5*time.Second)
+	})
+	assert.NotPanics(t, func() {
+		lcb.RecordFailure(types.ClusterA)
+	})
+	assert.NotPanics(t, func() {
+		lcb.RecordSuccess(types.ClusterA)
+	})
+	assert.NotPanics(t, func() {
+		assert.False(t, lcb.ShouldFailover(types.ClusterA, nil))
+	})
+	assert.NotPanics(t, func() {
+		assert.Equal(t, 0, lcb.Failures(types.ClusterA))
+	})
+	assert.NotPanics(t, func() {
+		lcb.SetClusterNames(types.DefaultClusterNames())
+	})
+	assert.NotPanics(t, func() {
+		assert.False(t, lcb.MetricsConfigured())
+	})
+	assert.NotPanics(t, func() {
+		lcb.SetMetrics(testutil.NewTestMetricsCollector())
+	})
+	assert.NotPanics(t, func() {
+		assert.False(t, lcb.LoggerConfigured())
+	})
+	assert.NotPanics(t, func() {
+		lcb.SetLogger(&captureLogger{messages: &[]string{}})
+	})
+}
+
 func TestLatencyCircuitBreaker_ResetTimeout(t *testing.T) {
 	lcb := NewLatencyCircuitBreaker(
 		WithLatencyAbsoluteMax(100*time.Millisecond),

@@ -149,6 +149,78 @@ func TestStrict_NilStrategy(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestStrict_NilStrategy_BothClustersRunConcurrently is a regression test
+// for the cql_client.go executeStrictDualWrite alloc-perf finding: the fix
+// runs writeA inline on the calling goroutine (instead of spawning a second
+// goroutine for it) while writeB still runs in a spawned goroutine. This
+// must not turn the writes sequential — both must still be in flight at the
+// same time. Mirrors TestExecuteDualWrite_DefaultPath_BothClustersRunConcurrently
+// (cql_client_test.go) for the Strict() path, reusing its blockingSession.
+func TestStrict_NilStrategy_BothClustersRunConcurrently(t *testing.T) {
+	sessionA := newBlockingSession()
+	sessionB := newBlockingSession()
+
+	client, err := NewCQLClient(sessionA, sessionB)
+	require.NoError(t, err)
+	defer client.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Query("INSERT INTO t (id) VALUES (?)", 1).Strict().ExecContext(context.Background())
+	}()
+
+	// Both sessions must report entry before either is released — if the
+	// writes ran sequentially, the second session would never enter until
+	// the first is released, and this would time out.
+	timeout := time.After(2 * time.Second)
+	for range 2 {
+		select {
+		case <-sessionA.entered:
+		case <-sessionB.entered:
+		case <-timeout:
+			t.Fatal("both clusters' writes must be in flight concurrently — timed out waiting for entry")
+		}
+	}
+
+	close(sessionA.release)
+	close(sessionB.release)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("ExecContext did not return after both sessions were released")
+	}
+}
+
+// TestStrict_NilStrategy_PanicInA_ReturnsPartialWriteError is a regression
+// test for the default (nil WriteStrategy) Strict() dual-write path: a
+// panic on cluster A's write — which runs inline on the calling goroutine —
+// must be recovered by safeCQLWrite and converted into A's error instead of
+// unwinding out of executeStrictDualWrite, which would skip wg.Wait
+// (leaving B's goroutine detached) and the error-classification path below.
+// This proves B is still joined (its write reaches the session) and A's
+// panic is classified exactly like any other real error: PartialWriteError
+// with B acknowledged and A unacknowledged.
+func TestStrict_NilStrategy_PanicInA_ReturnsPartialWriteError(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	sa.execPanic = "driver exploded"
+
+	client := newDualClient(t, sa, sb)
+
+	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().ExecContext(t.Context())
+
+	require.Len(t, sb.queries, 1, "cluster B's write must still run — wg.Wait must join it despite A's panic")
+
+	pwe, ok := types.AsPartialWriteError(err)
+	require.True(t, ok, "expected PartialWriteError, got %T: %v", err, err)
+	assert.Equal(t, ClusterB, pwe.Acknowledged)
+	assert.Equal(t, ClusterA, pwe.Unacknowledged)
+	require.Error(t, pwe.Cause)
+	assert.Contains(t, pwe.Cause.Error(), "panic")
+	assert.Contains(t, pwe.Cause.Error(), "driver exploded")
+}
+
 // TestStrict_UnsupportedStrategy verifies that Strict() on a client whose
 // WriteStrategy does not implement StrictWriter returns ErrStrictUnsupported.
 func TestStrict_UnsupportedStrategy(t *testing.T) {

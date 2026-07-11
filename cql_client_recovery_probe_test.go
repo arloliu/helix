@@ -319,6 +319,35 @@ func TestRecoveryProbe_ZeroValueUsesDefaults(t *testing.T) {
 	require.NotNil(t, client.recoveryProbeCtx, "probe goroutines must start for AdaptiveDualWrite")
 }
 
+// TestRecoveryProbe_NegativeIntervalRejected verifies that a negative
+// Interval is NOT silently clamped to the default — it must surface as a
+// types.OptionError from NewCQLClient, per WithRecoveryProbe's documented
+// contract.
+func TestRecoveryProbe_NegativeIntervalRejected(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+
+	client, err := NewCQLClient(sa, sb,
+		WithRecoveryProbe(RecoveryProbe{Interval: -1 * time.Second, Timeout: time.Second}),
+	)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+	assert.ErrorContains(t, err, "WithRecoveryProbe")
+	assert.Nil(t, client)
+}
+
+// TestRecoveryProbe_NegativeTimeoutRejected mirrors the Interval case for Timeout.
+func TestRecoveryProbe_NegativeTimeoutRejected(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+
+	client, err := NewCQLClient(sa, sb,
+		WithRecoveryProbe(RecoveryProbe{Interval: time.Second, Timeout: -1 * time.Second}),
+	)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+	assert.ErrorContains(t, err, "WithRecoveryProbe")
+	assert.Nil(t, client)
+}
+
 // TestRecoveryProbe_NilProbeFilled verifies that a RecoveryProbe with explicit
 // durations but nil Probe is filled with the default probe function.
 func TestRecoveryProbe_NilProbeFilled(t *testing.T) {

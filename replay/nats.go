@@ -6,8 +6,8 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
-	"strconv"
 	"sync"
 	"time"
 
@@ -452,7 +452,7 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 	if payload.Priority == types.PriorityHigh {
 		priorityStr = "high"
 	}
-	subject := fmt.Sprintf("%s.%s.%s", n.config.SubjectPrefix, priorityStr, payload.TargetCluster)
+	subject := n.config.SubjectPrefix + "." + priorityStr + "." + string(payload.TargetCluster)
 
 	// Publish with timeout
 	pubCtx, cancel := context.WithTimeout(ctx, n.config.PublishTimeout)
@@ -489,8 +489,8 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 	}
 	n.mu.RUnlock()
 
-	consumerName := fmt.Sprintf("helix-worker-%s", cluster)
-	filterSubject := fmt.Sprintf("%s.*.%s", n.config.SubjectPrefix, cluster)
+	consumerName := "helix-worker-" + string(cluster)
+	filterSubject := n.config.SubjectPrefix + ".*." + string(cluster)
 
 	consumer, err := n.getOrCreateConsumer(ctx, consumerName, filterSubject)
 	if err != nil {
@@ -533,8 +533,8 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		priorityStr = "high"
 	}
 
-	consumerName := fmt.Sprintf("helix-worker-%s-%s", priorityStr, cluster)
-	filterSubject := fmt.Sprintf("%s.%s.%s", n.config.SubjectPrefix, priorityStr, cluster)
+	consumerName := "helix-worker-" + priorityStr + "-" + string(cluster)
+	filterSubject := n.config.SubjectPrefix + "." + priorityStr + "." + string(cluster)
 
 	consumer, err := n.getOrCreateConsumer(ctx, consumerName, filterSubject)
 	if err != nil {
@@ -718,6 +718,19 @@ func (n *NATSReplayer) invalidateConsumer(consumerName string) {
 	n.mu.Unlock()
 }
 
+// avgArgEncodedSize is a rough per-argument capacity hint for encodeArgs'
+// output buffer, covering common CQL argument encodings (short strings,
+// numbers, UUID extensions) without inspecting each argument's concrete
+// type. A per-type estimate (e.g. msgp.GuessSize) was benchmarked and
+// rejected: msgp.GuessSize doesn't recognize UUID-like values (this
+// package's UUID extension methods use a pointer receiver, and driver
+// UUID types aren't msgp builtins) and falls back to a 512-byte default
+// per UUID, and even a UUID-aware estimate doubles the per-argument
+// type-switch cost paid again moments later by appendArg. A flat hint
+// avoids both problems while still cutting reallocations for the common
+// case.
+const avgArgEncodedSize = 24
+
 // encodeArgs encodes []any arguments to msgp.Raw.
 //
 // msgp doesn't directly support []any, so we use msgp's AppendIntf which
@@ -744,7 +757,7 @@ func encodeArgs(args []any) (msgp.Raw, error) {
 		return nil, errors.New("helix: too many arguments to encode")
 	}
 
-	var buf []byte
+	buf := make([]byte, 0, msgp.ArrayHeaderSize+len(args)*avgArgEncodedSize)
 	//nolint:gosec // overflow checked above
 	buf = msgp.AppendArrayHeader(buf, uint32(len(args)))
 
@@ -941,7 +954,9 @@ func (m *ReplayMessage) Term() error {
 //
 // Returns:
 //   - int: Number of pending messages
-//   - error: Error if unable to get stream info
+//   - error: Error if unable to get stream info, or if the stream's message
+//     count overflows the platform int width (only possible on 32-bit
+//     builds with a very large stream)
 func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 	n.mu.RLock()
 	if n.closed {
@@ -956,13 +971,19 @@ func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("helix: failed to get stream info: %w", err)
 	}
 
-	pending, convErr := strconv.Atoi(strconv.FormatUint(info.State.Msgs, 10))
-	if convErr != nil {
-		// Atoi reports range errors when Msgs exceeds local int width.
-		return int(^uint(0) >> 1), nil
+	return msgsToInt(info.State.Msgs)
+}
+
+// msgsToInt converts a JetStream stream's uint64 message count to a
+// platform int, returning an error instead of a fabricated sentinel value
+// when the count overflows the local int width (only reachable on 32-bit
+// builds with a very large stream, or when Msgs exceeds math.MaxInt64).
+func msgsToInt(msgs uint64) (int, error) {
+	if msgs > math.MaxInt {
+		return 0, fmt.Errorf("helix: pending count %d overflows platform int", msgs)
 	}
 
-	return pending, nil
+	return int(msgs), nil
 }
 
 // handleCorrupt terminates a message that cannot be decoded and invokes the

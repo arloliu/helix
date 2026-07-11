@@ -11,6 +11,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// BenchmarkConcurrentDualWrite_Execute measures goroutine-spawn overhead for
+// the common healthy-cluster path. Write funcs are no-ops so the benchmark
+// isolates Execute's own allocation/scheduling cost.
+func BenchmarkConcurrentDualWrite_Execute(b *testing.B) {
+	strategy := NewConcurrentDualWrite()
+	ctx := context.Background()
+	noop := func(_ context.Context) error { return nil }
+
+	for b.Loop() {
+		_, _ = strategy.Execute(ctx, noop, noop)
+	}
+}
+
 func TestConcurrentDualWriteBothSucceed(t *testing.T) {
 	strategy := NewConcurrentDualWrite()
 
@@ -32,6 +45,58 @@ func TestConcurrentDualWriteBothSucceed(t *testing.T) {
 	require.NoError(t, errB)
 	require.Equal(t, int32(1), callCountA.Load())
 	require.Equal(t, int32(1), callCountB.Load())
+}
+
+// TestConcurrentDualWrite_Execute_BothWritesRunConcurrently is a regression
+// test for the write_strategy.go alloc-perf finding: Execute now runs writeA
+// inline on the calling goroutine (instead of spawning a second goroutine
+// for it) while writeB still runs in a spawned goroutine. This must not
+// turn the writes sequential — both must still be in flight at the same
+// time, proven by blocking both write funcs and asserting BOTH report entry
+// before either is released.
+func TestConcurrentDualWrite_Execute_BothWritesRunConcurrently(t *testing.T) {
+	strategy := NewConcurrentDualWrite()
+
+	enteredA := make(chan struct{}, 1)
+	enteredB := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	//nolint:unparam // must match the func(context.Context) error write-func signature Execute requires
+	writeA := func(_ context.Context) error {
+		enteredA <- struct{}{}
+		<-release
+		return nil
+	}
+	//nolint:unparam // must match the func(context.Context) error write-func signature Execute requires
+	writeB := func(_ context.Context) error {
+		enteredB <- struct{}{}
+		<-release
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = strategy.Execute(context.Background(), writeA, writeB)
+	}()
+
+	timeout := time.After(2 * time.Second)
+	for range 2 {
+		select {
+		case <-enteredA:
+		case <-enteredB:
+		case <-timeout:
+			t.Fatal("both writes must be in flight concurrently — timed out waiting for entry")
+		}
+	}
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute did not return after release")
+	}
 }
 
 func TestConcurrentDualWriteOneFails(t *testing.T) {

@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"math"
 	"testing"
 
 	"github.com/gocql/gocql"
@@ -52,5 +53,28 @@ func TestTryConvertToUUID(t *testing.T) {
 		res, ok := tryConvertToUUID("not a uuid")
 		assert.False(t, ok)
 		assert.Equal(t, UUID{}, res)
+	})
+}
+
+// TestMsgsToInt verifies that msgsToInt (used by NATSReplayer.Pending)
+// propagates a real error instead of fabricating a sentinel value when a
+// stream's message count cannot be represented as a platform int.
+func TestMsgsToInt(t *testing.T) {
+	t.Run("in-range value converts exactly", func(t *testing.T) {
+		got, err := msgsToInt(42)
+		assert.NoError(t, err)
+		assert.Equal(t, 42, got)
+	})
+
+	t.Run("zero converts exactly", func(t *testing.T) {
+		got, err := msgsToInt(0)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, got)
+	})
+
+	t.Run("out-of-range value returns error, not a fabricated sentinel", func(t *testing.T) {
+		got, err := msgsToInt(math.MaxUint64)
+		assert.Error(t, err)
+		assert.Zero(t, got)
 	})
 }

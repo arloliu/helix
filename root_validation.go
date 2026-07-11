@@ -33,6 +33,7 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootAutoRefresh(config),
 		validateRootMirrorMode(config),
 		validateRootDefaultMaxRows(config),
+		validateRootRecoveryProbe(config),
 	)
 }
 
@@ -77,6 +78,26 @@ func validateRootDefaultMaxRows(config *ClientConfig) error {
 		return newRootOptionError("WithDefaultMaxRows", "must be < math.MaxInt32")
 	}
 	return nil
+}
+
+// validateRootRecoveryProbe rejects a negative Interval or Timeout on
+// [RecoveryProbe]. [WithRecoveryProbe] only substitutes defaults for the
+// zero value; negative values reach here untouched so they surface as a
+// types.OptionError instead of being silently clamped to the default.
+func validateRootRecoveryProbe(config *ClientConfig) error {
+	if config.RecoveryProbe == nil {
+		return nil
+	}
+
+	errList := make([]error, 0, 2)
+	if config.RecoveryProbe.Interval < 0 {
+		errList = append(errList, newRootOptionError("WithRecoveryProbe", "Interval must be >= 0"))
+	}
+	if config.RecoveryProbe.Timeout < 0 {
+		errList = append(errList, newRootOptionError("WithRecoveryProbe", "Timeout must be >= 0"))
+	}
+
+	return joinRootValidationErrors(errList...)
 }
 
 func validateRootMirrorMode(config *ClientConfig) error {

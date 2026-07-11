@@ -404,6 +404,24 @@ func safeProbe(ctx context.Context, probe func(context.Context, cql.Session) err
 	return probe(ctx, session)
 }
 
+// safeCQLWrite calls write and recovers from panics, converting them to
+// errors so a panic in one dual-write leg cannot unwind past the calling
+// goroutine before its sibling is joined and the error-aggregation /
+// replay-enqueue path below runs. Mirrors policy/write_strategy.go's
+// safeWrite: the captured stack is included in the returned error for
+// post-mortem debugging.
+func safeCQLWrite(ctx context.Context, write func(context.Context) error, cluster string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			err = fmt.Errorf("helix: panic in cluster %s write: %v\n%s", cluster, r, buf[:n])
+		}
+	}()
+
+	return write(ctx)
+}
+
 // isReadTerminalNonHealth reports whether err is a read-pipeline data
 // sentinel — [types.ErrNotFound] or [types.ErrRowLimitExceeded] — that
 // terminates the read but MUST NOT count as a cluster-health failure.
@@ -713,30 +731,50 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 }
 
 // watchTopology monitors topology updates and updates drain state.
+//
+// Cancellation does not rely solely on the configured [TopologyWatcher]
+// closing its update channel when topologyCtx is cancelled — a nil channel,
+// or a custom/misbehaving TopologyWatcher that never closes it, would
+// otherwise block this goroutine forever and defeat [CQLClient.Close]'s
+// cancellation of topologyCtx. The select loop below (mirroring
+// autoRefreshLoop) gives topologyCtx.Done() an independent exit path.
 func (c *CQLClient) watchTopology() {
 	updates := c.config.TopologyWatcher.Watch(c.topologyCtx)
-	for update := range updates {
-		var previousDrain bool
-		switch update.Cluster {
-		case ClusterA:
-			previousDrain = c.drainA.Swap(update.DrainMode)
-		case ClusterB:
-			previousDrain = c.drainB.Swap(update.DrainMode)
-		}
+	if updates == nil {
+		return
+	}
 
-		// Record drain mode transitions
-		if !previousDrain && update.DrainMode {
-			c.config.Metrics.IncDrainModeEntered(update.Cluster)
-			c.config.Metrics.SetClusterDraining(update.Cluster, true)
-			c.config.Logger.Warn("cluster entering drain mode",
-				"cluster", c.clusterName(update.Cluster),
-			)
-		} else if previousDrain && !update.DrainMode {
-			c.config.Metrics.IncDrainModeExited(update.Cluster)
-			c.config.Metrics.SetClusterDraining(update.Cluster, false)
-			c.config.Logger.Info("cluster exiting drain mode",
-				"cluster", c.clusterName(update.Cluster),
-			)
+	for {
+		select {
+		case <-c.topologyCtx.Done():
+			return
+		case update, ok := <-updates:
+			if !ok {
+				return
+			}
+
+			var previousDrain bool
+			switch update.Cluster {
+			case ClusterA:
+				previousDrain = c.drainA.Swap(update.DrainMode)
+			case ClusterB:
+				previousDrain = c.drainB.Swap(update.DrainMode)
+			}
+
+			// Record drain mode transitions
+			if !previousDrain && update.DrainMode {
+				c.config.Metrics.IncDrainModeEntered(update.Cluster)
+				c.config.Metrics.SetClusterDraining(update.Cluster, true)
+				c.config.Logger.Warn("cluster entering drain mode",
+					"cluster", c.clusterName(update.Cluster),
+				)
+			} else if previousDrain && !update.DrainMode {
+				c.config.Metrics.IncDrainModeExited(update.Cluster)
+				c.config.Metrics.SetClusterDraining(update.Cluster, false)
+				c.config.Logger.Info("cluster exiting drain mode",
+					"cluster", c.clusterName(update.Cluster),
+				)
+			}
 		}
 	}
 }
@@ -819,17 +857,30 @@ func (c *CQLClient) NewBatch(kind BatchType) Batch {
 	return c.Batch(kind)
 }
 
+// errNilBatch is returned by the deprecated ExecuteBatch / ExecuteBatchCAS /
+// MapExecuteBatchCAS compat shims when the caller passes a nil Batch. These
+// methods invoke a method directly on the caller-supplied Batch interface,
+// so without this guard a nil argument would panic on a nil-interface method
+// call instead of returning a diagnosable error. types.ErrNilSession is not
+// reused here since its message ("session cannot be nil") would misdescribe
+// the failure; this sentinel is local to the file, matching errNilSliceScanFn.
+var errNilBatch = errors.New("helix: batch must not be nil")
+
 // ExecuteBatch executes a batch operation.
 //
 // Deprecated: Use batch.Exec() instead for the modern fluent API.
 // This method is provided for compatibility with gocql v1 users.
 //
 // Parameters:
-//   - batch: The batch to execute
+//   - batch: The batch to execute. Must not be nil.
 //
 // Returns:
-//   - error: Any execution error
+//   - error: errNilBatch if batch is nil; otherwise any execution error
 func (c *CQLClient) ExecuteBatch(batch Batch) error {
+	if batch == nil {
+		return errNilBatch
+	}
+
 	return batch.Exec()
 }
 
@@ -839,14 +890,18 @@ func (c *CQLClient) ExecuteBatch(batch Batch) error {
 // This method is provided for compatibility with gocql v1 users.
 //
 // Parameters:
-//   - batch: The batch to execute
+//   - batch: The batch to execute. Must not be nil.
 //   - dest: Optional destination for result columns
 //
 // Returns:
 //   - applied: true if the transaction was applied
 //   - iter: Iterator for result rows if not applied
-//   - err: Any execution error
+//   - err: errNilBatch if batch is nil; otherwise any execution error
 func (c *CQLClient) ExecuteBatchCAS(batch Batch, dest ...any) (applied bool, iter Iter, err error) {
+	if batch == nil {
+		return false, nil, errNilBatch
+	}
+
 	return batch.ExecCAS(dest...)
 }
 
@@ -856,14 +911,18 @@ func (c *CQLClient) ExecuteBatchCAS(batch Batch, dest ...any) (applied bool, ite
 // This method is provided for compatibility with gocql v1 users.
 //
 // Parameters:
-//   - batch: The batch to execute
+//   - batch: The batch to execute. Must not be nil.
 //   - dest: Map to receive result columns
 //
 // Returns:
 //   - applied: true if the transaction was applied
 //   - iter: Iterator for result rows if not applied
-//   - err: Any execution error
+//   - err: errNilBatch if batch is nil; otherwise any execution error
 func (c *CQLClient) MapExecuteBatchCAS(batch Batch, dest map[string]any) (applied bool, iter Iter, err error) {
+	if batch == nil {
+		return false, nil, errNilBatch
+	}
+
 	return batch.MapExecCAS(dest)
 }
 
@@ -1587,6 +1646,14 @@ func (c *CQLClient) executeWriteWithDrain(
 }
 
 // executeDualWrite performs the normal dual-cluster write.
+//
+// When no [WriteStrategy] is configured, both cluster legs run through
+// safeCQLWrite: a panic on either leg is recovered and converted into that
+// cluster's error, exactly like the panic-to-error conversion the built-in
+// policy strategies already apply (see policy/write_strategy.go's
+// safeWrite). This keeps the two legs symmetric — the sibling write is
+// always joined via wg.Wait and participates in the same metrics/replay
+// aggregation below regardless of whether a leg errored or panicked.
 func (c *CQLClient) executeDualWrite(
 	ctx context.Context,
 	wc writeContext,
@@ -1619,16 +1686,23 @@ func (c *CQLClient) executeDualWrite(
 	if c.config.WriteStrategy != nil {
 		errA, errB = c.config.WriteStrategy.Execute(ctx, writeA, writeB)
 	} else {
-		// Default: concurrent dual write
+		// Default: concurrent dual write. Only writeB is dispatched to a
+		// spawned goroutine; writeA runs inline on the calling goroutine,
+		// which blocks on wg.Wait() immediately afterward, so A and B still
+		// execute concurrently — this halves the per-write goroutine-spawn
+		// count versus spawning both. Both legs go through safeCQLWrite so a
+		// panic in either becomes that cluster's error instead of unwinding
+		// past this function (which would skip wg.Wait, metrics, and the
+		// aggregation/replay path below) or crashing the process (an
+		// unrecovered panic in the spawned goroutine is fatal regardless of
+		// which goroutine raised it).
 		var wg sync.WaitGroup
 
 		wg.Go(func() {
-			errA = writeA(ctx)
+			errB = safeCQLWrite(ctx, writeB, "B")
 		})
 
-		wg.Go(func() {
-			errB = writeB(ctx)
-		})
+		errA = safeCQLWrite(ctx, writeA, "A")
 
 		wg.Wait()
 	}
@@ -1771,8 +1845,10 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 // partial failure or [*types.DualClusterError] when both clusters fail.
 //
 // A nil WriteStrategy uses the same inline concurrent write as the default
-// non-strict path. A non-nil WriteStrategy that does not implement [StrictWriter]
-// surfaces as [types.ErrStrictUnsupported].
+// non-strict path, including the same safeCQLWrite panic-to-error
+// conversion on both legs described on [CQLClient.executeDualWrite]. A
+// non-nil WriteStrategy that does not implement [StrictWriter] surfaces as
+// [types.ErrStrictUnsupported].
 func (c *CQLClient) executeStrictDualWrite(
 	ctx context.Context,
 	writeFunc func(context.Context, cql.Session) error,
@@ -1795,9 +1871,16 @@ func (c *CQLClient) executeStrictDualWrite(
 	} else if c.config.WriteStrategy != nil {
 		return types.ErrStrictUnsupported
 	} else {
+		// See executeDualWrite's default branch: only writeB is spawned;
+		// writeA runs inline on the calling goroutine, which still blocks on
+		// wg.Wait() right after, preserving A/B concurrency with one fewer
+		// goroutine spawn per write. Both legs go through safeCQLWrite so a
+		// panic in either becomes that cluster's error (joined via wg.Wait,
+		// then classified below) instead of unwinding past this function or
+		// crashing the process.
 		var wg sync.WaitGroup
-		wg.Go(func() { errA = writeA(ctx) })
-		wg.Go(func() { errB = writeB(ctx) })
+		wg.Go(func() { errB = safeCQLWrite(ctx, writeB, "B") })
+		errA = safeCQLWrite(ctx, writeA, "A")
 		wg.Wait()
 	}
 
@@ -2100,6 +2183,15 @@ func (c *CQLClient) executeReadNoFailover(
 		return res.err
 	}
 
+	// A scanFn-returned ErrNotFound (shielded so it does not match
+	// isReadTerminalNonHealth above and misfire the empty-retry path) is
+	// still a data sentinel, not a cluster fault — exclude it from health
+	// recording the same way a genuine ErrNotFound is, without unwrapping it
+	// (SliceScanContext does that at the public boundary).
+	if isShieldedScanFnNotFound(res.err) {
+		return res.err
+	}
+
 	// Real error path: record ALL terminal signals here because there is
 	// no failover branch to claim ownership of RecordFailure. RecordFailure
 	// is gated on dual-cluster + a configured FailoverPolicy to preserve
@@ -2360,6 +2452,17 @@ func (c *CQLClient) executeFallbackRead(
 		return err
 	}
 
+	// A scanFn-returned ErrNotFound on the alt leg (shielded so the
+	// types.IsNotFound check above does not misfire the "both confirmed
+	// not-found" branch and re-triggering issues) is a data sentinel from
+	// the caller's own callback, not an alt-cluster fault — exclude it from
+	// health recording like the ErrRowLimitExceeded case above. The caller
+	// still sees it: SliceScanContext's propagateAltErr always returns true
+	// once scanFn ran on the alt, and unwraps the shield before returning.
+	if isShieldedScanFnNotFound(err) {
+		return err
+	}
+
 	// Alternative returned a real error. Health classification is gated by
 	// opts.nonHealthAltErr: slice callers may mark ctx errors as caller-driven
 	// (no health impact). All other real errors record health on alt as
@@ -2411,11 +2514,42 @@ var errNilSliceScanFn = errors.New("helix: scanFn must not be nil")
 // throughout the internal pipeline. SliceScanContext unwraps the shield
 // before returning, so callers' errors.Is(err, types.ErrNotFound) checks
 // still match.
+//
+// This intentionally also defeats isReadTerminalNonHealth's own
+// errors.Is(err, types.ErrNotFound) check, which would otherwise route the
+// shielded error back into the empty-retry / silent-translation paths this
+// type exists to avoid. But isReadTerminalNonHealth serves TWO purposes —
+// (1) deciding whether to attempt the empty-retry / FallbackRead dance, and
+// (2) deciding whether the error counts as a cluster-health failure — and
+// blocking errors.Is wholesale accidentally defeats both. Only (1) should be
+// defeated. isShieldedScanFnNotFound restores (2): it is checked with
+// errors.As (not Is) at the specific call sites that decide health
+// recording (executeReadNoFailover, executeFallbackRead), so a business-logic
+// not-found returned by the caller's own scanFn is excluded from
+// IncReadError / recordOpOutcome / FailoverPolicy.RecordFailure the same way
+// a genuine types.ErrNotFound is, without reopening the empty-retry
+// misclassification (that decision still only consults errors.Is, which
+// this type still refuses).
 type scanFnNotFoundShieldError struct {
 	err error
 }
 
 func (e *scanFnNotFoundShieldError) Error() string { return e.err.Error() }
+
+// isShieldedScanFnNotFound reports whether err is (or wraps, via errors.As)
+// a *scanFnNotFoundShieldError. Deliberately implemented with errors.As
+// rather than adding Is to the type itself: an Is method would also make
+// errors.Is(err, types.ErrNotFound) succeed everywhere the shield flows,
+// including isReadTerminalNonHealth — reopening the exact empty-retry /
+// silent-translation bug the shield exists to prevent. errors.As only
+// matches the shield's own concrete type, so it is safe to use narrowly at
+// the health-recording call sites without affecting classification anywhere
+// else in the read pipeline.
+func isShieldedScanFnNotFound(err error) bool {
+	var shielded *scanFnNotFoundShieldError
+
+	return errors.As(err, &shielded)
+}
 
 // rowScannerAdapter narrows a driver [cql.Scanner] down to the public
 // [RowScanner] surface (Scan only). Helix's counted-drain loop owns Next()
@@ -2486,6 +2620,12 @@ func drainIterScanWithLimit(
 	return rowCount, nil
 }
 
+// sliceMapPreallocCap bounds the preallocation drainIterToSliceMapWithLimit
+// performs when a positive limit is known. See the comment inside that
+// function for the rationale (limit is often a generous safety cap, not the
+// expected row count).
+const sliceMapPreallocCap = 1024
+
 // drainIterToSliceMapWithLimit drains iter into a slice of column-name maps,
 // stopping when max > 0 is reached.
 //
@@ -2501,6 +2641,13 @@ func drainIterScanWithLimit(
 // page semantics: iter.MapScan does an in-place page replacement, so a
 // deferred close on the original iter always closes the active page
 // (verified against gocql v1 and cassandra-gocql-driver v2).
+//
+// rows must stay nil on a zero-row drain: SliceMapContext's readFunc uses
+// `drained == nil` (not len == 0) to detect "primary drained empty" and
+// synthesize ErrNotFound for the FallbackRead empty-retry. Preallocating
+// unconditionally before the loop breaks that signal (a preallocated-but-
+// unused slice is non-nil), so the capacity hint below is applied lazily on
+// the first row instead of up front.
 func drainIterToSliceMapWithLimit(
 	iter cql.Iter, limit int,
 ) (rows []map[string]any, err error) {
@@ -2519,6 +2666,17 @@ func drainIterToSliceMapWithLimit(
 		}
 		if limit > 0 && len(rows) >= limit {
 			return nil, types.ErrRowLimitExceeded
+		}
+		if rows == nil && limit > 0 {
+			// limit is frequently set as a generous safety cap (e.g.
+			// MaxRows(100_000)) rather than the exact expected row count, so
+			// preallocating to limit verbatim could itself become a large
+			// wasted allocation when the actual result is much smaller.
+			// Capping keeps the common case (result sets up to a few
+			// thousand rows) reallocation-free while bounding the worst
+			// case for large caps.
+			prealloc := min(limit, sliceMapPreallocCap)
+			rows = make([]map[string]any, 0, prealloc)
 		}
 		rows = append(rows, m)
 	}

@@ -418,8 +418,17 @@ func TestSliceScan_ScanFnReturnsErrNotFound_DualCluster_DoesNotInvokeAlt(t *test
 
 	assert.Equal(t, int32(0), sb.iterCtxCalls.Load(),
 		"shield prevents the wrapper from misclassifying the user error as the empty signal; alt must NOT be contacted")
-	assert.Equal(t, int64(1), met.get(met.ReadErrors, ClusterA),
-		"scanFn-returned errors record health on the primary (plan §1547-1549)")
+	// Regression for the codebase-review nil/error-handling audit
+	// (finding cql_client.go:2941): a business-logic ErrNotFound from the
+	// caller's own scanFn is a data sentinel, not a primary-cluster fault —
+	// it must NOT record health, matching every other ErrNotFound path in
+	// recordOpOutcomeAt. Superseded the older "record health on the primary"
+	// expectation from plan §1547-1549, which did not anticipate this
+	// interaction with the shield.
+	assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterA),
+		"scanFn-returned ErrNotFound must NOT record health on the primary")
+	assert.Empty(t, policy.RecordFailureCalls,
+		"scanFn-returned ErrNotFound must NOT advance FailoverPolicy state")
 }
 
 func TestSliceScan_AltScanFnReturnsErrNotFound_PropagatesViaShield(t *testing.T) {
@@ -438,8 +447,13 @@ func TestSliceScan_AltScanFnReturnsErrNotFound_PropagatesViaShield(t *testing.T)
 		"alt-leg user-callback ErrNotFound must propagate even when scanFnInvokedOnAlt is the trigger")
 	assert.Zero(t, rowCount, "rowCount counts only successful callbacks; the ErrNotFound was returned on the first row")
 
-	assert.Equal(t, int64(1), met.get(met.ReadErrors, ClusterB),
-		"scanFn errors on alt record health on alt (plan §1547-1549)")
+	// Regression for the codebase-review nil/error-handling audit
+	// (finding cql_client.go:2941): same rationale as the primary-leg case
+	// above, applied to the alt leg of executeFallbackRead.
+	assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterB),
+		"scanFn-returned ErrNotFound on alt must NOT record health")
+	assert.Empty(t, policy.RecordFailureCalls,
+		"scanFn-returned ErrNotFound on alt must NOT advance FailoverPolicy state")
 }
 
 // ─────────────────────────────────────────────

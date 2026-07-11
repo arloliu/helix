@@ -90,6 +90,50 @@ func TestWorkerConfigInvalidValuesAreNormalized(t *testing.T) {
 	assert.Equal(t, 1, worker.config.MaxAttempts)
 }
 
+// fakeNilableMetrics satisfies types.MetricsCollector purely by embedding
+// the interface, so a nil *fakeNilableMetrics is a valid (if unusable)
+// value of the interface type. It is never invoked in tests that use it
+// -- the point of TestWorkerConfigRejectsTypedNilOptions is that the
+// nil-fallback guard must catch it before any method is ever called.
+type fakeNilableMetrics struct {
+	types.MetricsCollector
+}
+
+var _ types.MetricsCollector = (*fakeNilableMetrics)(nil)
+
+// fakeNilableLogger satisfies types.Logger purely by embedding the
+// interface; see fakeNilableMetrics for rationale.
+type fakeNilableLogger struct {
+	types.Logger
+}
+
+var _ types.Logger = (*fakeNilableLogger)(nil)
+
+// TestWorkerConfigRejectsTypedNilOptions verifies that WithWorkerMetrics
+// and WithWorkerLogger normalize a typed-nil interface value (a non-nil
+// interface wrapping a nil concrete pointer, e.g. `var m *myCollector`)
+// to the Nop fallback instead of storing an unusable nil-underlying
+// value that would panic on first use.
+func TestWorkerConfigRejectsTypedNilOptions(t *testing.T) {
+	replayer := NewMemoryReplayer(WithQueueCapacity(10))
+	defer replayer.Close()
+
+	var nilMetrics *fakeNilableMetrics
+	var nilLogger *fakeNilableLogger
+
+	worker := NewMemoryWorker(replayer, nil,
+		WithWorkerMetrics(nilMetrics),
+		WithWorkerLogger(nilLogger),
+	)
+
+	_, isNopMetrics := worker.config.Metrics.(*metrics.NopMetrics)
+	assert.True(t, isNopMetrics, "typed-nil metrics should fall back to NopMetrics, got %T", worker.config.Metrics)
+	assert.False(t, worker.MetricsConfigured(), "typed-nil metrics should not count as explicitly configured")
+
+	_, isNopLogger := worker.config.Logger.(*logging.NopLogger)
+	assert.True(t, isNopLogger, "typed-nil logger should fall back to NopLogger, got %T", worker.config.Logger)
+}
+
 // TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown verifies the
 // shutdown contract: when stopCh fires mid-batch, every unprocessed
 // message in the batch is Nak'd so the broker re-delivers them

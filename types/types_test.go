@@ -23,6 +23,21 @@ func TestClusterError(t *testing.T) {
 	assert.True(t, errors.Is(err, cause))
 }
 
+func TestClusterError_NilCause(t *testing.T) {
+	err := &ClusterError{Cluster: "A", Operation: "write"}
+
+	// Must not panic
+	assert.NotPanics(t, func() { _ = err.Error() })
+	assert.Contains(t, err.Error(), "cluster A")
+	assert.Contains(t, err.Error(), "write failed")
+	assert.Contains(t, err.Error(), "<nil>")
+
+	// Unwrap must not panic and must return nil for a nil Cause.
+	assert.NotPanics(t, func() { _ = err.Unwrap() })
+	assert.Nil(t, err.Unwrap())
+	assert.False(t, errors.Is(err, errors.New("anything")))
+}
+
 func TestDualClusterError(t *testing.T) {
 	errA := errors.New("cluster A down")
 	errB := errors.New("cluster B down")

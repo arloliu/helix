@@ -371,10 +371,14 @@ func WithRecoveryProbe(p RecoveryProbe) Option {
 	if p.Probe == nil {
 		p.Probe = def.Probe
 	}
-	if p.Interval <= 0 {
+	// Only the documented "unset" zero value is defaulted here; negative
+	// values are left untouched so validateRootRecoveryProbe (called from
+	// NewCQLClient) can reject them with a types.OptionError instead of
+	// silently masking the misconfiguration.
+	if p.Interval == 0 {
 		p.Interval = def.Interval
 	}
-	if p.Timeout <= 0 {
+	if p.Timeout == 0 {
 		p.Timeout = def.Timeout
 	}
 

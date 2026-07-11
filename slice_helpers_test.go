@@ -173,6 +173,17 @@ func TestSliceScanAs_NilDecode_ReturnsError_NoClusterContact(t *testing.T) {
 		"no IterContext() call either — guard fires before SliceScanContext")
 }
 
+// TestSliceScanAs_NilQuery_ReturnsError_NoPanic is a regression test for
+// slice_helpers.go:75 (nil-safety finding): SliceScanAs guarded a nil decode
+// callback but not a nil Query, so q.SliceScanContext would panic on a
+// nil-interface method call. Symmetric with the nil-decode guard above.
+func TestSliceScanAs_NilQuery_ReturnsError_NoPanic(t *testing.T) {
+	rows, err := SliceScanAs(context.Background(), nil, decodePerson)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "query")
+	assert.Nil(t, rows)
+}
+
 // ─────────────────────────────────────────────
 // FallbackRead alt-leg composition: helper's "nil on err" must compose
 // with the underlying SliceScan's scanFnInvokedOnAlt-driven propagation.

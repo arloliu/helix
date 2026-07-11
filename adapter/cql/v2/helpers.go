@@ -113,15 +113,19 @@ func FromGocqlSerialConsistency(c gocql.Consistency) cql.Consistency {
 // for operations not exposed by the helix interface.
 //
 // Parameters:
-//   - s: Helix v2 Session adapter
+//   - s: Helix v2 Session adapter (may be nil)
 //
 // Returns:
-//   - *gocql.Session: The underlying gocql session
+//   - *gocql.Session: The underlying gocql session, or nil if s is nil
 //
 // Example:
 //
 //	gocqlSession := v2.UnwrapSession(session)
 //	keyspaceMeta, _ := gocqlSession.KeyspaceMetadata("my_keyspace")
 func UnwrapSession(s *Session) *gocql.Session {
+	if s == nil {
+		return nil
+	}
+
 	return s.session
 }

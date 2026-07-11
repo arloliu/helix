@@ -438,8 +438,15 @@ type ClusterError struct {
 }
 
 // Error implements the error interface.
+//
+// If Cause is nil, "<nil>" is substituted in its place rather than panicking.
 func (e *ClusterError) Error() string {
-	return "helix: cluster " + e.Cluster + " " + e.Operation + " failed: " + e.Cause.Error()
+	cause := "<nil>"
+	if e.Cause != nil {
+		cause = e.Cause.Error()
+	}
+
+	return "helix: cluster " + e.Cluster + " " + e.Operation + " failed: " + cause
 }
 
 // Unwrap returns the underlying cause for errors.Is/As compatibility.

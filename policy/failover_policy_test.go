@@ -73,6 +73,30 @@ func TestCircuitBreaker_ZeroValueDoesNotPanic(t *testing.T) {
 	}, "RecordSuccess on zero-value CircuitBreaker must not panic (cluster B)")
 }
 
+// TestCircuitBreaker_ZeroValueShouldFailoverReturnsFalse is a regression
+// test for the `threshold <= 0` guard in ShouldFailover: a zero-value
+// CircuitBreaker has threshold == 0, so the old `int(failures) < c.threshold`
+// check (e.g. 0 < 0, or 1 < 0) is always false and falls through to
+// `return true` — a zero-value breaker would report a failover after a
+// single RecordFailure, or even with zero recorded failures, despite never
+// having (or being able to) record a trip. TestCircuitBreaker_ZeroValueDoesNotPanic
+// only asserts ShouldFailover does not panic; it does not capture the
+// return value, so it would not catch this on its own.
+func TestCircuitBreaker_ZeroValueShouldFailoverReturnsFalse(t *testing.T) {
+	var cb CircuitBreaker
+
+	assert.False(t, cb.ShouldFailover(types.ClusterA, nil),
+		"zero-value CircuitBreaker must never report a failover with no recorded failures")
+
+	cb.RecordFailure(types.ClusterA)
+	assert.False(t, cb.ShouldFailover(types.ClusterA, nil),
+		"zero-value CircuitBreaker (threshold=0) must never report a failover, even after RecordFailure")
+
+	cb.RecordFailure(types.ClusterB)
+	assert.False(t, cb.ShouldFailover(types.ClusterB, nil),
+		"zero-value CircuitBreaker must never report a failover for cluster B either")
+}
+
 // TestClusterNameOrID verifies the shared clusterNameOrID helper: it falls
 // back to the raw ClusterID when the atomic.Pointer[types.ClusterNames] has
 // never been Store'd (the zero-value CircuitBreaker/AdaptiveDualWrite case,
