@@ -284,20 +284,16 @@ func (q *Query) SerialConsistency(c cql.Consistency) cql.Query {
 	return q
 }
 
-// Batch wraps a gocql v2 batch.
+// Batch wraps a gocql v2 batch. The gocql batch is the single source of truth for
+// batch entries; Size and Statements derive from it.
 type Batch struct {
-	batch   *gocql.Batch
-	entries []cql.BatchEntry
-	ctx     context.Context
+	batch *gocql.Batch
+	ctx   context.Context
 }
 
 // Query adds a statement to the batch.
 func (b *Batch) Query(stmt string, args ...any) cql.Batch {
 	b.batch = b.batch.Query(stmt, args...)
-	b.entries = append(b.entries, cql.BatchEntry{
-		Statement: stmt,
-		Args:      args,
-	})
 
 	return b
 }
@@ -382,9 +378,19 @@ func (b *Batch) MapExecCASContext(ctx context.Context, dest map[string]any) (app
 	return applied, &Iter{iter: gocqlIter}, err
 }
 
-// Statements returns all statements in the batch.
+// Statements returns all statements in the batch. The slice is built on demand from
+// the underlying gocql batch (Args are shared, not copied), so callers that never call
+// Statements pay nothing for it.
 func (b *Batch) Statements() []cql.BatchEntry {
-	return b.entries
+	entries := make([]cql.BatchEntry, len(b.batch.Entries))
+	for i := range b.batch.Entries {
+		entries[i] = cql.BatchEntry{
+			Statement: b.batch.Entries[i].Stmt,
+			Args:      b.batch.Entries[i].Args,
+		}
+	}
+
+	return entries
 }
 
 // SerialConsistency sets the consistency level for the serial phase of CAS operations.
@@ -396,7 +402,7 @@ func (b *Batch) SerialConsistency(c cql.Consistency) cql.Batch {
 
 // Size returns the number of statements in the batch.
 func (b *Batch) Size() int {
-	return len(b.entries)
+	return len(b.batch.Entries)
 }
 
 // Iter wraps a gocql v2 iterator.

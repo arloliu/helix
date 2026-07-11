@@ -771,6 +771,39 @@ func BenchmarkCQLDirectBatch(b *testing.B) {
 	}
 }
 
+// BenchmarkCQLBatchBuildExec exercises the full single-cluster batch path: allocate a
+// cqlBatch, append 100 statements, then ExecContext (which rebuilds the entries into a
+// fresh downstream session batch). It measures the helix-layer allocation churn that a
+// high-volume offline batch-write workload pays per batch. The downstream session is a
+// zero-overhead mock so the numbers reflect helix's own bookkeeping, not the driver.
+func BenchmarkCQLBatchBuildExec(b *testing.B) {
+	client, err := helix.NewCQLClient(&mockCQLSession{}, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	const stmt = "INSERT INTO tchart (eqp_id, source, svid_name, date, dc_dt, val, data, tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+	rows := make([][]any, 100)
+	for i := range rows {
+		rows[i] = []any{"TOOL_00123", "SECS", "PRESSURE_CHAMBER_A", "2026-07-10", int64(i), 3.14159, "", "OK"}
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		batch := client.Batch(types.UnloggedBatch)
+		for _, row := range rows {
+			batch.Query(stmt, row...)
+		}
+		if err := batch.ExecContext(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // =============================================================================
 // CQL Parallel Benchmarks
 // =============================================================================
