@@ -181,7 +181,9 @@ type Batch interface {
 	// Size returns the number of statements in the batch.
 	Size() int
 
-	// Statements returns all statements in the batch.
+	// Statements returns all statements in the batch. The returned slice is a fresh
+	// copy the caller may keep; the Args slices are shared with the batch and must
+	// not be mutated.
 	Statements() []BatchEntry
 }
 

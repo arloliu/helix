@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -180,7 +181,7 @@ func (b *mockBatch) Consistency(_ cql.Consistency) cql.Batch       { return b }
 func (b *mockBatch) SerialConsistency(_ cql.Consistency) cql.Batch { return b }
 func (b *mockBatch) WithTimestamp(_ int64) cql.Batch               { return b }
 func (b *mockBatch) Size() int                                     { return len(b.entries) }
-func (b *mockBatch) Statements() []cql.BatchEntry                  { return b.entries }
+func (b *mockBatch) Statements() []cql.BatchEntry                  { return slices.Clone(b.entries) }
 
 func (b *mockBatch) Exec() error {
 	return b.session.execErr

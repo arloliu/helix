@@ -3,6 +3,7 @@ package helix_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -395,7 +396,7 @@ func (b *mockCQLBatch) MapExecCASContext(_ context.Context, _ map[string]any) (a
 	return true, &mockCQLIter{}, nil
 }
 
-func (b *mockCQLBatch) Statements() []cql.BatchEntry { return b.entries }
+func (b *mockCQLBatch) Statements() []cql.BatchEntry { return slices.Clone(b.entries) }
 
 // mockCQLIter provides a zero-overhead mock CQL iterator.
 type mockCQLIter struct {
