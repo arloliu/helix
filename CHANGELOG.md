@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] — 2026-07-11
+
+### Security
+
+- **Dependency bumps resolving 29 Dependabot alerts** (7 critical, 10 high,
+  12 moderate):
+  - `golang.org/x/crypto` 0.48.0 → 0.52.0 (12 alerts, up to critical —
+    SSH auth bypass, deadlocks, panics).
+  - `github.com/nats-io/nats-server/v2` 2.12.2 → 2.12.6 (15 alerts, up to
+    high — pre-auth DoS, ACL/auth bypasses, credential exposure). Only
+    reachable from `test/testutil` (embedded NATS for tests) and
+    `examples/replay`, not from any path a library consumer's binary pulls
+    in.
+  - `go.opentelemetry.io/otel/sdk` / `otel/sdk/metric` 1.37.0 → 1.43.0 (2
+    alerts, high — PATH hijacking / arbitrary code execution).
+  - Transitive deps pulled forward by `go mod tidy` to satisfy the new
+    requirements: `nats.go`, `nats-io/jwt/v2`, `nats-io/nkeys`, `otel`,
+    `otel/metric`, `otel/trace`, `golang.org/x/sys`, `golang.org/x/time`,
+    `antithesishq/antithesis-sdk-go`, `google/go-tpm`.
+  - No source changes — `go.mod`/`go.sum` only. Wire behavior and public
+    API are unaffected.
+
 ## [1.5.1] — 2026-07-11
 
 ### Performance
