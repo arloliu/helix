@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-07-11
+
+### Performance
+
+- **`adapter/cql/v2.Batch` allocation reduction**: The adapter kept its own
+  `[]cql.BatchEntry` slice, appended in lockstep with the underlying gocql
+  batch's `Entries` on every `Query` — a redundant second growing slice that
+  only fed `Size()`/`Statements()`. Removed it; both now derive from the
+  gocql batch. 100-statement batch: 17 → 9 allocs/op, 28352 → 16416 B/op.
+- **`adapter/cql/v1.Batch` allocation reduction**: Same fix ported to the
+  gocql v1 adapter. 100-statement batch: 17 → 8 allocs/op, 28368 → 16208
+  B/op.
+- Wire behavior, public API, and `Statements()`/`Size()` return values are
+  unchanged — this is a build-time bookkeeping change only.
+
+### Documentation
+
+- **`cql.Batch.Statements()` contract pinned**: The interface godoc now
+  states the returned slice is a fresh copy the caller may keep, and that
+  the per-entry `Args` are shared with the batch and must not be mutated —
+  matching what both adapters have always done.
+
+### Tests
+
+- New `TestBatchSizeAndStatementsDeriveFromGocql` and
+  `BenchmarkAdapterBatchQuery` in both `adapter/cql/v1` and
+  `adapter/cql/v2`, proving `Size`/`Statements` correctness and guarding
+  the allocation win against regression.
+- New `BenchmarkCQLBatchBuildExec` in the root package's benchmark suite,
+  measuring the full single-cluster batch build/exec path.
+
 ## [1.5.0] — 2026-05-11
 
 ### Breaking Changes
