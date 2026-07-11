@@ -61,6 +61,12 @@ func TestEngineDefaults(t *testing.T) {
 	e.Stop()
 }
 
+func TestNewEnginePanicsOnNilExecute(t *testing.T) {
+	require.PanicsWithValue(t, "mirror: NewEngine requires a non-nil execute function", func() {
+		NewEngine(nil)
+	})
+}
+
 func TestEngineEnqueueAndExecute(t *testing.T) {
 	rec := &recordingExecutor{}
 	e := NewEngine(rec.fn(), WithWorkers(2))

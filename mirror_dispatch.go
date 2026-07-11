@@ -32,6 +32,20 @@ func mirrorExecuteFunc(target *CQLClient) replay.ExecuteFunc {
 	}
 }
 
+// stopMirrorComponents stops the mirror engine and mirror replay worker
+// that setupMirror may have started, nil-guarding each so it is safe to call
+// regardless of which mirror mode (if any) was configured. Callers use this
+// to unwind mirror startup when a later NewCQLClient initialization step
+// fails after setupMirror has already succeeded.
+func stopMirrorComponents(config *ClientConfig) {
+	if config.MirrorEngine != nil {
+		config.MirrorEngine.Stop()
+	}
+	if config.MirrorReplayWorker != nil {
+		config.MirrorReplayWorker.Stop()
+	}
+}
+
 // setupMirror constructs the mirror engine and (in target mode) an
 // optional auto-built replay worker. Two mutually exclusive deployment
 // modes are recognized:

@@ -16,6 +16,13 @@ type natsBackend struct {
 	execute  ExecuteFunc
 	stopCh   <-chan struct{}
 	wg       *sync.WaitGroup
+
+	// backoffWait is a test seam allowing deterministic observation of
+	// backoff entry: when set, start() calls it instead of time.After to
+	// obtain the channel it waits on before retrying a dequeue. Production
+	// code always leaves this nil, in which case start() falls back to
+	// time.After — zero behavior change outside of tests.
+	backoffWait func(d time.Duration) <-chan time.Time
 }
 
 // Compile-time assertion that natsBackend implements workerBackend.
@@ -30,6 +37,9 @@ func (b *natsBackend) backendType() string {
 }
 
 // natsDequeueResult holds the result of a priority-aware dequeue operation.
+// msgs may be non-empty even when err is non-nil — a batch fetch interrupted
+// mid-stream can still carry successfully fetched messages, and callers must
+// forward/process those before handling err.
 type natsDequeueResult struct {
 	msgs          []ReplayMessage
 	err           error
@@ -47,6 +57,11 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		ratio = 1 // 1:1 equal priority
 	}
 
+	wait := b.backoffWait
+	if wait == nil {
+		wait = time.After
+	}
+
 	for {
 		select {
 		case <-b.stopCh:
@@ -60,6 +75,16 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 
 		highProcessed = result.highProcessed
 
+		// A batch fetch that is interrupted mid-stream (consumer deleted,
+		// ctx cancel, transport error) can still carry successfully fetched
+		// messages alongside the error. Process those first so they are
+		// Ack'd/Nak'd/Term'd before the error branch below backs off -
+		// otherwise each occurrence would burn a JetStream delivery attempt
+		// without execute() ever running on the fetched messages.
+		if len(result.msgs) > 0 {
+			b.processMessages(result.msgs)
+		}
+
 		if result.err != nil {
 			b.config.Logger.Error("failed to dequeue replay messages",
 				"cluster", b.clusterName(cluster),
@@ -69,7 +94,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 			select {
 			case <-b.stopCh:
 				return
-			case <-time.After(b.config.PollInterval):
+			case <-wait(b.config.PollInterval):
 				continue
 			}
 		}
@@ -79,13 +104,10 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 			select {
 			case <-b.stopCh:
 				return
-			case <-time.After(b.config.PollInterval):
+			case <-wait(b.config.PollInterval):
 				continue
 			}
 		}
-
-		// Process each message
-		b.processMessages(result.msgs)
 	}
 }
 
@@ -125,7 +147,14 @@ func (b *natsBackend) dequeueWithRatio(ctx context.Context, cluster types.Cluste
 func (b *natsBackend) dequeueLowFirst(ctx context.Context, cluster types.ClusterID) natsDequeueResult {
 	msgs, err := b.replayer.DequeueByPriority(ctx, cluster, types.PriorityLow, b.config.BatchSize)
 	if err != nil {
-		return natsDequeueResult{err: err}
+		// Forward messages fetched before the error; see natsDequeueResult.
+		// highProcessed is left at its zero value here, matching the
+		// success branch below: dequeueLowFirst has no incoming counter to
+		// preserve (unlike dequeueHighFirst, it isn't passed one), and any
+		// msgs forwarded alongside the error are still low-priority
+		// progress, so resetting is the correct, consistent fairness
+		// accounting whether or not msgs is empty.
+		return natsDequeueResult{msgs: msgs, err: err}
 	}
 	if len(msgs) > 0 {
 		return natsDequeueResult{msgs: msgs, highProcessed: 0} // Reset counter
@@ -144,7 +173,21 @@ func (b *natsBackend) dequeueLowFirst(ctx context.Context, cluster types.Cluster
 func (b *natsBackend) dequeueHighFirst(ctx context.Context, cluster types.ClusterID, highProcessed int) natsDequeueResult {
 	msgs, err := b.replayer.DequeueByPriority(ctx, cluster, types.PriorityHigh, b.config.BatchSize)
 	if err != nil {
-		return natsDequeueResult{err: err, highProcessed: highProcessed}
+		// Forward messages fetched before the error; see natsDequeueResult.
+		// Only advance the counter when messages were actually forwarded:
+		// start() processes and forwards result.msgs regardless of err, so
+		// a forwarded batch is real high-priority progress and must count
+		// toward HighPriorityRatio the same as the error-free success
+		// branch below. A zero-message error means nothing was processed,
+		// so the counter is left untouched — advancing it here would let
+		// repeated empty-batch errors fabricate progress and unfairly
+		// starve low priority once ratio-many errors accumulate.
+		newCount := highProcessed
+		if len(msgs) > 0 {
+			newCount = highProcessed + 1
+		}
+
+		return natsDequeueResult{msgs: msgs, err: err, highProcessed: newCount}
 	}
 	if len(msgs) > 0 {
 		return natsDequeueResult{msgs: msgs, highProcessed: highProcessed + 1}

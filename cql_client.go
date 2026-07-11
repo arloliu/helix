@@ -680,12 +680,16 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	}
 
 	// Start replay worker if configured. On failure, clean up the topology
-	// watcher goroutine that may already be running.
+	// watcher and any mirror components setupMirror already started above,
+	// following the same shutdown order as Close: topology watcher, then
+	// mirror engine, then mirror replay worker.
 	if config.ReplayWorker != nil {
 		if err := config.ReplayWorker.Start(); err != nil {
 			if client.topologyClose != nil {
 				client.topologyClose()
 			}
+			stopMirrorComponents(config)
+
 			return nil, err
 		}
 	}
@@ -906,12 +910,7 @@ func (c *CQLClient) Close() {
 		// Stop the mirror engine first so it stops generating new failure
 		// captures, then drain any failures that landed in the mirror
 		// replayer through its worker.
-		if c.config.MirrorEngine != nil {
-			c.config.MirrorEngine.Stop()
-		}
-		if c.config.MirrorReplayWorker != nil {
-			c.config.MirrorReplayWorker.Stop()
-		}
+		stopMirrorComponents(c.config)
 
 		// Stop replay worker
 		if c.config.ReplayWorker != nil {

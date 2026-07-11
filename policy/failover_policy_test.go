@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +41,60 @@ func TestCircuitBreakerThreshold(t *testing.T) {
 	policy.RecordFailure(types.ClusterA)
 	require.Equal(t, 3, policy.Failures(types.ClusterA))
 	require.True(t, policy.ShouldFailover(types.ClusterA, nil))
+}
+
+// TestCircuitBreaker_ZeroValueDoesNotPanic verifies that a bare
+// CircuitBreaker{} (bypassing NewCircuitBreaker / finalizeCircuitBreaker,
+// which leaves threshold=0 and metrics/logger as nil interfaces) never
+// panics. Before the fix, the first RecordFailure call crossed the
+// zero-value threshold (1 >= 0) and unconditionally invoked the nil
+// metrics/logger interfaces, panicking.
+func TestCircuitBreaker_ZeroValueDoesNotPanic(t *testing.T) {
+	var cb CircuitBreaker
+
+	require.NotPanics(t, func() {
+		cb.RecordFailure(types.ClusterA)
+	}, "RecordFailure on zero-value CircuitBreaker must not panic")
+
+	require.NotPanics(t, func() {
+		cb.RecordFailure(types.ClusterB)
+	}, "RecordFailure on zero-value CircuitBreaker must not panic (cluster B)")
+
+	require.NotPanics(t, func() {
+		cb.ShouldFailover(types.ClusterA, nil)
+	}, "ShouldFailover on zero-value CircuitBreaker must not panic")
+
+	require.NotPanics(t, func() {
+		cb.RecordSuccess(types.ClusterA)
+	}, "RecordSuccess on zero-value CircuitBreaker must not panic")
+
+	require.NotPanics(t, func() {
+		cb.RecordSuccess(types.ClusterB)
+	}, "RecordSuccess on zero-value CircuitBreaker must not panic (cluster B)")
+}
+
+// TestClusterNameOrID verifies the shared clusterNameOrID helper: it falls
+// back to the raw ClusterID when the atomic.Pointer[types.ClusterNames] has
+// never been Store'd (the zero-value CircuitBreaker/AdaptiveDualWrite case,
+// since neither struct's constructor has run), and defers to
+// ClusterNames.Name once a value has been stored.
+//
+// This path is unreachable through CircuitBreaker's zero-value methods
+// directly: RecordFailure/RecordSuccess only read clusterNames when
+// justTripped/wasOpen is true, which requires threshold > 0, so a bare
+// CircuitBreaker{} never reaches it. Testing the helper directly is the
+// cheap, reachable way to lock in the fallback behavior.
+func TestClusterNameOrID(t *testing.T) {
+	var names atomic.Pointer[types.ClusterNames]
+
+	assert.Equal(t, "A", clusterNameOrID(&names, types.ClusterA),
+		"unset clusterNames must fall back to the raw ClusterID")
+	assert.Equal(t, "B", clusterNameOrID(&names, types.ClusterB))
+
+	names.Store(&types.ClusterNames{A: "primary", B: "secondary"})
+	assert.Equal(t, "primary", clusterNameOrID(&names, types.ClusterA),
+		"once clusterNames is set, the configured display name must win")
+	assert.Equal(t, "secondary", clusterNameOrID(&names, types.ClusterB))
 }
 
 func TestCircuitBreaker_InvalidOptionsPreserveDefaults(t *testing.T) {

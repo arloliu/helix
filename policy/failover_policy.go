@@ -81,6 +81,12 @@ func (a *ActiveFailover) RecordSuccess(_ types.ClusterID) {}
 //     the "circuit opened" metric fires exactly once per trip.
 //   - clusterNames is stored in an atomic.Pointer so SetClusterNames is safe
 //     to call concurrently with RecordFailure / RecordSuccess.
+//
+// Zero value: a bare CircuitBreaker{} never panics — every method is safe to
+// call — but it is not functionally a circuit breaker: threshold is 0 and
+// metrics/logger are nil interfaces until finalizeCircuitBreaker runs, which
+// only happens inside NewCircuitBreaker / NewCircuitBreakerChecked. Use one
+// of those constructors to get a fully configured, functional CircuitBreaker.
 type CircuitBreaker struct {
 	threshold    int
 	resetTimeout time.Duration
@@ -420,7 +426,7 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 			newFailures = c.failuresA.Add(1)
 		}
 		c.lastFailureA.Store(nowNs)
-		if int(newFailures) >= c.threshold && !c.trippedA {
+		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedA {
 			c.trippedA = true
 			justTripped = true
 		}
@@ -436,7 +442,7 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 			newFailures = c.failuresB.Add(1)
 		}
 		c.lastFailureB.Store(nowNs)
-		if int(newFailures) >= c.threshold && !c.trippedB {
+		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedB {
 			c.trippedB = true
 			justTripped = true
 		}
@@ -444,12 +450,21 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 	}
 
 	if justTripped {
-		c.metrics.IncCircuitBreakerTrip(cluster)
-		c.metrics.SetCircuitBreakerState(cluster, 2) // 2 = open
-		c.logger.Warn("circuit breaker tripped",
-			"cluster", c.clusterNames.Load().Name(cluster),
-			"threshold", c.threshold,
-		)
+		// Guarded: a zero-value CircuitBreaker (metrics/logger nil until
+		// finalizeCircuitBreaker runs) must never reach here because
+		// justTripped requires threshold > 0 above, but the nil checks stay
+		// as a defensive backstop for any other path that sets threshold
+		// without going through the constructors.
+		if c.metrics != nil {
+			c.metrics.IncCircuitBreakerTrip(cluster)
+			c.metrics.SetCircuitBreakerState(cluster, 2) // 2 = open
+		}
+		if c.logger != nil {
+			c.logger.Warn("circuit breaker tripped",
+				"cluster", c.clusterName(cluster),
+				"threshold", c.threshold,
+			)
+		}
 	}
 }
 
@@ -480,12 +495,16 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 		c.muB.Unlock()
 	}
 
-	// Record metrics when circuit closes
+	// Same defensive backstop as RecordFailure's trip block; see there for rationale.
 	if wasOpen {
-		c.metrics.SetCircuitBreakerState(cluster, 0) // 0 = closed
-		c.logger.Info("circuit breaker closed",
-			"cluster", c.clusterNames.Load().Name(cluster),
-		)
+		if c.metrics != nil {
+			c.metrics.SetCircuitBreakerState(cluster, 0) // 0 = closed
+		}
+		if c.logger != nil {
+			c.logger.Info("circuit breaker closed",
+				"cluster", c.clusterName(cluster),
+			)
+		}
 	}
 }
 
@@ -516,4 +535,22 @@ func (c *CircuitBreaker) Failures(cluster types.ClusterID) int {
 //   - names: The cluster names to use in log messages
 func (c *CircuitBreaker) SetClusterNames(names types.ClusterNames) {
 	c.clusterNames.Store(&names)
+}
+
+// clusterName returns the display name for cluster, falling back to the raw
+// ClusterID when clusterNames has not been initialized — i.e. a zero-value
+// CircuitBreaker that never went through NewCircuitBreaker.
+func (c *CircuitBreaker) clusterName(cluster types.ClusterID) string {
+	return clusterNameOrID(&c.clusterNames, cluster)
+}
+
+// clusterNameOrID returns the display name for cluster from names, falling
+// back to the raw ClusterID when names has not been initialized yet — i.e.
+// a zero-value policy struct that never went through its constructor.
+func clusterNameOrID(names *atomic.Pointer[types.ClusterNames], cluster types.ClusterID) string {
+	if n := names.Load(); n != nil {
+		return n.Name(cluster)
+	}
+
+	return string(cluster)
 }

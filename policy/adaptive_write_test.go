@@ -122,6 +122,93 @@ func TestAdaptiveDualWriteChecked_ValidOptions(t *testing.T) {
 	assert.Equal(t, "primary", a.clusterName(types.ClusterA))
 }
 
+// TestAdaptiveDualWrite_ZeroValueDoesNotDropWrites verifies that a bare
+// AdaptiveDualWrite{} (bypassing NewAdaptiveDualWrite / finalizeAdaptiveDualWrite,
+// which leaves strikeThreshold=0 and fireForgetSem nil) never permanently
+// drops writes. Before the fix, a single write failure crossed the
+// zero-value strike threshold (1 >= 0), degrading the cluster; every
+// subsequent Execute then routed through fireAndForget, whose semaphore
+// select always hit the nil-channel default case, so the write function
+// was never invoked again — a silent, permanent data loss.
+func TestAdaptiveDualWrite_ZeroValueDoesNotDropWrites(t *testing.T) {
+	var a AdaptiveDualWrite
+	ctx := t.Context()
+
+	var callsA, callsB atomic.Int32
+	boom := errors.New("boom")
+
+	require.NotPanics(t, func() {
+		_, _ = a.Execute(ctx,
+			func(context.Context) error {
+				callsA.Add(1)
+				return boom
+			},
+			func(context.Context) error {
+				callsB.Add(1)
+				return nil
+			},
+		)
+	}, "Execute on zero-value AdaptiveDualWrite must not panic")
+
+	assert.Equal(t, int32(1), callsA.Load())
+	assert.Equal(t, int32(1), callsB.Load())
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"zero-value strikeThreshold must never degrade a cluster")
+
+	// The critical assertion: subsequent Execute calls must still invoke
+	// writeA. Before the fix, the cluster was silently degraded after the
+	// first failure and writeA was never called again.
+	errA, errB := a.Execute(ctx,
+		func(context.Context) error {
+			callsA.Add(1)
+			return nil
+		},
+		func(context.Context) error {
+			callsB.Add(1)
+			return nil
+		},
+	)
+
+	assert.NoError(t, errA)
+	assert.NoError(t, errB)
+	assert.Equal(t, int32(2), callsA.Load(),
+		"writeA must be invoked again — no silent drop on zero-value AdaptiveDualWrite")
+	assert.Equal(t, int32(2), callsB.Load())
+}
+
+// TestAdaptiveDualWrite_ZeroValueForceDegradeFallsBackToSynchronous verifies
+// the defensive guard in fireAndForget: if a zero-value AdaptiveDualWrite is
+// forced into a degraded state via ForceDegrade (bypassing the strike-based
+// path), fireAndForget must not drop the write just because fireForgetSem is
+// nil. It falls back to executing the write synchronously instead.
+func TestAdaptiveDualWrite_ZeroValueForceDegradeFallsBackToSynchronous(t *testing.T) {
+	var a AdaptiveDualWrite
+	ctx := t.Context()
+
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+
+	var calledA atomic.Bool
+
+	var errA, errB error
+	require.NotPanics(t, func() {
+		errA, errB = a.Execute(ctx,
+			func(context.Context) error {
+				calledA.Store(true)
+				return nil
+			},
+			func(context.Context) error {
+				return nil
+			},
+		)
+	}, "Execute on a ForceDegrade'd zero-value AdaptiveDualWrite must not panic")
+
+	assert.True(t, calledA.Load(),
+		"write must be invoked synchronously when fireForgetSem is nil, not dropped")
+	assert.NoError(t, errA)
+	assert.NoError(t, errB)
+}
+
 func TestAdaptiveDualWrite_BothHealthy(t *testing.T) {
 	a := NewAdaptiveDualWrite()
 	ctx := t.Context()

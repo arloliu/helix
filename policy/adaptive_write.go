@@ -48,6 +48,14 @@ const (
 //	    policy.WithAdaptiveAbsoluteMax(2 * time.Second),
 //	    policy.WithAdaptiveStrikeThreshold(3),
 //	)
+//
+// Zero value: a bare AdaptiveDualWrite{} never panics and never silently
+// drops writes — but it is not functionally adaptive: strikeThreshold is 0
+// (so recordStrike never degrades a cluster) and fireForgetSem is nil (so a
+// cluster degraded some other way, e.g. ForceDegrade, falls back to a
+// synchronous write in fireAndForget instead of true fire-and-forget). Use
+// [NewAdaptiveDualWrite] or [NewAdaptiveDualWriteChecked] for the fully
+// configured, adaptive behavior described above.
 type AdaptiveDualWrite struct {
 	// Configuration
 	deltaThreshold    time.Duration // Relative difference threshold
@@ -489,10 +497,7 @@ func (a *AdaptiveDualWrite) SetLogger(l types.Logger) {
 
 // clusterName returns the display name for the given cluster.
 func (a *AdaptiveDualWrite) clusterName(cluster types.ClusterID) string {
-	if names := a.clusterNames.Load(); names != nil {
-		return names.Name(cluster)
-	}
-	return string(cluster)
+	return clusterNameOrID(&a.clusterNames, cluster)
 }
 
 // Execute performs adaptive concurrent writes to both clusters.
@@ -580,12 +585,24 @@ func (a *AdaptiveDualWrite) Execute(
 // Returns:
 //   - types.ErrWriteAsync if the write was accepted for background execution
 //   - types.ErrWriteDropped if the concurrency limit was reached
+//   - the write's own result if fireForgetSem is nil — only possible on an
+//     uninitialized zero-value AdaptiveDualWrite{}; see the type doc
 func (a *AdaptiveDualWrite) fireAndForget(
 	cluster types.ClusterID,
 	write func(context.Context) error,
 	state *clusterWriteState,
 	siblingState *clusterWriteState,
 ) error {
+	if a.fireForgetSem == nil {
+		// fireForgetSem is only created by finalizeAdaptiveDualWrite (called
+		// from the constructors). On a zero-value AdaptiveDualWrite{} that
+		// somehow reached a degraded state (e.g. via ForceDegrade), the
+		// select below would always hit its nil-channel default case,
+		// permanently dropping this write with no recovery path. Fall back
+		// to executing it synchronously instead of dropping it.
+		return safeWrite(context.Background(), write, a.clusterName(cluster))
+	}
+
 	// Try to acquire semaphore (non-blocking)
 	select {
 	case a.fireForgetSem <- struct{}{}:
@@ -780,7 +797,13 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 	defer state.mu.Unlock()
 	state.fastStrikes = 0
 	state.slowStrikes++
-	if state.slowStrikes >= a.strikeThreshold {
+	// strikeThreshold > 0 guards the zero-value AdaptiveDualWrite{}: without
+	// it, a single failure (1 >= 0) would degrade the cluster, and every
+	// subsequent write would route through fireAndForget and be silently
+	// dropped forever (see fireAndForget's nil-fireForgetSem fallback).
+	// Constructors always normalize strikeThreshold to >= 1, so this has no
+	// effect on properly constructed instances.
+	if a.strikeThreshold > 0 && state.slowStrikes >= a.strikeThreshold {
 		state.isDegraded.Store(true)
 	}
 }

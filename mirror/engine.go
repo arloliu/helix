@@ -179,7 +179,22 @@ type Engine struct {
 // NewEngine constructs a mirror engine that dispatches captured writes via
 // execute. The engine is created in the started=false state; helix's
 // CQLClient calls Start during construction.
+//
+// Parameters:
+//   - execute: Dispatches a captured write to the mirror destination. Must be non-nil.
+//   - opts: Functional options (e.g., WithQueueSize, WithWorkers, WithOnError)
+//
+// Returns:
+//   - *Engine: Ready-to-start mirror engine
+//
+// NewEngine panics if execute is nil, since a nil ExecuteFunc would only
+// surface as an unrecovered panic in a worker goroutine on the first
+// dequeued payload.
 func NewEngine(execute ExecuteFunc, opts ...Option) *Engine {
+	if execute == nil {
+		panic("mirror: NewEngine requires a non-nil execute function")
+	}
+
 	cfg := config{
 		queueSize: DefaultQueueSize,
 		workers:   DefaultWorkers,
