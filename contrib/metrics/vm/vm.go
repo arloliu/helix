@@ -101,9 +101,16 @@ func WithClusterNames(names types.ClusterNames) Option {
 //
 // Buckets must be strictly increasing, finite, and positive; the +Inf
 // bucket is added implicitly. Invalid input is ignored and the collector
-// keeps the defaults (VictoriaMetrics would otherwise panic at
-// construction). The slice is copied; later mutation by the caller has
-// no effect.
+// keeps whatever bounds it already has — the defaults, or the bounds set
+// by an earlier valid WithDurationBuckets in the same [New] call
+// (VictoriaMetrics would otherwise panic at construction). The slice is
+// copied; later mutation by the caller has no effect.
+//
+// Rejection is silent: no error is returned, nothing is logged, and the
+// Collector exposes no accessor for its effective bounds. A typo therefore
+// produces a working collector with unintended buckets. Validate the input
+// yourself with a known-good literal, or check the exposed
+// {prefix}_..._duration_seconds_bucket series after startup.
 //
 // Parameters:
 //   - buckets: Histogram upper bounds in seconds, strictly increasing

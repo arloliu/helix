@@ -926,4 +926,5 @@ cannot provide the acknowledgement guarantees that `Strict()` requires.
 ## See Also
 
 - [Auto-Recovery Guide](auto-recovery.md) - End-to-end recovery lifecycle and operator workflow
+- [Cluster Events Guide](cluster-events.md) - The `replay_dropped` event, and why it counts fewer drops than `replay_dropped_total`
 - [NATS JetStream Documentation](https://docs.nats.io/nats-concepts/jetstream)

@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `helix.WithOnClusterEvent`: register a handler for typed cluster-health
+  events (`types.ClusterEvent`) — failover, read divergence, circuit
+  breaker open/close, adaptive-write degrade/recover, drain enter/exit,
+  replay drops, mirror replay drops (unless a caller-supplied
+  `mirror.WithOnError` replaces the internal mirror error handler), and
+  session refresh attempt/success/error. Delivery is asynchronous and
+  best-effort on a dedicated goroutine; circuit-breaker and adaptive-write
+  events are delivered in per-cluster transition order, per policy instance.
+  Registering the handler is not sufficient on its own: most kinds are
+  produced by an optional component (a circuit-breaker failover policy, an
+  adaptive write strategy, a replayer, a topology watcher, auto-refresh) and
+  stay silent without it. See
+  [docs/cluster-events.md](docs/cluster-events.md) for the per-kind
+  prerequisites.
+- `policy`: `SetEventEmitter` on `CircuitBreaker`, `LatencyCircuitBreaker`,
+  and `AdaptiveDualWrite` for standalone (non-`CQLClient`) usage; the
+  emitter is always invoked outside policy state locks.
+- `policy.AdaptiveDualWrite` now logs degrade/recover transitions
+  (previously silent) and emits a recovery event from `Reset`.
+- `contrib/metrics/vm`: `WithDurationBuckets` option (validated: strictly
+  increasing, finite, positive values) and `DefaultDurationBuckets()`
+  accessor for the default bucket bounds.
+
+### Changed
+
+- **`contrib/metrics/vm` (dashboard migration required):** all
+  `*_duration_seconds` histograms (read, write, replay, mirror exec) are
+  now classic Prometheus histograms (`_bucket{le=...}`, `_sum`, `_count`)
+  instead of VictoriaMetrics-native `vmrange` histograms.
+  `histogram_quantile()` over `le` buckets now works with vanilla
+  Prometheus, but existing `vmrange`-based dashboard queries against these
+  metrics will no longer return data and must be rewritten against `le`
+  buckets:
+
+  ```promql
+  histogram_quantile(0.99, sum(rate(helix_read_duration_seconds_bucket[5m])) by (le))
+  ```
+
+  Queries built on the `_sum` and `_count` series — average latency,
+  throughput — are unaffected; only quantile queries break.
+
+### Fixed
+
+- **`policy.CircuitBreaker` / `policy.LatencyCircuitBreaker`: circuit
+  breaker state gauge stuck at open.** When a tripped breaker went quiet
+  for longer than its reset timeout, the next `RecordFailure` cleared the
+  trip internally but never wrote `SetCircuitBreakerState(cluster, 0)`, and
+  the following `RecordSuccess` saw an already-cleared flag and wrote
+  nothing either. Any metrics collector kept reporting the breaker as open
+  (`2`) for a cluster that was closed and serving, so alerts built on that
+  gauge never cleared. The reset now records the close: it writes the gauge,
+  logs the transition, and emits
+  `types.EventCircuitBreakerClosed` with Reason `"reset timeout elapsed"`.
+  A breaker whose stale failure count merely aged out without ever tripping
+  is unaffected and still emits nothing. With threshold 1 the same call
+  closes and immediately re-opens, so the gauge correctly ends at open.
+- **`policy.CircuitBreaker` / `policy.LatencyCircuitBreaker`: circuit
+  breaker state gauge could report closed for a cluster whose breaker was
+  actually open.** A transition was latched under the cluster's state
+  mutex but its gauge write and log line happened after that mutex was
+  released, so two transitions on the same cluster could report out of
+  order: a call that closed the breaker, if descheduled before writing the
+  gauge, could still write `SetCircuitBreakerState(cluster, 0)` after a
+  concurrent re-trip had already written `2` — the inverse of the stuck-open
+  bug above. Each cluster's transitions are now sequenced, and a call writes
+  the gauge and the log line only while its transition is still the newest
+  one latched for that cluster; an older call that lost the race skips both
+  writes rather than overwriting a state the breaker has already left. Its
+  `types.ClusterEvent` is still delivered, in order. One consequence worth
+  knowing: because a superseded transition no longer logs, a count of
+  "circuit breaker tripped" log lines can now run below
+  `{prefix}_circuit_breaker_trips_total`, which counts every trip whether or
+  not it was later superseded.
+
 ## [1.5.3] — 2026-07-12
 
 ### Security

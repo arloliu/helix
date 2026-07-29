@@ -9,9 +9,14 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
-// eventBufferSize bounds the dispatcher's pending-event buffer. Events
-// are state transitions (not per-operation), so bursts are small; 128
-// absorbs a full failover storm without measurable memory cost.
+// eventBufferSize bounds the dispatcher's pending-event buffer. Most
+// kinds are state transitions, so their bursts are small and 128 absorbs
+// them without measurable memory cost. EventFailover and
+// EventReadDivergence are the exception: they fire once per affected read,
+// so a sustained outage overruns this buffer and the excess is dropped.
+// That is the accepted trade — the buffer exists to keep emission
+// non-blocking, and rates for those two kinds are meant to be read from
+// metrics, not reconstructed from events.
 const eventBufferSize = 128
 
 // ClusterEventHandler is called asynchronously for cluster-health events.
@@ -19,15 +24,21 @@ const eventBufferSize = 128
 //
 // The handler runs on a single dedicated goroutine: invocations never
 // overlap. Circuit-breaker and adaptive-write events arrive in
-// per-cluster transition order; events from independent producers arrive
-// in enqueue order with no cross-kind causal guarantee. Delivery is
-// best-effort: a slow handler never blocks read/write operations — when
-// the internal buffer fills, newest events are dropped, counted, and the
-// running total is logged from the dispatcher goroutine.
+// per-cluster transition order, per policy instance; events from
+// independent producers arrive in enqueue order with no cross-kind causal
+// guarantee. Delivery is best-effort: a slow handler never blocks
+// read/write operations — when the internal buffer fills, newest events
+// are dropped and counted. The drop total is logged from the dispatcher
+// goroutine on the first drop, then only once it has at least doubled
+// since the last line, plus once at shutdown; no accessor or metric
+// exposes the count, so an application cannot alert on it.
 //
 // The handler MUST NOT call [CQLClient.Close] synchronously (Close waits
 // for the in-flight handler invocation and would deadlock); trigger
-// shutdown from another goroutine and return instead.
+// shutdown from another goroutine and return instead. Calling anything
+// else on the client, or on a policy, from inside the handler is safe: no
+// policy lock is held during delivery, and an event produced by such a
+// reentrant call is enqueued with a non-blocking send.
 //
 // Parameters:
 //   - event: The cluster event. See [types.ClusterEvent] for which fields

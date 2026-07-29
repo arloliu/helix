@@ -605,6 +605,15 @@ func WithReplayWorker(worker ReplayWorker) Option {
 // and the failed write cannot be enqueued for replay (e.g., queue is full).
 // Use this to implement custom alerting or fallback persistence strategies.
 //
+// It covers both replay paths. With [WithMirror] and [WithMirrorReplayer]
+// configured, a mirror capture that cannot be enqueued for mirror replay
+// invokes this same callback — set it once to alert or persist for both. The
+// signature does not distinguish them: mirror payloads carry a fixed
+// conventional TargetCluster, so a handler that re-drives dropped payloads
+// against this client's clusters would also re-drive mirror-destined ones.
+// [types.EventMirrorReplayDropped] (see [WithOnClusterEvent]) is the signal
+// that tells the two apart.
+//
 // Parameters:
 //   - handler: Function called with the dropped payload and the enqueue error
 //
@@ -638,14 +647,28 @@ func WithOnReplayDropped(handler ReplayDroppedHandler) Option {
 // refresh attempts. Use it to drive alerting, paging, or operational
 // dashboards without polling metrics.
 //
+// Registering the handler does NOT make every kind reachable. The emitter
+// is installed into the configured WriteStrategy and FailoverPolicy, both
+// nil by default, and most other kinds come from an optional component:
+// circuit-breaker kinds need a [policy.CircuitBreaker] or
+// [policy.LatencyCircuitBreaker] via [WithFailoverPolicy], adaptive-write
+// kinds need [policy.AdaptiveDualWrite] via [WithWriteStrategy],
+// EventReplayDropped needs a Replayer, drain kinds need a TopologyWatcher,
+// and session-refresh kinds need [WithAutoRefresh] plus
+// [WithSessionRefresher]. An unconfigured kind is silent — no error, no
+// warning. See docs/cluster-events.md for the full table.
+//
 // Delivery is asynchronous and BEST-EFFORT on a dedicated goroutine:
 // invocations never overlap and never block read/write operations. If
 // the handler cannot keep up, newest events are dropped; drops are
-// counted exactly and logged. Circuit-breaker and adaptive-write events
-// arrive in per-cluster transition order; events from independent
+// counted exactly but the count is internal, with no accessor and no
+// metric. Circuit-breaker and adaptive-write events arrive in per-cluster
+// transition order, per policy instance; events from independent
 // producers arrive in enqueue order with no cross-kind causal guarantee.
-// This is a notification stream, not a durable audit log — use the
-// metrics collector as the authoritative source for rates and state.
+// This is a notification stream, not a durable audit log — prefer the
+// metrics collector for rates and state, except for
+// [types.EventWriteDegraded], [types.EventWriteRecovered], and
+// [types.EventMirrorReplayDropped], which have no metric counterpart.
 //
 // Shutdown semantics: [CQLClient.Close] stops event intake, drains
 // buffered events to the handler, and waits for the in-flight handler

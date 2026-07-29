@@ -180,6 +180,13 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveFireForgetTimeout` | 30s | Timeout applied to each background (fire-and-forget) write |
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent background writes; excess returns `ErrWriteDropped` |
 
+**Cluster events:** degrade and recover transitions emit
+`types.EventWriteDegraded` and `types.EventWriteRecovered`. Neither has a
+metric counterpart, so the event is the only machine-readable signal for a
+cluster entering or leaving degraded mode. Inside a client, register
+`helix.WithOnClusterEvent`; outside one, call `SetEventEmitter` on the
+strategy. See the [Cluster Events Guide](cluster-events.md).
+
 **Configuration validation:**
 
 - `NewAdaptiveDualWrite` is the compatibility constructor. Invalid values fall back to defaults.
@@ -423,6 +430,13 @@ breaker := policy.NewCircuitBreaker(
 | `WithCircuitBreakerMetrics` | no-op | Metrics collector for trip events and state changes |
 | `WithCircuitBreakerClusterNames` | "A"/"B" | Display names used in log and metric labels |
 
+**Cluster events:** open and close transitions also emit
+`types.EventCircuitBreakerOpen` and `types.EventCircuitBreakerClosed`. Inside a
+client, register `helix.WithOnClusterEvent` and Helix installs the emitter into
+the configured failover policy for you. Outside a client, call
+`SetEventEmitter` on the breaker directly. See the
+[Cluster Events Guide](cluster-events.md).
+
 **Configuration validation:**
 
 - `NewCircuitBreaker` is the compatibility constructor. Invalid values fall back to defaults.
@@ -438,7 +452,7 @@ if err != nil {
 }
 ```
 
-> **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence." The counter does not reset automatically over time — it resets to 1 only when the *next* failure arrives after a `resetTimeout`-long gap. If a cluster stays broken, the counter keeps incrementing; `resetTimeout` only protects against counting a failure from *last week* against today's blip. The only way to close an open circuit is a successful read (`RecordSuccess`).
+> **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence." The counter does not reset automatically over time — it resets to 1 only when the *next* failure arrives after a `resetTimeout`-long gap. If a cluster stays broken, the counter keeps incrementing; `resetTimeout` only protects against counting a failure from *last week* against today's blip. An open circuit closes two ways: a successful read (`RecordSuccess`) closes it immediately, or that delayed failure closes it first — ending the stale open span — before it starts the fresh count at 1. With `threshold` set to 1, the fresh count reaches threshold immediately, so the same call closes and reopens the circuit.
 
 **What triggers `RecordFailure` vs `RecordSuccess`:**
 - `RecordFailure`: every hard error returned by the driver (network failure, timeout, unavailable) — all errors except Helix-internal sentinels (`ErrWriteAsync`, `ErrWriteDropped`) which never appear on the read path
@@ -456,9 +470,10 @@ CLOSED (failures < threshold)
 OPEN (failures >= threshold)
   └─ ShouldFailover() → true    ← permits failover to alternative cluster
   └─ On RecordSuccess():
-       └─ Reset counter to 0, transition to CLOSED, emit metric
+       └─ Reset counter to 0, transition to CLOSED, emit metric (Reason: "operation succeeded")
   └─ On RecordFailure():
-       ├─ Gap since last failure > resetTimeout → reset counter to 1 (stale, stay OPEN)
+       ├─ Gap since last failure > resetTimeout → close (reset counter to 1, transition to CLOSED,
+       │    emit metric, Reason: "reset timeout elapsed"); threshold=1 re-opens in the same call
        └─ Otherwise → increment (stay OPEN)
 ```
 
@@ -511,6 +526,11 @@ breaker := policy.NewLatencyCircuitBreaker(
 | `WithLatencyLogger` | no-op | Structured logger |
 | `WithLatencyMetrics` | no-op | Metrics collector |
 
+**Cluster events:** same as `CircuitBreaker` — open and close transitions emit
+`types.EventCircuitBreakerOpen` and `types.EventCircuitBreakerClosed`, and
+`SetEventEmitter` is available for standalone use. See the
+[Cluster Events Guide](cluster-events.md).
+
 **Configuration validation:**
 
 - `NewLatencyCircuitBreaker` is the compatibility constructor. Invalid values fall back to defaults.
@@ -544,8 +564,10 @@ The client calls `RecordLatency()` automatically after each successful read if t
  t=4s   Read A → circuit still OPEN → failover to B → B in 600ms → RecordSuccess(B)
  t=5s   Read A → hard error → RecordFailure(A) directly → A.failures=4 (stays OPEN)
  t=10s  Read A → circuit OPEN → failover to B → B succeeds → RecordSuccess(B)
-           Meanwhile: A must receive a RecordSuccess call to CLOSE
-           (typically happens when A is directly selected and responds fast again)
+           Meanwhile: A closes on its next recorded call — a RecordSuccess
+           (Reason "operation succeeded"), or a RecordFailure arriving more
+           than resetTimeout after A's last failure (Reason "reset timeout
+           elapsed"). Until one of those arrives, A stays OPEN.
 ```
 
 > **Note:** Because every fast successful read calls `RecordSuccess()`, the `resetTimeout` is less significant in `LatencyCircuitBreaker` than in `CircuitBreaker` — successful reads continuously reset the counter, so stale failure accumulation is rare. The dominant closure mechanism is fast responses, not idle timeouts.

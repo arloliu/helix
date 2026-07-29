@@ -280,6 +280,18 @@ strategy.Reset()
 strategy.RecordFastWrite(helix.ClusterB)
 ```
 
+Each of these emits a cluster event when it actually changes state — see the
+[Cluster Events Guide](cluster-events.md) — and each is silent when the cluster
+is already in the state being requested.
+
+`Reset` delivers its recovery events once after both clusters are reset, so an
+uncontended handler sees both clusters healthy. Delivery is shared, so a
+concurrent transition can deliver cluster A's recovery before cluster B is
+reset, and a handler racing a `Reset` may observe a partially applied reset.
+Per-cluster order always holds. A handler that acts on `write_recovered` by
+restoring traffic should call `IsDegraded` for both clusters rather than infer
+global state from one event.
+
 ## Integration with Replay System
 
 AdaptiveDualWrite **requires** a Replayer for production use:

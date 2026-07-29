@@ -4,7 +4,7 @@ The Helix simulation suite is an end-to-end behavioral test harness that spins u
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - Docker (for Testcontainers)
 
 ## Running
@@ -107,7 +107,7 @@ helix:
   failover_policy:
     type: active        # active | circuit | latency_circuit
     threshold: 3        # Consecutive failures to open circuit
-    reset_timeout: 30s  # How long circuit stays open
+    reset_timeout: 30s  # Gap after which a failure is treated as stale; also when a probe is allowed through
     absolute_max: 2s    # (latency_circuit only) max acceptable latency
 
   replay:

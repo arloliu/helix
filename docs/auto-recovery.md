@@ -201,10 +201,13 @@ See [AdaptiveDualWrite Guide](adaptive-dual-write.md) for thresholds, tuning, an
 Trips after consecutive read failures, preventing failover until the cluster stabilizes:
 
 - **Trips** after `threshold` (default: 3) consecutive failures
-- **Resets** on any single successful read, or after `resetTimeout` (default: 30s) expires
+- **Routes a probe** once `resetTimeout` (default: 30s) has elapsed since the last failure: `ShouldFailover` returns false, so the next read goes back to the failed cluster
+- **Closes** on the next recorded outcome for that cluster — a successful read, or a failure arriving after that elapsed interval. The timeout expiring does not close the breaker on its own; with no further read on that cluster it stays open
 - `LatencyCircuitBreaker` also treats slow reads (above `absoluteMax`) as soft failures
 
-No manual intervention needed — recovery is fully automatic.
+No manual intervention needed — recovery is fully automatic as long as reads
+keep reaching the cluster. Both transitions emit cluster events; see the
+[Cluster Events Guide](cluster-events.md).
 
 ### Read Strategies
 
