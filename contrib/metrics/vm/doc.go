@@ -38,26 +38,61 @@
 // Read operations:
 //   - {prefix}_read_total{cluster} - Counter of read operations
 //   - {prefix}_read_errors_total{cluster} - Counter of read errors
+//   - {prefix}_read_divergence_total{cluster} - Counter of fallback reads that
+//     found the row on the alternative cluster (cluster = the one missing it)
 //   - {prefix}_read_duration_seconds{cluster} - Histogram of read latencies
 //
 // Write operations:
 //   - {prefix}_write_total{cluster} - Counter of write operations
 //   - {prefix}_write_errors_total{cluster} - Counter of write errors
+//   - {prefix}_write_async_total{cluster} - Counter of fire-and-forget writes
+//     dispatched to a degraded cluster
+//   - {prefix}_write_dropped_total{cluster} - Counter of fire-and-forget writes
+//     never attempted because the concurrency limit was full
 //   - {prefix}_write_duration_seconds{cluster} - Histogram of write latencies
 //
 // Failover:
 //   - {prefix}_failover_total{from,to} - Counter of failover events
 //
 // Circuit breaker:
-//   - {prefix}_circuit_breaker_state{cluster} - Gauge of circuit state (0=closed, 1=half-open, 2=open)
+//   - {prefix}_circuit_breaker_state{cluster} - Gauge of circuit state
+//     (0=closed, 2=open). The breaker admits a probe once its reset timeout
+//     elapses, but writes no distinct gauge value for that window: the gauge
+//     still reads 2 until the probe's outcome closes or re-opens the breaker.
 //   - {prefix}_circuit_breaker_trips_total{cluster} - Counter of circuit trips
 //
 // Replay queue:
 //   - {prefix}_replay_enqueued_total{cluster} - Counter of enqueued replays
 //   - {prefix}_replay_success_total{cluster} - Counter of successful replays
 //   - {prefix}_replay_errors_total{cluster} - Counter of failed replays
+//   - {prefix}_replay_dropped_total{cluster} - Counter of payloads that could
+//     not be enqueued by the client, plus payloads permanently dropped by a
+//     replay worker after exhausting its retry budget
 //   - {prefix}_replay_queue_depth{cluster} - Gauge of current queue depth
 //   - {prefix}_replay_duration_seconds{cluster} - Histogram of replay latencies
+//
+// Cluster health:
+//   - {prefix}_cluster_draining{cluster} - Gauge (1=draining, 0=healthy)
+//   - {prefix}_drain_mode_entered_total{cluster} - Counter of drain entries
+//   - {prefix}_drain_mode_exited_total{cluster} - Counter of drain exits
+//
+// Session refresh (recorded when the client's auto-refresh detector runs):
+//   - {prefix}_session_refresh_attempt_total{cluster} - Counter of refresh attempts
+//   - {prefix}_session_refresh_success_total{cluster} - Counter of successful refreshes
+//   - {prefix}_session_refresh_error_total{cluster} - Counter of failed refreshes
+//
+// Mirror (recorded when mirroring is configured):
+//   - {prefix}_mirror_enqueue_success_total - Counter of captures accepted by the engine queue
+//   - {prefix}_mirror_enqueue_dropped_total - Counter of captures rejected by a full engine queue
+//   - {prefix}_mirror_exec_success_total - Counter of successful mirror writes
+//   - {prefix}_mirror_exec_errors_total - Counter of failed mirror writes
+//   - {prefix}_mirror_exec_duration_seconds - Histogram of mirror write latencies
+//   - {prefix}_mirror_queue_depth - Gauge of current engine queue depth
+//   - {prefix}_mirror_enabled - Gauge (1=mirroring active, 0=inactive)
+//
+// Two cluster events have no metric counterpart here: AdaptiveDualWrite's
+// degrade/recover transitions and mirror replay-enqueue drops. See
+// docs/cluster-events.md.
 //
 // # Duration Histograms
 //
@@ -66,21 +101,15 @@
 // {prefix}_..._duration_seconds_bucket{...,le="<bound>"}, plus the matching
 // _sum and _count series. This makes them compatible with
 // histogram_quantile() in vanilla Prometheus, unlike VictoriaMetrics-native
-// histograms which expose vmrange buckets instead.
+// histograms which expose vmrange buckets instead:
+//
+//	histogram_quantile(0.99, sum(rate(helix_read_duration_seconds_bucket[5m])) by (le))
+//
+// Queries built on the _sum and _count series are unaffected by the change
+// from vmrange buckets; only quantile queries need rewriting.
 //
 // The default bucket bounds are available via DefaultDurationBuckets() and
 // can be overridden per collector with WithDurationBuckets.
-//
-// Cluster health:
-//   - {prefix}_cluster_draining{cluster} - Gauge (1=draining, 0=healthy)
-//   - {prefix}_drain_mode_entered_total{cluster} - Counter of drain entries
-//   - {prefix}_drain_mode_exited_total{cluster} - Counter of drain exits
-//
-// Connection pool:
-//   - {prefix}_active_connections{cluster} - Gauge of active connections
-//
-// Latency:
-//   - {prefix}_p99_latency_seconds{cluster} - Gauge of observed P99 latency
 //
 // # Performance Notes
 //

@@ -31,6 +31,7 @@ If one strand snaps, the other keeps the organism alive. It's 4 billion years of
 - **Strict Writes** - Per-statement opt-in for replay-unsafe writes (counters, list/set append) that surfaces partial failures immediately — see [Strict Write Guide](docs/strict-write.md)
 - **Async Mirror Writes** - Per-statement `Mirror()` opt-in for seamless cluster migrations; async fire-and-forget with durable replay retry and optional out-of-process publisher mode — see [Mirror Guide](docs/mirror.md)
 - **Session Refresh** - Manual or automatic recovery from permanently-dead sessions (cluster restart with port reassignment, DNS rotation) without rebuilding the client — see [Session Refresh Guide](docs/session-refresh.md)
+- **Cluster Event Notification** - Single `WithOnClusterEvent` hook delivers typed alerts for failover, circuit breaker trips, adaptive-write degrade/recover, drain transitions, replay drops, and session refresh — see [Cluster Events Guide](docs/cluster-events.md)
 - **Drop-in Replacement** - Interface-based design mirrors `gocql` API for minimal migration effort
 
 > **CAS/LWT Warning:** Lightweight Transactions (`INSERT ... IF NOT EXISTS`, `ScanCAS`, etc.) are **not safe** in a shared-nothing dual-cluster architecture. Each cluster has an independent Paxos state, so CAS conditions cannot be coordinated across clusters. Do not use Helix for CAS/LWT operations.
@@ -204,6 +205,50 @@ rows, err := client.Query("SELECT * FROM orders WHERE user = ?", userID).
 
 See [Slice Read Guide](docs/slice-read.md) for all methods, `MaxRows` configuration, the typed `SliceScanAs[T]` helper, and performance notes.
 
+## Cluster Event Notification
+
+Register one handler to receive typed `types.ClusterEvent` notifications for
+operationally significant transitions — failover, circuit breaker open/close,
+adaptive-write degrade/recover, drain enter/exit, replay drops, and session
+refresh:
+
+```go
+client, err := helix.NewCQLClient(sessionA, sessionB,
+    // circuit_breaker_open comes from the failover policy, which is unset by
+    // default — without this option the handler below is never called.
+    helix.WithFailoverPolicy(policy.NewCircuitBreaker()),
+
+    helix.WithOnClusterEvent(func(ev types.ClusterEvent) {
+        if ev.Kind == types.EventCircuitBreakerOpen {
+            alerting.Page("cluster degraded", "cluster", string(ev.Cluster))
+        }
+    }),
+)
+```
+
+Which kinds you receive depends on what else you configure: most are produced
+by an optional component and stay silent when it is absent, with no warning.
+The [Cluster Events Guide](docs/cluster-events.md) has a per-kind
+prerequisites table, plus the full event reference, delivery/shutdown
+semantics, and standalone policy usage.
+
+## Duration Histograms (`contrib/metrics/vm`)
+
+**Breaking — dashboard migration required.** The bundled collector now exposes
+`*_duration_seconds` metrics as classic Prometheus histograms
+(`_bucket{le=...}`, `_sum`, `_count`) instead of VictoriaMetrics-native
+`vmrange` histograms. `histogram_quantile()` now works in vanilla Prometheus,
+but existing `vmrange`-based quantile queries return no data and must be
+rewritten against `le` buckets:
+
+```promql
+histogram_quantile(0.99, sum(rate(helix_read_duration_seconds_bucket[5m])) by (le))
+```
+
+Queries built on `_sum` and `_count` — average latency, throughput — are
+unaffected; only quantile queries break. See the
+[CHANGELOG](CHANGELOG.md) for the full entry.
+
 ## Replay System
 
 Helix provides two replay implementations for handling partial write failures:
@@ -335,11 +380,12 @@ See the [examples](examples/) directory:
 - [Mirror Guide](docs/mirror.md) — Async per-statement mirroring for seamless cluster migrations
 - [Auto-Recovery Guide](docs/auto-recovery.md) — Recovery lifecycle, coordinated drain / re-enable workflow, and operator best practices
 - [Session Refresh Guide](docs/session-refresh.md) — Recover from permanently-dead sessions without rebuilding the client
+- [Cluster Events Guide](docs/cluster-events.md) — `WithOnClusterEvent` notification hook: event reference, delivery/shutdown semantics, standalone policy usage
 - [Simulation Guide](docs/simulation_guide.md) — Behavioral test harness for multi-cluster failure scenarios
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.26+
 - For CQL: v1: `github.com/gocql/gocql` or v2: `github.com/apache/cassandra-gocql-driver`
 - For NATS Replay: `github.com/nats-io/nats.go`
 

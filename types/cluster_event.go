@@ -24,7 +24,10 @@ const (
 	EventCircuitBreakerOpen ClusterEventKind = "circuit_breaker_open"
 
 	// EventCircuitBreakerClosed fires when a previously open circuit
-	// breaker closes after a successful operation.
+	// breaker closes. Reason distinguishes the two causes: a successful
+	// operation ("operation succeeded"), or the reset timeout elapsing
+	// with no recovery, which ends the open span on the next recorded
+	// failure ("reset timeout elapsed").
 	EventCircuitBreakerClosed ClusterEventKind = "circuit_breaker_closed"
 
 	// EventWriteDegraded fires when AdaptiveDualWrite transitions a cluster
@@ -79,24 +82,34 @@ const (
 // Delivery is asynchronous and best-effort: a bounded buffer absorbs
 // bursts, and events are dropped (and counted) rather than ever blocking
 // a read/write operation. Treat this as an alerting/notification stream,
-// not a durable audit log — metrics remain the authoritative source for
-// rates and current state.
+// not a durable audit log. Where a kind has a metric counterpart, read
+// rates and current state from the metric. EventWriteDegraded,
+// EventWriteRecovered, and EventMirrorReplayDropped have none, so for
+// those the event is the only machine-readable signal.
 //
 // Ordering: events produced by circuit-breaker and adaptive-write state
-// transitions are delivered in per-cluster transition order. Events from
-// independent producers (failover, read divergence, replay drops, drain
-// transitions, session refresh) are delivered in enqueue order with no
-// cross-kind causal guarantee. Metric updates and log lines may become
-// visible before or after the corresponding handler invocation.
+// transitions are delivered in per-cluster transition order, per policy
+// instance; the two policy types keep separate queues, so their events are
+// not ordered against each other. Order holds among the events actually
+// delivered — a drop can remove either end of an open/closed pair, so a
+// handler must tolerate an unmatched close. Events from independent
+// producers (failover, read divergence, replay drops, drain transitions,
+// session refresh) are delivered in enqueue order with no cross-kind causal
+// guarantee. Metric updates and log lines may become visible before or
+// after the corresponding handler invocation.
 //
-// Only the fields relevant to a given Kind are populated; unpopulated
-// fields hold zero values.
+// EventFailover and EventReadDivergence fire once per affected read rather
+// than once per state change, so they arrive at read rate during an outage
+// and are the kinds most likely to be dropped.
+//
+// Kind and Timestamp are always set. Of the remaining fields, only the ones
+// relevant to a given Kind are populated; the rest hold zero values.
 //
 // Field population by Kind:
 //   - EventFailover: FromCluster, ToCluster, Cluster (= ToCluster), Err
 //   - EventReadDivergence: Cluster (cluster missing the row), Reason
 //   - EventCircuitBreakerOpen: Cluster, Count (failures at trip)
-//   - EventCircuitBreakerClosed: Cluster
+//   - EventCircuitBreakerClosed: Cluster, Reason
 //   - EventWriteDegraded: Cluster, Count (slow strikes), Reason
 //   - EventWriteRecovered: Cluster, Reason
 //   - EventDrainEntered / EventDrainExited: Cluster

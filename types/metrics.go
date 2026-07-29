@@ -82,7 +82,10 @@ type MetricsCollector interface {
 	// ----------------------
 
 	// SetCircuitBreakerState sets the circuit breaker state gauge.
-	// State values: 0=closed, 1=half-open, 2=open.
+	// State values: 0=closed, 1=half-open (reserved; no policy in this
+	// module emits it today — a breaker admitting a probe after its reset
+	// timeout still reports 2 until the probe's outcome closes or re-opens
+	// it), 2=open.
 	// Metric: [prefix]_circuit_breaker_state{cluster="..."}
 	SetCircuitBreakerState(cluster ClusterID, state int)
 

@@ -146,6 +146,8 @@ Three optional metrics are exposed via the `types.SessionRefreshMetrics` interfa
 
 `Attempt = Success + Error`. The detector also logs at `Info` on attempt and success, `Warn` on error.
 
+The same three points emit `session_refresh_attempt`, `session_refresh_success`, and `session_refresh_error` cluster events when `helix.WithOnClusterEvent` is registered. See the [Cluster Events Guide](cluster-events.md).
+
 ---
 
 ## What Auto-refresh Does NOT Do
