@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1598,6 +1599,30 @@ func TestAdaptiveDualWrite_StalledEmitterCannotReorderTransitions(t *testing.T) 
 		em.kinds(), "Recovered must never overtake its preceding Degraded")
 }
 
+// TestAdaptiveDualWrite_ForceDegradeCarriesLiveStrikeCount pins the Count
+// field on a manual degrade. A manual degrade clears fastStrikes but leaves
+// slowStrikes alone, so the event must report the strikes the cluster had
+// already accumulated — the same number the log line reports — rather than
+// zero.
+func TestAdaptiveDualWrite_ForceDegradeCarriesLiveStrikeCount(t *testing.T) {
+	em := &recordingEmitter{}
+	a := NewAdaptiveDualWrite() // strike threshold 3
+	a.SetEventEmitter(em)
+
+	a.recordStrike(&a.stateA)
+	a.recordStrike(&a.stateA) // two strikes: still below the threshold
+	require.False(t, a.IsDegraded(types.ClusterA))
+	require.Empty(t, em.kinds(), "no transition yet")
+
+	a.ForceDegrade(types.ClusterA)
+
+	events := em.snapshot()
+	require.Len(t, events, 1)
+	require.Equal(t, types.EventWriteDegraded, events[0].Kind)
+	require.Equal(t, "manual", events[0].Reason)
+	require.Equal(t, 2, events[0].Count, "the manual degrade must report the accumulated slow strikes")
+}
+
 func TestAdaptiveDualWrite_ResetEmitsRecoveryForDegradedClustersOnly(t *testing.T) {
 	em := &recordingEmitter{}
 	a := NewAdaptiveDualWrite()
@@ -1644,4 +1669,64 @@ func TestAdaptiveDualWrite_ZeroValueWithEmitterReportsCorrectCluster(t *testing.
 	require.Equal(t, types.EventWriteRecovered, events[3].Kind)
 	require.Equal(t, "fast-strike recovery", events[3].Reason,
 		"the last recovery must come from recordFast, the path that derives the cluster from the state pointer")
+}
+
+// resetInspectingEmitter records, for every recovery event it receives, what
+// the strategy reported for both clusters at the moment the handler ran.
+type resetInspectingEmitter struct {
+	recordingEmitter
+	a *AdaptiveDualWrite
+
+	mu        sync.Mutex
+	observed  []bool // degraded state of cluster A seen per recovery event
+	observedB []bool // degraded state of cluster B seen per recovery event
+}
+
+func (e *resetInspectingEmitter) EmitClusterEvent(ev types.ClusterEvent) {
+	e.recordingEmitter.EmitClusterEvent(ev)
+	if ev.Kind != types.EventWriteRecovered {
+		return
+	}
+	degradedA := e.a.IsDegraded(types.ClusterA)
+	degradedB := e.a.IsDegraded(types.ClusterB)
+	e.mu.Lock()
+	e.observed = append(e.observed, degradedA)
+	e.observedB = append(e.observedB, degradedB)
+	e.mu.Unlock()
+}
+
+// TestAdaptiveDualWrite_ResetDeliversAfterBothClusters verifies that Reset
+// delivers its recovery events once, after both clusters have been reset. A
+// handler that inspects the strategy must see the settled result: both
+// clusters healthy. Delivering inside the per-cluster loop instead would hand
+// the handler cluster A's recovery while cluster B is still degraded.
+//
+// Scope: this is the uncontended case, which is the whole of what Reset
+// promises. Delivery is shared, so a transition running on another goroutine
+// while Reset sits between the two clusters can still deliver cluster A's
+// recovery early; see [AdaptiveDualWrite.Reset] for that limit.
+func TestAdaptiveDualWrite_ResetDeliversAfterBothClusters(t *testing.T) {
+	a := NewAdaptiveDualWrite()
+	em := &resetInspectingEmitter{a: a}
+	a.SetEventEmitter(em)
+
+	a.ForceDegrade(types.ClusterA)
+	a.ForceDegrade(types.ClusterB)
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.True(t, a.IsDegraded(types.ClusterB))
+
+	a.Reset()
+
+	em.mu.Lock()
+	observedA := slices.Clone(em.observed)
+	observedB := slices.Clone(em.observedB)
+	em.mu.Unlock()
+
+	require.Len(t, observedA, 2, "both clusters were degraded, so both recover")
+	for i := range observedA {
+		require.False(t, observedA[i],
+			"recovery event %d ran while cluster A still reported degraded", i)
+		require.False(t, observedB[i],
+			"recovery event %d ran while cluster B still reported degraded", i)
+	}
 }

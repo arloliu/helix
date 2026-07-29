@@ -230,13 +230,16 @@ func TestLatencyCircuitBreaker_WithLogger(t *testing.T) {
 	assert.Contains(t, logged[0], "circuit breaker tripped")
 }
 
-// captureLogger records Warn messages for test assertions.
+// captureLogger records Info and Warn messages, in call order, for test
+// assertions.
 type captureLogger struct {
 	messages *[]string
 }
 
 func (l *captureLogger) Debug(_ string, _ ...any) {}
-func (l *captureLogger) Info(_ string, _ ...any)  {}
+func (l *captureLogger) Info(msg string, _ ...any) {
+	*l.messages = append(*l.messages, msg)
+}
 func (l *captureLogger) Warn(msg string, _ ...any) {
 	*l.messages = append(*l.messages, msg)
 }

@@ -995,7 +995,22 @@ func (a *AdaptiveDualWrite) IsDegraded(cluster types.ClusterID) bool {
 // healthy produces no event. The two clusters are reset one after the other,
 // each under its own mutex — the first is fully released before the second is
 // taken, so Reset never holds both locks at once.
+//
+// Reset delivers its events once, after both clusters have been reset. When
+// no other transition is running, a handler that inspects the strategy from
+// inside the callback therefore sees both clusters healthy rather than
+// cluster A recovered while cluster B is still degraded.
+//
+// That is not a guarantee against concurrent callers. Delivery is shared:
+// whichever goroutine gets there first delivers everything queued, so a
+// transition on either cluster that runs while Reset sits between the two
+// clusters can deliver cluster A's recovery before cluster B has been reset.
+// A handler racing a Reset may therefore observe a partially applied reset.
+// Per-cluster order still holds in every case — for one cluster, events are
+// delivered in the order its transitions happened.
 func (a *AdaptiveDualWrite) Reset() {
+	var anyRecovered bool
+
 	for _, state := range []*clusterWriteState{&a.stateA, &a.stateB} {
 		cluster := a.stateCluster(state)
 
@@ -1015,9 +1030,16 @@ func (a *AdaptiveDualWrite) Reset() {
 		state.mu.Unlock()
 
 		if wasDegraded {
+			anyRecovered = true
 			a.logWriteRecovered(cluster, "manual reset")
-			a.events.drain()
 		}
+	}
+
+	// Deliver after the loop, once both clusters have settled, and after the
+	// log lines above — the same "events are the last side effect" ordering
+	// every other transition in this type follows.
+	if anyRecovered {
+		a.events.drain()
 	}
 }
 
@@ -1028,9 +1050,11 @@ func (a *AdaptiveDualWrite) Reset() {
 // transition — preventing a stale fast-strike accumulation from immediately
 // recovering the cluster on the very next recordFast call.
 //
-// Emits [types.EventWriteDegraded] with Reason "manual" when this call performs
-// the transition. Calling it on an already-degraded cluster still clears
-// fastStrikes but emits nothing.
+// Emits [types.EventWriteDegraded] with Reason "manual" and Count set to the
+// cluster's current slow-strike count when this call performs the transition.
+// A manual degrade does not clear slowStrikes, so Count reports whatever had
+// accumulated before the call rather than always being zero. Calling it on an
+// already-degraded cluster still clears fastStrikes but emits nothing.
 //
 // Parameters:
 //   - cluster: The cluster to degrade
@@ -1055,6 +1079,7 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 			Kind:    types.EventWriteDegraded,
 			Cluster: cluster,
 			Reason:  "manual",
+			Count:   strikes,
 		})
 	}
 	state.mu.Unlock()
