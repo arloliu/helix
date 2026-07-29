@@ -373,3 +373,143 @@ func TestCircuitBreaker_SetClusterNames_ThreadSafe(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestCircuitBreaker_EmitsOpenAndClosedEvents(t *testing.T) {
+	em := &recordingEmitter{}
+	cb := NewCircuitBreaker(WithThreshold(2))
+	cb.SetEventEmitter(em)
+
+	cb.RecordFailure(types.ClusterA)
+	require.Empty(t, em.kinds(), "below threshold: no event")
+
+	cb.RecordFailure(types.ClusterA) // trips
+	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds())
+	openEv := em.snapshot()[0]
+	require.Equal(t, types.ClusterA, openEv.Cluster)
+	require.Equal(t, 2, openEv.Count)
+
+	cb.RecordFailure(types.ClusterA) // still open: no duplicate
+	require.Len(t, em.kinds(), 1)
+
+	cb.RecordSuccess(types.ClusterA) // closes
+	require.Equal(t,
+		[]types.ClusterEventKind{types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed},
+		em.kinds())
+
+	cb.RecordSuccess(types.ClusterA) // already closed: no duplicate
+	require.Len(t, em.kinds(), 2)
+}
+
+// TestCircuitBreaker_StalledEmitterCannotReorderTransitions proves the
+// causal-order guarantee deterministically: the emitter is parked while
+// delivering the Open event, and while it is parked a concurrent
+// RecordSuccess performs the Closed transition. Because the transition
+// enqueues the event under the state mutex and only delivers afterward,
+// the Closed event queues behind Open and RecordSuccess returns without
+// waiting on the stalled emitter. An implementation that emitted directly
+// after unlocking (instead of queueing) would let Closed be delivered
+// before Open, since Closed's own transition finishes and emits while
+// Open's emission is still parked.
+func TestCircuitBreaker_StalledEmitterCannotReorderTransitions(t *testing.T) {
+	em := newGateEmitter()
+	cb := NewCircuitBreaker(WithThreshold(1))
+	cb.SetEventEmitter(em)
+
+	// Unblock the parked emitter at cleanup even if an assertion below
+	// fails first, so the goroutine started below is never left stuck.
+	releaseOnce := sync.OnceFunc(func() { close(em.release) })
+	t.Cleanup(releaseOnce)
+
+	tripDone := make(chan struct{})
+	go func() { cb.RecordFailure(types.ClusterA); close(tripDone) }()
+
+	select {
+	case <-em.entered: // drainer is parked inside emitting Open
+	case <-time.After(5 * time.Second):
+		t.Fatal("Open emission never started")
+	}
+
+	// RecordSuccess only needs to enqueue its Closed event and lose the
+	// delivery race to the still-parked drainer, so it must return almost
+	// immediately. A bounded wait turns a regression that instead runs
+	// the emitter under the state mutex (and would therefore block here
+	// until the gate is released) into a fast, attributable failure
+	// rather than a silent hang.
+	successDone := make(chan struct{})
+	go func() { cb.RecordSuccess(types.ClusterA); close(successDone) }()
+	select {
+	case <-successDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecordSuccess blocked — emitter appears to run under the state mutex")
+	}
+
+	releaseOnce()
+	select {
+	case <-tripDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecordFailure did not return")
+	}
+
+	require.Equal(t,
+		[]types.ClusterEventKind{types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed},
+		em.kinds(), "Closed must never overtake its preceding Open")
+}
+
+// TestCircuitBreaker_ZeroValueSafeWithEventEmitterInstalled verifies that
+// installing an event emitter on a zero-value CircuitBreaker, followed by
+// RecordFailure / RecordSuccess, never panics. It does not exercise the
+// event enqueue or drain paths: a zero-value breaker has threshold 0, so
+// RecordFailure's trip latch is never entered and RecordSuccess never
+// observes an open breaker. Reaching the event paths on a zero value is
+// not possible through the exported API — this test covers the setter
+// and the pre-existing zero-value guards only.
+func TestCircuitBreaker_ZeroValueSafeWithEventEmitterInstalled(t *testing.T) {
+	var cb CircuitBreaker
+	require.NotPanics(t, func() {
+		cb.SetEventEmitter(&recordingEmitter{})
+		cb.RecordFailure(types.ClusterA)
+		cb.RecordSuccess(types.ClusterA)
+	})
+}
+
+// reentrantCloseEmitter closes the breaker from inside the Open
+// emission, exercising the documented-safe reentrancy pattern: an
+// emitter is allowed to call back into the policy it is observing.
+type reentrantCloseEmitter struct {
+	recordingEmitter
+	cb   *CircuitBreaker
+	once atomic.Bool
+}
+
+func (r *reentrantCloseEmitter) EmitClusterEvent(ev types.ClusterEvent) {
+	r.recordingEmitter.EmitClusterEvent(ev)
+	if ev.Kind == types.EventCircuitBreakerOpen && r.once.CompareAndSwap(false, true) {
+		r.cb.RecordSuccess(types.ClusterA)
+	}
+}
+
+// TestCircuitBreaker_ReentrantEmitterKeepsStateAndMetricConsistent
+// verifies that delivering events as the last side-effect step pays off
+// under reentrancy: by the time the Open event is handed to the emitter,
+// RecordFailure has already written its metrics (gauge=open). The
+// reentrant RecordSuccess triggered from inside that Open delivery then
+// writes gauge=closed. So by the time both calls have returned, the
+// gauge matches the final state (closed), and the events observed are
+// Open followed by Closed — never the metric and the state disagreeing,
+// and never Closed observed before Open.
+func TestCircuitBreaker_ReentrantEmitterKeepsStateAndMetricConsistent(t *testing.T) {
+	em := &reentrantCloseEmitter{}
+	mc := testutil.NewTestMetricsCollector()
+	cb := NewCircuitBreaker(WithThreshold(1), WithCircuitBreakerMetrics(mc))
+	em.cb = cb
+	cb.SetEventEmitter(em)
+
+	cb.RecordFailure(types.ClusterA) // trips; emitter reenters RecordSuccess mid-drain
+
+	require.Equal(t,
+		[]types.ClusterEventKind{types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed},
+		em.kinds(), "reentrant close must be delivered after the open, never before")
+	require.Zero(t, cb.Failures(types.ClusterA), "final breaker state must be closed")
+	require.EqualValues(t, 0, mc.CircuitBreakerState[types.ClusterA],
+		"final gauge must agree with final state: closed (0), not open (2)")
+}

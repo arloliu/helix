@@ -111,6 +111,17 @@ type CircuitBreaker struct {
 	trippedB     bool         // circuit open for B; guarded by muB
 	failuresB    atomic.Int32 // lock-free for ShouldFailover; written under muB
 	lastFailureB atomic.Int64 // Unix nano; written under muB
+
+	// events queues open/close transitions for delivery to an optional
+	// cluster event emitter. Its zero value is disabled. enqueue is
+	// called only from inside the trip and close branches of
+	// RecordFailure / RecordSuccess, so a call that does not actually
+	// trip or close the breaker never reaches it. On a real transition
+	// with no emitter installed, the cost is enqueue's single atomic
+	// load plus drain()'s CompareAndSwap and pending-queue check, since
+	// drain runs unconditionally after every transition regardless of
+	// whether enqueue appended anything.
+	events eventOutbox
 }
 
 // CircuitBreakerOption configures a CircuitBreaker policy.
@@ -223,6 +234,27 @@ func (c *CircuitBreaker) SetLogger(l types.Logger) {
 	}
 	c.logger = l
 	c.loggerExplicit = true
+}
+
+// SetEventEmitter sets the cluster event emitter used for circuit
+// breaker open/close notifications. helix.NewCQLClient injects this
+// automatically when a WithOnClusterEvent handler is registered;
+// standalone users may call it directly at any time, since the emitter
+// reference is swapped atomically. Delivery is best-effort: a transition
+// racing exactly with an emitter install or removal may not reach
+// either the old or the new emitter.
+//
+// Emission ordering: an open or close transition is recorded, and its
+// event appended to an internal queue, under that cluster's state
+// mutex, so events for one cluster are delivered in the order their
+// transitions occurred. The emitter itself is always invoked with no
+// breaker locks held — see [types.ClusterEventEmitter] for the full
+// (relaxed) contract an emitter must satisfy.
+//
+// Parameters:
+//   - em: The event emitter; nil disables emission
+func (c *CircuitBreaker) SetEventEmitter(em types.ClusterEventEmitter) {
+	c.events.setEmitter(em)
 }
 
 // WithCircuitBreakerClusterNames sets the cluster display names for log messages.
@@ -444,6 +476,11 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedA {
 			c.trippedA = true
 			justTripped = true
+			c.events.enqueue(types.ClusterEvent{
+				Kind:    types.EventCircuitBreakerOpen,
+				Cluster: cluster,
+				Count:   int(newFailures),
+			})
 		}
 		c.muA.Unlock()
 	} else {
@@ -460,6 +497,11 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedB {
 			c.trippedB = true
 			justTripped = true
+			c.events.enqueue(types.ClusterEvent{
+				Kind:    types.EventCircuitBreakerOpen,
+				Cluster: cluster,
+				Count:   int(newFailures),
+			})
 		}
 		c.muB.Unlock()
 	}
@@ -480,6 +522,12 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 				"threshold", c.threshold,
 			)
 		}
+		// Deliver the queued Open event last, after the metrics and log
+		// updates above. This block only runs on a real trip, so a handler
+		// that reenters and closes the breaker mid-delivery cannot observe
+		// (or leave behind) a metrics gauge that still says "open" once
+		// both calls have returned.
+		c.events.drain()
 	}
 }
 
@@ -500,6 +548,12 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 		c.failuresA.Store(0)
 		c.lastFailureA.Store(0)
 		c.trippedA = false
+		if wasOpen {
+			c.events.enqueue(types.ClusterEvent{
+				Kind:    types.EventCircuitBreakerClosed,
+				Cluster: cluster,
+			})
+		}
 		c.muA.Unlock()
 	} else {
 		c.muB.Lock()
@@ -507,6 +561,12 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 		c.failuresB.Store(0)
 		c.lastFailureB.Store(0)
 		c.trippedB = false
+		if wasOpen {
+			c.events.enqueue(types.ClusterEvent{
+				Kind:    types.EventCircuitBreakerClosed,
+				Cluster: cluster,
+			})
+		}
 		c.muB.Unlock()
 	}
 
@@ -520,6 +580,12 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 				"cluster", c.clusterName(cluster),
 			)
 		}
+		// Deliver the queued Closed event last, after the metrics and log
+		// updates above, for the same reason as RecordFailure's trip
+		// block: this only runs on a real close, and delivering last
+		// keeps the metrics gauge consistent with the breaker's state
+		// even if a reentrant handler changes it again mid-delivery.
+		c.events.drain()
 	}
 }
 
