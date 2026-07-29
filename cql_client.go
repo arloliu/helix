@@ -255,9 +255,15 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	now := c.config.NowProvider()
 	cfg := c.config.AutoRefresh
 
+	// Capture the failure count once: it feeds both the trigger predicate
+	// and the attempt event below, so the event reports the exact count
+	// that qualified this refresh even if concurrent successes reset the
+	// live counter before the event is read downstream.
+	//
 	// FailureThreshold is an int but compared against an int32 atomic;
 	// widen both sides so gosec doesn't flag the narrowing conversion.
-	if int64(s.consecutiveFailures.Load()) < int64(cfg.FailureThreshold) {
+	failures := s.consecutiveFailures.Load()
+	if int64(failures) < int64(cfg.FailureThreshold) {
 		return
 	}
 	if now-s.lastSuccessNanos.Load() < int64(cfg.SustainedFailureWindow) {
@@ -276,9 +282,14 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	if refreshMetrics != nil {
 		refreshMetrics.IncSessionRefreshAttempt(cluster)
 	}
+	c.emitClusterEvent(types.ClusterEvent{
+		Kind:    types.EventSessionRefreshAttempt,
+		Cluster: cluster,
+		Count:   int(failures),
+	})
 	c.config.Logger.Info("auto-refresh: session believed dead, invoking refresher",
 		"cluster", c.clusterName(cluster),
-		"consecutiveFailures", s.consecutiveFailures.Load(),
+		"consecutiveFailures", failures,
 		"secondsSinceLastSuccess", (now-s.lastSuccessNanos.Load())/int64(time.Second),
 	)
 
@@ -289,6 +300,11 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 		if refreshMetrics != nil {
 			refreshMetrics.IncSessionRefreshError(cluster)
 		}
+		c.emitClusterEvent(types.ClusterEvent{
+			Kind:    types.EventSessionRefreshError,
+			Cluster: cluster,
+			Err:     err,
+		})
 		c.config.Logger.Warn("auto-refresh: session refresh failed",
 			"cluster", c.clusterName(cluster),
 			"error", err.Error(),
@@ -300,6 +316,10 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	if refreshMetrics != nil {
 		refreshMetrics.IncSessionRefreshSuccess(cluster)
 	}
+	c.emitClusterEvent(types.ClusterEvent{
+		Kind:    types.EventSessionRefreshSuccess,
+		Cluster: cluster,
+	})
 	c.config.Logger.Info("auto-refresh: session refreshed",
 		"cluster", c.clusterName(cluster),
 	)
@@ -545,6 +565,62 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 	}
 }
 
+// createEventDispatcher installs the client's event dispatcher when a handler
+// is registered, and does nothing otherwise.
+//
+// NewCQLClient calls this before mirror setup so the mirror error handler can
+// capture the dispatcher when it is built. Delivery does not begin here: the
+// dispatcher buffers events until startEventDelivery runs, which happens after
+// the constructor's last step that can fail, so an error path never leaves a
+// delivery goroutine behind.
+func createEventDispatcher(config *ClientConfig) {
+	if config.OnClusterEvent == nil {
+		return
+	}
+
+	config.events = newEventDispatcher(config.OnClusterEvent, config.Logger)
+}
+
+// startEventDelivery installs the emitter into the components that accept one
+// and starts the dispatcher's delivery goroutine. No-op when no handler is
+// registered.
+//
+// NewCQLClient calls this after its last step that can fail, so no error path
+// leaks the dispatcher goroutine, and before the auto-refresh and
+// recovery-probe goroutines start: a probe that succeeds on its first tick
+// reports a recovery, and injecting the emitter afterwards would race that
+// report and lose the event.
+func startEventDelivery(config *ClientConfig) {
+	if config.events == nil {
+		return
+	}
+
+	autoInjectEventEmitter(config)
+	config.events.start()
+}
+
+// autoInjectEventEmitter threads the client's event dispatcher into
+// components that opt in by exposing a SetEventEmitter method — the same
+// type-assertion pattern autoInjectMetricsAndLogger uses. Called after the
+// constructor's last step that can fail and before any background goroutine
+// starts, so a component never observes a half-installed emitter.
+func autoInjectEventEmitter(config *ClientConfig) {
+	type eventAware interface {
+		SetEventEmitter(types.ClusterEventEmitter)
+	}
+
+	if config.WriteStrategy != nil {
+		if ws, ok := config.WriteStrategy.(eventAware); ok {
+			ws.SetEventEmitter(config.events)
+		}
+	}
+	if config.FailoverPolicy != nil {
+		if fp, ok := config.FailoverPolicy.(eventAware); ok {
+			fp.SetEventEmitter(config.events)
+		}
+	}
+}
+
 // shouldLogOverrideErr returns true on the first occurrence and on every
 // power-of-2 occurrence thereafter (1, 2, 4, 8, 16 …). This prevents a
 // misconfigured AllowedClusters provider from flooding the log at high QPS
@@ -552,6 +628,35 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 func (c *CQLClient) shouldLogOverrideErr() bool {
 	seq := c.overrideErrSeq.Add(1)
 	return seq == 1 || seq&(seq-1) == 0
+}
+
+// emitClusterEvent forwards ev to the event dispatcher. Safe when no handler
+// is registered: the dispatcher is then nil and every method no-ops.
+func (c *CQLClient) emitClusterEvent(ev types.ClusterEvent) {
+	c.config.events.EmitClusterEvent(ev)
+}
+
+// emitReplayDropped invokes the legacy OnReplayDropped callback, if any, and
+// then emits an EventReplayDropped cluster event for a write that could not
+// be enqueued for replay. Both write-path call sites that hit this failure
+// share the same callback-then-event sequence.
+func (c *CQLClient) emitReplayDropped(cluster ClusterID, payload types.ReplayPayload, enqueueErr error) {
+	if c.config.OnReplayDropped != nil {
+		c.config.OnReplayDropped(payload, enqueueErr)
+	}
+	c.emitClusterEvent(types.ClusterEvent{
+		Kind:    types.EventReplayDropped,
+		Cluster: cluster,
+		Err:     enqueueErr,
+	})
+}
+
+// abortEventDispatcher stops the event dispatcher created earlier in
+// NewCQLClient on a constructor error path, so any event already buffered is
+// counted as dropped instead of sitting undelivered forever. Safe to call on
+// a never-started dispatcher.
+func abortEventDispatcher(config *ClientConfig) {
+	config.events.stop()
 }
 
 // NewCQLClient creates a new Helix CQL client.
@@ -673,6 +778,10 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
 
+	// Must run before mirror setup: the mirror error handler captures the
+	// dispatcher by value when it is built below.
+	createEventDispatcher(config)
+
 	// Auto-inject client metrics/logger into components that opt in via
 	// type-assertion-based interfaces (replay.Worker, AdaptiveDualWrite).
 	// This keeps client and component instrumentation unified without
@@ -683,6 +792,7 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 		if client.topologyClose != nil {
 			client.topologyClose()
 		}
+		abortEventDispatcher(config)
 
 		return nil, err
 	}
@@ -707,10 +817,18 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 				client.topologyClose()
 			}
 			stopMirrorComponents(config)
+			abortEventDispatcher(config)
 
 			return nil, err
 		}
 	}
+
+	// Must run after every constructor step above that can still return an
+	// error (so no error path leaves a delivery goroutine running) and
+	// before the auto-refresh and recovery-probe goroutines below start
+	// (so a fast successful probe cannot race the emitter installation and
+	// lose an event).
+	startEventDelivery(config)
 
 	// Start the auto-refresh detector if enabled AND a refresher is
 	// registered. Without a refresher the detector cannot do anything
@@ -768,12 +886,20 @@ func (c *CQLClient) watchTopology() {
 				c.config.Logger.Warn("cluster entering drain mode",
 					"cluster", c.clusterName(update.Cluster),
 				)
+				c.emitClusterEvent(types.ClusterEvent{
+					Kind:    types.EventDrainEntered,
+					Cluster: update.Cluster,
+				})
 			} else if previousDrain && !update.DrainMode {
 				c.config.Metrics.IncDrainModeExited(update.Cluster)
 				c.config.Metrics.SetClusterDraining(update.Cluster, false)
 				c.config.Logger.Info("cluster exiting drain mode",
 					"cluster", c.clusterName(update.Cluster),
 				)
+				c.emitClusterEvent(types.ClusterEvent{
+					Kind:    types.EventDrainExited,
+					Cluster: update.Cluster,
+				})
 			}
 		}
 	}
@@ -943,6 +1069,15 @@ func (c *CQLClient) MapExecuteBatchCAS(batch Batch, dest map[string]any) (applie
 // that batch's wall time via the worker's own timeouts if you need a hard
 // upper bound on Close latency.
 //
+// When a handler is registered via [WithOnClusterEvent], Close also stops
+// event intake, drains the buffered events to that handler, and waits for
+// the in-flight handler invocation to return; the final drop report is
+// written through the configured Logger. A handler that does not return, or
+// a Logger that blocks, therefore blocks Close. For the same reason the
+// handler must never call Close itself — it would wait for its own
+// invocation to finish and deadlock. Trigger shutdown from another
+// goroutine instead.
+//
 // Calling Close concurrently with SwapSession or RefreshSession is undefined:
 // Close may end up closing either the old or the new session depending on
 // scheduling, and the caller of SwapSession still owns the session it
@@ -982,6 +1117,14 @@ func (c *CQLClient) Close() {
 			c.recoveryProbeClose()
 			c.recoveryProbeWG.Wait()
 		}
+
+		// Stop the event dispatcher: intake halts, buffered events drain to
+		// the handler, and the in-flight handler invocation is awaited. The
+		// topology and auto-refresh goroutines were cancelled above but not
+		// joined, so a terminal event of theirs can still arrive after this
+		// point; such events are dropped and counted, as documented on
+		// WithOnClusterEvent.
+		c.config.events.stop()
 
 		c.loadSessionA().Close()
 		if !c.singleCluster {
@@ -1636,9 +1779,7 @@ func (c *CQLClient) executeWriteWithDrain(
 				"cluster", c.clusterName(drainingCluster),
 				"enqueueError", enqueueErr.Error(),
 			)
-			if c.config.OnReplayDropped != nil {
-				c.config.OnReplayDropped(payload, enqueueErr)
-			}
+			c.emitReplayDropped(drainingCluster, payload, enqueueErr)
 		}
 	}
 
@@ -1834,9 +1975,7 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 			"writeError", err.Error(),
 			"enqueueError", enqueueErr.Error(),
 		)
-		if c.config.OnReplayDropped != nil {
-			c.config.OnReplayDropped(payload, enqueueErr)
-		}
+		c.emitReplayDropped(cluster, payload, enqueueErr)
 	}
 }
 
@@ -2292,6 +2431,13 @@ func (c *CQLClient) tryFallbackCluster(
 		"toCluster", c.clusterName(fallback),
 		"error", primaryErr.Error(),
 	)
+	c.emitClusterEvent(types.ClusterEvent{
+		Kind:        types.EventFailover,
+		Cluster:     fallback,
+		FromCluster: selected,
+		ToCluster:   fallback,
+		Err:         primaryErr,
+	})
 
 	session := c.getSession(fallback)
 	start := time.Now()
@@ -2431,6 +2577,12 @@ func (c *CQLClient) executeFallbackRead(
 		c.config.Logger.Debug("fallback read: found data on alternative cluster",
 			"staleCluster", c.clusterName(selectedCluster),
 		)
+		c.emitClusterEvent(types.ClusterEvent{
+			Kind:    types.EventReadDivergence,
+			Cluster: selectedCluster,
+			Reason:  "row found on alternative cluster after not-found",
+		})
+
 		return nil
 	}
 
