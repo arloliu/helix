@@ -196,10 +196,8 @@ func TestRecoveryProbe_FailingProbeDoesNotRecover(t *testing.T) {
 	adaptive.ForceDegrade(ClusterA)
 
 	probes := &probeCounters{}
-	probeCalls := atomic.Int32{}
 	customProbe := RecoveryProbe{
 		Probe: func(_ context.Context, _ cql.Session) error {
-			probeCalls.Add(1)
 			return errors.New("probe: cluster unreachable")
 		},
 		Interval: 5 * time.Millisecond,
@@ -214,9 +212,14 @@ func TestRecoveryProbe_FailingProbeDoesNotRecover(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
+	// Wait on the recorded failure count itself, not on probe entry: the
+	// client increments IncRecoveryProbeFailure only after the probe call
+	// returns, so waiting on a separate entry counter could observe a probe
+	// that started but has not yet had its failure recorded, and the
+	// assertion below would then read a partial count.
 	require.Eventually(t, func() bool {
-		return probeCalls.Load() >= 3
-	}, 500*time.Millisecond, 5*time.Millisecond, "probe must have fired at least 3 times")
+		return probes.failureA.Load() >= 3
+	}, 500*time.Millisecond, 5*time.Millisecond, "IncRecoveryProbeFailure must reach 3 recorded failures")
 
 	assert.True(t, adaptive.IsDegraded(ClusterA), "cluster A must remain degraded")
 	assert.GreaterOrEqual(t, probes.failureA.Load(), int32(3),
