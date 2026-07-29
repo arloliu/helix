@@ -310,3 +310,24 @@ func TestLatencyCircuitBreaker_ResetTimeout(t *testing.T) {
 	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond)
 	assert.Equal(t, 1, lcb.Failures(types.ClusterA))
 }
+
+func TestLatencyCircuitBreaker_SetEventEmitterDelegates(t *testing.T) {
+	em := &recordingEmitter{}
+	lcb := NewLatencyCircuitBreaker(WithLatencyThreshold(2))
+	lcb.SetEventEmitter(em)
+
+	lcb.RecordFailure(types.ClusterB)
+	lcb.RecordFailure(types.ClusterB)
+	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds())
+}
+
+// TestLatencyCircuitBreaker_ZeroValueSetEventEmitterIsSafe checks that a
+// zero-value LatencyCircuitBreaker, whose embedded *CircuitBreaker is
+// nil, tolerates SetEventEmitter without panicking — matching every
+// other method on this type, which all guard against a nil embed.
+func TestLatencyCircuitBreaker_ZeroValueSetEventEmitterIsSafe(t *testing.T) {
+	var lcb LatencyCircuitBreaker
+	require.NotPanics(t, func() {
+		lcb.SetEventEmitter(&recordingEmitter{})
+	})
+}

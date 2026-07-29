@@ -41,7 +41,7 @@ const defaultLatencyAbsoluteMax = 2 * time.Second
 // depend on the pointer field shape. Because the embed can be nil, every
 // promoted-looking method below (ShouldFailover, RecordFailure,
 // RecordSuccess, Failures, SetClusterNames, MetricsConfigured, SetMetrics,
-// LoggerConfigured, SetLogger) is an explicit wrapper with a nil guard
+// SetEventEmitter, LoggerConfigured, SetLogger) is an explicit wrapper with a nil guard
 // rather than a compiler-promoted method — use one of the constructors
 // (NewLatencyCircuitBreaker / NewLatencyCircuitBreakerChecked) to get a
 // fully configured, functional LatencyCircuitBreaker.
@@ -363,6 +363,21 @@ func (l *LatencyCircuitBreaker) SetMetrics(m types.MetricsCollector) {
 	}
 
 	l.CircuitBreaker.SetMetrics(m)
+}
+
+// SetEventEmitter sets the cluster event emitter used for circuit
+// breaker open/close notifications. See [CircuitBreaker.SetEventEmitter]
+// for the full contract. A zero-value LatencyCircuitBreaker (nil
+// embedded *CircuitBreaker) safely no-ops, mirroring SetMetrics.
+//
+// Parameters:
+//   - em: The event emitter; nil disables emission
+func (l *LatencyCircuitBreaker) SetEventEmitter(em types.ClusterEventEmitter) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.SetEventEmitter(em)
 }
 
 // LoggerConfigured reports whether the logger was explicitly set via

@@ -1493,3 +1493,155 @@ func TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded(t *testing
 	assert.GreaterOrEqual(t, a.stateA.slowStrikes, int32(3),
 		"A's slowStrikes must reach the threshold when cap violation persists")
 }
+
+func TestAdaptiveDualWrite_EmitsDegradeAndRecoverEvents(t *testing.T) {
+	em := &recordingEmitter{}
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(2),
+		WithAdaptiveRecoveryThreshold(2),
+	)
+	a.SetEventEmitter(em)
+
+	a.ForceDegrade(types.ClusterA)
+	require.Equal(t, []types.ClusterEventKind{types.EventWriteDegraded}, em.kinds())
+	degraded := em.snapshot()[0]
+	require.Equal(t, types.ClusterA, degraded.Cluster)
+	require.Equal(t, "manual", degraded.Reason)
+
+	a.ForceDegrade(types.ClusterA) // already degraded: no duplicate
+	require.Len(t, em.kinds(), 1)
+
+	a.RecordProbeSuccess(types.ClusterA)
+	a.RecordProbeSuccess(types.ClusterA)
+	require.Equal(t,
+		[]types.ClusterEventKind{types.EventWriteDegraded, types.EventWriteRecovered},
+		em.kinds())
+	recovered := em.snapshot()[1]
+	require.Equal(t, types.ClusterA, recovered.Cluster)
+	require.Equal(t, "fast-strike recovery", recovered.Reason)
+
+	a.ForceRecover(types.ClusterA) // healthy: no duplicate
+	require.Len(t, em.kinds(), 2)
+}
+
+// TestAdaptiveDualWrite_StrikeThresholdEmitsDegraded exercises the automatic
+// path: latency-delta strikes accumulated through Execute must emit exactly one
+// EventWriteDegraded carrying the strike count and the threshold reason. The
+// sleeps live inside the exec funcs to simulate write latency, which is the
+// established pattern for this strategy's tests.
+func TestAdaptiveDualWrite_StrikeThresholdEmitsDegraded(t *testing.T) {
+	em := &recordingEmitter{}
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(2),
+		WithAdaptiveDeltaThreshold(5*time.Millisecond),
+		WithAdaptiveMinFloor(1*time.Millisecond),
+	)
+	a.SetEventEmitter(em)
+
+	ctx := t.Context()
+	slow := func(_ context.Context) error { time.Sleep(20 * time.Millisecond); return nil }
+	fast := func(_ context.Context) error { return nil }
+
+	_, _ = a.Execute(ctx, slow, fast)
+	_, _ = a.Execute(ctx, slow, fast)
+
+	require.Equal(t, []types.ClusterEventKind{types.EventWriteDegraded}, em.kinds())
+	ev := em.snapshot()[0]
+	require.Equal(t, types.ClusterA, ev.Cluster)
+	require.Equal(t, "slow-strike threshold reached", ev.Reason)
+	require.Equal(t, 2, ev.Count)
+
+	_, _ = a.Execute(ctx, slow, fast) // already degraded: no re-emit
+	require.Len(t, em.kinds(), 1)
+}
+
+// TestAdaptiveDualWrite_StalledEmitterCannotReorderTransitions is a
+// deterministic proof that causal order survives a slow emitter: the Degraded
+// event is parked inside the emitter while ForceRecover performs the recovery
+// transition, and the delivered order must still be Degraded then Recovered.
+func TestAdaptiveDualWrite_StalledEmitterCannotReorderTransitions(t *testing.T) {
+	em := newGateEmitter()
+	a := NewAdaptiveDualWrite()
+	a.SetEventEmitter(em)
+
+	releaseOnce := sync.OnceFunc(func() { close(em.release) })
+	t.Cleanup(releaseOnce)
+
+	degradeDone := make(chan struct{})
+	go func() { a.ForceDegrade(types.ClusterA); close(degradeDone) }()
+
+	select {
+	case <-em.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Degraded emission never started")
+	}
+
+	// The second transition must complete while the first emitter is still
+	// gated; if it blocks, the emitter is running under the state mutex.
+	recoverDone := make(chan struct{})
+	go func() { a.ForceRecover(types.ClusterA); close(recoverDone) }()
+	select {
+	case <-recoverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForceRecover blocked — emitter appears to run under the state mutex")
+	}
+
+	releaseOnce()
+	select {
+	case <-degradeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ForceDegrade did not return")
+	}
+
+	require.Equal(t,
+		[]types.ClusterEventKind{types.EventWriteDegraded, types.EventWriteRecovered},
+		em.kinds(), "Recovered must never overtake its preceding Degraded")
+}
+
+func TestAdaptiveDualWrite_ResetEmitsRecoveryForDegradedClustersOnly(t *testing.T) {
+	em := &recordingEmitter{}
+	a := NewAdaptiveDualWrite()
+	a.SetEventEmitter(em)
+
+	a.ForceDegrade(types.ClusterA) // B stays healthy
+	a.Reset()
+
+	events := em.snapshot()
+	require.Len(t, events, 2) // 1 degrade + 1 recovery (A only)
+	require.Equal(t, types.EventWriteRecovered, events[1].Kind)
+	require.Equal(t, types.ClusterA, events[1].Cluster)
+	require.Equal(t, "manual reset", events[1].Reason)
+}
+
+// TestAdaptiveDualWrite_ZeroValueWithEmitterReportsCorrectCluster checks that a
+// zero-value AdaptiveDualWrite still accepts an emitter and reports the right
+// cluster, even though a zero value never runs constructor initialization.
+//
+// It covers both ways an event learns its cluster. ForceDegrade and ForceRecover
+// take the cluster as a parameter and pass it straight through. The recovery
+// credited by RecordProbeSuccess instead flows through recordFast, which has
+// only a state pointer and must map it back via stateCluster — so that step is
+// what proves pointer-derived identity resolves to B rather than falling back to
+// A. Its "fast-strike recovery" reason pins which of the two paths produced it.
+// On a zero value recoveryThreshold is 0, so a single credit recovers the
+// cluster immediately.
+func TestAdaptiveDualWrite_ZeroValueWithEmitterReportsCorrectCluster(t *testing.T) {
+	em := &recordingEmitter{}
+	var a AdaptiveDualWrite
+	a.SetEventEmitter(em)
+
+	require.NotPanics(t, func() {
+		a.ForceDegrade(types.ClusterB)
+		a.ForceRecover(types.ClusterB)
+		a.ForceDegrade(types.ClusterB)
+		a.RecordProbeSuccess(types.ClusterB)
+	})
+	events := em.snapshot()
+	require.Len(t, events, 4)
+	for i, ev := range events {
+		require.Equal(t, types.ClusterB, ev.Cluster, "event %d must report cluster B", i)
+	}
+	require.Equal(t, types.EventWriteRecovered, events[3].Kind)
+	require.Equal(t, "fast-strike recovery", events[3].Reason,
+		"the last recovery must come from recordFast, the path that derives the cluster from the state pointer")
+}
