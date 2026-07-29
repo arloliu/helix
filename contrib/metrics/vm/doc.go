@@ -59,6 +59,18 @@
 //   - {prefix}_replay_queue_depth{cluster} - Gauge of current queue depth
 //   - {prefix}_replay_duration_seconds{cluster} - Histogram of replay latencies
 //
+// # Duration Histograms
+//
+// All *_duration_seconds metrics (read, write, replay, and mirror exec) are
+// classic Prometheus histograms with explicit upper bounds, exposed as
+// {prefix}_..._duration_seconds_bucket{...,le="<bound>"}, plus the matching
+// _sum and _count series. This makes them compatible with
+// histogram_quantile() in vanilla Prometheus, unlike VictoriaMetrics-native
+// histograms which expose vmrange buckets instead.
+//
+// The default bucket bounds are available via DefaultDurationBuckets() and
+// can be overridden per collector with WithDurationBuckets.
+//
 // Cluster health:
 //   - {prefix}_cluster_draining{cluster} - Gauge (1=draining, 0=healthy)
 //   - {prefix}_drain_mode_entered_total{cluster} - Counter of drain entries

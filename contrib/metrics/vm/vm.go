@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sync/atomic"
 
@@ -12,6 +13,51 @@ import (
 
 // Option configures a Collector.
 type Option func(*Collector)
+
+// defaultDurationBuckets is the canonical default for all
+// *_duration_seconds histograms. It is never handed out directly: New
+// copies it into each collector and DefaultDurationBuckets returns a
+// fresh copy on every call, so no caller can mutate it and corrupt
+// buckets for a collector built afterward.
+var defaultDurationBuckets = []float64{
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+}
+
+// DefaultDurationBuckets returns a copy of the default histogram upper
+// bounds (seconds) used for all *_duration_seconds histograms. They
+// target CQL operation latency: healthy reads/writes land in the
+// 1-50 ms buckets, while the 0.25-10 s tail captures degraded clusters,
+// retries, and driver timeouts (default driver timeouts fall between
+// 600 ms and 12 s). Values above 10 s land in the implicit +Inf bucket.
+//
+// Override per collector with [WithDurationBuckets].
+//
+// Returns:
+//   - []float64: A fresh copy of the default bucket upper bounds
+func DefaultDurationBuckets() []float64 {
+	return append([]float64(nil), defaultDurationBuckets...)
+}
+
+// validDurationBuckets reports whether buckets is non-empty, strictly
+// increasing, and contains only finite positive values. VictoriaMetrics
+// only rejects non-increasing bounds by panicking at histogram
+// construction; it does not validate for NaN, infinite, zero, or negative
+// values, so this check covers those cases too before anything reaches
+// the histogram constructor.
+func validDurationBuckets(buckets []float64) bool {
+	if len(buckets) == 0 {
+		return false
+	}
+	prev := 0.0
+	for _, b := range buckets {
+		if math.IsNaN(b) || math.IsInf(b, 0) || b <= prev {
+			return false
+		}
+		prev = b
+	}
+
+	return true
+}
 
 // WithPrefix sets the metric name prefix.
 //
@@ -49,6 +95,36 @@ func WithClusterNames(names types.ClusterNames) Option {
 	}
 }
 
+// WithDurationBuckets overrides the default buckets (see
+// [DefaultDurationBuckets]) for every duration histogram (read, write,
+// replay, mirror exec).
+//
+// Buckets must be strictly increasing, finite, and positive; the +Inf
+// bucket is added implicitly. Invalid input is ignored and the collector
+// keeps the defaults (VictoriaMetrics would otherwise panic at
+// construction). The slice is copied; later mutation by the caller has
+// no effect.
+//
+// Parameters:
+//   - buckets: Histogram upper bounds in seconds, strictly increasing
+//
+// Returns:
+//   - Option: A configuration option
+//
+// Example:
+//
+//	collector := vm.New(
+//	    vm.WithDurationBuckets([]float64{0.005, 0.05, 0.5, 5}),
+//	)
+func WithDurationBuckets(buckets []float64) Option {
+	return func(c *Collector) {
+		if !validDurationBuckets(buckets) {
+			return
+		}
+		c.durationBuckets = append([]float64(nil), buckets...)
+	}
+}
+
 // WithMetricsSet sets the metrics set to use.
 //
 // If provided, the collector will register metrics with this set instead of
@@ -71,17 +147,18 @@ func WithMetricsSet(set *metrics.Set) Option {
 // All metrics are pre-created at initialization time for optimal performance.
 // Thread-safe for concurrent use.
 type Collector struct {
-	set          *metrics.Set
-	prefix       string
-	clusterNames types.ClusterNames
+	set             *metrics.Set
+	prefix          string
+	clusterNames    types.ClusterNames
+	durationBuckets []float64
 
 	// Read metrics
 	readTotalA      *metrics.Counter
 	readTotalB      *metrics.Counter
 	readErrorsA     *metrics.Counter
 	readErrorsB     *metrics.Counter
-	readDurationA   *metrics.Histogram
-	readDurationB   *metrics.Histogram
+	readDurationA   *metrics.PrometheusHistogram
+	readDurationB   *metrics.PrometheusHistogram
 	readDivergenceA *metrics.Counter
 	readDivergenceB *metrics.Counter
 
@@ -94,8 +171,8 @@ type Collector struct {
 	writeAsyncB    *metrics.Counter
 	writeDroppedA  *metrics.Counter
 	writeDroppedB  *metrics.Counter
-	writeDurationA *metrics.Histogram
-	writeDurationB *metrics.Histogram
+	writeDurationA *metrics.PrometheusHistogram
+	writeDurationB *metrics.PrometheusHistogram
 
 	// Failover metrics
 	failoverAToB *metrics.Counter
@@ -118,8 +195,8 @@ type Collector struct {
 	replayDroppedB    *metrics.Counter
 	replayQueueDepthA atomic.Int64
 	replayQueueDepthB atomic.Int64
-	replayDurationA   *metrics.Histogram
-	replayDurationB   *metrics.Histogram
+	replayDurationA   *metrics.PrometheusHistogram
+	replayDurationB   *metrics.PrometheusHistogram
 
 	// Cluster health metrics
 	clusterDrainingA  atomic.Int64
@@ -142,7 +219,7 @@ type Collector struct {
 	mirrorEnqueueDropped *metrics.Counter
 	mirrorExecSuccess    *metrics.Counter
 	mirrorExecError      *metrics.Counter
-	mirrorExecDuration   *metrics.Histogram
+	mirrorExecDuration   *metrics.PrometheusHistogram
 	mirrorQueueDepth     atomic.Int64
 	mirrorEnabled        atomic.Int64
 }
@@ -181,6 +258,10 @@ func New(opts ...Option) *Collector {
 		metrics.RegisterSet(c.set)
 	}
 
+	if c.durationBuckets == nil {
+		c.durationBuckets = append([]float64(nil), defaultDurationBuckets...)
+	}
+
 	c.initMetrics()
 
 	return c
@@ -197,8 +278,8 @@ func (c *Collector) initMetrics() {
 	c.readTotalB = c.set.NewCounter(fmt.Sprintf(`%s_read_total{cluster="%s"}`, p, nB))
 	c.readErrorsA = c.set.NewCounter(fmt.Sprintf(`%s_read_errors_total{cluster="%s"}`, p, nA))
 	c.readErrorsB = c.set.NewCounter(fmt.Sprintf(`%s_read_errors_total{cluster="%s"}`, p, nB))
-	c.readDurationA = c.set.NewHistogram(fmt.Sprintf(`%s_read_duration_seconds{cluster="%s"}`, p, nA))
-	c.readDurationB = c.set.NewHistogram(fmt.Sprintf(`%s_read_duration_seconds{cluster="%s"}`, p, nB))
+	c.readDurationA = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_read_duration_seconds{cluster="%s"}`, p, nA), c.durationBuckets)
+	c.readDurationB = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_read_duration_seconds{cluster="%s"}`, p, nB), c.durationBuckets)
 	c.readDivergenceA = c.set.NewCounter(fmt.Sprintf(`%s_read_divergence_total{cluster="%s"}`, p, nA))
 	c.readDivergenceB = c.set.NewCounter(fmt.Sprintf(`%s_read_divergence_total{cluster="%s"}`, p, nB))
 
@@ -211,8 +292,8 @@ func (c *Collector) initMetrics() {
 	c.writeAsyncB = c.set.NewCounter(fmt.Sprintf(`%s_write_async_total{cluster="%s"}`, p, nB))
 	c.writeDroppedA = c.set.NewCounter(fmt.Sprintf(`%s_write_dropped_total{cluster="%s"}`, p, nA))
 	c.writeDroppedB = c.set.NewCounter(fmt.Sprintf(`%s_write_dropped_total{cluster="%s"}`, p, nB))
-	c.writeDurationA = c.set.NewHistogram(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nA))
-	c.writeDurationB = c.set.NewHistogram(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nB))
+	c.writeDurationA = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nA), c.durationBuckets)
+	c.writeDurationB = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nB), c.durationBuckets)
 
 	// Failover metrics
 	c.failoverAToB = c.set.NewCounter(fmt.Sprintf(`%s_failover_total{from="%s",to="%s"}`, p, nA, nB))
@@ -243,8 +324,8 @@ func (c *Collector) initMetrics() {
 	c.set.NewGauge(fmt.Sprintf(`%s_replay_queue_depth{cluster="%s"}`, p, nB), func() float64 {
 		return float64(c.replayQueueDepthB.Load())
 	})
-	c.replayDurationA = c.set.NewHistogram(fmt.Sprintf(`%s_replay_duration_seconds{cluster="%s"}`, p, nA))
-	c.replayDurationB = c.set.NewHistogram(fmt.Sprintf(`%s_replay_duration_seconds{cluster="%s"}`, p, nB))
+	c.replayDurationA = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_replay_duration_seconds{cluster="%s"}`, p, nA), c.durationBuckets)
+	c.replayDurationB = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_replay_duration_seconds{cluster="%s"}`, p, nB), c.durationBuckets)
 
 	// Cluster health metrics
 	c.set.NewGauge(fmt.Sprintf(`%s_cluster_draining{cluster="%s"}`, p, nA), func() float64 {
@@ -271,7 +352,7 @@ func (c *Collector) initMetrics() {
 	c.mirrorEnqueueDropped = c.set.NewCounter(fmt.Sprintf(`%s_mirror_enqueue_dropped_total`, p))
 	c.mirrorExecSuccess = c.set.NewCounter(fmt.Sprintf(`%s_mirror_exec_success_total`, p))
 	c.mirrorExecError = c.set.NewCounter(fmt.Sprintf(`%s_mirror_exec_errors_total`, p))
-	c.mirrorExecDuration = c.set.NewHistogram(fmt.Sprintf(`%s_mirror_exec_duration_seconds`, p))
+	c.mirrorExecDuration = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_mirror_exec_duration_seconds`, p), c.durationBuckets)
 	c.set.NewGauge(fmt.Sprintf(`%s_mirror_queue_depth`, p), func() float64 {
 		return float64(c.mirrorQueueDepth.Load())
 	})
