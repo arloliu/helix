@@ -533,6 +533,14 @@ func (r *recordingReplayer) count() int {
 	return len(r.captured)
 }
 
+// enqueueCount reports how many Enqueue calls were made, including the ones
+// that returned enqueueErr and therefore captured nothing.
+func (r *recordingReplayer) enqueueCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.enqueueCnt
+}
+
 func (r *recordingReplayer) first() types.ReplayPayload {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -770,4 +778,86 @@ func TestCloneBatchEntries(t *testing.T) {
 	require.Len(t, out, 2)
 	require.Equal(t, []byte{1, 2}, out[0].Args[0])
 	require.Equal(t, "s", out[1].Args[0])
+}
+
+// TestMirrorReplayDroppedEventRespectsCallerOnError pins both directions of
+// the "caller options win" rule for the mirror error handler. Helix installs
+// its own mirror.WithOnError to push failed captures onto the mirror replayer
+// and to report an unenqueueable capture as EventMirrorReplayDropped; a
+// caller-supplied mirror.WithOnError replaces that handler entirely, and with
+// it the event.
+func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
+	isMirrorDrop := func(ev types.ClusterEvent) bool {
+		return ev.Kind == types.EventMirrorReplayDropped
+	}
+
+	t.Run("caller handler replaces the internal one", func(t *testing.T) {
+		mirrorSA := newMockSession()
+		mirrorSA.execErr = errors.New("mirror cluster down")
+		mirrorTarget, err := NewCQLClient(mirrorSA, nil)
+		require.NoError(t, err)
+		defer mirrorTarget.Close()
+
+		replayer := &recordingReplayer{enqueueErr: errors.New("replayer queue full")}
+		rec := newInternalEventRecorder()
+		callerCh := make(chan error, 4)
+
+		client, err := NewCQLClient(newMockSession(), nil,
+			WithMirror(mirrorTarget,
+				mirror.WithWorkers(1),
+				mirror.WithOnError(func(_ types.ReplayPayload, writeErr error) {
+					callerCh <- writeErr
+				}),
+			),
+			WithMirrorReplayer(replayer),
+			WithOnClusterEvent(rec.handler),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		require.NoError(t, client.Query("INSERT", "z").Mirror().ExecContext(t.Context()))
+
+		select {
+		case writeErr := <-callerCh:
+			require.Error(t, writeErr, "the caller handler must receive the mirror write error")
+		case <-time.After(2 * time.Second):
+			t.Fatal("caller-supplied mirror.WithOnError never fired")
+		}
+
+		// The caller handler ran instead of Helix's, so nothing was enqueued
+		// and no event can be produced. Allow a short settle window before
+		// asserting the absence.
+		<-time.After(100 * time.Millisecond)
+		require.Zero(t, replayer.enqueueCount(), "the caller handler must own the failure entirely")
+		require.False(t, rec.has(isMirrorDrop),
+			"a caller-supplied mirror.WithOnError must suppress EventMirrorReplayDropped")
+	})
+
+	t.Run("internal handler emits the event", func(t *testing.T) {
+		mirrorSA := newMockSession()
+		mirrorSA.execErr = errors.New("mirror cluster down")
+		mirrorTarget, err := NewCQLClient(mirrorSA, nil)
+		require.NoError(t, err)
+		defer mirrorTarget.Close()
+
+		enqueueErr := errors.New("replayer queue full")
+		replayer := &recordingReplayer{enqueueErr: enqueueErr}
+		rec := newInternalEventRecorder()
+
+		client, err := NewCQLClient(newMockSession(), nil,
+			WithMirror(mirrorTarget, mirror.WithWorkers(1)),
+			WithMirrorReplayer(replayer),
+			WithOnClusterEvent(rec.handler),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		require.NoError(t, client.Query("INSERT", "z").Mirror().ExecContext(t.Context()))
+
+		ev := rec.waitFor(t, isMirrorDrop)
+		require.ErrorIs(t, ev.Err, enqueueErr)
+		require.Empty(t, ev.Cluster, "mirror payloads target a logical sink, not one of this client's clusters")
+		require.NotEmpty(t, ev.Reason)
+		require.False(t, ev.Timestamp.IsZero())
+	})
 }

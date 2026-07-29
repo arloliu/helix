@@ -479,6 +479,33 @@ func TestFallback_DivergenceMetricOnSuccess(t *testing.T) {
 		"IncReadDivergence must not be called on the cluster that had data")
 }
 
+// TestFallback_DivergenceEventOnSuccess is the event-stream counterpart of
+// TestFallback_DivergenceMetricOnSuccess: a registered cluster-event handler
+// must receive an EventReadDivergence naming the stale cluster.
+func TestFallback_DivergenceEventOnSuccess(t *testing.T) {
+	sessionA := newMockSession()
+	sessionA.scanErr = types.ErrNotFound
+	sessionB := newMockSession()
+	// sessionB returns success
+	rec := newInternalEventRecorder()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithOnClusterEvent(rec.handler),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	scanErr := client.Query("SELECT 1").FallbackRead().Scan()
+	require.NoError(t, scanErr)
+
+	ev := rec.waitFor(t, func(ev types.ClusterEvent) bool {
+		return ev.Kind == types.EventReadDivergence
+	})
+	assert.Equal(t, ClusterA, ev.Cluster, "the event must name the cluster that was missing the row")
+	assert.NotEmpty(t, ev.Reason)
+	assert.False(t, ev.Timestamp.IsZero())
+}
+
 // TestFallback_ReadTotalBothClustersRecorded verifies that IncReadTotal is called
 // for both the primary attempt and the fallback attempt.
 func TestFallback_ReadTotalBothClustersRecorded(t *testing.T) {

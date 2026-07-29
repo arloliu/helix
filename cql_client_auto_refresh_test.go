@@ -190,7 +190,7 @@ func driveOps(t *testing.T, c *helix.CQLClient, n int) {
 	t.Helper()
 	for i := range n {
 		// Explicitly use ExecContext to take the documented exec path.
-		_ = c.Query("INSERT INTO t (k,v) VALUES (?, ?)", i, "v").ExecContext(context.Background())
+		_ = c.Query("INSERT INTO t (k,v) VALUES (?, ?)", i, "v").ExecContext(t.Context())
 	}
 }
 

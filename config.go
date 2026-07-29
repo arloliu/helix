@@ -94,6 +94,7 @@ type ClientConfig struct {
 	Logger            types.Logger
 	ClusterNames      types.ClusterNames
 	OnReplayDropped   ReplayDroppedHandler
+	OnClusterEvent    ClusterEventHandler
 
 	// AllowedClusters, when set, overrides automatic read routing with an
 	// operator-controlled cluster list. This is the external control for
@@ -236,6 +237,13 @@ type ClientConfig struct {
 	// recoveryProbeOff disables the recovery probe even when AdaptiveDualWrite
 	// is detected. Set via [WithRecoveryProbeDisabled].
 	recoveryProbeOff bool
+
+	// events is the internal dispatcher created by NewCQLClient when
+	// OnClusterEvent is set. It is created before mirror setup so mirror
+	// callbacks can capture it, and started only after the constructor's
+	// last step that can fail and before the background probe and
+	// auto-refresh goroutines launch.
+	events *eventDispatcher
 }
 
 // SessionRefresher builds a fresh [cql.Session] for the given cluster.
@@ -617,6 +625,63 @@ func WithReplayWorker(worker ReplayWorker) Option {
 func WithOnReplayDropped(handler ReplayDroppedHandler) Option {
 	return func(c *ClientConfig) {
 		c.OnReplayDropped = handler
+	}
+}
+
+// WithOnClusterEvent registers a handler for cluster-health events.
+//
+// The handler receives a [types.ClusterEvent] for operationally
+// significant transitions: read failover, read divergence, circuit
+// breaker open/close, adaptive-write degrade/recover, drain enter/exit,
+// replay drops, mirror replay drops (unless a caller-supplied
+// mirror.WithOnError overrides the internal handler), and session
+// refresh attempts. Use it to drive alerting, paging, or operational
+// dashboards without polling metrics.
+//
+// Delivery is asynchronous and BEST-EFFORT on a dedicated goroutine:
+// invocations never overlap and never block read/write operations. If
+// the handler cannot keep up, newest events are dropped; drops are
+// counted exactly and logged. Circuit-breaker and adaptive-write events
+// arrive in per-cluster transition order; events from independent
+// producers arrive in enqueue order with no cross-kind causal guarantee.
+// This is a notification stream, not a durable audit log — use the
+// metrics collector as the authoritative source for rates and state.
+//
+// Shutdown semantics: [CQLClient.Close] stops event intake, drains
+// buffered events to the handler, and waits for the in-flight handler
+// invocation to return. Consequently the handler MUST NOT call Close
+// synchronously (deadlock) — trigger shutdown from another goroutine and
+// return. Events emitted concurrently with Close (including terminal
+// session-refresh or drain events from in-flight background work) may be
+// dropped; every drop is counted, and totals are logged while the
+// dispatcher runs plus once at shutdown — drops occurring after that
+// final report are counted but not logged. Handler-panic recovery and
+// the final drop report use the configured Logger, so a Logger that
+// blocks can stall delivery and delay Close.
+//
+// Parameters:
+//   - handler: Function called with each cluster event
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	helix.WithOnClusterEvent(func(ev types.ClusterEvent) {
+//	    switch ev.Kind {
+//	    case types.EventWriteDegraded, types.EventCircuitBreakerOpen:
+//	        alerting.Page("helix cluster issue",
+//	            "kind", string(ev.Kind),
+//	            "cluster", string(ev.Cluster),
+//	            "reason", ev.Reason,
+//	        )
+//	    case types.EventReplayDropped, types.EventMirrorReplayDropped:
+//	        alerting.Page("helix potential data loss", "error", ev.Err)
+//	    }
+//	})
+func WithOnClusterEvent(handler ClusterEventHandler) Option {
+	return func(c *ClientConfig) {
+		c.OnClusterEvent = handler
 	}
 }
 
