@@ -142,17 +142,21 @@ func defaultMirrorOptions(config *ClientConfig) []mirror.Option {
 
 // mirrorReplayOnError returns a mirror.ErrorHandler that pushes failed
 // captures onto config.MirrorReplayer; if Enqueue itself fails, the
-// existing OnReplayDropped callback fires and a mirror-replay-dropped
-// cluster event is emitted, so mirror and primary replay share one
-// alerting path.
+// existing OnReplayDropped callback fires, the optional
+// [types.MirrorReplayMetrics] counter is incremented, and a
+// mirror-replay-dropped cluster event is emitted, so mirror and primary
+// replay share one alerting path.
 //
 // Caller-supplied [mirror.Option] values are applied after this handler, so
-// a caller's own mirror.WithOnError replaces it entirely — taking both the
-// replay enqueue and the event with it.
+// a caller's own mirror.WithOnError replaces it entirely — taking the
+// replay enqueue, the metric, and the event with it.
 func mirrorReplayOnError(config *ClientConfig) mirror.ErrorHandler {
 	replayer := config.MirrorReplayer
 	logger := config.Logger
 	onDropped := config.OnReplayDropped
+	// Same type-assertion pattern as defaultMirrorOptions: the counter is
+	// nil (and skipped) when the collector does not opt in.
+	mrm, _ := config.Metrics.(types.MirrorReplayMetrics)
 	// The dispatcher is created before mirror setup, so capturing it here
 	// is safe; it is nil when no handler is registered and no-ops then.
 	events := config.events
@@ -168,6 +172,9 @@ func mirrorReplayOnError(config *ClientConfig) mirror.ErrorHandler {
 		)
 		if onDropped != nil {
 			onDropped(p, enqErr)
+		}
+		if mrm != nil {
+			mrm.IncMirrorReplayDropped()
 		}
 		events.EmitClusterEvent(types.ClusterEvent{
 			Kind:   types.EventMirrorReplayDropped,

@@ -237,3 +237,140 @@ func TestClusterEvents_SuccessfulConstructionInjectsBothSlotsBeforeProbes(t *tes
 	require.False(t, wsSpy.violation.Load(),
 		"a recovery-probe observation ran before the emitter was installed — injection must precede probe launch")
 }
+
+// clusterEventMetricsSpy extends mockMetricsCollector with the optional
+// types.ClusterEventMetrics method. Local spy: internal helix tests
+// cannot import test/testutil (import cycle), the same workaround as
+// mockMetricsCollector itself.
+type clusterEventMetricsSpy struct {
+	mockMetricsCollector
+
+	eventsDropped atomic.Int64
+}
+
+func (m *clusterEventMetricsSpy) AddClusterEventsDropped(n int) {
+	m.eventsDropped.Add(int64(n))
+}
+
+// TestClusterEvents_DropMetricWiredThroughConstructor proves the
+// production wiring end to end: a collector passed via WithMetrics that
+// implements types.ClusterEventMetrics must receive the dispatcher's drop
+// total without the test ever assigning the dispatcher's metrics field —
+// removing the createEventDispatcher attachment must fail this test. The
+// handler is wedged so the dispatcher goroutine cannot reconcile, the
+// buffer is overflowed, and Close performs the final reconcile.
+func TestClusterEvents_DropMetricWiredThroughConstructor(t *testing.T) {
+	m := &clusterEventMetricsSpy{}
+	block := make(chan struct{})
+	first := make(chan struct{})
+	var once sync.Once
+
+	var capturedCfg *ClientConfig
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithMetrics(m),
+		WithOnClusterEvent(func(types.ClusterEvent) {
+			once.Do(func() { close(first) })
+			<-block // wedge the consumer
+		}),
+		WithConfigCaptureForTest(&capturedCfg),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, capturedCfg)
+	d := capturedCfg.events
+	require.NotNil(t, d)
+
+	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventFailover})
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never entered")
+	}
+	for range eventBufferSize + 10 {
+		d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventReplayDropped})
+	}
+	require.GreaterOrEqual(t, d.dropped.Load(), uint64(10), "overflow must be counted")
+	require.Zero(t, m.eventsDropped.Load(),
+		"the metric must not be written from the emit hot path")
+
+	close(block)
+	client.Close()
+	require.Equal(t, d.dropped.Load(), uint64(m.eventsDropped.Load()),
+		"Close must reconcile the full internal drop total into the WithMetrics collector")
+}
+
+// adaptiveMetricsSpy extends mockMetricsCollector with the optional
+// types.AdaptiveWriteMetrics methods. Local spy for the same
+// import-cycle reason as clusterEventMetricsSpy.
+type adaptiveMetricsSpy struct {
+	mockMetricsCollector
+
+	mu            sync.Mutex
+	degradedState map[types.ClusterID]bool
+	degraded      map[types.ClusterID]int64
+	recovered     map[types.ClusterID]int64
+}
+
+func (m *adaptiveMetricsSpy) SetWriteDegraded(cluster types.ClusterID, degraded bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.degradedState == nil {
+		m.degradedState = make(map[types.ClusterID]bool)
+	}
+	m.degradedState[cluster] = degraded
+}
+
+func (m *adaptiveMetricsSpy) IncWriteDegraded(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.degraded == nil {
+		m.degraded = make(map[types.ClusterID]int64)
+	}
+	m.degraded[cluster]++
+}
+
+func (m *adaptiveMetricsSpy) IncWriteRecovered(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recovered == nil {
+		m.recovered = make(map[types.ClusterID]int64)
+	}
+	m.recovered[cluster]++
+}
+
+func (m *adaptiveMetricsSpy) snapshot(cluster types.ClusterID) (state bool, degraded, recovered int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.degradedState[cluster], m.degraded[cluster], m.recovered[cluster]
+}
+
+// TestClusterEvents_AdaptiveWriteMetricsAutoInjectedThroughClient proves
+// metric auto-injection through the production constructor: an
+// AdaptiveDualWrite built WITHOUT WithAdaptiveMetrics must record its
+// transitions into the WithMetrics collector after NewCQLClient threads
+// it in via autoInjectMetricsAndLogger — not only when a collector is
+// handed to the policy directly.
+func TestClusterEvents_AdaptiveWriteMetricsAutoInjectedThroughClient(t *testing.T) {
+	m := &adaptiveMetricsSpy{}
+	strategy := policy.NewAdaptiveDualWrite()
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(strategy),
+		WithMetrics(m),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// ForceDegrade/ForceRecover record their metrics synchronously before
+	// returning, so the assertions need no waiting.
+	strategy.ForceDegrade(types.ClusterA)
+	state, degraded, recovered := m.snapshot(types.ClusterA)
+	require.True(t, state, "auto-injected collector must receive the degraded gauge")
+	require.Equal(t, int64(1), degraded)
+	require.Zero(t, recovered)
+
+	strategy.ForceRecover(types.ClusterA)
+	state, degraded, recovered = m.snapshot(types.ClusterA)
+	require.False(t, state, "recovery must flip the gauge back to healthy")
+	require.Equal(t, int64(1), degraded)
+	require.Equal(t, int64(1), recovered)
+}

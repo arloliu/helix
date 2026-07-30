@@ -166,6 +166,45 @@ func (m *NopMetrics) IncWriteSkipped(_ types.ClusterID) {}
 var _ types.StrictMetrics = (*NopMetrics)(nil)
 
 // ----------------------
+// Adaptive write transitions (optional types.AdaptiveWriteMetrics)
+// ----------------------
+
+// SetWriteDegraded discards the metric.
+func (m *NopMetrics) SetWriteDegraded(_ types.ClusterID, _ bool) {}
+
+// IncWriteDegraded discards the metric.
+func (m *NopMetrics) IncWriteDegraded(_ types.ClusterID) {}
+
+// IncWriteRecovered discards the metric.
+func (m *NopMetrics) IncWriteRecovered(_ types.ClusterID) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.AdaptiveWriteMetrics interface so embedders pick up no-op coverage.
+var _ types.AdaptiveWriteMetrics = (*NopMetrics)(nil)
+
+// ----------------------
+// Cluster event dispatcher (optional types.ClusterEventMetrics)
+// ----------------------
+
+// AddClusterEventsDropped discards the metric.
+func (m *NopMetrics) AddClusterEventsDropped(_ int) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.ClusterEventMetrics interface so embedders pick up no-op coverage.
+var _ types.ClusterEventMetrics = (*NopMetrics)(nil)
+
+// ----------------------
+// Mirror replay (optional types.MirrorReplayMetrics)
+// ----------------------
+
+// IncMirrorReplayDropped discards the metric.
+func (m *NopMetrics) IncMirrorReplayDropped() {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.MirrorReplayMetrics interface so embedders pick up no-op coverage.
+var _ types.MirrorReplayMetrics = (*NopMetrics)(nil)
+
+// ----------------------
 // Recovery probe (optional types.RecoveryProbeMetrics)
 // ----------------------
 

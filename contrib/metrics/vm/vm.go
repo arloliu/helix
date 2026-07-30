@@ -181,6 +181,14 @@ type Collector struct {
 	writeDurationA *metrics.PrometheusHistogram
 	writeDurationB *metrics.PrometheusHistogram
 
+	// Adaptive write transitions (optional types.AdaptiveWriteMetrics)
+	writeDegradedStateA  atomic.Int64
+	writeDegradedStateB  atomic.Int64
+	writeDegradedTotalA  *metrics.Counter
+	writeDegradedTotalB  *metrics.Counter
+	writeRecoveredTotalA *metrics.Counter
+	writeRecoveredTotalB *metrics.Counter
+
 	// Failover metrics
 	failoverAToB *metrics.Counter
 	failoverBToA *metrics.Counter
@@ -229,6 +237,12 @@ type Collector struct {
 	mirrorExecDuration   *metrics.PrometheusHistogram
 	mirrorQueueDepth     atomic.Int64
 	mirrorEnabled        atomic.Int64
+
+	// Mirror replay drops (optional types.MirrorReplayMetrics)
+	mirrorReplayDropped *metrics.Counter
+
+	// Cluster event dispatcher drops (optional types.ClusterEventMetrics)
+	clusterEventsDropped *metrics.Counter
 }
 
 // New creates a new VictoriaMetrics-based metrics collector.
@@ -302,6 +316,19 @@ func (c *Collector) initMetrics() {
 	c.writeDurationA = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nA), c.durationBuckets)
 	c.writeDurationB = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nB), c.durationBuckets)
 
+	// Adaptive write transitions (optional types.AdaptiveWriteMetrics) -
+	// gauge with callbacks, plus per-direction transition counters
+	c.set.NewGauge(fmt.Sprintf(`%s_write_degraded{cluster="%s"}`, p, nA), func() float64 {
+		return float64(c.writeDegradedStateA.Load())
+	})
+	c.set.NewGauge(fmt.Sprintf(`%s_write_degraded{cluster="%s"}`, p, nB), func() float64 {
+		return float64(c.writeDegradedStateB.Load())
+	})
+	c.writeDegradedTotalA = c.set.NewCounter(fmt.Sprintf(`%s_write_degraded_total{cluster="%s"}`, p, nA))
+	c.writeDegradedTotalB = c.set.NewCounter(fmt.Sprintf(`%s_write_degraded_total{cluster="%s"}`, p, nB))
+	c.writeRecoveredTotalA = c.set.NewCounter(fmt.Sprintf(`%s_write_recovered_total{cluster="%s"}`, p, nA))
+	c.writeRecoveredTotalB = c.set.NewCounter(fmt.Sprintf(`%s_write_recovered_total{cluster="%s"}`, p, nB))
+
 	// Failover metrics
 	c.failoverAToB = c.set.NewCounter(fmt.Sprintf(`%s_failover_total{from="%s",to="%s"}`, p, nA, nB))
 	c.failoverBToA = c.set.NewCounter(fmt.Sprintf(`%s_failover_total{from="%s",to="%s"}`, p, nB, nA))
@@ -366,6 +393,12 @@ func (c *Collector) initMetrics() {
 	c.set.NewGauge(fmt.Sprintf(`%s_mirror_enabled`, p), func() float64 {
 		return float64(c.mirrorEnabled.Load())
 	})
+
+	// Mirror replay drops (optional types.MirrorReplayMetrics)
+	c.mirrorReplayDropped = c.set.NewCounter(fmt.Sprintf(`%s_mirror_replay_dropped_total`, p))
+
+	// Cluster event dispatcher drops (optional types.ClusterEventMetrics)
+	c.clusterEventsDropped = c.set.NewCounter(fmt.Sprintf(`%s_cluster_events_dropped_total`, p))
 }
 
 func (c *Collector) Set() *metrics.Set {
@@ -476,6 +509,41 @@ func (c *Collector) ObserveWriteDuration(cluster types.ClusterID, seconds float6
 		c.writeDurationA.Update(seconds)
 	} else {
 		c.writeDurationB.Update(seconds)
+	}
+}
+
+// SetWriteDegraded sets the degraded-state gauge for a cluster
+// (1=degraded fire-and-forget, 0=healthy synchronous). Part of the
+// optional types.AdaptiveWriteMetrics interface.
+func (c *Collector) SetWriteDegraded(cluster types.ClusterID, degraded bool) {
+	val := int64(0)
+	if degraded {
+		val = 1
+	}
+	if cluster == types.ClusterA {
+		c.writeDegradedStateA.Store(val)
+	} else {
+		c.writeDegradedStateB.Store(val)
+	}
+}
+
+// IncWriteDegraded increments the counter when AdaptiveDualWrite moves a
+// cluster into degraded (fire-and-forget) mode.
+func (c *Collector) IncWriteDegraded(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.writeDegradedTotalA.Inc()
+	} else {
+		c.writeDegradedTotalB.Inc()
+	}
+}
+
+// IncWriteRecovered increments the counter when AdaptiveDualWrite moves a
+// cluster back to healthy (synchronous) mode.
+func (c *Collector) IncWriteRecovered(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.writeRecoveredTotalA.Inc()
+	} else {
+		c.writeRecoveredTotalB.Inc()
 	}
 }
 
@@ -682,3 +750,13 @@ func (c *Collector) SetMirrorEnabled(enabled bool) {
 // Compile-time assertion that *Collector implements the optional
 // types.MirrorMetrics interface.
 var _ types.MirrorMetrics = (*Collector)(nil)
+
+// IncMirrorReplayDropped increments the counter when a failed mirror
+// write cannot be enqueued for mirror replay. Part of the optional
+// types.MirrorReplayMetrics interface.
+func (c *Collector) IncMirrorReplayDropped() { c.mirrorReplayDropped.Inc() }
+
+// AddClusterEventsDropped adds n to the cluster event drop counter.
+// Called by the event dispatcher with the delta accumulated since the
+// previous call. Part of the optional types.ClusterEventMetrics interface.
+func (c *Collector) AddClusterEventsDropped(n int) { c.clusterEventsDropped.Add(n) }

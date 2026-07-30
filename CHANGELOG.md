@@ -28,6 +28,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitter is always invoked outside policy state locks.
 - `policy.AdaptiveDualWrite` now logs degrade/recover transitions
   (previously silent) and emits a recovery event from `Reset`.
+- `types.AdaptiveWriteMetrics` (optional `MetricsCollector` interface):
+  `AdaptiveDualWrite` records a degraded-state gauge and per-direction
+  transition counters on collectors that implement it. `contrib/metrics/vm`
+  exposes them as `{prefix}_write_degraded{cluster}` (1=degraded, 0=healthy),
+  `{prefix}_write_degraded_total{cluster}`, and
+  `{prefix}_write_recovered_total{cluster}`.
+- `types.ClusterEventMetrics` (optional `MetricsCollector` interface): the
+  cluster event dispatcher reconciles its drop total into collectors that
+  implement it — from the dispatcher goroutine, never from the read/write
+  hot path — so applications can alert on event loss.
+  `contrib/metrics/vm` exposes it as
+  `{prefix}_cluster_events_dropped_total`.
+- `types.MirrorReplayMetrics` (optional `MetricsCollector` interface): the
+  internal mirror error handler counts mirror captures that could not be
+  enqueued for mirror replay. `contrib/metrics/vm` exposes it as
+  `{prefix}_mirror_replay_dropped_total` (no cluster label — mirror targets
+  a logical sink). A caller-supplied `mirror.WithOnError` replaces the
+  internal handler and suppresses this metric along with the event.
+  With these three interfaces every cluster event kind has a metric
+  counterpart; existing by-hand `MetricsCollector` implementations remain
+  source-compatible and opt in by adding the methods.
 - `contrib/metrics/vm`: `WithDurationBuckets` option (validated: strictly
   increasing, finite, positive values) and `DefaultDurationBuckets()`
   accessor for the default bucket bounds.

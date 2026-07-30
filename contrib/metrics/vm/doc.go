@@ -49,6 +49,12 @@
 //     dispatched to a degraded cluster
 //   - {prefix}_write_dropped_total{cluster} - Counter of fire-and-forget writes
 //     never attempted because the concurrency limit was full
+//   - {prefix}_write_degraded{cluster} - Gauge of AdaptiveDualWrite's write
+//     mode (1=degraded fire-and-forget, 0=healthy synchronous)
+//   - {prefix}_write_degraded_total{cluster} - Counter of healthy-to-degraded
+//     transitions
+//   - {prefix}_write_recovered_total{cluster} - Counter of degraded-to-healthy
+//     transitions
 //   - {prefix}_write_duration_seconds{cluster} - Histogram of write latencies
 //
 // Failover:
@@ -89,10 +95,18 @@
 //   - {prefix}_mirror_exec_duration_seconds - Histogram of mirror write latencies
 //   - {prefix}_mirror_queue_depth - Gauge of current engine queue depth
 //   - {prefix}_mirror_enabled - Gauge (1=mirroring active, 0=inactive)
+//   - {prefix}_mirror_replay_dropped_total - Counter of failed mirror writes
+//     that could not be enqueued for mirror replay (no cluster label: mirror
+//     payloads target a logical sink)
 //
-// Two cluster events have no metric counterpart here: AdaptiveDualWrite's
-// degrade/recover transitions and mirror replay-enqueue drops. See
-// docs/cluster-events.md.
+// Cluster events (recorded when helix.WithOnClusterEvent is registered):
+//   - {prefix}_cluster_events_dropped_total - Counter of cluster events
+//     dropped by the dispatcher (handler too slow, or emission racing Close).
+//     Reconciled from the dispatcher goroutine, so it can briefly lag the
+//     internal count while the handler is blocked.
+//
+// Every cluster event kind has a metric counterpart; see
+// docs/cluster-events.md for the kind-to-metric table.
 //
 // # Duration Histograms
 //
