@@ -11,15 +11,11 @@ affected read. See [Per-operation kinds](#per-operation-kinds).
 
 This is a push-based, best-effort notification stream for driving alerting,
 paging, or an operational dashboard. A handler that cannot keep up loses
-events; a metrics counter does not. Where an event has a metric counterpart,
+events; a metrics counter does not. Every kind has a metric counterpart —
 read rates and current state from the metric and use the event only as the
-push notification.
-
-Three kinds have no metric counterpart: `write_degraded`, `write_recovered`,
-and `mirror_replay_dropped`. For those the event is the only machine-readable
-signal, and a dropped event cannot be recovered from metrics. See
-[Events and Metrics](#events-and-metrics) for the full comparison, including
-one kind whose event and metric count different things.
+push notification. See [Events and Metrics](#events-and-metrics) for the full
+kind-to-metric table, including one kind whose event and metric count
+different things.
 
 ---
 
@@ -61,14 +57,20 @@ for you.
 reaches only the write strategy and the failover policy, both unset by
 default, and most other kinds come from a component that is also optional. A
 dual-cluster client configured with nothing but the handler can produce only
-`failover`, plus `read_divergence` on queries that opt into FallbackRead. Every
-other kind stays silent, and nothing tells you so: registering a handler for an
-unreachable kind is not an error and produces no warning. From the handler's
-side, "receiving nothing" and "everything is healthy" look identical.
+`failover`, plus `read_divergence` on queries that opt into FallbackRead.
+Every other kind stays silent. Registering a handler while some kinds are
+unreachable is not an error, but the constructor logs one Info line listing
+the unreachable kinds (field `unreachableKinds`), so the gap is visible at
+startup instead of during an incident. At runtime, "receiving nothing" and
+"everything is healthy" still look identical from the handler's side —
+`read_divergence` is treated as reachable in dual-cluster mode because
+FallbackRead is a per-read opt-in the constructor cannot see, and
+`mirror_replay_dropped` is listed as reachable whenever `WithMirror` +
+`WithMirrorReplayer` are set, even though a caller-supplied
+`mirror.WithOnError` (opaque at construction) also suppresses it.
 
-(The one related warning Helix does log is unrelated to events: a dual-cluster
-client built without a `Replayer` logs "dual-cluster mode with no Replayer
-configured" at construction.)
+(Separately, a dual-cluster client built without a `Replayer` still logs the
+"dual-cluster mode with no Replayer configured" warning at construction.)
 
 The **Requires** column in the next section lists the configuration each kind
 needs. Check it against your own options before you build an alert on a kind.
@@ -94,15 +96,15 @@ and mirror events work in either mode.
 | Kind | Requires | Fires when | Populated fields | Suggested action |
 |---|---|---|---|---|
 | `failover` (`EventFailover`) | Nothing — on by default. A configured `FailoverPolicy` can gate it. | A read fails on the selected cluster and is retried on the alternative cluster. Fires **once per failing read**, not once per outage. | `Cluster` (= `ToCluster`), `FromCluster`, `ToCluster`, `Err` | Investigate the `FromCluster` if it recurs. Read the rate from `{prefix}_failover_total`, not from event counts. |
-| `read_divergence` (`EventReadDivergence`) | A read that opted into FallbackRead: `Query.FallbackRead()`, `helix.WithFallbackRead(ctx)`, or `helix.WithDefaultFallbackRead(true)`. | A fallback read finds the row on the alternative cluster after the selected cluster returned not-found. Fires **once per divergent read**. | `Cluster` (the cluster missing the row), `Reason` | Watch for a rising rate — it signals replay lag on `Cluster`. Read the rate from `{prefix}_read_divergence_total`. |
+| `read_divergence` (`EventReadDivergence`) | A read that opted into FallbackRead: `Query.FallbackRead()`, `helix.WithFallbackRead(ctx)`, or `helix.WithDefaultFallbackRead(true)`. | A fallback read finds the row on the alternative cluster after the selected cluster returned not-found. Fires **once per divergent read**. | `Cluster` (the cluster missing the row), `Reason` (always `"row found on alternative cluster after not-found"`) | Watch for a rising rate — it signals replay lag on `Cluster`. Read the rate from `{prefix}_read_divergence_total`. |
 | `circuit_breaker_open` (`EventCircuitBreakerOpen`) | `helix.WithFailoverPolicy` holding a `policy.CircuitBreaker` or `policy.LatencyCircuitBreaker`. `policy.ActiveFailover` produces no events. | A circuit breaker trips open for a cluster. | `Cluster`, `Count` (consecutive failures at trip) | Page — reads are being routed away from `Cluster`. |
 | `circuit_breaker_closed` (`EventCircuitBreakerClosed`) | Same as `circuit_breaker_open`. | A previously open circuit breaker closes. `Reason` `"operation succeeded"` means a read on that cluster succeeded — this is always the reason on a success-driven close. `Reason` `"reset timeout elapsed"` means a subsequent failure observed that the gap since the last recorded failure had exceeded `resetTimeout`; this reason only ever appears on a failure-driven close, on the *next* `RecordFailure` that observes the expired interval, not when the timeout itself elapses. See [Circuit Breaker Close Timing](#circuit-breaker-close-timing). | `Cluster`, `Reason` (`"operation succeeded"`, or `"reset timeout elapsed"`) | Split by `Reason`. `"operation succeeded"`: the cluster served a read; clear the alert. `"reset timeout elapsed"`: the open span ended on a timer with no successful read, so the cluster is not known to be healthy; keep the alert. |
-| `write_degraded` (`EventWriteDegraded`) | `helix.WithWriteStrategy(policy.NewAdaptiveDualWrite(...))`. | `AdaptiveDualWrite` moves a cluster into degraded (fire-and-forget) mode. | `Cluster`, `Count` (slow-strike count), `Reason` (`"slow-strike threshold reached"`, or `"manual"` for `ForceDegrade`) | Page — writes to `Cluster` are no longer synchronous and rely on replay. No metric reports this; the event is the only signal. |
-| `write_recovered` (`EventWriteRecovered`) | Same as `write_degraded`. | `AdaptiveDualWrite` moves a cluster back to healthy (synchronous) mode. | `Cluster`, `Reason` (`"fast-strike recovery"`, or `"manual"` / `"manual reset"` for `ForceRecover` / `Reset`) | Clear any related alert. `"fast-strike recovery"` covers both a fast write from ordinary traffic and a successful recovery probe; the two are not distinguishable from the event. No metric reports this either. |
+| `write_degraded` (`EventWriteDegraded`) | `helix.WithWriteStrategy(policy.NewAdaptiveDualWrite(...))`. | `AdaptiveDualWrite` moves a cluster into degraded (fire-and-forget) mode. | `Cluster`, `Count` (slow-strike count), `Reason` (`"slow-strike threshold reached"`, or `"manual"` for `ForceDegrade`) | Page — writes to `Cluster` are no longer synchronous and rely on replay. Read current state from the `{prefix}_write_degraded` gauge and transitions from `{prefix}_write_degraded_total`. |
+| `write_recovered` (`EventWriteRecovered`) | Same as `write_degraded`. | `AdaptiveDualWrite` moves a cluster back to healthy (synchronous) mode. | `Cluster`, `Reason` (`"fast-strike recovery"`, or `"manual"` / `"manual reset"` for `ForceRecover` / `Reset`) | Clear any related alert. `"fast-strike recovery"` covers both a fast write from ordinary traffic and a successful recovery probe; the two are not distinguishable from the event. The `{prefix}_write_degraded` gauge returns to 0 and `{prefix}_write_recovered_total` increments. |
 | `drain_entered` (`EventDrainEntered`) | `helix.WithTopologyWatcher`. | A cluster enters drain mode via the topology watcher. | `Cluster` | Confirm this matches an expected maintenance window. |
 | `drain_exited` (`EventDrainExited`) | Same as `drain_entered`. | A cluster exits drain mode. | `Cluster` | Informational. |
 | `replay_dropped` (`EventReplayDropped`) | A configured replayer: `helix.WithReplayer` or `helix.WithAutoMemoryWorker`. **Without one, a failed write is lost and no event fires at all.** | A failed write cannot be enqueued for replay (queue full or unavailable) — potential data loss. | `Cluster` (replay target), `Err` (enqueue error) | Page immediately; this is the primary data-loss signal for the enqueue step. For payload access (not just the fact of a drop), also register `helix.WithOnReplayDropped`. |
-| `mirror_replay_dropped` (`EventMirrorReplayDropped`) | `helix.WithMirror` **and** `helix.WithMirrorReplayer`, and no caller-supplied `mirror.WithOnError`. | A failed mirror write cannot be enqueued for mirror replay — potential mirror-target data loss. `Cluster` is unset: mirror payloads target a logical sink, not one of this client's clusters. | `Err` (enqueue error), `Reason` | Page; treat like `replay_dropped` but for the mirror destination. No metric reports this. See [Relationship to Other Hooks](#relationship-to-other-hooks) for when this event does not fire. |
+| `mirror_replay_dropped` (`EventMirrorReplayDropped`) | `helix.WithMirror` **and** `helix.WithMirrorReplayer`, and no caller-supplied `mirror.WithOnError`. | A failed mirror write cannot be enqueued for mirror replay — potential mirror-target data loss. `Cluster` is unset: mirror payloads target a logical sink, not one of this client's clusters. | `Err` (enqueue error), `Reason` | Page; treat like `replay_dropped` but for the mirror destination. `{prefix}_mirror_replay_dropped_total` counts the same drops. See [Relationship to Other Hooks](#relationship-to-other-hooks) for when this event does not fire. |
 | `session_refresh_attempt` (`EventSessionRefreshAttempt`) | `helix.WithAutoRefresh` **and** `helix.WithSessionRefresher`. | The auto-refresh detector decides a cluster's session is permanently dead and invokes the `SessionRefresher`. | `Cluster`, `Count` (qualifying consecutive-failure count) | Informational; a refresh is starting. |
 | `session_refresh_success` (`EventSessionRefreshSuccess`) | Same as `session_refresh_attempt`. | A session refresh attempt succeeds. | `Cluster` | Informational; clear any related alert. |
 | `session_refresh_error` (`EventSessionRefreshError`) | Same as `session_refresh_attempt`. | A session refresh attempt fails. | `Cluster`, `Err` | Page — the cluster's session is still considered dead. |
@@ -121,6 +123,13 @@ notifications that an outage has started.
 
 Every other kind fires on a state change, so its volume is bounded by how
 often the cluster's state actually flips.
+
+The 128-slot buffer is shared across **all** kinds, not partitioned per kind.
+A `failover` / `read_divergence` storm during an outage can therefore evict a
+rare state-transition event — exactly the window in which a `write_degraded`
+is most likely to fire. If you miss one, its metric counterpart still records
+it: the `{prefix}_write_degraded` gauge and the transition counters survive
+any event loss.
 
 ### Circuit Breaker Close Timing
 
@@ -170,21 +179,27 @@ the breaker ends up open.
 
 ### What you can observe about drops
 
-Drops are counted exactly, but the count is internal. There is no exported
-accessor and no metric, so an application cannot alert on "my event stream is
-dropping events". Plan for that when you design alerting on this stream.
+Drops are counted exactly, and dispatcher drops are observable in two ways:
 
-What you do get:
+- **A metric.** When the configured collector implements the optional
+  `types.ClusterEventMetrics` interface (the bundled `contrib/metrics/vm`
+  collector does), the dispatcher's drop total is exposed as
+  `{prefix}_cluster_events_dropped_total`, so an application can alert on
+  "my event stream is dropping events". The counter is reconciled from the
+  dispatcher goroutine — after each delivered event and once more at
+  shutdown — never from the read/write hot path, so it can briefly lag the
+  internal count while the handler is blocked. Drops occurring after the
+  shutdown reconciliation are counted internally but never reach the metric.
+- **A log line.** Dispatcher drops (handler too slow, or emission racing
+  `Close`) produce a `Warn` line through the configured `Logger` carrying the
+  running total. The line is not written per drop or on a schedule: it is
+  written on the first drop and then only once the total has at least doubled
+  since the last line, plus once more at shutdown. After a million drops the
+  last line may read 524288.
 
-- **Dispatcher drops** (handler too slow, or emission racing `Close`) produce a
-  `Warn` log line through the configured `Logger` carrying the running total.
-  The line is not written per drop or on a schedule: it is written on the first
-  drop and then only once the total has at least doubled since the last line,
-  plus once more at shutdown. After a million drops the last line may read
-  524288.
-- **Policy-side drops** produce nothing at all. The per-policy queue described
-  in [Standalone Policy Usage](#standalone-policy-usage) counts its drops
-  internally and never logs them.
+**Policy-side drops** produce nothing at all. The per-policy queue described
+in [Standalone Policy Usage](#standalone-policy-usage) counts its drops
+internally and never logs them or exposes them as a metric.
 
 ### Ordering scope
 
@@ -249,10 +264,11 @@ helix.WithOnClusterEvent(func(ev types.ClusterEvent) {
 
 Events emitted concurrently with `Close` — including terminal
 session-refresh or drain events from in-flight background work — may be
-dropped. Every drop is still counted internally. Totals are logged while the
-dispatcher is running and once more at shutdown; drops that occur after that
-final report are counted but not logged, since there is no dispatcher
-goroutine left to log them.
+dropped. Every drop is still counted internally. Totals are logged (and
+reconciled into `{prefix}_cluster_events_dropped_total`) while the dispatcher
+is running and once more at shutdown; drops that occur after that final
+report are counted but neither logged nor reflected in the metric, since
+there is no dispatcher goroutine left to do either.
 
 The final drop report and handler-panic recovery both use the configured
 `Logger`. A `Logger` call that blocks therefore delays delivery and, in turn,
@@ -271,15 +287,14 @@ fits what you need:
 | `helix.WithOnReplayDropped` | Access to the full dropped `types.ReplayPayload` (query, args, target cluster) — not just the fact that a drop happened. It covers **both** replay paths: it fires alongside `EventReplayDropped` for a primary-path drop and alongside `EventMirrorReplayDropped` for a mirror-path drop. Nothing in the callback signature tells the two apart — mirror payloads carry a fixed conventional `TargetCluster`, so a handler that re-drives dropped payloads against the primary clusters would also re-drive mirror-destined ones. |
 | `mirror.WithOnError` | Full control over mirror write failures. Supplying this option **replaces** Helix's internal mirror error handler entirely — and with it, `EventMirrorReplayDropped` stops firing, because that event is emitted by the internal handler you just replaced. This is existing "caller options win" behavior, not a special case for events. |
 | `replay.WithOnDrop` | Worker-side permanent drops (a replay exhausted its retry budget), a different failure mode from enqueue-time drops. |
-| A `types.MetricsCollector` (e.g. `contrib/metrics/vm`) | Rates, current state, and dashboards, for the kinds that have a metric counterpart. See [Events and Metrics](#events-and-metrics). |
+| A `types.MetricsCollector` (e.g. `contrib/metrics/vm`) | Rates, current state, and dashboards — every kind has a metric counterpart. See [Events and Metrics](#events-and-metrics). |
 
 ---
 
 ## Events and Metrics
 
 Metrics do not lose anything, and events do, so a metric is the better source
-wherever one exists. But the coverage is not complete, and one pair does not
-line up.
+wherever one exists. Every kind has one, but one pair does not line up.
 
 | Event kind | Metric counterpart |
 |---|---|
@@ -289,13 +304,16 @@ line up.
 | `drain_entered` / `drain_exited` | `{prefix}_drain_mode_entered_total{cluster}` / `{prefix}_drain_mode_exited_total{cluster}`. |
 | `session_refresh_attempt` / `_success` / `_error` | `{prefix}_session_refresh_attempt_total{cluster}` and siblings. |
 | `replay_dropped` | `{prefix}_replay_dropped_total{cluster}` — **counts more than the event does**, see below. |
-| `write_degraded` / `write_recovered` | **None.** `AdaptiveDualWrite` writes no transition counter and no degraded-state gauge. `{prefix}_write_async_total` is the nearest proxy, but it counts individual fire-and-forget writes, so it needs live write traffic and reports neither a transition count nor current state. |
-| `mirror_replay_dropped` | **None.** `{prefix}_mirror_enqueue_dropped_total` is a different failure — the mirror engine's own ring buffer rejecting a capture, not the replay enqueue failing. |
+| `write_degraded` / `write_recovered` | The `{prefix}_write_degraded{cluster}` gauge (1=degraded, 0=healthy) plus the `{prefix}_write_degraded_total{cluster}` / `{prefix}_write_recovered_total{cluster}` transition counters, written at the same transitions that emit the events. `{prefix}_write_async_total` remains the per-write view: it counts individual fire-and-forget writes, not transitions. |
+| `mirror_replay_dropped` | `{prefix}_mirror_replay_dropped_total` (no cluster label — mirror targets a logical sink) — same call site, same meaning. Distinct from `{prefix}_mirror_enqueue_dropped_total`, which is the mirror engine's own ring buffer rejecting a capture, not the replay enqueue failing. |
 
-For the three kinds with no counterpart, the event is the only machine-readable
-signal, and it is lost if the handler falls behind. Two of them —
-`write_degraded` and `mirror_replay_dropped` — are what the Quick Start pages
-on. If you need a durable record, log them from inside the handler.
+The transition counters and the degraded-state gauge require a
+`types.MetricsCollector` that implements the optional
+`types.AdaptiveWriteMetrics` / `types.MirrorReplayMetrics` interfaces; the
+bundled `contrib/metrics/vm` collector implements both. A collector that does
+not opt in silently skips them, in which case the event is still delivered —
+if you need a durable record with such a collector, log the events from
+inside the handler.
 
 **`replay_dropped` and `{prefix}_replay_dropped_total` do not agree.** The
 event fires only for an enqueue-time drop in the client. The metric is

@@ -227,7 +227,8 @@ client, err := helix.NewCQLClient(sessionA, sessionB,
 ```
 
 Which kinds you receive depends on what else you configure: most are produced
-by an optional component and stay silent when it is absent, with no warning.
+by an optional component and stay silent when it is absent. The constructor
+logs one Info line listing any kinds left unreachable by the configuration.
 The [Cluster Events Guide](docs/cluster-events.md) has a per-kind
 prerequisites table, plus the full event reference, delivery/shutdown
 semantics, and standalone policy usage.

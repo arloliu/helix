@@ -1457,6 +1457,49 @@ func Example_errorHandling() {
 	}
 }
 
+// ExampleWithOnClusterEvent demonstrates registering a cluster event handler
+// alongside a component that produces events. Most kinds come from an
+// optional component — here the circuit-breaker failover policy produces the
+// circuit_breaker_open/_closed kinds — and the constructor logs any kinds
+// left unreachable by the rest of the configuration.
+func ExampleWithOnClusterEvent() {
+	// In real code, create proper gocql sessions wrapped with v1.NewSession() or v2.NewSession().
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		// circuit_breaker_open / _closed come from the failover policy,
+		// which is unset by default.
+		WithFailoverPolicy(policy.NewCircuitBreaker()),
+
+		WithOnClusterEvent(func(ev types.ClusterEvent) {
+			switch ev.Kind { //nolint:exhaustive // an alerting handler handles only the kinds it pages on
+			case types.EventCircuitBreakerOpen:
+				// Page: reads are being routed away from ev.Cluster.
+				_ = ev.Cluster
+			case types.EventFailover:
+				// A read failed over from ev.FromCluster to ev.ToCluster.
+				_ = ev.FromCluster
+			case types.EventReplayDropped:
+				// Potential data loss: a failed write could not be
+				// enqueued for replay.
+				_ = ev.Err
+			default:
+				// Ignore the kinds this application does not alert on.
+			}
+		}),
+	)
+	if err != nil {
+		// Handle error
+		return
+	}
+	defer client.Close()
+
+	// The handler now receives events asynchronously; it must not call
+	// client.Close() synchronously.
+	_ = client
+}
+
 // mockWriteStrategy is a configurable WriteStrategy for unit tests.
 // It returns the pre-set errA/errB values on every Execute call.
 type mockWriteStrategy struct {

@@ -13,6 +13,9 @@
 //   - Session Refresh: Manual or automatic recovery from permanently-dead sessions
 //     (cluster restart with port reassignment, DNS rotation) without rebuilding
 //     the client; see docs/session-refresh.md
+//   - Cluster Event Notifications: One WithOnClusterEvent handler receives a
+//     typed types.ClusterEvent stream for alerting on cluster-health
+//     transitions; see docs/cluster-events.md
 //   - Drop-in Replacement: Interface-based design mirrors gocql API
 //
 // # Basic Usage
@@ -141,6 +144,20 @@
 //	)
 //
 // See docs/session-refresh.md for the full guide.
+//
+// # Cluster Event Notifications
+//
+// WithOnClusterEvent registers one handler for a typed stream of
+// types.ClusterEvent values covering operationally significant transitions:
+// failover, read divergence, circuit breaker open/close, adaptive-write
+// degrade/recover, drain enter/exit, replay drops, mirror replay drops, and
+// session refresh. Delivery is asynchronous and best-effort — events never
+// block reads or writes, and the newest events are dropped when the handler
+// falls behind. Most kinds are produced by an optional component (a
+// circuit-breaker failover policy, an adaptive write strategy, a replayer, a
+// topology watcher, auto-refresh) and stay silent without it; the constructor
+// logs any unreachable kinds at startup. See the WithOnClusterEvent example
+// for wiring and docs/cluster-events.md for the full guide.
 //
 // # CAS/LWT Warning
 //
