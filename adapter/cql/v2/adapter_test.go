@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/arloliu/helix/adapter/cql"
-	v2 "github.com/arloliu/helix/adapter/cql/v2" //nolint:revive // required for v2_test package
+	v2 "github.com/arloliu/helix/adapter/cql/v2" //nolint:revive,nolintlint // goimports requires the alias for the v2 path element; revive calls it redundant
 	"github.com/arloliu/helix/types"
 )
 
