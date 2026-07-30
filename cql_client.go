@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -587,6 +588,97 @@ func createEventDispatcher(config *ClientConfig) {
 	}
 }
 
+// eventAware is the opt-in contract for emitter auto-injection. It is
+// shared by autoInjectEventEmitter and eventKindUnreachable so the
+// unreachable-kinds log derives reachability from the same assertion
+// that performs the wiring.
+type eventAware interface {
+	SetEventEmitter(types.ClusterEventEmitter)
+}
+
+// orderedClusterEventKinds lists every cluster event kind in the order
+// docs/cluster-events.md documents them. eventKindUnreachable's switch is
+// exhaustive-lint enforced, so adding a kind to types without classifying
+// it here fails lint.
+var orderedClusterEventKinds = []types.ClusterEventKind{
+	types.EventFailover,
+	types.EventReadDivergence,
+	types.EventCircuitBreakerOpen,
+	types.EventCircuitBreakerClosed,
+	types.EventWriteDegraded,
+	types.EventWriteRecovered,
+	types.EventDrainEntered,
+	types.EventDrainExited,
+	types.EventReplayDropped,
+	types.EventMirrorReplayDropped,
+	types.EventSessionRefreshAttempt,
+	types.EventSessionRefreshSuccess,
+	types.EventSessionRefreshError,
+}
+
+// eventKindUnreachable reports whether kind can never fire given the rest
+// of the configuration. Reachability mirrors the Requires column of
+// docs/cluster-events.md: most kinds come from an optional component, and
+// seven additionally require dual-cluster mode. read_divergence is treated
+// as reachable in dual-cluster mode because FallbackRead is a per-read
+// runtime opt-in the constructor cannot see. mirror_replay_dropped is
+// best-effort: a caller-supplied mirror.WithOnError also suppresses it,
+// but mirror options are opaque here.
+func eventKindUnreachable(kind types.ClusterEventKind, config *ClientConfig, dualCluster bool) bool {
+	switch kind {
+	case types.EventFailover, types.EventReadDivergence:
+		return !dualCluster
+	case types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed:
+		_, ok := config.FailoverPolicy.(eventAware)
+		return !ok || !dualCluster
+	case types.EventWriteDegraded, types.EventWriteRecovered:
+		_, ok := config.WriteStrategy.(eventAware)
+		return !ok || !dualCluster
+	case types.EventDrainEntered, types.EventDrainExited:
+		return config.TopologyWatcher == nil
+	case types.EventReplayDropped:
+		return !dualCluster || config.Replayer == nil
+	case types.EventMirrorReplayDropped:
+		return !config.mirrorTargetSet || config.MirrorReplayer == nil
+	case types.EventSessionRefreshAttempt, types.EventSessionRefreshSuccess, types.EventSessionRefreshError:
+		return !config.AutoRefresh.Enabled || config.SessionRefresher == nil
+	}
+
+	return false
+}
+
+// unreachableEventKinds returns the cluster event kinds that can never
+// fire given the rest of the configuration, in docs order.
+func unreachableEventKinds(config *ClientConfig, dualCluster bool) []string {
+	var kinds []string
+	for _, kind := range orderedClusterEventKinds {
+		if eventKindUnreachable(kind, config, dualCluster) {
+			kinds = append(kinds, string(kind))
+		}
+	}
+
+	return kinds
+}
+
+// logUnreachableEventKinds emits one construction-time Info line listing
+// the event kinds the registered handler can never receive, so a handler
+// written for an unconfigured kind is discovered at startup rather than
+// during an incident. No-op when every kind is reachable or no handler
+// is registered. Follows the "dual-cluster mode with no Replayer" warning
+// precedent: one concise line, not one per kind.
+func logUnreachableEventKinds(config *ClientConfig, dualCluster bool) {
+	if config.events == nil {
+		return
+	}
+	kinds := unreachableEventKinds(config, dualCluster)
+	if len(kinds) == 0 {
+		return
+	}
+	config.Logger.Info("cluster event handler registered but some kinds are unreachable with the current configuration - see docs/cluster-events.md for per-kind prerequisites",
+		"unreachableKinds", strings.Join(kinds, ","),
+	)
+}
+
 // startEventDelivery installs the emitter into the components that accept one
 // and starts the dispatcher's delivery goroutine. No-op when no handler is
 // registered.
@@ -611,10 +703,6 @@ func startEventDelivery(config *ClientConfig) {
 // constructor's last step that can fail and before any background goroutine
 // starts, so a component never observes a half-installed emitter.
 func autoInjectEventEmitter(config *ClientConfig) {
-	type eventAware interface {
-		SetEventEmitter(types.ClusterEventEmitter)
-	}
-
 	if config.WriteStrategy != nil {
 		if ws, ok := config.WriteStrategy.(eventAware); ok {
 			ws.SetEventEmitter(config.events)
@@ -787,6 +875,7 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// Must run before mirror setup: the mirror error handler captures the
 	// dispatcher by value when it is built below.
 	createEventDispatcher(config)
+	logUnreachableEventKinds(config, sessionB != nil)
 
 	// Auto-inject client metrics/logger into components that opt in via
 	// type-assertion-based interfaces (replay.Worker, AdaptiveDualWrite).

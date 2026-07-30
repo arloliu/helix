@@ -3,6 +3,7 @@ package helix
 import (
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -79,6 +80,164 @@ type emitterSpyPolicy struct {
 
 func (s *emitterSpyPolicy) SetEventEmitter(types.ClusterEventEmitter) {
 	s.setCalls.Add(1)
+}
+
+// unreachableKindsField returns the value logged under the
+// "unreachableKinds" key of the construction-time unreachable-kinds Info
+// line, or "" when no such line was logged. The contract is ONE concise
+// line, so a second matching Info line fails the test rather than being
+// silently ignored.
+func (l *captureLogger) unreachableKindsField(t *testing.T) string {
+	t.Helper()
+	l.Lock()
+	defer l.Unlock()
+	var fields []string
+	for i, msg := range l.infoMsgs {
+		if !strings.Contains(msg, "unreachable") {
+			continue
+		}
+		field := ""
+		kvs := l.infoKVs[i]
+		for j := 0; j+1 < len(kvs); j += 2 {
+			if kvs[j] == "unreachableKinds" {
+				field, _ = kvs[j+1].(string)
+			}
+		}
+		fields = append(fields, field)
+	}
+	require.LessOrEqual(t, len(fields), 1,
+		"the unreachable-kinds notice must be one Info line, not several")
+	if len(fields) == 0 {
+		return ""
+	}
+
+	return fields[0]
+}
+
+// TestClusterEvents_UnreachableKindsLoggedAtConstruction verifies that
+// registering a handler while some kinds cannot fire produces one Info
+// line at construction listing exactly the unreachable kinds, that
+// configuring a producing component removes its kinds from the list, and
+// that no line is logged without a handler.
+func TestClusterEvents_UnreachableKindsLoggedAtConstruction(t *testing.T) {
+	t.Run("dual cluster with only a handler lists every optional kind", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithOnClusterEvent(func(types.ClusterEvent) {}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// failover and read_divergence are reachable in dual-cluster mode
+		// (read_divergence is a per-read runtime opt-in), so exactly the
+		// component-gated kinds must be listed, in the documented order.
+		require.Equal(t,
+			"circuit_breaker_open,circuit_breaker_closed,"+
+				"write_degraded,write_recovered,"+
+				"drain_entered,drain_exited,"+
+				"replay_dropped,mirror_replay_dropped,"+
+				"session_refresh_attempt,session_refresh_success,session_refresh_error",
+			logger.unreachableKindsField(t))
+	})
+
+	t.Run("single cluster with only a handler lists all kinds in documented order", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), nil,
+			WithLogger(logger),
+			WithOnClusterEvent(func(types.ClusterEvent) {}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// Single-cluster mode with no optional components makes every
+		// kind unreachable, so this pins the COMPLETE documented order —
+		// including the two leading kinds that are reachable in
+		// dual-cluster mode.
+		require.Equal(t,
+			"failover,read_divergence,"+
+				"circuit_breaker_open,circuit_breaker_closed,"+
+				"write_degraded,write_recovered,"+
+				"drain_entered,drain_exited,"+
+				"replay_dropped,mirror_replay_dropped,"+
+				"session_refresh_attempt,session_refresh_success,session_refresh_error",
+			logger.unreachableKindsField(t))
+	})
+
+	t.Run("ActiveFailover does not count as a circuit breaker", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithFailoverPolicy(policy.NewActiveFailover()),
+			WithOnClusterEvent(func(types.ClusterEvent) {}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// ActiveFailover does not implement SetEventEmitter, so the
+		// circuit-breaker kinds must remain listed as unreachable.
+		kinds := strings.Split(logger.unreachableKindsField(t), ",")
+		require.Contains(t, kinds, string(types.EventCircuitBreakerOpen))
+		require.Contains(t, kinds, string(types.EventCircuitBreakerClosed))
+	})
+
+	t.Run("mirror with a mirror replayer removes mirror_replay_dropped", func(t *testing.T) {
+		mirrorTarget, err := NewCQLClient(newMockSession(), nil)
+		require.NoError(t, err)
+		defer mirrorTarget.Close()
+
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithMirror(mirrorTarget),
+			WithMirrorReplayer(&mockReplayer{}),
+			WithOnClusterEvent(func(types.ClusterEvent) {}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		kinds := strings.Split(logger.unreachableKindsField(t), ",")
+		require.NotContains(t, kinds, string(types.EventMirrorReplayDropped))
+		require.Contains(t, kinds, string(types.EventReplayDropped),
+			"replay_dropped needs a Replayer and must remain listed")
+	})
+
+	t.Run("configured components remove their kinds", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithFailoverPolicy(policy.NewCircuitBreaker()),
+			WithWriteStrategy(policy.NewAdaptiveDualWrite()),
+			WithReplayer(&mockReplayer{}),
+			WithOnClusterEvent(func(types.ClusterEvent) {}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		// Split into exact kind names: "mirror_replay_dropped" contains
+		// "replay_dropped" as a substring, so string containment checks
+		// would misfire.
+		kinds := strings.Split(logger.unreachableKindsField(t), ",")
+		require.NotContains(t, kinds, string(types.EventCircuitBreakerOpen))
+		require.NotContains(t, kinds, string(types.EventCircuitBreakerClosed))
+		require.NotContains(t, kinds, string(types.EventWriteDegraded))
+		require.NotContains(t, kinds, string(types.EventWriteRecovered))
+		require.NotContains(t, kinds, string(types.EventReplayDropped))
+		require.Contains(t, kinds, string(types.EventDrainEntered),
+			"kinds whose component is still missing must remain listed")
+		require.Contains(t, kinds, string(types.EventMirrorReplayDropped))
+	})
+
+	t.Run("no handler produces no line", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		require.Empty(t, logger.unreachableKindsField(t))
+	})
 }
 
 // TestClusterEvents_ConstructorFailureLeaksNothing verifies the dispatcher's

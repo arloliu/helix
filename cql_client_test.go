@@ -1852,18 +1852,21 @@ func TestExecuteDualWrite_DefaultPath_BothClustersRunConcurrently(t *testing.T) 
 	}
 }
 
-// captureLogger records Info/Warn/Error messages for assertion in tests.
+// captureLogger records Info/Warn/Error messages, plus Info key-value
+// pairs, for assertion in tests.
 type captureLogger struct {
 	sync.Mutex
 	infoMsgs []string
+	infoKVs  [][]any
 	warnMsgs []string
 }
 
 func (l *captureLogger) Debug(_ string, _ ...any) {}
-func (l *captureLogger) Info(msg string, _ ...any) {
+func (l *captureLogger) Info(msg string, keysAndValues ...any) {
 	l.Lock()
 	defer l.Unlock()
 	l.infoMsgs = append(l.infoMsgs, msg)
+	l.infoKVs = append(l.infoKVs, keysAndValues)
 }
 
 func (l *captureLogger) Warn(msg string, _ ...any) {
