@@ -211,7 +211,7 @@ destination is recorded against that destination's own metrics namespace
 |---|---|
 | Engine queue full | `mirror_enqueue_dropped_total` + log + `mirror.WithOnDrop`. |
 | Target-mode dispatch error | `mirror_exec_errors_total` + log + `mirror.WithOnError`. With `WithMirrorReplayer`, also pushed onto the replayer. |
-| Replayer enqueue failure | `helix.WithOnReplayDropped` (shared with primary replay) + the `mirror_replay_dropped` cluster event. No metric covers this. |
+| Replayer enqueue failure | `helix.WithOnReplayDropped` (shared with primary replay) + the `mirror_replay_dropped` cluster event + `mirror_replay_dropped_total` (optional `types.MirrorReplayMetrics`). |
 | Publisher-mode `publisher.Enqueue` error | `mirror_exec_errors_total` + log + `mirror.WithOnError`. **Not** routed through `WithOnReplayDropped`. |
 
 ## Examples

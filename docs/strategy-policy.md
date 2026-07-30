@@ -181,11 +181,14 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent background writes; excess returns `ErrWriteDropped` |
 
 **Cluster events:** degrade and recover transitions emit
-`types.EventWriteDegraded` and `types.EventWriteRecovered`. Neither has a
-metric counterpart, so the event is the only machine-readable signal for a
-cluster entering or leaving degraded mode. Inside a client, register
-`helix.WithOnClusterEvent`; outside one, call `SetEventEmitter` on the
-strategy. See the [Cluster Events Guide](cluster-events.md).
+`types.EventWriteDegraded` and `types.EventWriteRecovered`, and record the
+`{prefix}_write_degraded{cluster}` gauge plus the
+`{prefix}_write_degraded_total` / `{prefix}_write_recovered_total` transition
+counters on collectors that implement the optional
+`types.AdaptiveWriteMetrics` interface (the bundled `contrib/metrics/vm`
+collector does). Inside a client, register `helix.WithOnClusterEvent`;
+outside one, call `SetEventEmitter` on the strategy. See the
+[Cluster Events Guide](cluster-events.md).
 
 **Configuration validation:**
 

@@ -17,6 +17,7 @@ const (
 	// EventReadDivergence fires when a fallback read finds a row on the
 	// alternative cluster after the selected cluster returned not-found.
 	// Cluster identifies the cluster that was missing the row (replay lag).
+	// Reason is always "row found on alternative cluster after not-found".
 	EventReadDivergence ClusterEventKind = "read_divergence"
 
 	// EventCircuitBreakerOpen fires when a circuit breaker trips open for
@@ -107,6 +108,7 @@ const (
 // Field population by Kind:
 //   - EventFailover: FromCluster, ToCluster, Cluster (= ToCluster), Err
 //   - EventReadDivergence: Cluster (cluster missing the row), Reason
+//     (always "row found on alternative cluster after not-found")
 //   - EventCircuitBreakerOpen: Cluster, Count (failures at trip)
 //   - EventCircuitBreakerClosed: Cluster, Reason
 //   - EventWriteDegraded: Cluster, Count (slow strikes), Reason
