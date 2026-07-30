@@ -655,8 +655,10 @@ func WithOnReplayDropped(handler ReplayDroppedHandler) Option {
 // kinds need [policy.AdaptiveDualWrite] via [WithWriteStrategy],
 // EventReplayDropped needs a Replayer, drain kinds need a TopologyWatcher,
 // and session-refresh kinds need [WithAutoRefresh] plus
-// [WithSessionRefresher]. An unconfigured kind is silent — no error, no
-// warning. See docs/cluster-events.md for the full table.
+// [WithSessionRefresher]. Registering a handler while some kinds are
+// unreachable is not an error, but the constructor logs one Info line
+// listing the unreachable kinds so the gap is visible at startup. See
+// docs/cluster-events.md for the full table.
 //
 // Delivery is asynchronous and BEST-EFFORT on a dedicated goroutine:
 // invocations never overlap and never block read/write operations. If

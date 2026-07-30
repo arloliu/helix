@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Registering the handler is not sufficient on its own: most kinds are
   produced by an optional component (a circuit-breaker failover policy, an
   adaptive write strategy, a replayer, a topology watcher, auto-refresh) and
-  stay silent without it. See
+  stay silent without it — the constructor logs one Info line listing the
+  kinds left unreachable by the configuration. See
   [docs/cluster-events.md](docs/cluster-events.md) for the per-kind
   prerequisites.
 - `policy`: `SetEventEmitter` on `CircuitBreaker`, `LatencyCircuitBreaker`,
