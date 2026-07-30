@@ -661,14 +661,16 @@ func WithOnReplayDropped(handler ReplayDroppedHandler) Option {
 // Delivery is asynchronous and BEST-EFFORT on a dedicated goroutine:
 // invocations never overlap and never block read/write operations. If
 // the handler cannot keep up, newest events are dropped; drops are
-// counted exactly but the count is internal, with no accessor and no
-// metric. Circuit-breaker and adaptive-write events arrive in per-cluster
-// transition order, per policy instance; events from independent
-// producers arrive in enqueue order with no cross-kind causal guarantee.
-// This is a notification stream, not a durable audit log — prefer the
-// metrics collector for rates and state, except for
-// [types.EventWriteDegraded], [types.EventWriteRecovered], and
-// [types.EventMirrorReplayDropped], which have no metric counterpart.
+// counted exactly, logged, and — when the configured collector implements
+// [types.ClusterEventMetrics] — exposed as a counter
+// (contrib/metrics/vm: {prefix}_cluster_events_dropped_total) so the
+// application can alert on event loss. Circuit-breaker and adaptive-write
+// events arrive in per-cluster transition order, per policy instance;
+// events from independent producers arrive in enqueue order with no
+// cross-kind causal guarantee. This is a notification stream, not a
+// durable audit log — every kind has a metric counterpart, so prefer the
+// metrics collector for rates and state and use the event as the push
+// notification.
 //
 // Shutdown semantics: [CQLClient.Close] stops event intake, drains
 // buffered events to the handler, and waits for the in-flight handler

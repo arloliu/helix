@@ -11,6 +11,16 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+// Compile-time assertions that *Collector implements the optional
+// types.AdaptiveWriteMetrics, types.MirrorReplayMetrics, and
+// types.ClusterEventMetrics interfaces. Placed in a _test.go file per the
+// public-package assertion convention.
+var (
+	_ types.AdaptiveWriteMetrics = (*Collector)(nil)
+	_ types.MirrorReplayMetrics  = (*Collector)(nil)
+	_ types.ClusterEventMetrics  = (*Collector)(nil)
+)
+
 func TestCollector_DurationHistogramsUsePrometheusBuckets(t *testing.T) {
 	c := New(WithMetricsSet(metrics.NewSet()))
 
@@ -127,4 +137,42 @@ func TestDefaultDurationBuckets_StrictlyIncreasingAndFinite(t *testing.T) {
 			require.Greater(t, v, b[i-1])
 		}
 	}
+}
+
+// The adaptive-write, mirror-replay, and cluster-event metrics are
+// pre-created at zero and recorded through the optional interface
+// methods; the degraded gauge must follow the last SetWriteDegraded.
+func TestCollector_AdaptiveMirrorAndClusterEventMetrics(t *testing.T) {
+	c := New(WithMetricsSet(metrics.NewSet()))
+
+	var buf bytes.Buffer
+	c.WritePrometheus(&buf)
+	out := buf.String()
+	require.Contains(t, out, `helix_write_degraded{cluster="A"} 0`, "gauge must be pre-created at healthy")
+	require.Contains(t, out, `helix_write_degraded_total{cluster="A"} 0`)
+	require.Contains(t, out, `helix_write_recovered_total{cluster="B"} 0`)
+	require.Contains(t, out, `helix_mirror_replay_dropped_total 0`)
+	require.Contains(t, out, `helix_cluster_events_dropped_total 0`)
+
+	c.SetWriteDegraded(types.ClusterA, true)
+	c.IncWriteDegraded(types.ClusterA)
+	c.IncWriteRecovered(types.ClusterB)
+	c.IncMirrorReplayDropped()
+	c.AddClusterEventsDropped(3)
+
+	buf.Reset()
+	c.WritePrometheus(&buf)
+	out = buf.String()
+	require.Contains(t, out, `helix_write_degraded{cluster="A"} 1`)
+	require.Contains(t, out, `helix_write_degraded_total{cluster="A"} 1`)
+	require.Contains(t, out, `helix_write_recovered_total{cluster="B"} 1`)
+	require.Contains(t, out, `helix_mirror_replay_dropped_total 1`)
+	require.Contains(t, out, `helix_cluster_events_dropped_total 3`,
+		"AddClusterEventsDropped must add the full delta")
+
+	c.SetWriteDegraded(types.ClusterA, false)
+	buf.Reset()
+	c.WritePrometheus(&buf)
+	require.Contains(t, buf.String(), `helix_write_degraded{cluster="A"} 0`,
+		"recovery must return the gauge to healthy")
 }

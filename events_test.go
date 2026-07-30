@@ -1,7 +1,9 @@
 package helix
 
 import (
+	"math"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -663,6 +665,97 @@ func TestEventDispatcher_OverflowNeverBlocksEmit(t *testing.T) {
 	}()
 	waitSignal(t, emitDone, "non-blocking emits")
 	require.GreaterOrEqual(t, d.dropped.Load(), uint64(10), "overflow must be counted")
+}
+
+// fakeClusterEventMetrics records AddClusterEventsDropped deltas for
+// assertions on the dispatcher's drop-metric reconciliation.
+type fakeClusterEventMetrics struct {
+	mu     sync.Mutex
+	deltas []int
+	total  atomic.Int64
+}
+
+func (f *fakeClusterEventMetrics) AddClusterEventsDropped(n int) {
+	f.mu.Lock()
+	f.deltas = append(f.deltas, n)
+	f.mu.Unlock()
+	f.total.Add(int64(n))
+}
+
+// TestEventDispatcher_DropTotalReconciledToMetric wedges the handler,
+// overflows the buffer, and verifies two properties of the optional drop
+// metric: it is never written from the emit hot path (the wedged handler
+// means no dispatcher-goroutine sync has run, so the metric must still be
+// zero right after the overflow), and stop() reconciles the full internal
+// drop total into it, keeping the exact-accounting invariant visible to
+// the collector.
+func TestEventDispatcher_DropTotalReconciledToMetric(t *testing.T) {
+	block := make(chan struct{})
+	first := make(chan struct{})
+	var once sync.Once
+	m := &fakeClusterEventMetrics{}
+	d := newEventDispatcher(func(_ types.ClusterEvent) {
+		once.Do(func() { close(first) })
+		<-block // wedge the consumer
+	}, logging.NewNopLogger())
+	d.metrics = m
+	d.start()
+
+	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventFailover})
+	waitSignal(t, first, "consumer wedge")
+
+	for range eventBufferSize + 10 {
+		d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventReplayDropped})
+	}
+	require.GreaterOrEqual(t, d.dropped.Load(), uint64(10), "overflow must be counted")
+	require.Zero(t, m.total.Load(),
+		"the metric must not be written from the emit hot path — only the dispatcher goroutine reconciles it")
+
+	close(block)
+	d.stop()
+	require.Equal(t, d.dropped.Load(), uint64(m.total.Load()),
+		"stop() must reconcile the full internal drop total into the metric")
+}
+
+// TestEventDispatcher_StopWithoutStartReconcilesDropMetric covers the
+// never-started path: the final buffer sweep in stop() counts the
+// undelivered event as dropped and must still reconcile it into the
+// metric, even though no delivery goroutine ever ran.
+func TestEventDispatcher_StopWithoutStartReconcilesDropMetric(t *testing.T) {
+	m := &fakeClusterEventMetrics{}
+	d := newEventDispatcher(func(types.ClusterEvent) {}, logging.NewNopLogger())
+	d.metrics = m
+	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventFailover}) // buffered, never delivered
+	d.stop()
+	require.Equal(t, uint64(1), d.dropped.Load())
+	require.Equal(t, int64(1), m.total.Load(),
+		"stop() on a never-started dispatcher must reconcile the swept drop into the metric")
+}
+
+// TestEventDispatcher_ReconcileDropsCarriesOversizedRemainder pins the
+// metric-cursor arithmetic for a drop delta above math.MaxInt. Such a
+// delta is unreachable through real emission (it needs math.MaxInt drops
+// between two reconciliations), so the counter is seeded directly on a
+// never-started dispatcher, where the test goroutine is the only toucher.
+// One reconcile reports at most math.MaxInt and must advance the cursor
+// only by that amount; the next reconcile must report the remainder, so
+// the excess converges into the metric rather than being lost.
+func TestEventDispatcher_ReconcileDropsCarriesOversizedRemainder(t *testing.T) {
+	m := &fakeClusterEventMetrics{}
+	d := newEventDispatcher(func(types.ClusterEvent) {}, logging.NewNopLogger())
+	d.metrics = m
+	d.dropped.Store(uint64(math.MaxInt) + 5)
+
+	d.reconcileDrops(false)
+	d.reconcileDrops(false)
+
+	m.mu.Lock()
+	deltas := slices.Clone(m.deltas)
+	m.mu.Unlock()
+	require.Equal(t, []int{math.MaxInt, 5}, deltas,
+		"the capped excess must be reported by the next reconciliation, not dropped")
+	require.Equal(t, uint64(math.MaxInt)+5, d.droppedMetricReported,
+		"the cursor must converge on the internal drop total")
 }
 
 // TestEventDispatcher_CloseWaitsForInflightHandler verifies the Close

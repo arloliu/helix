@@ -579,6 +579,12 @@ func createEventDispatcher(config *ClientConfig) {
 	}
 
 	config.events = newEventDispatcher(config.OnClusterEvent, config.Logger)
+	// Attach the optional drop-total metric. The dispatcher reconciles it
+	// from its own goroutine, never from the emit hot path, so an
+	// arbitrary collector implementation cannot slow emitters down.
+	if cem, ok := config.Metrics.(types.ClusterEventMetrics); ok {
+		config.events.metrics = cem
+	}
 }
 
 // startEventDelivery installs the emitter into the components that accept one

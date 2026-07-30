@@ -65,3 +65,24 @@ type MirrorMetrics interface {
 	// false = disabled or stopped.
 	SetMirrorEnabled(enabled bool)
 }
+
+// MirrorReplayMetrics is an OPTIONAL interface that [MetricsCollector]
+// implementations may satisfy to receive mirror replay-enqueue drop
+// counts (see helix.WithMirrorReplayer).
+//
+// It is separate from [MirrorMetrics] so existing implementations of
+// that interface stay source-compatible. Helix's internal mirror error
+// handler type-asserts on this interface and silently no-ops if the
+// configured collector does not implement it; a caller-supplied
+// mirror.WithOnError replaces that handler and with it this metric,
+// exactly as it does [EventMirrorReplayDropped].
+//
+// Like the [MirrorMetrics] methods, the counter is not cluster-scoped:
+// mirror payloads target a logical sink, not one of this client's
+// clusters.
+type MirrorReplayMetrics interface {
+	// IncMirrorReplayDropped increments when a failed mirror write cannot
+	// be enqueued for mirror replay — potential mirror-target data loss.
+	// Metric: [prefix]_mirror_replay_dropped_total
+	IncMirrorReplayDropped()
+}

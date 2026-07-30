@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -780,12 +781,24 @@ func TestCloneBatchEntries(t *testing.T) {
 	require.Equal(t, "s", out[1].Args[0])
 }
 
+// mirrorReplayMetricsSpy is a full MetricsCollector (via the embedded
+// no-op collector) that additionally counts IncMirrorReplayDropped calls,
+// opting in to the optional types.MirrorReplayMetrics interface.
+type mirrorReplayMetricsSpy struct {
+	metrics.NopMetrics
+
+	dropped atomic.Int64
+}
+
+func (s *mirrorReplayMetricsSpy) IncMirrorReplayDropped() { s.dropped.Add(1) }
+
 // TestMirrorReplayDroppedEventRespectsCallerOnError pins both directions of
 // the "caller options win" rule for the mirror error handler. Helix installs
-// its own mirror.WithOnError to push failed captures onto the mirror replayer
-// and to report an unenqueueable capture as EventMirrorReplayDropped; a
-// caller-supplied mirror.WithOnError replaces that handler entirely, and with
-// it the event.
+// its own mirror.WithOnError to push failed captures onto the mirror
+// replayer and to report an unenqueueable capture as
+// EventMirrorReplayDropped plus an IncMirrorReplayDropped metric; a
+// caller-supplied mirror.WithOnError replaces that handler entirely, and
+// with it the event and the metric.
 func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
 	isMirrorDrop := func(ev types.ClusterEvent) bool {
 		return ev.Kind == types.EventMirrorReplayDropped
@@ -800,6 +813,7 @@ func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
 
 		replayer := &recordingReplayer{enqueueErr: errors.New("replayer queue full")}
 		rec := newInternalEventRecorder()
+		spy := &mirrorReplayMetricsSpy{}
 		callerCh := make(chan error, 4)
 
 		client, err := NewCQLClient(newMockSession(), nil,
@@ -810,6 +824,7 @@ func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
 				}),
 			),
 			WithMirrorReplayer(replayer),
+			WithMetrics(spy),
 			WithOnClusterEvent(rec.handler),
 		)
 		require.NoError(t, err)
@@ -831,6 +846,8 @@ func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
 		require.Zero(t, replayer.enqueueCount(), "the caller handler must own the failure entirely")
 		require.False(t, rec.has(isMirrorDrop),
 			"a caller-supplied mirror.WithOnError must suppress EventMirrorReplayDropped")
+		require.Zero(t, spy.dropped.Load(),
+			"a caller-supplied mirror.WithOnError must suppress IncMirrorReplayDropped too")
 	})
 
 	t.Run("internal handler emits the event", func(t *testing.T) {
@@ -843,10 +860,12 @@ func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
 		enqueueErr := errors.New("replayer queue full")
 		replayer := &recordingReplayer{enqueueErr: enqueueErr}
 		rec := newInternalEventRecorder()
+		spy := &mirrorReplayMetricsSpy{}
 
 		client, err := NewCQLClient(newMockSession(), nil,
 			WithMirror(mirrorTarget, mirror.WithWorkers(1)),
 			WithMirrorReplayer(replayer),
+			WithMetrics(spy),
 			WithOnClusterEvent(rec.handler),
 		)
 		require.NoError(t, err)
@@ -859,5 +878,9 @@ func TestMirrorReplayDroppedEventRespectsCallerOnError(t *testing.T) {
 		require.Empty(t, ev.Cluster, "mirror payloads target a logical sink, not one of this client's clusters")
 		require.NotEmpty(t, ev.Reason)
 		require.False(t, ev.Timestamp.IsZero())
+		// The metric is incremented before the event is emitted, so
+		// observing the delivered event guarantees the count is visible.
+		require.Equal(t, int64(1), spy.dropped.Load(),
+			"the internal handler must record IncMirrorReplayDropped for an unenqueueable capture")
 	})
 }

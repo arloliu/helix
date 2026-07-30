@@ -1,6 +1,7 @@
 package helix
 
 import (
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -30,8 +31,11 @@ const eventBufferSize = 128
 // read/write operations — when the internal buffer fills, newest events
 // are dropped and counted. The drop total is logged from the dispatcher
 // goroutine on the first drop, then only once it has at least doubled
-// since the last line, plus once at shutdown; no accessor or metric
-// exposes the count, so an application cannot alert on it.
+// since the last line, plus once at shutdown. When the configured
+// [types.MetricsCollector] also implements [types.ClusterEventMetrics],
+// the total is additionally exposed as a counter (contrib/metrics/vm:
+// {prefix}_cluster_events_dropped_total), reconciled from the dispatcher
+// goroutine, so an application can alert on event loss.
 //
 // The handler MUST NOT call [CQLClient.Close] synchronously (Close waits
 // for the in-flight handler invocation and would deadlock); trigger
@@ -50,9 +54,10 @@ type ClusterEventHandler func(event types.ClusterEvent)
 //
 // Hot-path contract: EmitClusterEvent performs ONLY an admission
 // increment, a stopped check, a timestamp stamp, and a non-blocking
-// buffered send (overflow = atomic count). No logging, no locks. Drop
-// totals are reported from the dispatcher goroutine and finalized in
-// stop().
+// buffered send (overflow = atomic count). No logging, no locks, no
+// metric calls. Drop totals are reported to the log and reconciled into
+// the optional metrics collector from the dispatcher goroutine, and
+// finalized in stop().
 //
 // Lifecycle (serialized by lifecycleMu; never touched by the emit path):
 // newEventDispatcher (no goroutine) -> start() (spawns delivery;
@@ -67,6 +72,10 @@ type ClusterEventHandler func(event types.ClusterEvent)
 type eventDispatcher struct {
 	handler ClusterEventHandler
 	logger  types.Logger
+	// metrics receives the drop total when the configured collector opts
+	// in via types.ClusterEventMetrics; nil otherwise. Never called from
+	// the emit hot path — see reconcileDrops.
+	metrics types.ClusterEventMetrics
 	ch      chan types.ClusterEvent
 	quit    chan struct{}
 	done    chan struct{}
@@ -81,6 +90,10 @@ type eventDispatcher struct {
 	// droppedReported tracks the last logged drop total. Touched only by
 	// the dispatcher goroutine and by stop() after joining it.
 	droppedReported uint64
+
+	// droppedMetricReported tracks the drop total already reconciled into
+	// the metrics collector. Same touch discipline as droppedReported.
+	droppedMetricReported uint64
 
 	// testEmitGate, when non-nil, parks emitters inside the admission
 	// window (after registering in emitting, before the send); an emitter
@@ -167,7 +180,7 @@ func (d *eventDispatcher) run() {
 		select {
 		case ev := <-d.ch:
 			d.invoke(ev)
-			d.maybeReportDrops(false)
+			d.reconcileDrops(false)
 		case <-d.quit:
 			for {
 				select {
@@ -195,14 +208,33 @@ func (d *eventDispatcher) invoke(ev types.ClusterEvent) {
 	d.handler(ev)
 }
 
-// maybeReportDrops logs the cumulative drop total. To keep log volume
-// from growing linearly with the drop count, it reports on the first
-// drop and then only each time the total has at least doubled since the
-// last report; final=true forces a report of any unreported remainder
-// regardless of that threshold. Called only from the dispatcher
-// goroutine or from stop() after the join.
-func (d *eventDispatcher) maybeReportDrops(final bool) {
+// reconcileDrops reads the atomic drop total once and reconciles both
+// observers of it. The optional metrics collector receives the delta
+// since the last call, capped at math.MaxInt per call with the cursor
+// advanced only by the amount actually reported, so any capped remainder
+// carries into later calls and the exported counter converges on the
+// internal count — equal at every sync point short of the unreachable
+// case of math.MaxInt drops accumulating between two calls. The log
+// reports on the first drop and then only
+// each time the total has at least doubled since the last report, so log
+// volume does not grow linearly with the drop count; final=true forces a
+// report of any unreported remainder regardless of that threshold.
+//
+// Called only from the dispatcher goroutine or from stop() after the
+// join — never from the emit hot path, so an arbitrary (possibly
+// locking) collector implementation cannot slow emitters down. Drops
+// that occur after stop's final call are counted internally but reach
+// neither the metric nor the log.
+func (d *eventDispatcher) reconcileDrops(final bool) {
 	n := d.dropped.Load()
+	if d.metrics != nil && n != d.droppedMetricReported {
+		// The cap is unreachable in practice; it keeps the conversion
+		// safe. The cursor advances only by what is reported, so any
+		// capped excess is reported by later calls rather than lost.
+		delta := min(n-d.droppedMetricReported, math.MaxInt)
+		d.droppedMetricReported += delta
+		d.metrics.AddClusterEventsDropped(int(delta)) //nolint:gosec // delta is capped at math.MaxInt above; gosec cannot see through min()
+	}
 	if n == 0 || n == d.droppedReported {
 		return
 	}
@@ -224,8 +256,8 @@ func (d *eventDispatcher) maybeReportDrops(final bool) {
 // final drop report and handler-panic recovery use the configured
 // logger, so a wedged logger can block stop (and therefore
 // CQLClient.Close). Events dropped after the final report (post-stop
-// emissions from unjoined background goroutines) are counted but not
-// logged.
+// emissions from unjoined background goroutines) are counted but neither
+// logged nor reconciled into the metric.
 func (d *eventDispatcher) stop() {
 	if d == nil {
 		return
@@ -258,7 +290,7 @@ func (d *eventDispatcher) stop() {
 		case <-d.ch:
 			d.dropped.Add(1)
 		default:
-			d.maybeReportDrops(true)
+			d.reconcileDrops(true)
 			return
 		}
 	}

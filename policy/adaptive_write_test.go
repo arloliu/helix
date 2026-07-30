@@ -1730,3 +1730,156 @@ func TestAdaptiveDualWrite_ResetDeliversAfterBothClusters(t *testing.T) {
 			"recovery event %d ran while cluster B still reported degraded", i)
 	}
 }
+
+// TestAdaptiveDualWrite_TransitionMetricsRecorded verifies that every
+// degrade/recover transition path records the optional
+// types.AdaptiveWriteMetrics gauge and transition counters exactly once
+// per actual transition, and that repeated calls on an unchanged state
+// record nothing.
+func TestAdaptiveDualWrite_TransitionMetricsRecorded(t *testing.T) {
+	m := testutil.NewTestMetricsCollector()
+	a := NewAdaptiveDualWrite(WithAdaptiveMetrics(m))
+
+	// Manual degrade records the gauge and the degraded counter.
+	a.ForceDegrade(types.ClusterA)
+	require.True(t, m.GetWriteDegradedState(types.ClusterA))
+	require.Equal(t, int64(1), m.GetWriteDegradedTransitions(types.ClusterA))
+	require.Zero(t, m.GetWriteRecoveredTransitions(types.ClusterA))
+
+	// Degrading an already-degraded cluster is not a transition.
+	a.ForceDegrade(types.ClusterA)
+	require.Equal(t, int64(1), m.GetWriteDegradedTransitions(types.ClusterA))
+
+	// Manual recover flips the gauge and records the recovered counter.
+	a.ForceRecover(types.ClusterA)
+	require.False(t, m.GetWriteDegradedState(types.ClusterA))
+	require.Equal(t, int64(1), m.GetWriteRecoveredTransitions(types.ClusterA))
+
+	// Reset records recovery only for clusters that were degraded.
+	a.ForceDegrade(types.ClusterB)
+	a.Reset()
+	require.False(t, m.GetWriteDegradedState(types.ClusterB))
+	require.Equal(t, int64(1), m.GetWriteRecoveredTransitions(types.ClusterB))
+	require.Equal(t, int64(1), m.GetWriteRecoveredTransitions(types.ClusterA),
+		"Reset must not record recovery for an already-healthy cluster")
+}
+
+// TestAdaptiveDualWrite_TransitionMetricsThresholdPaths drives the
+// strike-threshold degrade and fast-strike recovery transitions (the
+// non-manual paths) and verifies they record the same metrics.
+func TestAdaptiveDualWrite_TransitionMetricsThresholdPaths(t *testing.T) {
+	m := testutil.NewTestMetricsCollector()
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveMetrics(m),
+		WithAdaptiveStrikeThreshold(1),
+		WithAdaptiveRecoveryThreshold(1),
+	)
+
+	a.recordStrike(&a.stateA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.True(t, m.GetWriteDegradedState(types.ClusterA))
+	require.Equal(t, int64(1), m.GetWriteDegradedTransitions(types.ClusterA))
+
+	a.recordFast(&a.stateA)
+	require.False(t, a.IsDegraded(types.ClusterA))
+	require.False(t, m.GetWriteDegradedState(types.ClusterA))
+	require.Equal(t, int64(1), m.GetWriteRecoveredTransitions(types.ClusterA))
+}
+
+// TestAdaptiveDualWrite_SupersededTransitionSkipsGauge pins the gauge
+// sequencing contract: a transition report that has been superseded by a
+// newer latched transition must not overwrite the degraded-state gauge
+// with a state the cluster has already left, while its cumulative
+// transition counter still increments (the transition did happen). This
+// mirrors the circuit breaker's state-gauge sequencing.
+func TestAdaptiveDualWrite_SupersededTransitionSkipsGauge(t *testing.T) {
+	m := testutil.NewTestMetricsCollector()
+	a := NewAdaptiveDualWrite(WithAdaptiveMetrics(m))
+
+	a.ForceDegrade(types.ClusterA) // latches seq 1
+	a.ForceRecover(types.ClusterA) // latches seq 2; gauge now healthy
+	require.False(t, m.GetWriteDegradedState(types.ClusterA))
+
+	// Replay the degrade report with its stale seq, as if its goroutine
+	// had been descheduled past the recovery: the gauge must stay
+	// healthy, the counter must still count the transition.
+	a.recordTransitionMetrics(&a.stateA, types.ClusterA, true, 1)
+	require.False(t, m.GetWriteDegradedState(types.ClusterA),
+		"a superseded transition must not overwrite the gauge")
+	require.Equal(t, int64(2), m.GetWriteDegradedTransitions(types.ClusterA),
+		"the cumulative counter must still count the superseded transition")
+}
+
+// gatedAdaptiveMetrics wraps TestMetricsCollector and parks the first
+// IncWriteDegraded call — the cumulative-counter call recordTransitionMetrics
+// makes outside reportMu, before it takes the mutex for the gauge — so a test
+// can hold one transition's report at exactly that boundary while another
+// transition runs to completion.
+type gatedAdaptiveMetrics struct {
+	*testutil.TestMetricsCollector
+
+	entered chan struct{} // closed when IncWriteDegraded is entered
+	release chan struct{} // closed to let the parked call proceed
+	once    sync.Once
+}
+
+func (g *gatedAdaptiveMetrics) IncWriteDegraded(cluster types.ClusterID) {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	g.TestMetricsCollector.IncWriteDegraded(cluster)
+}
+
+// TestAdaptiveDualWrite_ConcurrentTransitionsSupersededGaugeSkipped drives
+// the counter-outside-mutex vs gauge-under-mutex interleaving through two
+// concurrent EXPORTED transitions, deterministically: ForceDegrade latches
+// its transition (seq 1) under the state mutex, releases it, and is then
+// parked inside the collector's counter call — after the state flip is
+// visible, before its gauge write. A concurrent ForceRecover then runs the
+// full recovery transition (seq 2), writing the gauge to healthy. When the
+// parked degrade report resumes, its seq check under reportMu must skip the
+// gauge — the cluster has already left that state — while its cumulative
+// counter still records that the transition happened.
+func TestAdaptiveDualWrite_ConcurrentTransitionsSupersededGaugeSkipped(t *testing.T) {
+	g := &gatedAdaptiveMetrics{
+		TestMetricsCollector: testutil.NewTestMetricsCollector(),
+		entered:              make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+	a := NewAdaptiveDualWrite(WithAdaptiveMetrics(g))
+
+	degradeDone := make(chan struct{})
+	go func() {
+		defer close(degradeDone)
+		a.ForceDegrade(types.ClusterA)
+	}()
+
+	// The degrade transition is latched and its report is parked in the
+	// counter call: the state mutex is released, reportMu is not yet held.
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ForceDegrade never reached the metrics collector")
+	}
+	require.True(t, a.IsDegraded(types.ClusterA),
+		"the state flip must be visible before the report runs")
+
+	// The recovery transition supersedes the parked degrade report and
+	// completes its whole report, gauge included, while the degrade report
+	// is still parked before reportMu.
+	a.ForceRecover(types.ClusterA)
+	require.False(t, g.GetWriteDegradedState(types.ClusterA))
+	require.Equal(t, int64(1), g.GetWriteRecoveredTransitions(types.ClusterA))
+
+	close(g.release)
+	select {
+	case <-degradeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ForceDegrade did not return after the collector was released")
+	}
+
+	require.False(t, g.GetWriteDegradedState(types.ClusterA),
+		"the superseded degrade report must not overwrite the gauge with a state the cluster has left")
+	require.Equal(t, int64(1), g.GetWriteDegradedTransitions(types.ClusterA),
+		"the superseded transition still increments its cumulative counter")
+	require.Equal(t, int64(1), g.GetWriteRecoveredTransitions(types.ClusterA))
+}

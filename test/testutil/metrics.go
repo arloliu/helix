@@ -25,6 +25,11 @@ type TestMetricsCollector struct {
 	WriteDropped  map[types.ClusterID]int64
 	WriteDuration map[types.ClusterID][]float64
 
+	// Adaptive write transitions (optional types.AdaptiveWriteMetrics)
+	WriteDegradedState map[types.ClusterID]bool
+	WriteDegraded      map[types.ClusterID]int64
+	WriteRecovered     map[types.ClusterID]int64
+
 	// Failover
 	FailoverTotal map[string]int64 // key: "from->to"
 
@@ -50,6 +55,12 @@ type TestMetricsCollector struct {
 	SessionRefreshSuccesses map[types.ClusterID]int64
 	SessionRefreshErrors    map[types.ClusterID]int64
 
+	// Mirror replay (optional types.MirrorReplayMetrics)
+	MirrorReplayDropped int64
+
+	// Cluster events (optional types.ClusterEventMetrics)
+	ClusterEventsDropped int64
+
 	// Atomic counters for quick access
 	totalReplayEnqueued atomic.Int64
 	totalReplaySuccess  atomic.Int64
@@ -71,6 +82,9 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		WriteAsync:              make(map[types.ClusterID]int64),
 		WriteDropped:            make(map[types.ClusterID]int64),
 		WriteDuration:           make(map[types.ClusterID][]float64),
+		WriteDegradedState:      make(map[types.ClusterID]bool),
+		WriteDegraded:           make(map[types.ClusterID]int64),
+		WriteRecovered:          make(map[types.ClusterID]int64),
 		FailoverTotal:           make(map[string]int64),
 		CircuitBreakerState:     make(map[types.ClusterID]int),
 		CircuitBreakerTrips:     make(map[types.ClusterID]int64),
@@ -150,6 +164,59 @@ func (m *TestMetricsCollector) ObserveWriteDuration(cluster types.ClusterID, sec
 	defer m.mu.Unlock()
 	m.WriteDuration[cluster] = append(m.WriteDuration[cluster], seconds)
 }
+
+// ----------------------
+// Adaptive Write Transitions (optional types.AdaptiveWriteMetrics)
+// ----------------------
+
+func (m *TestMetricsCollector) SetWriteDegraded(cluster types.ClusterID, degraded bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.WriteDegradedState[cluster] = degraded
+}
+
+func (m *TestMetricsCollector) IncWriteDegraded(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.WriteDegraded[cluster]++
+}
+
+func (m *TestMetricsCollector) IncWriteRecovered(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.WriteRecovered[cluster]++
+}
+
+// GetWriteDegradedState returns the last recorded degraded-state gauge
+// value for the given cluster.
+func (m *TestMetricsCollector) GetWriteDegradedState(cluster types.ClusterID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.WriteDegradedState[cluster]
+}
+
+// GetWriteDegradedTransitions returns the healthy-to-degraded transition
+// count for the given cluster.
+func (m *TestMetricsCollector) GetWriteDegradedTransitions(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.WriteDegraded[cluster]
+}
+
+// GetWriteRecoveredTransitions returns the degraded-to-healthy transition
+// count for the given cluster.
+func (m *TestMetricsCollector) GetWriteRecoveredTransitions(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.WriteRecovered[cluster]
+}
+
+// Compile-time assertion that TestMetricsCollector implements the
+// optional types.AdaptiveWriteMetrics interface.
+var _ types.AdaptiveWriteMetrics = (*TestMetricsCollector)(nil)
 
 // ----------------------
 // Failover
@@ -297,6 +364,52 @@ func (m *TestMetricsCollector) GetSessionRefreshErrors(cluster types.ClusterID) 
 var _ types.SessionRefreshMetrics = (*TestMetricsCollector)(nil)
 
 // ----------------------
+// Mirror Replay (optional types.MirrorReplayMetrics)
+// ----------------------
+
+func (m *TestMetricsCollector) IncMirrorReplayDropped() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.MirrorReplayDropped++
+}
+
+// GetMirrorReplayDropped returns the cumulative count of failed mirror
+// writes that could not be enqueued for mirror replay.
+func (m *TestMetricsCollector) GetMirrorReplayDropped() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.MirrorReplayDropped
+}
+
+// Compile-time assertion that TestMetricsCollector implements the
+// optional types.MirrorReplayMetrics interface.
+var _ types.MirrorReplayMetrics = (*TestMetricsCollector)(nil)
+
+// ----------------------
+// Cluster Events (optional types.ClusterEventMetrics)
+// ----------------------
+
+func (m *TestMetricsCollector) AddClusterEventsDropped(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClusterEventsDropped += int64(n)
+}
+
+// GetClusterEventsDropped returns the cumulative count of cluster events
+// dropped by the event dispatcher.
+func (m *TestMetricsCollector) GetClusterEventsDropped() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.ClusterEventsDropped
+}
+
+// Compile-time assertion that TestMetricsCollector implements the
+// optional types.ClusterEventMetrics interface.
+var _ types.ClusterEventMetrics = (*TestMetricsCollector)(nil)
+
+// ----------------------
 // Test Helpers
 // ----------------------
 
@@ -394,6 +507,9 @@ func (m *TestMetricsCollector) Reset() {
 	m.WriteAsync = make(map[types.ClusterID]int64)
 	m.WriteDropped = make(map[types.ClusterID]int64)
 	m.WriteDuration = make(map[types.ClusterID][]float64)
+	m.WriteDegradedState = make(map[types.ClusterID]bool)
+	m.WriteDegraded = make(map[types.ClusterID]int64)
+	m.WriteRecovered = make(map[types.ClusterID]int64)
 	m.FailoverTotal = make(map[string]int64)
 	m.CircuitBreakerState = make(map[types.ClusterID]int)
 	m.CircuitBreakerTrips = make(map[types.ClusterID]int64)
@@ -409,6 +525,8 @@ func (m *TestMetricsCollector) Reset() {
 	m.SessionRefreshAttempts = make(map[types.ClusterID]int64)
 	m.SessionRefreshSuccesses = make(map[types.ClusterID]int64)
 	m.SessionRefreshErrors = make(map[types.ClusterID]int64)
+	m.MirrorReplayDropped = 0
+	m.ClusterEventsDropped = 0
 
 	m.totalReplayEnqueued.Store(0)
 	m.totalReplaySuccess.Store(0)
