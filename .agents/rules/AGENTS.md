@@ -12,6 +12,8 @@
 ### 1. Core Directives
 - **[100-overview.md](100-overview.md)**
   *Identity, project structure, architecture notes, dependencies, and prime directives.*
+- **[150-memex.md](150-memex.md)**
+  *Durable implementation-mechanics knowledge bundle and its use.*
 
 ### 2. Standards
 - **[200-coding-style.md](200-coding-style.md)**
