@@ -125,11 +125,19 @@ func (q *cqlQuery) getContext() context.Context {
 	return context.Background()
 }
 
-func (q *cqlQuery) getTimestamp() int64 {
+// writeTimestamp returns the client-side timestamp for this write.
+// Zero is rejected: the drivers treat it as "use the current time", which
+// would let a replayed write outrank data written after the original.
+func (q *cqlQuery) writeTimestamp() (int64, error) {
+	ts := q.client.config.TimestampProvider()
 	if q.timestamp != nil {
-		return *q.timestamp
+		ts = *q.timestamp
 	}
-	return q.client.config.TimestampProvider()
+	if ts == 0 {
+		return 0, types.ErrInvalidTimestamp
+	}
+
+	return ts, nil
 }
 
 func (q *cqlQuery) getPriority() PriorityLevel {
@@ -161,7 +169,10 @@ func (q *cqlQuery) Exec() error {
 }
 
 func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
-	ts := q.getTimestamp()
+	ts, err := q.writeTimestamp()
+	if err != nil {
+		return err
+	}
 	priority := q.getPriority()
 
 	if q.strict && q.mirror {

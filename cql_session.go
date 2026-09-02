@@ -87,10 +87,13 @@ type Query interface {
 	// WithTimestamp sets a specific timestamp for the write operation.
 	//
 	// This is critical for idempotency in dual-write scenarios.
-	// If not set, the client's TimestampProvider is used.
+	// If not set, the client's TimestampProvider is used. A zero timestamp
+	// is rejected with [types.ErrInvalidTimestamp] when the write executes,
+	// because the drivers would replace it with the current time and a
+	// replayed write could then overwrite newer data.
 	//
 	// Parameters:
-	//   - ts: Timestamp in microseconds since Unix epoch
+	//   - ts: Timestamp in microseconds since Unix epoch, non-zero
 	//
 	// Returns:
 	//   - Query: The same query for chaining
@@ -488,8 +491,11 @@ type Batch interface {
 
 	// WithTimestamp sets a specific timestamp for all statements in the batch.
 	//
+	// A zero timestamp is rejected with [types.ErrInvalidTimestamp] when the
+	// batch executes; see [Query.WithTimestamp].
+	//
 	// Parameters:
-	//   - ts: Timestamp in microseconds since Unix epoch
+	//   - ts: Timestamp in microseconds since Unix epoch, non-zero
 	//
 	// Returns:
 	//   - Batch: The same batch for chaining

@@ -354,6 +354,13 @@ var (
 	// This is returned to the caller as a hard failure.
 	ErrBothClustersFailed = errors.New("helix: write failed on both clusters")
 
+	// ErrInvalidTimestamp reports a write timestamp of zero, either passed
+	// through WithTimestamp or returned by the client's TimestampProvider.
+	// The drivers treat zero as "assign the current time", which would give
+	// a replayed write a newer timestamp than the original and let it
+	// overwrite later data.
+	ErrInvalidTimestamp = errors.New("helix: write timestamp must not be zero")
+
 	// ErrNoSynchronousAck is wrapped by every [NoSynchronousAckError]: no
 	// cluster acknowledged the write before the call returned.
 	ErrNoSynchronousAck = errors.New("helix: write was not acknowledged synchronously by any cluster")

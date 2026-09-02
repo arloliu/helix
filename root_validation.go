@@ -35,7 +35,19 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootDefaultMaxRows(config),
 		validateRootRecoveryProbe(config),
 		validateRootReplayWiring(config),
+		validateRootTimestampProvider(config),
 	)
+}
+
+// validateRootTimestampProvider samples the timestamp provider once and
+// rejects one that returns zero, which the drivers would replace with the
+// server's current time on every replay.
+func validateRootTimestampProvider(config *ClientConfig) error {
+	if config.TimestampProvider == nil || config.TimestampProvider() != 0 {
+		return nil
+	}
+
+	return newRootOptionError("WithTimestampProvider", "must return a non-zero timestamp")
 }
 
 // validateRootReplayWiring rejects [WithAutoMemoryWorker] combined with a

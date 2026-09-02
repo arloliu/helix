@@ -195,11 +195,18 @@ func (b *cqlBatch) getContext() context.Context {
 	return context.Background()
 }
 
-func (b *cqlBatch) getTimestamp() int64 {
+// writeTimestamp returns the client-side timestamp for this batch.
+// Zero is rejected for the reason given on [cqlQuery.writeTimestamp].
+func (b *cqlBatch) writeTimestamp() (int64, error) {
+	ts := b.client.config.TimestampProvider()
 	if b.timestamp != nil {
-		return *b.timestamp
+		ts = *b.timestamp
 	}
-	return b.client.config.TimestampProvider()
+	if ts == 0 {
+		return 0, types.ErrInvalidTimestamp
+	}
+
+	return ts, nil
 }
 
 func (b *cqlBatch) getPriority() PriorityLevel {
@@ -214,7 +221,10 @@ func (b *cqlBatch) Exec() error {
 }
 
 func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
-	ts := b.getTimestamp()
+	ts, err := b.writeTimestamp()
+	if err != nil {
+		return err
+	}
 	priority := b.getPriority()
 
 	if b.strict && b.mirror {
@@ -293,7 +303,10 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 		return &errorIter{err: types.ErrSessionClosed}
 	}
 
-	ts := b.getTimestamp()
+	ts, err := b.writeTimestamp()
+	if err != nil {
+		return &errorIter{err: err}
+	}
 
 	rt := b.client.resolveReadTarget(ctx, readOptions{})
 	if rt.err != nil {
@@ -331,7 +344,10 @@ func (b *cqlBatch) ExecCAS(dest ...any) (applied bool, iter Iter, err error) {
 // ExecCASContext executes a batch lightweight transaction with context.
 // CAS operations are executed on a single cluster and are NOT replicated.
 func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, iter Iter, err error) {
-	ts := b.getTimestamp()
+	ts, err := b.writeTimestamp()
+	if err != nil {
+		return false, nil, err
+	}
 
 	selectedCluster := b.client.selectClusterForCAS(ctx)
 
@@ -370,7 +386,10 @@ func (b *cqlBatch) MapExecCAS(dest map[string]any) (applied bool, iter Iter, err
 // MapExecCASContext executes a batch lightweight transaction with context and scans into a map.
 // CAS operations are executed on a single cluster and are NOT replicated.
 func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (applied bool, iter Iter, err error) {
-	ts := b.getTimestamp()
+	ts, err := b.writeTimestamp()
+	if err != nil {
+		return false, nil, err
+	}
 
 	selectedCluster := b.client.selectClusterForCAS(ctx)
 
