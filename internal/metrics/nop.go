@@ -217,3 +217,17 @@ func (m *NopMetrics) IncRecoveryProbeFailure(_ types.ClusterID) {}
 // Compile-time assertion that NopMetrics implements the optional
 // types.RecoveryProbeMetrics interface so embedders pick up no-op coverage.
 var _ types.RecoveryProbeMetrics = (*NopMetrics)(nil)
+
+// ----------------------
+// Replay backlog (optional types.ReplayBacklogMetrics)
+// ----------------------
+
+// SetReplayOldestAge discards the metric.
+func (m *NopMetrics) SetReplayOldestAge(_ types.ClusterID, _ float64) {}
+
+// IncReplayWorkerDropped discards the metric.
+func (m *NopMetrics) IncReplayWorkerDropped(_ types.ClusterID, _ string) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.ReplayBacklogMetrics interface so embedders pick up no-op coverage.
+var _ types.ReplayBacklogMetrics = (*NopMetrics)(nil)

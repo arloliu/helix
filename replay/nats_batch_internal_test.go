@@ -83,13 +83,13 @@ var invalidMsgpBytes = msgp.Raw{0xc1}
 // consumer.Fetch with a 1-second window, and a shorter AckWait would cause
 // unacked messages to be redelivered within that same window, producing
 // duplicate entries in the result and making assertions unreliable.
-func newTestReplayer(t *testing.T, js jetstream.JetStream, name, prefix string) *NATSReplayer {
+func newTestReplayer(t *testing.T, js jetstream.JetStream, name, prefix string, opts ...NATSReplayerOption) *NATSReplayer {
 	t.Helper()
 
-	r, err := NewNATSReplayer(js,
+	r, err := NewNATSReplayer(js, append([]NATSReplayerOption{
 		WithStreamName(name),
 		WithSubjectPrefix(prefix),
-	)
+	}, opts...)...)
 	require.NoError(t, err)
 
 	t.Cleanup(func() { _ = r.Close() })

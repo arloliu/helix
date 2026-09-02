@@ -4,6 +4,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/arloliu/helix/adapter/cql"
@@ -17,6 +18,41 @@ func mapNotFound(err error) error {
 		return types.ErrNotFound
 	}
 	return err
+}
+
+// mapUnreachable wraps driver errors that mean the cluster could not be
+// reached in types.ErrClusterUnreachable.
+// The driver error stays in the chain for errors.Is and errors.As.
+func mapUnreachable(err error) error {
+	if err == nil {
+		return nil
+	}
+	var unavailable *gocql.RequestErrUnavailable
+	switch {
+	case errors.Is(err, gocql.ErrNoConnections),
+		errors.Is(err, gocql.ErrNoConnectionsStarted),
+		errors.Is(err, gocql.ErrConnectionClosed),
+		errors.Is(err, gocql.ErrSessionClosed),
+		errors.Is(err, gocql.ErrNoHosts),
+		errors.As(err, &unavailable):
+		return fmt.Errorf("%w: %w", types.ErrClusterUnreachable, err)
+	default:
+		return err
+	}
+}
+
+// mapErr applies every adapter-boundary translation to a driver result.
+func mapErr(err error) error {
+	if err = mapNotFound(err); err == nil || err == types.ErrNotFound { //nolint:errorlint // identity check on the sentinel mapNotFound just returned
+		return err
+	}
+
+	return mapUnreachable(err)
+}
+
+// mapCAS applies mapErr to a lightweight-transaction result.
+func mapCAS(applied bool, err error) (bool, error) {
+	return applied, mapErr(err)
 }
 
 // Session wraps a gocql v1 session.
@@ -176,12 +212,12 @@ func (q *Query) WithTimestamp(ts int64) cql.Query {
 
 // Exec executes the query.
 func (q *Query) Exec() error {
-	return q.query.Exec()
+	return mapErr(q.query.Exec())
 }
 
 // Scan executes and scans a single row.
 func (q *Query) Scan(dest ...any) error {
-	return mapNotFound(q.query.Scan(dest...))
+	return mapErr(q.query.Scan(dest...))
 }
 
 // Iter returns an iterator for results.
@@ -191,7 +227,7 @@ func (q *Query) Iter() cql.Iter {
 
 // MapScan executes and scans into a map.
 func (q *Query) MapScan(m map[string]any) error {
-	return mapNotFound(q.query.MapScan(m))
+	return mapErr(q.query.MapScan(m))
 }
 
 // Statement returns the CQL statement.
@@ -211,12 +247,12 @@ func (q *Query) Release() {
 
 // ExecContext executes the query with context.
 func (q *Query) ExecContext(ctx context.Context) error {
-	return q.query.WithContext(ctx).Exec()
+	return mapErr(q.query.WithContext(ctx).Exec())
 }
 
 // ScanContext executes and scans a single row with context.
 func (q *Query) ScanContext(ctx context.Context, dest ...any) error {
-	return mapNotFound(q.query.WithContext(ctx).Scan(dest...))
+	return mapErr(q.query.WithContext(ctx).Scan(dest...))
 }
 
 // IterContext returns an iterator for results with context.
@@ -226,27 +262,27 @@ func (q *Query) IterContext(ctx context.Context) cql.Iter {
 
 // MapScanContext executes and scans into a map with context.
 func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
-	return mapNotFound(q.query.WithContext(ctx).MapScan(m))
+	return mapErr(q.query.WithContext(ctx).MapScan(m))
 }
 
 // ScanCAS executes a lightweight transaction and scans the result.
 func (q *Query) ScanCAS(dest ...any) (applied bool, err error) {
-	return q.query.ScanCAS(dest...)
+	return mapCAS(q.query.ScanCAS(dest...))
 }
 
 // ScanCASContext executes a lightweight transaction with context.
 func (q *Query) ScanCASContext(ctx context.Context, dest ...any) (applied bool, err error) {
-	return q.query.WithContext(ctx).ScanCAS(dest...)
+	return mapCAS(q.query.WithContext(ctx).ScanCAS(dest...))
 }
 
 // MapScanCAS executes a lightweight transaction and scans into a map.
 func (q *Query) MapScanCAS(dest map[string]any) (applied bool, err error) {
-	return q.query.MapScanCAS(dest)
+	return mapCAS(q.query.MapScanCAS(dest))
 }
 
 // MapScanCASContext executes a lightweight transaction with context.
 func (q *Query) MapScanCASContext(ctx context.Context, dest map[string]any) (applied bool, err error) {
-	return q.query.WithContext(ctx).MapScanCAS(dest)
+	return mapCAS(q.query.WithContext(ctx).MapScanCAS(dest))
 }
 
 // SerialConsistency sets the consistency level for the serial phase of CAS operations.
@@ -295,12 +331,12 @@ func (b *Batch) WithTimestamp(ts int64) cql.Batch {
 
 // Exec executes the batch.
 func (b *Batch) Exec() error {
-	return b.session.ExecuteBatch(b.batch)
+	return mapErr(b.session.ExecuteBatch(b.batch))
 }
 
 // ExecContext executes the batch with context.
 func (b *Batch) ExecContext(ctx context.Context) error {
-	return b.session.ExecuteBatch(b.batch.WithContext(ctx))
+	return mapErr(b.session.ExecuteBatch(b.batch.WithContext(ctx)))
 }
 
 // IterContext executes the batch with context and returns an iterator.
@@ -319,36 +355,36 @@ func (b *Batch) IterContext(ctx context.Context) cql.Iter {
 func (b *Batch) ExecCAS(dest ...any) (applied bool, iter cql.Iter, err error) {
 	applied, gocqlIter, err := b.session.ExecuteBatchCAS(b.batch, dest...)
 	if gocqlIter != nil {
-		return applied, &Iter{iter: gocqlIter}, err
+		return applied, &Iter{iter: gocqlIter}, mapErr(err)
 	}
-	return applied, &Iter{iter: nil}, err
+	return applied, &Iter{iter: nil}, mapErr(err)
 }
 
 // ExecCASContext executes a batch lightweight transaction with context.
 func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, iter cql.Iter, err error) {
 	applied, gocqlIter, err := b.session.ExecuteBatchCAS(b.batch.WithContext(ctx), dest...)
 	if gocqlIter != nil {
-		return applied, &Iter{iter: gocqlIter}, err
+		return applied, &Iter{iter: gocqlIter}, mapErr(err)
 	}
-	return applied, &Iter{iter: nil}, err
+	return applied, &Iter{iter: nil}, mapErr(err)
 }
 
 // MapExecCAS executes a batch lightweight transaction and scans into a map.
 func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, err error) {
 	applied, gocqlIter, err := b.session.MapExecuteBatchCAS(b.batch, dest)
 	if gocqlIter != nil {
-		return applied, &Iter{iter: gocqlIter}, err
+		return applied, &Iter{iter: gocqlIter}, mapErr(err)
 	}
-	return applied, &Iter{iter: nil}, err
+	return applied, &Iter{iter: nil}, mapErr(err)
 }
 
 // MapExecCASContext executes a batch lightweight transaction with context.
 func (b *Batch) MapExecCASContext(ctx context.Context, dest map[string]any) (applied bool, iter cql.Iter, err error) {
 	applied, gocqlIter, err := b.session.MapExecuteBatchCAS(b.batch.WithContext(ctx), dest)
 	if gocqlIter != nil {
-		return applied, &Iter{iter: gocqlIter}, err
+		return applied, &Iter{iter: gocqlIter}, mapErr(err)
 	}
-	return applied, &Iter{iter: nil}, err
+	return applied, &Iter{iter: nil}, mapErr(err)
 }
 
 // Statements returns all statements in the batch. The slice is built on demand from
@@ -397,7 +433,7 @@ func (i *Iter) Close() error {
 		return nil
 	}
 
-	return i.iter.Close()
+	return mapErr(i.iter.Close())
 }
 
 // MapScan reads the next row into a map.
@@ -415,7 +451,9 @@ func (i *Iter) SliceMap() ([]map[string]any, error) {
 		return nil, nil
 	}
 
-	return i.iter.SliceMap()
+	rows, err := i.iter.SliceMap()
+
+	return rows, mapErr(err)
 }
 
 // PageState returns the pagination token.
@@ -492,7 +530,7 @@ func (s *scanner) Scan(dest ...any) error {
 		return nil
 	}
 
-	return s.scanner.Scan(dest...)
+	return mapErr(s.scanner.Scan(dest...))
 }
 
 func (s *scanner) Err() error {
@@ -500,5 +538,5 @@ func (s *scanner) Err() error {
 		return nil
 	}
 
-	return s.scanner.Err()
+	return mapErr(s.scanner.Err())
 }

@@ -345,6 +345,20 @@ var (
 	// Distinct from ErrInvalidClusterOverride, which is read-override-specific.
 	ErrInvalidCluster = errors.New("helix: invalid cluster for this client")
 
+	// ErrClusterUnreachable marks a driver error that means the cluster could
+	// not be reached at all: no connections in the pool, a closed session, a
+	// connection dropped before it answered, or a coordinator reporting that
+	// not enough replicas were alive.
+	// It is distinct from an error that means the cluster rejected the
+	// statement.
+	//
+	// The bundled adapters wrap such driver errors so that
+	// errors.Is(err, ErrClusterUnreachable) holds while the original driver
+	// error stays reachable through errors.Is and errors.As.
+	// The replay worker uses it to keep retrying a payload for as long as it
+	// is retained instead of counting the attempt against a poison budget.
+	ErrClusterUnreachable = errors.New("helix: cluster unreachable")
+
 	// ErrNoSessionRefresher indicates RefreshSession was called but no
 	// SessionRefresher was registered via WithSessionRefresher. The caller
 	// must either register one at construction or use the lower-level

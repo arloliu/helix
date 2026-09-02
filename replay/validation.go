@@ -81,6 +81,13 @@ func validateWorkerConfigForChecked(config WorkerConfig, component string) error
 	if config.MaxAttempts <= 0 {
 		errList = append(errList, optionErrPositiveInt(component, "WithMaxAttempts"))
 	}
+	if config.RetryWindow <= 0 {
+		errList = append(errList, optionErrPositiveDuration(component, "WithRetryWindow"))
+	}
+	if !config.RetryPolicy.valid() {
+		errList = append(errList, newOptionError(component, "WithRetryPolicy",
+			"must be RetryBounded or RetryWhileRetained"))
+	}
 	if config.HighPriorityRatio < 0 {
 		errList = append(errList, optionErrNonNegativeInt(component, "WithHighPriorityRatio"))
 	}

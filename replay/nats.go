@@ -117,6 +117,11 @@ type NATSReplayer struct {
 	consumers map[string]jetstream.Consumer
 	closed    bool
 	mu        sync.RWMutex
+
+	// redeliveryBackoff is set by a worker running RetryWhileRetained before
+	// it starts: consumers created afterwards allow unlimited deliveries and
+	// use this server-side redelivery schedule for unacknowledged messages.
+	redeliveryBackoff []time.Duration
 }
 
 // NATSReplayerOption configures a NATSReplayer.
@@ -537,7 +542,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		priorityStr = "high"
 	}
 
-	consumerName := "helix-worker-" + priorityStr + "-" + string(cluster)
+	consumerName := workerConsumerName(priorityStr, cluster)
 	filterSubject := n.config.SubjectPrefix + "." + priorityStr + "." + string(cluster)
 
 	consumer, err := n.getOrCreateConsumer(ctx, consumerName, filterSubject)
@@ -570,7 +575,7 @@ func (n *NATSReplayer) getOrCreateConsumer(
 		return consumer, nil
 	}
 
-	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+	consumerConfig := jetstream.ConsumerConfig{
 		Name:            consumerName,
 		Durable:         consumerName,
 		FilterSubject:   filterSubject,
@@ -580,7 +585,17 @@ func (n *NATSReplayer) getOrCreateConsumer(
 		MaxAckPending:   n.config.MaxAckPending,
 		MaxRequestBatch: n.config.MaxRequestBatch,
 		AckWait:         n.config.AckWait,
-	})
+	}
+	if n.redeliveryBackoff != nil {
+		// The worker owns the poison budget; the server must never drop a
+		// message on its own. BackOff only governs redelivery of messages
+		// that were never acknowledged (worker crash mid-batch); explicit
+		// delayed NAKs carry their own delay.
+		consumerConfig.MaxDeliver = -1
+		consumerConfig.BackOff = n.redeliveryBackoff
+	}
+
+	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, consumerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("helix: failed to create consumer: %w", err)
 	}
@@ -625,8 +640,10 @@ msgLoop:
 		// Extract delivery metadata
 		meta, metaErr := msg.Metadata()
 		var deliveryCount uint64 = 1
+		var streamSeq uint64
 		if metaErr == nil {
 			deliveryCount = meta.NumDelivered
+			streamSeq = meta.Sequence.Stream
 		}
 
 		var natsMsg natsReplayMessage
@@ -681,11 +698,14 @@ msgLoop:
 				BatchType:       types.BatchType(natsMsg.BatchType),
 				BatchStatements: batchStmts,
 			},
-			ackFunc:       msg.Ack,
-			nakFunc:       msg.Nak,
-			termFunc:      msg.Term,
-			DeliveryCount: deliveryCount,
-			MaxDeliver:    maxDeliver,
+			ackFunc:          msg.Ack,
+			nakFunc:          msg.Nak,
+			nakWithDelayFunc: msg.NakWithDelay,
+			inProgressFunc:   msg.InProgress,
+			termFunc:         msg.Term,
+			DeliveryCount:    deliveryCount,
+			MaxDeliver:       maxDeliver,
+			StreamSequence:   streamSeq,
 		})
 	}
 
@@ -904,10 +924,12 @@ func decodeArgs(raw msgp.Raw) ([]any, error) {
 
 // ReplayMessage wraps a replay payload with acknowledgment functions.
 type ReplayMessage struct {
-	Payload  types.ReplayPayload
-	ackFunc  func() error
-	nakFunc  func() error
-	termFunc func() error
+	Payload          types.ReplayPayload
+	ackFunc          func() error
+	nakFunc          func() error
+	nakWithDelayFunc func(time.Duration) error
+	inProgressFunc   func() error
+	termFunc         func() error
 
 	// DeliveryCount is the number of times this message has been delivered.
 	// Starts at 1 for the first delivery.
@@ -915,7 +937,13 @@ type ReplayMessage struct {
 
 	// MaxDeliver is the maximum delivery attempts configured for this consumer.
 	// When DeliveryCount equals MaxDeliver and the message is Nak'd, it will be dropped.
+	// Under RetryWhileRetained the consumer allows unlimited deliveries and
+	// the worker's MaxAttempts bounds dead-letter attempts instead.
 	MaxDeliver int
+
+	// StreamSequence is the message's sequence number in the stream.
+	// It identifies the message across redeliveries.
+	StreamSequence uint64
 }
 
 // Ack acknowledges successful processing of the message.
@@ -937,6 +965,35 @@ func (m *ReplayMessage) Ack() error {
 func (m *ReplayMessage) Nak() error {
 	if m.nakFunc != nil {
 		return m.nakFunc()
+	}
+
+	return nil
+}
+
+// NakWithDelay negatively acknowledges the message and asks the server to
+// redeliver it no sooner than delay from now.
+//
+// Parameters:
+//   - delay: Minimum time before redelivery
+//
+// Returns:
+//   - error: Error if negative acknowledgment fails
+func (m *ReplayMessage) NakWithDelay(delay time.Duration) error {
+	if m.nakWithDelayFunc != nil {
+		return m.nakWithDelayFunc(delay)
+	}
+
+	return nil
+}
+
+// InProgress tells the server the message is still being processed,
+// resetting its AckWait timer so a long batch is not redelivered mid-flight.
+//
+// Returns:
+//   - error: Error if the notification fails
+func (m *ReplayMessage) InProgress() error {
+	if m.inProgressFunc != nil {
+		return m.inProgressFunc()
 	}
 
 	return nil
@@ -1035,4 +1092,68 @@ func (n *NATSReplayer) Close() error {
 //   - string: The stream name
 func (n *NATSReplayer) StreamName() string {
 	return n.config.StreamName
+}
+
+// Config returns a copy of the effective replayer configuration.
+//
+// Returns:
+//   - NATSReplayerConfig: The configuration after defaults and options
+func (n *NATSReplayer) Config() NATSReplayerConfig {
+	return n.config
+}
+
+// PendingByCluster returns the number of messages for one cluster that have
+// not yet been replayed successfully: not yet delivered, delivered but not
+// acknowledged, and waiting for redelivery, across both priority consumers.
+//
+// Consumers that this replayer has not created yet contribute 0.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - cluster: The target cluster to count
+//
+// Returns:
+//   - int: Outstanding messages for that cluster
+//   - error: Error if consumer info cannot be fetched
+func (n *NATSReplayer) PendingByCluster(ctx context.Context, cluster types.ClusterID) (int, error) {
+	n.mu.RLock()
+	if n.closed {
+		n.mu.RUnlock()
+
+		return 0, types.ErrSessionClosed
+	}
+	consumers := make([]jetstream.Consumer, 0, 2)
+	for _, priority := range []string{"high", "low"} {
+		if consumer, ok := n.consumers[workerConsumerName(priority, cluster)]; ok {
+			consumers = append(consumers, consumer)
+		}
+	}
+	n.mu.RUnlock()
+
+	total := uint64(0)
+	for _, consumer := range consumers {
+		info, err := consumer.Info(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("helix: failed to get consumer info: %w", err)
+		}
+		total += info.NumPending + uint64(info.NumAckPending) //nolint:gosec // NumAckPending is a non-negative count
+	}
+
+	return msgsToInt(total)
+}
+
+// enableRetainedDelivery makes every consumer created from now on allow
+// unlimited deliveries and use backoff as its redelivery schedule for
+// unacknowledged messages.
+// A worker running RetryWhileRetained calls it before Start.
+func (n *NATSReplayer) enableRetainedDelivery(backoff []time.Duration) {
+	n.mu.Lock()
+	n.redeliveryBackoff = backoff
+	n.mu.Unlock()
+}
+
+// workerConsumerName is the durable consumer a worker uses for one
+// priority level of one cluster.
+func workerConsumerName(priority string, cluster types.ClusterID) string {
+	return "helix-worker-" + priority + "-" + string(cluster)
 }

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/internal/typeutil"
 	"github.com/arloliu/helix/types"
 )
@@ -27,7 +28,8 @@ type WorkerConfig struct {
 	PollInterval time.Duration
 
 	// RetryDelay is the initial delay before retrying a failed replay.
-	// Uses exponential backoff with jitter.
+	// The delay doubles after every failed attempt, without jitter, up to
+	// MaxRetryDelay.
 	// Default: 100ms
 	RetryDelay time.Duration
 
@@ -43,12 +45,32 @@ type WorkerConfig struct {
 	// in the memory backend. After MaxAttempts failures, the payload is
 	// dropped and OnDrop is invoked with the final error.
 	//
-	// The NATS backend uses NATSReplayerConfig.MaxDeliver instead and
-	// ignores this setting.
+	// Under RetryWhileRetained it is the poison budget on both backends:
+	// only attempts the classifier marks DispositionDeadLetter count toward
+	// it.
+	//
+	// Under RetryBounded the NATS backend uses NATSReplayerConfig.MaxDeliver
+	// instead and ignores this setting.
 	//
 	// Values <= 0 are treated as 1 (no retry beyond the initial attempt).
 	// Default: 5
 	MaxAttempts int
+
+	// RetryPolicy selects how failed attempts are budgeted.
+	// See ReplayRetryPolicy.
+	// Default: RetryBounded
+	RetryPolicy ReplayRetryPolicy
+
+	// RetryWindow bounds how long the memory backend keeps retrying a
+	// payload under RetryWhileRetained, measured from its first attempt.
+	// The NATS backend is bounded by the stream MaxAge instead.
+	// Default: 24 hours
+	RetryWindow time.Duration
+
+	// Classifier maps an execution error to a ReplayDisposition under
+	// RetryWhileRetained.
+	// Default: DefaultReplayClassifier
+	Classifier ReplayClassifier
 
 	// HighPriorityRatio controls the ratio of high-priority to low-priority
 	// processing. The exact unit depends on the backend:
@@ -76,6 +98,10 @@ type WorkerConfig struct {
 	// If nil, no metrics are recorded.
 	Metrics types.MetricsCollector
 
+	// backlog is Metrics narrowed to the optional backlog interface, or a
+	// no-op collector when Metrics does not implement it.
+	backlog types.ReplayBacklogMetrics
+
 	// metricsExplicit is true when WithWorkerMetrics was called by the
 	// caller. Used by [Worker.MetricsConfigured] so a parent (e.g. the
 	// helix CQLClient) can detect "user did NOT pass WithWorkerMetrics"
@@ -98,8 +124,9 @@ type WorkerConfig struct {
 	// The error and attempt number are provided.
 	OnError func(payload types.ReplayPayload, err error, attempt int)
 
-	// OnDrop is called when a message exceeds max retries and is dropped (optional).
-	// Only applicable for NATS replayer which has built-in max delivery.
+	// OnDrop is called once when a payload is permanently dropped (optional).
+	// Both backends invoke it; the reason is reported through the optional
+	// types.ReplayBacklogMetrics interface and the worker log.
 	OnDrop func(payload types.ReplayPayload, err error)
 }
 
@@ -112,6 +139,7 @@ func DefaultWorkerConfig() WorkerConfig {
 		MaxRetryDelay:     30 * time.Second,
 		ExecuteTimeout:    30 * time.Second,
 		MaxAttempts:       5,
+		RetryWindow:       defaultRetryWindow,
 		HighPriorityRatio: 10,
 		StrictPriority:    false,
 		ClusterNames:      types.DefaultClusterNames(),
@@ -158,8 +186,11 @@ func WithExecuteTimeout(d time.Duration) WorkerOption {
 
 // WithMaxAttempts sets the maximum number of attempts for a single payload
 // in the memory backend before it is dropped via OnDrop.
+// Under [RetryWhileRetained] it is the poison budget on both backends: only
+// attempts the classifier marks [DispositionDeadLetter] count toward it.
 //
-// Memory only — the NATS backend uses MaxDeliver on the consumer.
+// Under [RetryBounded] the NATS backend uses MaxDeliver on the consumer
+// instead.
 // Values <= 0 are treated as 1 (no retry beyond the initial attempt).
 func WithMaxAttempts(n int) WorkerOption {
 	return func(c *WorkerConfig) {
@@ -402,6 +433,7 @@ func (w *Worker) SetMetrics(m types.MetricsCollector) {
 	}
 	w.config.Metrics = m
 	w.config.metricsExplicit = true
+	w.config.resolveBacklog()
 }
 
 // Metrics returns the worker's metrics collector. Useful for tests and
@@ -416,8 +448,60 @@ func (w *Worker) BackendType() string {
 	return w.backend.backendType()
 }
 
+// resolveBacklog narrows Metrics to the optional backlog interface once so
+// the workers can report without a type assertion per payload.
+func (c *WorkerConfig) resolveBacklog() {
+	c.backlog = c.backlogMetrics()
+}
+
+// backlogMetrics returns the resolved backlog collector, deriving it from
+// Metrics for configurations built without finalizeWorkerConfig.
+func (c *WorkerConfig) backlogMetrics() types.ReplayBacklogMetrics {
+	if c.backlog != nil {
+		return c.backlog
+	}
+	if bm, ok := c.Metrics.(types.ReplayBacklogMetrics); ok {
+		return bm
+	}
+
+	return metrics.NewNopMetrics()
+}
+
+// observeAge publishes how old the payload about to be executed is,
+// measured from its client-side write timestamp (microseconds).
+func (c *WorkerConfig) observeAge(payload types.ReplayPayload) {
+	if payload.Timestamp <= 0 {
+		return
+	}
+	c.backlogMetrics().SetReplayOldestAge(payload.TargetCluster,
+		max(float64(time.Now().UnixMicro()-payload.Timestamp)/1e6, 0))
+}
+
+// observeIdle resets the age gauge for a cluster with nothing pending.
+func (c *WorkerConfig) observeIdle(cluster types.ClusterID) {
+	c.backlogMetrics().SetReplayOldestAge(cluster, 0)
+}
+
+// observeDrop records one permanently dropped payload exactly once: the
+// drop counters, the per-reason series, the log line, and OnDrop.
+// reason is one of the types.ReplayDrop constants; attrs are extra log
+// fields.
+func (c *WorkerConfig) observeDrop(payload types.ReplayPayload, err error, reason string, attrs ...any) {
+	cluster := payload.TargetCluster
+	c.Metrics.IncReplayDropped(cluster)
+	c.backlogMetrics().IncReplayWorkerDropped(cluster, reason)
+	c.Logger.Error("replay message dropped", append([]any{
+		"cluster", c.ClusterNames.Name(cluster),
+		"reason", reason,
+		"error", errString(err),
+	}, attrs...)...)
+	if c.OnDrop != nil {
+		c.OnDrop(payload, err)
+	}
+}
+
 // calculateBackoff calculates the backoff delay with exponential increase.
-// This is a standalone function used by memory backend for retry logic.
+// Both backends use it to space out retries of a failed payload.
 func calculateBackoff(attempt int, retryDelay, maxRetryDelay time.Duration) time.Duration {
 	delay := retryDelay
 

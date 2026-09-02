@@ -213,6 +213,11 @@ type Collector struct {
 	replayDurationA   *metrics.PrometheusHistogram
 	replayDurationB   *metrics.PrometheusHistogram
 
+	// Replay backlog (optional types.ReplayBacklogMetrics): age gauges hold
+	// float64 bits; per-reason drop counters are created on first use.
+	replayOldestAgeA atomic.Uint64
+	replayOldestAgeB atomic.Uint64
+
 	// Cluster health metrics
 	clusterDrainingA  atomic.Int64
 	clusterDrainingB  atomic.Int64
@@ -360,6 +365,14 @@ func (c *Collector) initMetrics() {
 	})
 	c.replayDurationA = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_replay_duration_seconds{cluster="%s"}`, p, nA), c.durationBuckets)
 	c.replayDurationB = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_replay_duration_seconds{cluster="%s"}`, p, nB), c.durationBuckets)
+
+	// Replay backlog (optional types.ReplayBacklogMetrics)
+	c.set.NewGauge(fmt.Sprintf(`%s_replay_oldest_age_seconds{cluster="%s"}`, p, nA), func() float64 {
+		return math.Float64frombits(c.replayOldestAgeA.Load())
+	})
+	c.set.NewGauge(fmt.Sprintf(`%s_replay_oldest_age_seconds{cluster="%s"}`, p, nB), func() float64 {
+		return math.Float64frombits(c.replayOldestAgeB.Load())
+	})
 
 	// Cluster health metrics
 	c.set.NewGauge(fmt.Sprintf(`%s_cluster_draining{cluster="%s"}`, p, nA), func() float64 {
@@ -638,6 +651,24 @@ func (c *Collector) ObserveReplayDuration(cluster types.ClusterID, seconds float
 	} else {
 		c.replayDurationB.Update(seconds)
 	}
+}
+
+// SetReplayOldestAge sets the backlog-head age gauge for a cluster. Part of
+// the optional types.ReplayBacklogMetrics interface.
+func (c *Collector) SetReplayOldestAge(cluster types.ClusterID, seconds float64) {
+	if cluster == types.ClusterA {
+		c.replayOldestAgeA.Store(math.Float64bits(seconds))
+	} else {
+		c.replayOldestAgeB.Store(math.Float64bits(seconds))
+	}
+}
+
+// IncReplayWorkerDropped increments the per-reason worker drop counter.
+// Part of the optional types.ReplayBacklogMetrics interface.
+func (c *Collector) IncReplayWorkerDropped(cluster types.ClusterID, reason string) {
+	name := fmt.Sprintf(`%s_replay_worker_dropped_total{cluster="%s",reason="%s"}`,
+		c.prefix, c.clusterNames.Name(cluster), reason)
+	c.set.GetOrCreateCounter(name).Inc()
 }
 
 // ----------------------

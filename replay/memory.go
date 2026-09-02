@@ -54,6 +54,8 @@ type MemoryReplayer struct {
 	closed    atomic.Bool
 	capacity  int
 	pending   atomic.Int64
+	pendingA  atomic.Int64 // slots held by payloads targeting cluster A
+	pendingB  atomic.Int64 // slots held by payloads targeting cluster B
 
 	// For priority-aware dequeue tracking
 	mu                sync.Mutex
@@ -228,7 +230,7 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 		return ctx.Err()
 	default:
 	}
-	if !m.tryReserveSlot() {
+	if !m.tryReserveSlot(payload.TargetCluster) {
 		return types.ErrReplayQueueFull
 	}
 
@@ -242,12 +244,12 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 
 	select {
 	case <-ctx.Done():
-		m.releaseSlot()
+		m.releaseSlot(payload.TargetCluster)
 		return ctx.Err()
 	case targetQueue <- payload:
 		return nil
 	default:
-		m.releaseSlot()
+		m.releaseSlot(payload.TargetCluster)
 		return types.ErrReplayQueueFull
 	}
 }
@@ -282,7 +284,7 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 		// Determine which queue to try based on priority mode
 		payload, ok := m.tryDequeueWithPriority()
 		if ok {
-			m.releaseSlot()
+			m.releaseSlot(payload.TargetCluster)
 			return payload, true
 		}
 
@@ -299,25 +301,26 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 			m.mu.Lock()
 			m.highProcessed++
 			m.mu.Unlock()
-			m.releaseSlot()
+			m.releaseSlot(payload.TargetCluster)
 			return payload, true
 		case payload := <-m.lowQueue:
 			m.mu.Lock()
 			m.highProcessed = 0 // Reset counter after processing low
 			m.mu.Unlock()
-			m.releaseSlot()
+			m.releaseSlot(payload.TargetCluster)
 			return payload, true
 		}
 	}
 }
 
-func (m *MemoryReplayer) tryReserveSlot() bool {
+func (m *MemoryReplayer) tryReserveSlot(cluster types.ClusterID) bool {
 	for {
 		current := m.pending.Load()
 		if current >= int64(m.capacity) {
 			return false
 		}
 		if m.pending.CompareAndSwap(current, current+1) {
+			m.clusterPending(cluster).Add(1)
 			return true
 		}
 	}
@@ -327,16 +330,43 @@ func (m *MemoryReplayer) tryReserveSlot() bool {
 // tryReserveSlot for capacity accounting. A defensive CAS loop refuses to
 // drive the counter below zero so a regression that releases more than it
 // reserved cannot inflate effective capacity on subsequent reservations.
-func (m *MemoryReplayer) releaseSlot() {
+func (m *MemoryReplayer) releaseSlot(cluster types.ClusterID) {
 	for {
 		current := m.pending.Load()
 		if current <= 0 {
 			return
 		}
 		if m.pending.CompareAndSwap(current, current-1) {
+			m.clusterPending(cluster).Add(-1)
 			return
 		}
 	}
+}
+
+// clusterPending returns the per-cluster slot counter.
+// Enqueue has already rejected any target other than A or B.
+func (m *MemoryReplayer) clusterPending(cluster types.ClusterID) *atomic.Int64 {
+	if cluster == types.ClusterA {
+		return &m.pendingA
+	}
+
+	return &m.pendingB
+}
+
+// tryDequeueRetained removes the next payload without releasing its
+// capacity slot.
+// The worker that took it must call releaseSlot once the payload has been
+// replayed or dropped, so capacity keeps counting executing and waiting
+// payloads.
+func (m *MemoryReplayer) tryDequeueRetained() (types.ReplayPayload, bool) {
+	if m.highQueue == nil || m.lowQueue == nil {
+		return types.ReplayPayload{}, false
+	}
+	if m.closed.Load() && m.Len() == 0 {
+		return types.ReplayPayload{}, false
+	}
+
+	return m.tryDequeueWithPriority()
 }
 
 // tryDequeueWithPriority attempts to dequeue based on priority settings.
@@ -406,38 +436,49 @@ func (m *MemoryReplayer) tryDequeueWithPriority() (types.ReplayPayload, bool) {
 //   - types.ReplayPayload: The payload if available
 //   - bool: true if a payload was retrieved, false if queue is empty or closed
 func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
-	if m.highQueue == nil || m.lowQueue == nil {
-		return types.ReplayPayload{}, false
-	}
-	if m.closed.Load() && m.Len() == 0 {
-		return types.ReplayPayload{}, false
-	}
-
-	payload, ok := m.tryDequeueWithPriority()
+	payload, ok := m.tryDequeueRetained()
 	if ok {
-		m.releaseSlot()
+		m.releaseSlot(payload.TargetCluster)
 	}
 
 	return payload, ok
 }
 
-// Len returns the current number of pending replays across both queues.
+// Len returns the number of capacity slots currently held.
 //
-// IMPORTANT: Len reports queue depth only — items dequeued by a worker
-// for an attempt are NOT counted while in flight, even though they still
-// represent active work. A worker pulling a payload, attempting it,
-// failing, and re-enqueueing with backoff produces a transient
-// `Len() == 0` window even though work remains. Do not use Len()==0 as a
-// "replay drained" signal in tests or operational checks; instead observe
-// an authoritative downstream signal (row counts on the destination,
-// success-counter convergence, or worker-callback completion). Misuse of
-// this contract was the root cause of the S1 e2e flake fixed in
-// `test/e2e/cql/write_replay_test.go` — see the comment there.
+// Under the worker's default [RetryBounded] policy a slot is released as
+// soon as a worker dequeues the payload, so Len reports queue depth only:
+// payloads being attempted or sleeping between attempts are NOT counted,
+// and a worker pulling a payload, failing, and retrying with backoff
+// produces a transient `Len() == 0` window even though work remains.
+// Do not use Len()==0 as a "replay drained" signal in tests or operational
+// checks; instead observe an authoritative downstream signal (row counts on
+// the destination, success-counter convergence, or worker-callback
+// completion). Misuse of this contract was the root cause of the S1 e2e
+// flake fixed in `test/e2e/cql/write_replay_test.go` — see the comment
+// there.
+//
+// Under [RetryWhileRetained] the worker holds the slot until the payload is
+// replayed or dropped, so Len counts queued, executing, and waiting payloads
+// together and reaches 0 only when the backlog has converged.
 //
 // Returns:
-//   - int: Total number of items currently in the high and low priority queues
+//   - int: Number of slots held across both priority queues
 func (m *MemoryReplayer) Len() int {
 	return int(m.pending.Load())
+}
+
+// PendingByCluster returns the number of capacity slots held by payloads
+// targeting one cluster.
+// It follows the same slot lifecycle as [MemoryReplayer.Len].
+//
+// Parameters:
+//   - cluster: The target cluster to count
+//
+// Returns:
+//   - int: Slots held by payloads for that cluster
+func (m *MemoryReplayer) PendingByCluster(cluster types.ClusterID) int {
+	return int(m.clusterPending(cluster).Load())
 }
 
 // HighLen returns the current number of high-priority pending replays.
@@ -501,7 +542,7 @@ func (m *MemoryReplayer) DrainAll() []types.ReplayPayload {
 	for {
 		select {
 		case payload := <-m.highQueue:
-			m.releaseSlot()
+			m.releaseSlot(payload.TargetCluster)
 			payloads = append(payloads, payload)
 		default:
 			goto drainLow
@@ -513,7 +554,7 @@ drainLow:
 	for {
 		select {
 		case payload := <-m.lowQueue:
-			m.releaseSlot()
+			m.releaseSlot(payload.TargetCluster)
 			payloads = append(payloads, payload)
 		default:
 			return payloads

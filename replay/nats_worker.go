@@ -9,6 +9,14 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+// depthRefreshInterval bounds how often a NATS worker goroutine asks the
+// server for consumer info to publish the queue depth gauge.
+const depthRefreshInterval = time.Second
+
+// maxRedeliverySteps caps the length of the server-side redelivery schedule
+// handed to a consumer under RetryWhileRetained.
+const maxRedeliverySteps = 8
+
 // natsBackend implements workerBackend for NATSReplayer.
 type natsBackend struct {
 	replayer *NATSReplayer
@@ -16,6 +24,13 @@ type natsBackend struct {
 	execute  ExecuteFunc
 	stopCh   <-chan struct{}
 	wg       *sync.WaitGroup
+
+	// deadLetters counts, per stream sequence, the attempts the classifier
+	// marked dead-letter under RetryWhileRetained. Both cluster goroutines
+	// share it; sequence numbers are unique across the stream. It is not
+	// persisted, so a restart resets the poison budget.
+	dlMu        sync.Mutex
+	deadLetters map[uint64]int
 
 	// backoffWait is a test seam allowing deterministic observation of
 	// backoff entry: when set, start() calls it instead of time.After to
@@ -62,6 +77,9 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		wait = time.After
 	}
 
+	var nextDepthAt time.Time
+	retained := b.config.RetryPolicy == RetryWhileRetained
+
 	for {
 		select {
 		case <-b.stopCh:
@@ -71,6 +89,10 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		result := b.dequeueWithPriority(ctx, cluster, highProcessed, ratio)
+		if now := time.Now(); !now.Before(nextDepthAt) {
+			b.reportDepth(ctx, cluster)
+			nextDepthAt = now.Add(depthRefreshInterval)
+		}
 		cancel()
 
 		highProcessed = result.highProcessed
@@ -82,7 +104,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		// otherwise each occurrence would burn a JetStream delivery attempt
 		// without execute() ever running on the fetched messages.
 		if len(result.msgs) > 0 {
-			b.processMessages(result.msgs)
+			b.processMessages(result.msgs, retained)
 		}
 
 		if result.err != nil {
@@ -100,6 +122,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		}
 
 		if len(result.msgs) == 0 {
+			b.config.observeIdle(cluster)
 			// No messages, wait before polling again
 			select {
 			case <-b.stopCh:
@@ -209,7 +232,11 @@ func (b *natsBackend) dequeueHighFirst(ctx context.Context, cluster types.Cluste
 // messages would sit unacknowledged until AckWait expires (default 30s)
 // before a restarted worker could re-process them — a long visible delay
 // during graceful restarts.
-func (b *natsBackend) processMessages(msgs []ReplayMessage) {
+//
+// Under RetryWhileRetained every message is marked in progress before it
+// is executed, so a slow batch is not redelivered while it is still being
+// worked through, and failures are settled by settleRetained.
+func (b *natsBackend) processMessages(msgs []ReplayMessage, retained bool) {
 	for i, msg := range msgs {
 		select {
 		case <-b.stopCh:
@@ -217,43 +244,50 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 			// in the batch. Each Nak is independent; an error on one does
 			// not block the others.
 			for j := i; j < len(msgs); j++ {
-				b.nakMessage(msgs[j], "shutdown")
+				b.nakMessage(msgs[j], "shutdown", 0)
 			}
 
 			return
 		default:
 		}
 
+		if retained {
+			if progressErr := msg.InProgress(); progressErr != nil {
+				b.config.Logger.Debug("failed to mark replay message in progress",
+					"cluster", b.clusterName(msg.Payload.TargetCluster),
+					"error", progressErr.Error(),
+				)
+			}
+		}
+		b.config.observeAge(msg.Payload)
+
 		start := time.Now()
 		err := b.executeOnce(msg.Payload)
 		elapsed := time.Since(start).Seconds()
 
 		if err != nil {
+			b.config.Metrics.IncReplayError(msg.Payload.TargetCluster)
+			b.config.Metrics.ObserveReplayDuration(msg.Payload.TargetCluster, elapsed)
+
+			if retained {
+				b.settleRetained(msg, err)
+
+				continue
+			}
+
 			// Compare using uint64 to avoid integer overflow warning
 			// MaxDeliver is always a small positive int (typically 1-10), so this is safe
 			isLastAttempt := msg.MaxDeliver > 0 && msg.DeliveryCount >= uint64(msg.MaxDeliver)
-
-			b.config.Metrics.IncReplayError(msg.Payload.TargetCluster)
-			b.config.Metrics.ObserveReplayDuration(msg.Payload.TargetCluster, elapsed)
 
 			if isLastAttempt {
 				// This is the last attempt - message will be dropped
 				// Use Term() to explicitly terminate, preventing any redelivery
 				if b.termMessage(msg, "max retries exceeded") {
-					b.config.Metrics.IncReplayDropped(msg.Payload.TargetCluster)
-					b.config.Logger.Error("replay execution failed, max retries exceeded, message dropped",
-						"cluster", b.clusterName(msg.Payload.TargetCluster),
-						"attempt", msg.DeliveryCount,
-						"maxDeliver", msg.MaxDeliver,
-						"error", err.Error(),
-					)
-					if b.config.OnDrop != nil {
-						b.config.OnDrop(msg.Payload, err)
-					}
+					b.recordDrop(msg, err, types.ReplayDropMaxAttempts)
 				}
 			} else {
 				// Nak for redelivery
-				b.nakMessage(msg, "retry")
+				b.nakMessage(msg, "retry", 0)
 				b.config.Logger.Warn("replay execution failed, will retry",
 					"cluster", b.clusterName(msg.Payload.TargetCluster),
 					"attempt", msg.DeliveryCount,
@@ -276,6 +310,9 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 
 				continue
 			}
+			if retained {
+				b.forgetDeadLetters(msg.StreamSequence)
+			}
 			b.config.Metrics.IncReplaySuccess(msg.Payload.TargetCluster)
 			b.config.Metrics.ObserveReplayDuration(msg.Payload.TargetCluster, elapsed)
 			if b.config.OnSuccess != nil {
@@ -283,6 +320,105 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage) {
 			}
 		}
 	}
+}
+
+// settleRetained handles a failed attempt under RetryWhileRetained: a
+// dead-letter disposition consumes the poison budget (MaxAttempts) and
+// terminates the message once it is exhausted; every other disposition
+// asks the server to redeliver after the backoff delay, for as long as the
+// stream retains the message.
+func (b *natsBackend) settleRetained(msg ReplayMessage, err error) {
+	disposition := b.config.Classifier(err)
+	attempt := int(min(msg.DeliveryCount, 1<<30)) //nolint:gosec // clamped before conversion
+
+	if disposition == DispositionDeadLetter {
+		count := b.countDeadLetter(msg.StreamSequence)
+		if count >= b.config.MaxAttempts {
+			if b.termMessage(msg, "dead-lettered") {
+				b.recordDrop(msg, err, types.ReplayDropDeadLetter)
+			}
+			b.forgetDeadLetters(msg.StreamSequence)
+
+			return
+		}
+		attempt = count
+	}
+
+	delay := calculateBackoff(attempt, b.config.RetryDelay, b.config.MaxRetryDelay)
+	b.nakMessage(msg, "retry", delay)
+	b.config.Logger.Warn("replay execution failed, will retry",
+		"cluster", b.clusterName(msg.Payload.TargetCluster),
+		"attempt", msg.DeliveryCount,
+		"disposition", disposition.String(),
+		"delay", delay.String(),
+		"error", err.Error(),
+	)
+	if b.config.OnError != nil {
+		b.config.OnError(msg.Payload, err, attempt)
+	}
+}
+
+// countDeadLetter increments and returns the dead-letter count for a
+// stream sequence.
+func (b *natsBackend) countDeadLetter(seq uint64) int {
+	b.dlMu.Lock()
+	defer b.dlMu.Unlock()
+
+	b.deadLetters[seq]++
+
+	return b.deadLetters[seq]
+}
+
+// forgetDeadLetters clears the dead-letter count once a message leaves the
+// stream.
+func (b *natsBackend) forgetDeadLetters(seq uint64) {
+	b.dlMu.Lock()
+	delete(b.deadLetters, seq)
+	b.dlMu.Unlock()
+}
+
+// recordDrop reports a permanently dropped message; the reason is one of
+// the types.ReplayDrop constants.
+func (b *natsBackend) recordDrop(msg ReplayMessage, err error, reason string) {
+	b.config.observeDrop(msg.Payload, err, reason,
+		"attempt", msg.DeliveryCount,
+		"maxDeliver", msg.MaxDeliver,
+	)
+}
+
+// reportDepth publishes the outstanding message count for a cluster as the
+// queue depth gauge.
+func (b *natsBackend) reportDepth(ctx context.Context, cluster types.ClusterID) {
+	depth, err := b.replayer.PendingByCluster(ctx, cluster)
+	if err != nil {
+		b.config.Logger.Debug("failed to read replay backlog depth",
+			"cluster", b.clusterName(cluster),
+			"error", err.Error(),
+		)
+
+		return
+	}
+	b.config.Metrics.SetReplayQueueDepth(cluster, depth)
+}
+
+// redeliverySchedule builds the server-side redelivery delays for
+// unacknowledged messages under RetryWhileRetained: it starts at ackWait,
+// which the server also adopts as the consumer's AckWait, and doubles up to
+// the larger of ackWait and maxDelay.
+func redeliverySchedule(ackWait, maxDelay time.Duration) []time.Duration {
+	if ackWait <= 0 {
+		ackWait = DefaultNATSReplayerConfig().AckWait
+	}
+	limit := max(maxDelay, ackWait)
+	schedule := make([]time.Duration, 0, maxRedeliverySteps)
+	for d := ackWait; len(schedule) < maxRedeliverySteps && d < limit; d *= 2 {
+		schedule = append(schedule, d)
+	}
+	if len(schedule) < maxRedeliverySteps {
+		schedule = append(schedule, limit)
+	}
+
+	return schedule
 }
 
 func (b *natsBackend) ackMessage(msg ReplayMessage) error {
@@ -301,8 +437,13 @@ func (b *natsBackend) ackMessage(msg ReplayMessage) error {
 	return wrapped
 }
 
-func (b *natsBackend) nakMessage(msg ReplayMessage, reason string) {
-	if err := msg.Nak(); err != nil {
+// nakMessage requests redelivery, after delay when it is positive.
+func (b *natsBackend) nakMessage(msg ReplayMessage, reason string, delay time.Duration) {
+	err := msg.Nak()
+	if delay > 0 {
+		err = msg.NakWithDelay(delay)
+	}
+	if err != nil {
 		b.config.Logger.Error("failed to nak replay message",
 			"cluster", b.clusterName(msg.Payload.TargetCluster),
 			"reason", reason,
@@ -403,11 +544,18 @@ func newNATSWorkerWithConfig(
 
 	// Create and inject the NATS backend
 	w.backend = &natsBackend{
-		replayer: replayer,
-		config:   &w.config,
-		execute:  execute,
-		stopCh:   w.stopCh,
-		wg:       &w.wg,
+		replayer:    replayer,
+		config:      &w.config,
+		execute:     execute,
+		stopCh:      w.stopCh,
+		wg:          &w.wg,
+		deadLetters: make(map[uint64]int),
+	}
+
+	if config.RetryPolicy == RetryWhileRetained && replayer != nil {
+		replayer.enableRetainedDelivery(
+			redeliverySchedule(replayer.config.AckWait, config.MaxRetryDelay),
+		)
 	}
 
 	return w
