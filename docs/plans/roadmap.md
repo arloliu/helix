@@ -253,6 +253,21 @@ new option rejection and warnings, exported capability interfaces) are recorded 
 **Verification:** the Phase 0 regression tests for the listed findings pass; the classification
 matrix shows parent-context rows as non-health on every entry point.
 
+**Status (2026-09-03):** 3.1 to 3.13 done on branch `feat/root-restructure`.
+The read matrix now has a caller-context column (non-health, no failover on every entry point)
+and a driver-timeout column (a cluster error), and the R-2, FB-1, FB-2, FB-5, FO-2, D-3
+regression tests are enabled.
+Two items deviate from the table:
+
+- 3.9 is documented rather than changed: calling `RecordSuccess` before `RecordLatency` would
+  let the success reset the slow-read count the latency breaker accumulates, so `LatencyRecorder`
+  now states that `RecordLatency` is the success signal for the read path.
+- 3.10 versions the envelope (version field plus optional consistency levels, absent for
+  version 1 messages) and documents the worker-first rollout, but keeps the subjects and
+  consumer names unchanged: a work-queue stream forbids two consumers with overlapping filters,
+  so a versioned consumer name would require migrating the durable consumer, and an older worker
+  reading a version 2 message behaves exactly as it does today.
+
 ---
 
 ## Phase 4 — Authorities, per-cluster replay, auto-recovery (`v1.8.0`)
