@@ -58,7 +58,7 @@ type WorkerConfig struct {
 
 	// RetryPolicy selects how failed attempts are budgeted.
 	// See ReplayRetryPolicy.
-	// Default: RetryBounded
+	// Default: RetryWhileRetained
 	RetryPolicy ReplayRetryPolicy
 
 	// RetryWindow bounds how long the memory backend keeps retrying a
@@ -139,6 +139,7 @@ func DefaultWorkerConfig() WorkerConfig {
 		MaxRetryDelay:     30 * time.Second,
 		ExecuteTimeout:    30 * time.Second,
 		MaxAttempts:       5,
+		RetryPolicy:       RetryWhileRetained,
 		RetryWindow:       defaultRetryWindow,
 		HighPriorityRatio: 10,
 		StrictPriority:    false,

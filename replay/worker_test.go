@@ -663,6 +663,7 @@ func TestMemoryWorker_MaxAttemptsBoundsRetries(t *testing.T) {
 		replay.WithRetryDelay(5*time.Millisecond),
 		replay.WithMaxRetryDelay(20*time.Millisecond),
 		replay.WithMaxAttempts(3),
+		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithOnDrop(func(_ types.ReplayPayload, _ error) {
 			dropped.Add(1)
 		}),
@@ -781,6 +782,7 @@ func TestMemoryWorker_RetryPoolSaturationDropsImmediately(t *testing.T) {
 		replay.WithRetryDelay(10*time.Second),
 		replay.WithMaxRetryDelay(10*time.Second),
 		replay.WithMaxAttempts(5),
+		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithOnDrop(func(_ types.ReplayPayload, err error) {
 			dropped.Add(1)
 			// Drops attributable to pool saturation see the original

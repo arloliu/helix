@@ -429,6 +429,7 @@ func TestMirrorReplayerEndToEndExhaustsRetriesViaOnDrop(t *testing.T) {
 			replay.WithPollInterval(20*time.Millisecond),
 			replay.WithRetryDelay(10*time.Millisecond),
 			replay.WithMaxAttempts(2),
+			replay.WithRetryPolicy(replay.RetryBounded),
 			replay.WithOnDrop(func(p types.ReplayPayload, _ error) {
 				dropCh <- p
 			}),

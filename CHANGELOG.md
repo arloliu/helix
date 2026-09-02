@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behavior change
 
+- `replay.RetryWhileRetained` is now the default retry policy on both
+  replay backends: a payload is retried, with exponential backoff, for as
+  long as it is retained (the memory worker's `WithRetryWindow`, default
+  24 h; the NATS stream's `MaxAge`), and only attempts the classifier marks
+  dead-letter consume the `MaxAttempts` poison budget. Previously the
+  default budget was five attempts, about 1.5 s on the memory backend, so
+  any longer outage lost every replayed write. The NATS consumer is now
+  created with unlimited deliveries and delayed redelivery. Restore the
+  old policy with one line: `replay.WithRetryPolicy(replay.RetryBounded)`.
 - A FallbackRead probe no longer contacts a draining alternative: drain is
   the operator's signal that the cluster should not serve reads, and a
   draining cluster may hold stale rows. The probe returns not-found

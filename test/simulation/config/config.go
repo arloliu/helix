@@ -63,7 +63,7 @@ type ReplayConfig struct {
 	Type        string `yaml:"type"` // memory | nats
 	QueueSize   int    `yaml:"queue_size"`
 	NATSURL     string `yaml:"nats_url"`
-	RetryPolicy string `yaml:"retry_policy"` // bounded (default) | retained
+	RetryPolicy string `yaml:"retry_policy"` // retained (default) | bounded
 }
 
 type WorkloadConfig struct {

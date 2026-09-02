@@ -58,17 +58,18 @@ func (d ReplayDisposition) String() string {
 type ReplayRetryPolicy int
 
 const (
-	// RetryBounded is the default: a payload gets MaxAttempts attempts on the
-	// memory worker or MaxDeliver deliveries on the NATS worker, then it is
-	// dropped through OnDrop.
+	// RetryBounded gives a payload MaxAttempts attempts on the memory worker
+	// or MaxDeliver deliveries on the NATS worker, then drops it through
+	// OnDrop. It was the default before RetryWhileRetained existed and is
+	// kept for callers that prefer a short, fixed retry buffer.
 	// With default settings the memory worker's backoff totals about 1.5
 	// seconds and the NATS worker redelivers without delay, so a payload only
 	// survives an outage of a few seconds.
 	RetryBounded ReplayRetryPolicy = iota
 
-	// RetryWhileRetained keeps retrying a payload for as long as it is
-	// retained: the worker's RetryWindow on the memory backend, the stream's
-	// MaxAge on the NATS backend.
+	// RetryWhileRetained is the default: a payload is retried for as long as
+	// it is retained, the worker's RetryWindow on the memory backend, the
+	// stream's MaxAge on the NATS backend.
 	// Only [DispositionDeadLetter] attempts consume the attempt budget, which
 	// is MaxAttempts on both backends; the NATS replayer's MaxDeliver is not
 	// used.

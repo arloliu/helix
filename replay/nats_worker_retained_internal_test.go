@@ -137,7 +137,7 @@ func TestWorkerRetryPolicyValidation(t *testing.T) {
 		WithRetryPolicy(ReplayRetryPolicy(42)),
 		WithRetryWindow(-time.Second),
 	)
-	assert.Equal(t, RetryBounded, w.config.RetryPolicy)
+	assert.Equal(t, RetryWhileRetained, w.config.RetryPolicy, "an invalid policy falls back to the default")
 	assert.Equal(t, defaultRetryWindow, w.config.RetryWindow)
 	assert.NotNil(t, w.config.Classifier)
 }
