@@ -485,13 +485,25 @@ func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 			for _, stmt := range payload.BatchStatements {
 				batch = batch.Query(stmt.Query, stmt.Args...)
 			}
+			if payload.Consistency != nil {
+				batch = batch.Consistency(*payload.Consistency)
+			}
+			if payload.SerialConsistency != nil {
+				batch = batch.SerialConsistency(*payload.SerialConsistency)
+			}
 
 			return batch.WithTimestamp(payload.Timestamp).ExecContext(ctx)
 		}
 
-		return session.Query(payload.Query, payload.Args...).
-			WithTimestamp(payload.Timestamp).
-			ExecContext(ctx)
+		query := session.Query(payload.Query, payload.Args...)
+		if payload.Consistency != nil {
+			query = query.Consistency(*payload.Consistency)
+		}
+		if payload.SerialConsistency != nil {
+			query = query.SerialConsistency(*payload.SerialConsistency)
+		}
+
+		return query.WithTimestamp(payload.Timestamp).ExecContext(ctx)
 	}
 }
 

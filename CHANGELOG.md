@@ -112,6 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Replay preserves the consistency and serial consistency a write set.
+  `types.ReplayPayload` gains `Consistency` and `SerialConsistency`
+  (nil for a session-default write), the client records them on every
+  replay and mirror payload, and `DefaultExecuteFunc` applies them. The
+  NATS envelope is now versioned: version 2 messages carry the levels, and
+  workers keep reading version 1 messages. Upgrade workers before
+  publishers; an older worker replays a version 2 message at its session
+  default, as it did before. `USING TTL` drift on replay is documented.
 - `Query.NonIdempotent` and `Batch.NonIdempotent` mark a statement that
   must not be applied twice, such as a counter update or a collection
   append. The write takes the strict path (synchronous on both clusters,

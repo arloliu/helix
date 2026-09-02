@@ -451,6 +451,15 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 		IsBatch:         payload.IsBatch,
 		BatchType:       uint8(payload.BatchType),
 		BatchStatements: batchStmts,
+		Version:         replayEnvelopeVersion,
+	}
+	if payload.Consistency != nil {
+		msg.HasConsistency = true
+		msg.Consistency = uint16(*payload.Consistency)
+	}
+	if payload.SerialConsistency != nil {
+		msg.HasSerialConsistency = true
+		msg.SerialConsistency = uint16(*payload.SerialConsistency)
 	}
 
 	// Use msgp for efficient serialization
@@ -690,17 +699,29 @@ msgLoop:
 			}
 		}
 
+		payload := types.ReplayPayload{
+			TargetCluster:   types.ClusterID(natsMsg.TargetCluster),
+			Query:           natsMsg.Query,
+			Args:            args,
+			Timestamp:       natsMsg.Timestamp,
+			Priority:        types.PriorityLevel(natsMsg.Priority),
+			IsBatch:         natsMsg.IsBatch,
+			BatchType:       types.BatchType(natsMsg.BatchType),
+			BatchStatements: batchStmts,
+		}
+		// A version 1 message, or a write that used the session default,
+		// carries no consistency: leave the fields nil.
+		if natsMsg.HasConsistency {
+			c := types.Consistency(natsMsg.Consistency)
+			payload.Consistency = &c
+		}
+		if natsMsg.HasSerialConsistency {
+			c := types.Consistency(natsMsg.SerialConsistency)
+			payload.SerialConsistency = &c
+		}
+
 		result = append(result, ReplayMessage{
-			Payload: types.ReplayPayload{
-				TargetCluster:   types.ClusterID(natsMsg.TargetCluster),
-				Query:           natsMsg.Query,
-				Args:            args,
-				Timestamp:       natsMsg.Timestamp,
-				Priority:        types.PriorityLevel(natsMsg.Priority),
-				IsBatch:         natsMsg.IsBatch,
-				BatchType:       types.BatchType(natsMsg.BatchType),
-				BatchStatements: batchStmts,
-			},
+			Payload:          payload,
 			ackFunc:          msg.Ack,
 			nakFunc:          msg.Nak,
 			nakWithDelayFunc: msg.NakWithDelay,

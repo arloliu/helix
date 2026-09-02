@@ -41,6 +41,10 @@ type writeContext struct {
 	batchType    BatchType
 	batchEntries []batchEntry // Internal format, converted lazily for replay
 	strict       bool         // if true: no replay, returns PartialWriteError on partial failure
+	// consistency and serialConsistency are the levels set on the query
+	// or batch, nil for the session default; replay applies the same ones.
+	consistency       *Consistency
+	serialConsistency *Consistency
 }
 
 // writeLegErrKind classifies the result of one cluster leg of a dual write.
@@ -384,15 +388,28 @@ func (c *CQLClient) replayLeg(
 // write returns, while the payload is replayed later.
 func (c *CQLClient) replayPayload(wc writeContext, cluster ClusterID) types.ReplayPayload {
 	return types.ReplayPayload{
-		TargetCluster:   cluster,
-		Query:           wc.statement,
-		Args:            cloneArgs(wc.args),
-		IsBatch:         wc.isBatch,
-		BatchType:       wc.batchType,
-		BatchStatements: cloneBatchEntries(wc.batchEntries),
-		Timestamp:       wc.timestamp,
-		Priority:        wc.priority,
+		TargetCluster:     cluster,
+		Query:             wc.statement,
+		Args:              cloneArgs(wc.args),
+		IsBatch:           wc.isBatch,
+		BatchType:         wc.batchType,
+		BatchStatements:   cloneBatchEntries(wc.batchEntries),
+		Timestamp:         wc.timestamp,
+		Priority:          wc.priority,
+		Consistency:       cloneConsistency(wc.consistency),
+		SerialConsistency: cloneConsistency(wc.serialConsistency),
 	}
+}
+
+// cloneConsistency copies an optional consistency level so a payload never
+// aliases the query it was built from.
+func cloneConsistency(c *Consistency) *Consistency {
+	if c == nil {
+		return nil
+	}
+	v := *c
+
+	return &v
 }
 
 // enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
