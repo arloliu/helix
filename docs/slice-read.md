@@ -168,7 +168,7 @@ See the [FallbackRead Guide — Slice Methods](fallback-read.md#slice-methods) f
 
 ## Performance Notes
 
-**Materialization.** All rows up to `MaxRows` are held in memory before the method returns. For large partitions, size `MaxRows` conservatively and paginate via `PageState` if needed.
+**Materialization.** All rows up to `MaxRows` are held in memory before the method returns. For large partitions, size `MaxRows` conservatively and paginate via `PageState` if needed. A token from `Iter.PageState` names the cluster that issued it, and every paged read follows it there.
 
 **Page-size clamp.** When `MaxRows` is set, the effective gocql page size is clamped to `maxRows+1` unless the caller already set a smaller page size. For very small caps (e.g., `MaxRows(10)`), this avoids fetching a full page just to discard all but the first few rows while still allowing Helix to detect overflow immediately.
 

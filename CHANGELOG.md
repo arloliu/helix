@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A paged read is sent to the cluster that issued its paging token.
+  `Iter.PageState` now wraps the driver's token with the issuing cluster,
+  and `Query.PageState` routes `Iter`, `SliceMap`, and `SliceScan` to that
+  cluster regardless of the read strategy or drain state; an
+  `AllowedClusters` override that excludes it fails the read with
+  `types.ErrNoValidClusters`. Previously `Iter` re-resolved the cluster on
+  every page and could ship one cluster's cursor to the other once the
+  sticky preference moved. The token is Helix-specific and must be handed
+  back to a Helix client; a driver token still works and resumes on the
+  cluster the strategy selects.
 - A write timestamp of zero is rejected: `WithTimestamp(0)` on a query or
   batch fails at execution with `types.ErrInvalidTimestamp`, and
   `NewCQLClient` rejects a `TimestampProvider` that returns zero with a

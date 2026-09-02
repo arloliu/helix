@@ -29,6 +29,19 @@ func (c *CQLClient) Query(stmt string, values ...any) Query {
 	}
 }
 
+// pagedReadOptions returns the routing options for a read that carries a
+// PageState: the issuing cluster is pinned when the token names one, and
+// drain-aware re-selection is suppressed either way. Without a PageState
+// the zero options apply.
+func (q *cqlQuery) pagedReadOptions() readOptions {
+	if q.pageState == nil {
+		return readOptions{}
+	}
+	cluster, _ := decodePageState(q.pageState)
+
+	return readOptions{preserveSelectedCluster: true, pinnedCluster: cluster}
+}
+
 // cqlQuery implements the Query interface for CQLClient.
 type cqlQuery struct {
 	client            *CQLClient
@@ -158,7 +171,8 @@ func (q *cqlQuery) applyConfig(query cql.Query) cql.Query {
 		query = query.PageSize(*q.pageSize)
 	}
 	if q.pageState != nil {
-		query = query.PageState(q.pageState)
+		_, raw := decodePageState(q.pageState)
+		query = query.PageState(raw)
 	}
 
 	return query
@@ -255,6 +269,12 @@ func (q *cqlQuery) Iter() Iter {
 // Only the retry itself is skipped. Auto-refresh accounting is updated on
 // Close for every outcome except a caller-context error.
 //
+// A query that carries a PageState is sent to the cluster that issued the
+// token, whatever the read strategy or drain state say now: a paging cursor
+// is only meaningful on the cluster that produced it. A token without the
+// Helix routing header keeps whatever cluster resolves first and skips the
+// drain-aware re-selection.
+//
 // If resolveReadTarget returns an error (fail-closed), an errorIter is returned
 // that defers the error to Close(). Always call Close() and check its error.
 func (q *cqlQuery) IterContext(ctx context.Context) Iter {
@@ -262,7 +282,7 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 		return &errorIter{err: types.ErrSessionClosed}
 	}
 
-	rt := q.client.resolveReadTarget(ctx, readOptions{})
+	rt := q.client.resolveReadTarget(ctx, q.pagedReadOptions())
 	if rt.err != nil {
 		return &errorIter{err: rt.err}
 	}

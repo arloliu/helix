@@ -57,6 +57,46 @@ func (i *cqlIter) Close() error {
 	return err
 }
 
+// pageStatePrefixLen is the length of the routing header Helix prepends to
+// a driver paging token: a magic, a version, and the cluster letter.
+const pageStatePrefixLen = 4
+
+// pageStateMagic identifies a paging token issued by Helix; the byte after
+// it is the format version, followed by the cluster letter.
+var pageStateMagic = []byte{'h', 'x'}
+
+// encodePageState prepends the issuing cluster to a driver paging token.
+// An empty token (no more pages) is returned unchanged so callers keep the
+// driver's "nil means done" convention.
+func encodePageState(cluster ClusterID, raw []byte) []byte {
+	if len(raw) == 0 {
+		return raw
+	}
+	out := make([]byte, 0, pageStatePrefixLen+len(raw))
+	out = append(out, pageStateMagic...)
+	out = append(out, '1')
+	out = append(out, cluster.String()...)
+
+	return append(out, raw...)
+}
+
+// decodePageState splits a token produced by encodePageState into the
+// issuing cluster and the driver token. A token without the Helix header
+// (one produced by a driver directly, or by an older Helix) is returned
+// as-is with an empty cluster.
+func decodePageState(state []byte) (cluster ClusterID, raw []byte) {
+	if len(state) <= pageStatePrefixLen ||
+		state[0] != pageStateMagic[0] || state[1] != pageStateMagic[1] || state[2] != '1' {
+		return "", state
+	}
+	cluster = ClusterID(state[3:4])
+	if cluster != ClusterA && cluster != ClusterB {
+		return "", state
+	}
+
+	return cluster, state[pageStatePrefixLen:]
+}
+
 // errorIter is returned when resolveReadTarget fails. It defers the error
 // to Close() since IterContext's signature cannot return an error directly.
 // Scan()/MapScan() always return false. Close()/SliceMap() return the error.
@@ -91,8 +131,11 @@ func (i *cqlIter) SliceMap() ([]map[string]any, error) {
 	return i.iter.SliceMap()
 }
 
+// PageState returns the token for resuming this iteration. When more pages
+// remain, the token carries the cluster that issued it so the next page is
+// read from the same cluster whatever the read routing decides meanwhile.
 func (i *cqlIter) PageState() []byte {
-	return i.iter.PageState()
+	return encodePageState(i.cluster, i.iter.PageState())
 }
 
 func (i *cqlIter) NumRows() int {

@@ -289,8 +289,6 @@ func TestRead_CircuitBreakerBelowThresholdRetriesOnHealthyCluster(t *testing.T) 
 // iterator carrying a PageState is sent to the cluster that issued that
 // cursor, even after the sticky preference has moved to the other cluster.
 func TestIter_PageStatePinsClusterAcrossPreferenceChange(t *testing.T) {
-	t.Skip("pending: Iter with a PageState re-resolves the cluster on every call and ships cluster A's paging cursor to cluster B once the sticky preference has moved")
-
 	sa, sb := newReadProbeSession(), newReadProbeSession()
 	sticky := policy.NewStickyRead(policy.WithPreferredCluster(ClusterA), policy.WithStickyReadCooldown(0))
 	client := newReadProbeClient(t, sa, sb,
@@ -311,7 +309,7 @@ func TestIter_PageStatePinsClusterAcrossPreferenceChange(t *testing.T) {
 	require.Equal(t, ClusterB, sticky.Preferred(), "sticky preference must have moved to cluster B")
 
 	// Page 2 carries A's cursor and must still go to A.
-	cursor := []byte("paging-state-issued-by-cluster-a")
+	cursor := encodePageState(ClusterA, []byte("paging-state-issued-by-cluster-a"))
 	page2 := client.Query("SELECT v FROM t").PageSize(10).PageState(cursor).IterContext(t.Context())
 	require.NoError(t, page2.Close())
 	require.Equal(t, int64(2), sa.iters.Load(), "page 2 carries cluster A's cursor and must be served by cluster A")
