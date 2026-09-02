@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A write timestamp of zero is rejected: `WithTimestamp(0)` on a query or
+  batch fails at execution with `types.ErrInvalidTimestamp`, and
+  `NewCQLClient` rejects a `TimestampProvider` that returns zero with a
+  `types.OptionError`. The drivers treat zero as "use the current time", so
+  a replayed write would have carried a newer timestamp than the original
+  and overwritten later data.
 - `Iter.Close` now reports its outcome to the failover policy and the read
   strategy like every other read: a clean close is a `RecordSuccess`, and a
   cluster error is a `RecordFailure` plus `OnFailure` (the suggested

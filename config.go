@@ -65,7 +65,12 @@ func systemLocalProbe(ctx context.Context, session cql.Session) error {
 
 // TimestampProvider generates timestamps for write operations.
 //
-// The default provider uses time.Now().UnixMicro().
+// The default provider uses time.Now().UnixMicro(). A provider must never
+// return zero: [NewCQLClient] samples it once and rejects a zero result with
+// a [types.OptionError], and a write whose timestamp is zero fails with
+// [types.ErrInvalidTimestamp]. Timestamps decide last-write-wins across
+// both clusters and across replays, so independent clients writing the same
+// row rely on their clocks agreeing to within the spacing of their writes.
 type TimestampProvider func() int64
 
 // DefaultTimestampProvider returns the current time in microseconds.
