@@ -15,33 +15,20 @@ import (
 var errNilSliceScanFn = errors.New("helix: scanFn must not be nil")
 
 // scanFnNotFoundShieldError wraps a user-returned types.ErrNotFound (or any error
-// wrapping it) so the read-pipeline wrappers cannot misclassify it as the
-// synthetic "drained 0 rows" signal. Without this shield, types.IsNotFound
-// at executeRead / executeReadNoFailover (cql_client.go:2031, :2098) would
-// trigger an empty-retry against the alt session, and the SliceScanContext
-// boundary translation (cql_client.go:2949) would silently translate the
-// caller's error to (0, nil).
+// wrapping it) so the read pipeline cannot mistake it for the synthetic
+// "drained 0 rows" signal. Without this shield, classifyReadErr would report
+// readNotFound, executeRead / executeReadNoFailover would trigger an
+// empty-retry against the alt session, and the SliceScanContext boundary
+// translation would silently translate the caller's error to (0, nil).
 //
 // Deliberately omits Unwrap/Is — that breaks errors.Is(shield, ErrNotFound)
 // throughout the internal pipeline. SliceScanContext unwraps the shield
 // before returning, so callers' errors.Is(err, types.ErrNotFound) checks
 // still match.
 //
-// This intentionally also defeats isReadTerminalNonHealth's own
-// errors.Is(err, types.ErrNotFound) check, which would otherwise route the
-// shielded error back into the empty-retry / silent-translation paths this
-// type exists to avoid. But isReadTerminalNonHealth serves TWO purposes —
-// (1) deciding whether to attempt the empty-retry / FallbackRead dance, and
-// (2) deciding whether the error counts as a cluster-health failure — and
-// blocking errors.Is wholesale accidentally defeats both. Only (1) should be
-// defeated. isShieldedScanFnNotFound restores (2): it is checked with
-// errors.As (not Is) at the specific call sites that decide health
-// recording (executeReadNoFailover, executeFallbackRead), so a business-logic
-// not-found returned by the caller's own scanFn is excluded from
-// IncReadError / recordOpOutcome / FailoverPolicy.RecordFailure the same way
-// a genuine types.ErrNotFound is, without reopening the empty-retry
-// misclassification (that decision still only consults errors.Is, which
-// this type still refuses).
+// classifyReadErr recognises the shield as readCallerNotFound, its own kind:
+// the read terminates, no cluster-health signal is recorded, and no
+// FallbackRead probe is attempted.
 type scanFnNotFoundShieldError struct {
 	err error
 }
@@ -52,11 +39,8 @@ func (e *scanFnNotFoundShieldError) Error() string { return e.err.Error() }
 // a *scanFnNotFoundShieldError. Deliberately implemented with errors.As
 // rather than adding Is to the type itself: an Is method would also make
 // errors.Is(err, types.ErrNotFound) succeed everywhere the shield flows,
-// including isReadTerminalNonHealth — reopening the exact empty-retry /
-// silent-translation bug the shield exists to prevent. errors.As only
-// matches the shield's own concrete type, so it is safe to use narrowly at
-// the health-recording call sites without affecting classification anywhere
-// else in the read pipeline.
+// reopening the exact empty-retry / silent-translation bug the shield
+// exists to prevent.
 func isShieldedScanFnNotFound(err error) bool {
 	var shielded *scanFnNotFoundShieldError
 
@@ -293,7 +277,7 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 		// off OR alt also drained empty OR alt was draining-and-skipped OR
 		// PageState suppressed the empty-retry). All of those collapse to
 		// the "empty but successful" return shape for callers.
-		if types.IsNotFound(err) {
+		if classifyReadErr(err) == readNotFound {
 			return nil, nil
 		}
 		// drainIterToSliceMapWithLimit's discard-on-error contract already nils
@@ -309,9 +293,9 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 // is stateless (no closure capture), so a package-level value avoids the
 // per-call allocation that building it inline would incur.
 //
-// ErrRowLimitExceeded is intentionally NOT listed in propagateAltErr: the
-// pre-real-error branch in executeFallbackRead already propagates it
-// before the predicate is consulted (cql_client.go ~line 2362).
+// ErrRowLimitExceeded is intentionally NOT listed in propagateAltErr:
+// executeFallbackRead already propagates readRowLimit before the predicate
+// is consulted.
 var sliceMapFallbackOpts = fallbackReadOptions{
 	skipDrainingAlt: true,
 	propagateAltErr: isCtxErr,
@@ -399,7 +383,7 @@ func (q *cqlQuery) SliceScanContext(
 		// the unwrapped value.
 		return rowCount, shielded.err
 	}
-	if err != nil && types.IsNotFound(err) {
+	if classifyReadErr(err) == readNotFound {
 		// rowCount is zero by construction: synthetic ErrNotFound only
 		// fires when the drain produced no rows, and executeFallbackRead
 		// returns ErrNotFound only when alt also drained empty.
