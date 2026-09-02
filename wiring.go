@@ -345,13 +345,6 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		return nil, err
 	}
 
-	// Keep a defensive auto-refresh sanitizer even after strict
-	// constructor validation so custom/untyped options cannot leave the
-	// goroutine with panic-prone ticker settings.
-	if config.AutoRefresh.Enabled {
-		sanitizeAutoRefreshConfig(&config.AutoRefresh, config.Logger)
-	}
-
 	client := &CQLClient{
 		config:        config,
 		singleCluster: sessionB == nil,
@@ -415,9 +408,6 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	autoInjectMetricsAndLogger(config)
 
 	if err := client.setupMirror(); err != nil {
-		if client.topologyClose != nil {
-			client.topologyClose()
-		}
 		client.abortEventDispatcher()
 
 		return client, err

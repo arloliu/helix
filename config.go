@@ -1065,41 +1065,6 @@ func DefaultAutoRefreshConfig() AutoRefreshConfig {
 	}
 }
 
-// sanitizeAutoRefreshConfig replaces non-positive tuning values with the
-// defaults from DefaultAutoRefreshConfig and warns on each substitution.
-// CheckInterval <= 0 panics in time.NewTicker; the others produce broken
-// (immediately-expired contexts, no-throttle) but non-fatal behavior.
-// Treat all five as misconfiguration so misuse is visible without
-// crashing the auto-refresh goroutine.
-func sanitizeAutoRefreshConfig(cfg *AutoRefreshConfig, logger types.Logger) {
-	defaults := DefaultAutoRefreshConfig()
-	if cfg.CheckInterval <= 0 {
-		logger.Warn("auto-refresh CheckInterval must be > 0; using default",
-			"got", cfg.CheckInterval, "default", defaults.CheckInterval)
-		cfg.CheckInterval = defaults.CheckInterval
-	}
-	if cfg.RefreshTimeout <= 0 {
-		logger.Warn("auto-refresh RefreshTimeout must be > 0; using default",
-			"got", cfg.RefreshTimeout, "default", defaults.RefreshTimeout)
-		cfg.RefreshTimeout = defaults.RefreshTimeout
-	}
-	if cfg.MinRetryInterval <= 0 {
-		logger.Warn("auto-refresh MinRetryInterval must be > 0; using default",
-			"got", cfg.MinRetryInterval, "default", defaults.MinRetryInterval)
-		cfg.MinRetryInterval = defaults.MinRetryInterval
-	}
-	if cfg.SustainedFailureWindow <= 0 {
-		logger.Warn("auto-refresh SustainedFailureWindow must be > 0; using default",
-			"got", cfg.SustainedFailureWindow, "default", defaults.SustainedFailureWindow)
-		cfg.SustainedFailureWindow = defaults.SustainedFailureWindow
-	}
-	if cfg.FailureThreshold <= 0 {
-		logger.Warn("auto-refresh FailureThreshold must be > 0; using default",
-			"got", cfg.FailureThreshold, "default", defaults.FailureThreshold)
-		cfg.FailureThreshold = defaults.FailureThreshold
-	}
-}
-
 // AutoRefreshOption is a per-knob configurator for [WithAutoRefresh].
 type AutoRefreshOption func(*AutoRefreshConfig)
 
