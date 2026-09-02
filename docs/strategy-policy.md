@@ -680,7 +680,7 @@ This is critical: the excluded cluster may have stale or missing rows. A Fallbac
 
 CAS operations (`ScanCAS`, `MapScanCAS`, batch `ExecCAS`, `MapExecCAS`) are single-cluster, non-replicated conditional writes. The override is a read-safety mechanism — it prevents reading stale data from a recovering cluster. CAS operations are write-like: they apply conditional mutations and are never replicated to the other cluster.
 
-If the override rerouted a CAS to a different cluster, it would silently move conditional writes, potentially increasing divergence. CAS paths continue using `ReadStrategy.Select()` directly. To control which cluster CAS operations target, use `ForceDegrade`/`ForceRecover` on the write side.
+If the override rerouted a CAS to a different cluster, it would silently move conditional writes, potentially increasing divergence. CAS paths use `ReadStrategy.Select()` and, like every read, avoid a draining cluster when the other one is not draining; a read failure that moves the sticky preference therefore also moves subsequent CAS operations. To control which cluster CAS operations target, use `ForceDegrade`/`ForceRecover` on the write side.
 
 ### Iterator Paths Defer Errors to `Close()`
 

@@ -265,7 +265,14 @@ func (c *CQLClient) watchTopology() {
 //
 // When a cluster is draining:
 //   - Writes to the cluster are skipped and enqueued for replay
-//   - Reads are failed over to the non-draining cluster
+//   - Reads (Scan, Iter, slice reads, and CAS) are routed to the
+//     non-draining cluster, except a paged read that carries the draining
+//     cluster's own cursor
+//   - A FallbackRead probe does not contact it unless
+//     [WithFallbackReadOnDrainingCluster] is set
+//   - With both clusters draining, writes fail with
+//     [types.ErrBothClustersDraining] and reads proceed on the selected
+//     cluster
 //
 // Parameters:
 //   - cluster: The cluster to check

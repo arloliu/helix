@@ -90,12 +90,29 @@ func (c *CQLClient) alternativeCluster(cluster ClusterID) ClusterID {
 
 // selectClusterForCAS returns the cluster to use for CAS (lightweight transaction)
 // operations. CAS operations are single-cluster, non-replicated conditional writes
-// and are NOT affected by the AllowedClusters override.
+// and are NOT affected by the AllowedClusters override, but a draining
+// cluster is avoided when the other one is not draining.
 func (c *CQLClient) selectClusterForCAS(ctx context.Context) ClusterID {
-	if c.IsSingleCluster() || c.config.ReadStrategy == nil {
+	if c.IsSingleCluster() {
 		return ClusterA
 	}
-	return c.config.ReadStrategy.Select(ctx)
+
+	return c.avoidDraining(c.normalSelect(ctx))
+}
+
+// avoidDraining returns the other cluster when selected is draining and
+// the other is not; otherwise selected. With both clusters draining the
+// selection stands (best effort).
+func (c *CQLClient) avoidDraining(selected ClusterID) ClusterID {
+	drainA, drainB := c.getDrainStates()
+	if !c.clusterIsDraining(selected, drainA, drainB) {
+		return selected
+	}
+	if alt := c.alternativeCluster(selected); !c.clusterIsDraining(alt, drainA, drainB) {
+		return alt
+	}
+
+	return selected
 }
 
 // overrideSnapshot is the resolved override state for a single operation.
@@ -133,11 +150,15 @@ func callAllowedClusters(fn AllowedClustersFunc) (raw []ClusterID, err error) {
 // It returns the selected cluster and override snapshot as one unit.
 // Called exactly once per operation — no downstream function re-evaluates.
 //
-// When opts.preserveSelectedCluster is true, the dual-cluster override
-// path skips drain-filtering and returns the first known override entry
-// as-is; if it is currently draining, the resolver fails closed with
-// types.ErrNoValidClusters rather than shipping a paging cursor to a
-// different cluster.
+// Without an override the strategy's selection is moved away from a
+// draining cluster when the other one is not draining, so every entry
+// point (Scan, Iter, slice reads) avoids a draining cluster the same way.
+//
+// When opts.preserveSelectedCluster is true, drain-aware re-selection is
+// skipped, and the dual-cluster override path returns the first known
+// override entry as-is; if it is currently draining, the resolver fails
+// closed with types.ErrNoValidClusters rather than shipping a paging cursor
+// to a different cluster.
 func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) readTarget {
 	if opts.pinnedCluster != "" {
 		return c.resolveReadTargetPinned(opts.pinnedCluster)
@@ -145,7 +166,7 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) rea
 
 	fn := c.config.AllowedClusters
 	if fn == nil {
-		return readTarget{cluster: c.normalSelect(ctx)}
+		return c.resolveReadTargetNormal(ctx, opts)
 	}
 
 	raw, err := callAllowedClusters(fn)
@@ -161,7 +182,7 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) rea
 
 	// nil or empty = explicit opt-out, normal behavior
 	if len(raw) == 0 {
-		return readTarget{cluster: c.normalSelect(ctx)}
+		return c.resolveReadTargetNormal(ctx, opts)
 	}
 
 	// Single-cluster guard
@@ -241,6 +262,18 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) rea
 		cluster: primary,
 		snap:    overrideSnapshot{active: true, primary: primary, fallback: fallback},
 	}
+}
+
+// resolveReadTargetNormal is the no-override branch of resolveReadTarget:
+// the strategy's selection, moved away from a draining cluster unless the
+// caller asked to preserve it (paged reads must not move the cursor).
+func (c *CQLClient) resolveReadTargetNormal(ctx context.Context, opts readOptions) readTarget {
+	selected := c.normalSelect(ctx)
+	if !c.IsSingleCluster() && !opts.preserveSelectedCluster {
+		selected = c.avoidDraining(selected)
+	}
+
+	return readTarget{cluster: selected}
 }
 
 // resolveReadTargetPinned routes a read that carries a paging token to the
@@ -366,13 +399,12 @@ type readOptions struct {
 }
 
 func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOptions {
-	if q.fallbackRead {
-		return readOptions{fallbackRead: true}
+	enabled := q.fallbackRead || hasFallbackRead(ctx) || c.config.DefaultFallbackRead
+
+	return readOptions{
+		fallbackRead: enabled,
+		fallbackOpts: fallbackReadOptions{readDrainingAlt: c.config.FallbackReadOnDrainingCluster},
 	}
-	if hasFallbackRead(ctx) {
-		return readOptions{fallbackRead: true}
-	}
-	return readOptions{fallbackRead: c.config.DefaultFallbackRead}
 }
 
 // recordReadSuccess records a successful read, using latency-aware recording if supported.
@@ -415,9 +447,8 @@ type primaryAttemptResult struct {
 }
 
 // runPrimaryRead executes the single-attempt portion of a read: pre-
-// attempt fail-closed checks, cluster selection (drain-aware unless
-// opts.preserveSelectedCluster), and the once-per-attempt IncReadTotal /
-// ObserveReadDuration metrics.
+// attempt fail-closed checks, cluster selection through resolveReadTarget,
+// and the once-per-attempt IncReadTotal / ObserveReadDuration metrics.
 //
 // runPrimaryRead intentionally does NOT call IncReadError, recordOpOutcome,
 // recordReadSuccess, or FailoverPolicy.RecordFailure. Those terminal
@@ -448,24 +479,9 @@ func (c *CQLClient) runPrimaryRead(
 		selected = ClusterA
 		session = c.loadSessionA()
 	} else {
+		// resolveReadTarget already moved the selection away from a
+		// draining cluster where the options allow it.
 		selected = rt.cluster
-
-		// Drain-aware re-selection: when override is NOT active, swap
-		// away from a draining selected cluster. Suppressed by
-		// preserveSelectedCluster so paged slice reads don't move the
-		// cursor across clusters before the readFunc runs.
-		if !rt.snap.active && !opts.preserveSelectedCluster {
-			drainA, drainB := c.getDrainStates()
-			if c.clusterIsDraining(selected, drainA, drainB) {
-				alt := c.alternativeCluster(selected)
-				if !c.clusterIsDraining(alt, drainA, drainB) {
-					selected = alt
-				}
-				// If both are draining, proceed with the original
-				// selection (best effort).
-			}
-		}
-
 		session = c.getSession(selected)
 	}
 
@@ -772,18 +788,21 @@ func isCtxErr(err error) bool {
 // real alt errors to ErrNotFound. Slice methods pass non-zero values to opt
 // into drain-aware skip and error propagation.
 //
-//   - skipDrainingAlt: when true, executeFallbackRead returns ErrNotFound
-//     immediately without contacting the alt session if the alt is draining
-//     — no IncReadTotal, no ObserveReadDuration, no health calls. Required by
-//     slice methods: multi-row reads on a draining cluster can return partial
-//     state, and a "try harder" empty-retry must not introduce that risk.
+//   - readDrainingAlt: when true, executeFallbackRead contacts the alt
+//     session even while it is draining. By default a draining alt returns
+//     ErrNotFound immediately — no IncReadTotal, no ObserveReadDuration, no
+//     health calls — because drain is the operator's "do not read here"
+//     signal and a draining cluster may hold stale rows. Scan / MapScan set
+//     it from WithFallbackReadOnDrainingCluster; slice methods never do,
+//     because a multi-row read on a draining cluster can return partial
+//     state.
 //   - propagateAltErr: when non-nil and it returns true for a given alt
 //     error, executeFallbackRead returns that error to the caller instead of
 //     suppressing it to ErrNotFound. Health is recorded for every real alt
 //     error regardless of propagation; caller-context errors never reach
 //     the predicate because classifyReadErr returns them to the caller first.
 type fallbackReadOptions struct {
-	skipDrainingAlt bool
+	readDrainingAlt bool
 	propagateAltErr func(error) bool
 }
 
@@ -791,10 +810,8 @@ type fallbackReadOptions struct {
 // after the selected cluster returned not-found.
 //
 // This is a one-shot check — it does NOT re-enter the main failover sequence.
-// When override is not active, drain state is bypassed by default: the caller
-// explicitly asked to check both clusters, and a draining cluster may still
-// hold the data. Slice callers opt out of this drain bypass via
-// opts.skipDrainingAlt (see fallbackReadOptions).
+// A draining alternative is not contacted unless opts.readDrainingAlt is
+// set (see fallbackReadOptions and WithFallbackReadOnDrainingCluster).
 //
 // When override IS active, the alternative must be in the allowed set.
 // If the alternative is fenced off, ErrNotFound is returned immediately.
@@ -821,10 +838,10 @@ func (c *CQLClient) executeFallbackRead(
 		return types.ErrNotFound
 	}
 
-	// Drain-skip (slice methods only): a draining alt cannot be read for
-	// multi-row results without exposing partial state. Skip without any
-	// alt-side telemetry — this is a routing decision, not a fault.
-	if opts.skipDrainingAlt {
+	// Drain-skip: a draining cluster is the operator's "do not read here",
+	// and for multi-row results it could expose partial state. Skip without
+	// any alt-side telemetry — this is a routing decision, not a fault.
+	if !opts.readDrainingAlt {
 		drainA, drainB := c.getDrainStates()
 		if c.clusterIsDraining(alternativeCluster, drainA, drainB) {
 			return types.ErrNotFound

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behavior change
 
+- A FallbackRead probe no longer contacts a draining alternative: drain is
+  the operator's signal that the cluster should not serve reads, and a
+  draining cluster may hold stale rows. The probe returns not-found
+  without asking, as the slice methods already did. Restore the previous
+  `Scan` / `MapScan` behaviour with one line:
+  `helix.WithFallbackReadOnDrainingCluster(true)`.
 - A dual-cluster write that no cluster acknowledged synchronously now
   returns `*types.NoSynchronousAckError` instead of `nil`. This covers every
   leg pair without an acknowledgement: fire-and-forget plus
@@ -26,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Iter`, batch `IterContext`, and the CAS operations now avoid a draining
+  cluster like every other read, because drain-aware re-selection moved
+  into the shared read-target resolver. Previously only Scan, MapScan, and
+  the slice reads honoured drain state.
 - A paged read is sent to the cluster that issued its paging token.
   `Iter.PageState` now wraps the driver's token with the issuing cluster,
   and `Query.PageState` routes `Iter`, `SliceMap`, and `SliceScan` to that

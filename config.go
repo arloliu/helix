@@ -154,6 +154,12 @@ type ClientConfig struct {
 	// Default: false (opt-in per query or per context).
 	DefaultFallbackRead bool
 
+	// FallbackReadOnDrainingCluster lets a FallbackRead probe on Scan and
+	// MapScan contact the alternative cluster while it is draining. Default
+	// false: a draining alternative answers not-found without being asked.
+	// Set via [WithFallbackReadOnDrainingCluster].
+	FallbackReadOnDrainingCluster bool
+
 	// DefaultMaxRows is the client-wide row cap for [Query.SliceMap] and
 	// [Query.SliceScan] queries. A per-query [Query.MaxRows] override wins when
 	// non-zero; calling MaxRows(0) on a query clears the override and falls back
@@ -968,6 +974,28 @@ func WithClusterNames(nameA, nameB string) Option {
 func WithAllowedClusters(fn AllowedClustersFunc) Option {
 	return func(c *ClientConfig) {
 		c.AllowedClusters = fn
+	}
+}
+
+// WithFallbackReadOnDrainingCluster lets a FallbackRead probe read from a
+// draining cluster.
+//
+// By default a FallbackRead probe skips the alternative cluster while it is
+// draining and returns not-found: drain is the operator's signal that the
+// cluster should not serve reads, typically because it is being backfilled
+// or repaired and may return stale rows. Enable this only when a draining
+// cluster is known to hold current data and a false not-found is worse than
+// a stale row. It applies to Scan and MapScan; SliceMap and SliceScan never
+// read a draining alternative because a multi-row result could be partial.
+//
+// Parameters:
+//   - enabled: true to contact a draining alternative
+//
+// Returns:
+//   - Option: Configuration option
+func WithFallbackReadOnDrainingCluster(enabled bool) Option {
+	return func(c *ClientConfig) {
+		c.FallbackReadOnDrainingCluster = enabled
 	}
 }
 

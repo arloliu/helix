@@ -85,3 +85,25 @@ func TestWrite_HealthyLegFailsWhileOtherDrains(t *testing.T) {
 	defer replayer.Unlock()
 	require.Empty(t, replayer.payloads, "an unacknowledged write is not replayed")
 }
+
+// TestCAS_AvoidsDrainingCluster asserts that a lightweight transaction is
+// routed away from a draining cluster like any other read.
+func TestCAS_AvoidsDrainingCluster(t *testing.T) {
+	sessionA, sessionB := newMockSession(), newMockSession()
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithReadStrategy(newMockReadStrategy(ClusterA, ClusterB, true)),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	client.drainA.Store(true)
+
+	_, err = client.Query("UPDATE t SET v = ? WHERE k = ? IF v = ?", 2, 1, 1).ScanCAS()
+	require.NoError(t, err)
+	require.Empty(t, sessionA.queries, "the draining cluster must not receive the transaction")
+	require.Len(t, sessionB.queries, 1)
+
+	batch := client.Batch(LoggedBatch).Query("UPDATE t SET v = ? WHERE k = ? IF v = ?", 2, 1, 1)
+	_, _, err = batch.ExecCAS()
+	require.NoError(t, err)
+	require.Empty(t, sessionA.queries)
+}
