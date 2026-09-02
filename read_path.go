@@ -324,12 +324,15 @@ func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOpt
 // recordReadSuccess records a successful read, using latency-aware recording if supported.
 // When overrideActive is true, the ReadStrategy is frozen (no OnSuccess call).
 // FailoverPolicy always receives health signals regardless of override state.
+//
+// A policy that implements [LatencyRecorder] receives RecordLatency instead
+// of RecordSuccess: the sample is its success signal, and calling both would
+// let RecordSuccess erase the slow-read count a latency breaker keeps.
 func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64, overrideActive bool) {
 	if !overrideActive && c.config.ReadStrategy != nil {
 		c.config.ReadStrategy.OnSuccess(cluster)
 	}
 	if c.config.FailoverPolicy != nil {
-		// Use latency-aware recording if supported, otherwise just record success
 		if recorder, ok := c.config.FailoverPolicy.(LatencyRecorder); ok {
 			recorder.RecordLatency(cluster, time.Duration(elapsed*float64(time.Second)))
 		} else {
