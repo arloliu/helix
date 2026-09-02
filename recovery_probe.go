@@ -10,17 +10,8 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
-// probeReporter is the capability subset of [policy.AdaptiveDualWrite] that
-// the recovery probe goroutines need. Defined as a local interface so the root
-// package does not import the policy package, and so custom write strategies
-// that also implement IsDegraded + RecordProbeSuccess benefit from probing.
-type probeReporter interface {
-	IsDegraded(cluster types.ClusterID) bool
-	RecordProbeSuccess(cluster types.ClusterID)
-}
-
 // startRecoveryProbes starts one background goroutine per cluster when the
-// write strategy implements [probeReporter] (i.e. AdaptiveDualWrite or a
+// write strategy implements [ProbeReporter] (i.e. AdaptiveDualWrite or a
 // custom strategy with equivalent methods) and the recovery probe has not
 // been explicitly disabled via [WithRecoveryProbeDisabled]. Single-cluster
 // mode is skipped because there is no second cluster to recover.
@@ -31,7 +22,7 @@ func (c *CQLClient) startRecoveryProbes() {
 	if c.config.recoveryProbeOff || c.singleCluster {
 		return
 	}
-	pr, ok := c.config.WriteStrategy.(probeReporter)
+	pr, ok := c.config.WriteStrategy.(ProbeReporter)
 	if !ok {
 		return
 	}
@@ -52,7 +43,7 @@ func (c *CQLClient) startRecoveryProbes() {
 // executes the probe against its live session. A successful probe credits one
 // recovery point; a failing probe is logged at debug and the cluster stays
 // degraded. The loop exits when recoveryProbeCtx is cancelled (i.e. on Close).
-func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr probeReporter, p *RecoveryProbe) {
+func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *RecoveryProbe) {
 	// Metrics is immutable after construction, so resolve the optional
 	// interface once. rpm is nil for collectors that do not opt in.
 	rpm, _ := c.config.Metrics.(types.RecoveryProbeMetrics)

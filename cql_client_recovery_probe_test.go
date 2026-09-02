@@ -79,7 +79,7 @@ func TestRecoveryProbe_StartsForAdaptiveDualWrite(t *testing.T) {
 }
 
 // TestRecoveryProbe_NoStartWithoutAdaptive verifies that no probe goroutine
-// starts when the write strategy is not a probeReporter (e.g. ConcurrentDualWrite).
+// starts when the write strategy does not implement ProbeReporter (e.g. ConcurrentDualWrite).
 func TestRecoveryProbe_NoStartWithoutAdaptive(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 
@@ -93,7 +93,7 @@ func TestRecoveryProbe_NoStartWithoutAdaptive(t *testing.T) {
 		Timeout:  20 * time.Millisecond,
 	}
 
-	// ConcurrentDualWrite does not implement probeReporter.
+	// ConcurrentDualWrite does not implement ProbeReporter.
 	client, err := NewCQLClient(sa, sb,
 		WithWriteStrategy(policy.NewConcurrentDualWrite()),
 		WithRecoveryProbe(customProbe),
