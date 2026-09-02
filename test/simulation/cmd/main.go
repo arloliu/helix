@@ -142,6 +142,12 @@ func run() error {
 		return err
 	}
 
+	// Strategy groups build their own replay worker; give them the same
+	// retry policy the main client runs with.
+	if settings != nil && settings.Helix.Replay.RetryPolicy == "retained" {
+		groupWorkerOpts = append(groupWorkerOpts, replay.WithRetryPolicy(replay.RetryWhileRetained))
+	}
+
 	// Register scenarios based on profile
 	registerScenarios(sim, *flagProfile)
 
@@ -202,6 +208,10 @@ func makeStrategyGroupClientWithMetrics(
 	}
 }
 
+// groupWorkerOpts holds worker options shared by every strategy group's
+// replay worker, derived from the loaded configuration.
+var groupWorkerOpts []replay.WorkerOption
+
 func makeStrategyGroupClient(
 	writeStrategy helix.WriteStrategy,
 	readStrategy helix.ReadStrategy,
@@ -224,7 +234,7 @@ func makeStrategyGroupClient(
 		}
 
 		worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
-			replay.WithWorkerMetrics(mc),
+			append([]replay.WorkerOption{replay.WithWorkerMetrics(mc)}, groupWorkerOpts...)...,
 		)
 		if err := worker.Start(); err != nil {
 			client.Close()
@@ -377,7 +387,7 @@ func fallbackReadGroup() simulation.StrategyGroup {
 			}
 
 			worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
-				replay.WithWorkerMetrics(mc),
+				append([]replay.WorkerOption{replay.WithWorkerMetrics(mc)}, groupWorkerOpts...)...,
 			)
 			if err := worker.Start(); err != nil {
 				client.Close()
