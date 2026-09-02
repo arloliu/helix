@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Replay carries every common CQL argument type through the NATS wire
+  format: `*big.Int` (varint), `*inf.Dec` (decimal), `net.IP` (inet), and
+  CQL durations (a driver duration or the new `types.Duration`) now
+  round-trip as equal values, and an empty `[]byte` stays an empty blob
+  instead of becoming NULL. Previously varint, decimal, and duration
+  arguments failed at enqueue, an inet argument failed on every replay
+  attempt, and an empty blob replayed as a tombstone. Both replayers now
+  reject an argument no backend can carry (a struct or user-defined type,
+  or a map with non-string keys) at enqueue with
+  `types.ErrUnsupportedReplayArg`, so the write is reported as a dropped
+  replay on the memory backend as well.
 - A write to a cluster that `AdaptiveDualWrite` has degraded is applied
   once. The fire-and-forget leg's result now implements the new
   `helix.DeferredWriteResult` interface, and the client enqueues replay

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"net"
 	"reflect"
 	"sync"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/tinylib/msgp/msgp"
+	"gopkg.in/inf.v0"
 
 	"github.com/arloliu/helix/types"
 )
@@ -412,7 +415,7 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 	}
 	n.mu.RUnlock()
 
-	if err := validateTargetCluster(payload.TargetCluster); err != nil {
+	if err := validatePayloadArgs(payload); err != nil {
 		return err
 	}
 
@@ -804,11 +807,48 @@ func encodeArgs(args []any) (msgp.Raw, error) {
 }
 
 // appendArg encodes a single argument to the buffer.
-// It provides special handling for UUID types ([16]byte arrays).
+//
+// UUID-shaped values, big integers, decimals, IP addresses, and CQL
+// durations travel as MessagePack extensions so they decode back to the
+// value the driver expects. A nil byte slice is encoded as nil and an empty
+// one as an empty binary, so a replayed empty blob stays an empty blob.
 func appendArg(buf []byte, arg any) ([]byte, error) {
-	// Check for UUID-like types ([16]byte arrays)
 	if uuid, ok := tryConvertToUUID(arg); ok {
 		return msgp.AppendExtension(buf, &uuid)
+	}
+	if d, ok := durationFromValue(arg); ok {
+		return msgp.AppendExtension(buf, &durationExt{value: d})
+	}
+
+	switch v := arg.(type) {
+	case *big.Int:
+		if v == nil {
+			return msgp.AppendNil(buf), nil
+		}
+		ext := &varintExt{}
+		ext.value.Set(v)
+
+		return msgp.AppendExtension(buf, ext)
+	case *inf.Dec:
+		if v == nil {
+			return msgp.AppendNil(buf), nil
+		}
+		ext := &decimalExt{}
+		ext.value.Set(v)
+
+		return msgp.AppendExtension(buf, ext)
+	case net.IP:
+		if v == nil {
+			return msgp.AppendNil(buf), nil
+		}
+
+		return msgp.AppendExtension(buf, &inetExt{value: v})
+	case []byte:
+		if v == nil {
+			return msgp.AppendNil(buf), nil
+		}
+
+		return msgp.AppendBytes(buf, v), nil
 	}
 
 	// Fall back to standard msgp encoding
@@ -909,17 +949,38 @@ func decodeArgs(raw msgp.Raw) ([]any, error) {
 			return nil, fmt.Errorf("helix: failed to decode argument %d: %w", i, err)
 		}
 
-		// Unwrap UUID extension to []byte for compatibility with drivers (e.g. gocql)
-		if u, ok := val.(*UUID); ok {
-			// Return as []byte which is universally accepted by CQL drivers
-			// for both UUID and Blob columns
-			val = u.Bytes()
-		}
-
-		args[i] = val
+		args[i] = unwrapArg(val)
 	}
 
 	return args, nil
+}
+
+// unwrapArg turns a decoded MessagePack value into the value handed to the
+// driver: extensions become their Go types and an empty binary stays an
+// empty, non-nil byte slice.
+func unwrapArg(val any) any {
+	switch v := val.(type) {
+	case *UUID:
+		// []byte is universally accepted by CQL drivers for both UUID and
+		// blob columns.
+		return v.Bytes()
+	case *varintExt:
+		return &v.value
+	case *decimalExt:
+		return &v.value
+	case *inetExt:
+		return v.value
+	case *durationExt:
+		return v.value
+	case []byte:
+		if v == nil {
+			return []byte{}
+		}
+
+		return v
+	}
+
+	return val
 }
 
 // ReplayMessage wraps a replay payload with acknowledgment functions.

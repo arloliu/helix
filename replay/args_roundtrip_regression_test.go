@@ -18,19 +18,17 @@ import (
 // Each row states the Go value a caller passes to the driver and the value the
 // replay worker must hand back to the driver after a round-trip.
 //
-// Rows marked pending describe the desired behavior, not the current one:
-// today the NATS path rejects or mangles those types (varint, decimal, inet,
-// CQL duration, empty blob). They are skipped so the suite stays green until
-// the explicit encoders land; remove the skip line in the loop to see them fail.
+// Varint, decimal, inet, CQL duration, and empty blob values travel as
+// explicit encodings; a driver duration comes back as a [types.Duration],
+// which the bundled adapters convert when binding.
 func TestArgRoundtripRegression(t *testing.T) {
 	bigValue, ok := new(big.Int).SetString("123456789012345678901234567890", 10)
 	require.True(t, ok)
 
 	tests := []struct {
-		name    string
-		input   any
-		want    any
-		pending string
+		name  string
+		input any
+		want  any
 	}{
 		// Already correct: msgp widens all signed integers to int64, which gocql
 		// marshals back into int/bigint/smallint/tinyint columns.
@@ -61,51 +59,41 @@ func TestArgRoundtripRegression(t *testing.T) {
 		// Assumption: a varint argument decodes back to an equal *big.Int so the worker can pass it to the driver unchanged.
 		// Any other representation is acceptable only if gocql marshals it to the same varint bytes.
 		{
-			name:    "*big.Int round-trips as equal *big.Int",
-			input:   bigValue,
-			want:    bigValue,
-			pending: "NATS replay rejects *big.Int (varint) at encode time, so the write is dropped instead of replayed",
+			name:  "*big.Int round-trips as equal *big.Int",
+			input: bigValue,
+			want:  bigValue,
 		},
 		{
-			name:    "*inf.Dec round-trips as equal *inf.Dec",
-			input:   inf.NewDec(12345, 2),
-			want:    inf.NewDec(12345, 2),
-			pending: "NATS replay rejects *inf.Dec (decimal) at encode time, so the write is dropped instead of replayed",
+			name:  "*inf.Dec round-trips as equal *inf.Dec",
+			input: inf.NewDec(12345, 2),
+			want:  inf.NewDec(12345, 2),
 		},
 		{
-			name:    "net.IP v4 round-trips as equal net.IP",
-			input:   net.ParseIP("10.0.0.1"),
-			want:    net.ParseIP("10.0.0.1"),
-			pending: "NATS replay turns net.IP (inet) into a list of integers, so every replay attempt fails in the driver",
+			name:  "net.IP v4 round-trips as equal net.IP",
+			input: net.ParseIP("10.0.0.1"),
+			want:  net.ParseIP("10.0.0.1"),
 		},
 		{
-			name:    "net.IP v6 round-trips as equal net.IP",
-			input:   net.ParseIP("2001:db8::1"),
-			want:    net.ParseIP("2001:db8::1"),
-			pending: "NATS replay turns net.IP (inet) into a list of integers, so every replay attempt fails in the driver",
+			name:  "net.IP v6 round-trips as equal net.IP",
+			input: net.ParseIP("2001:db8::1"),
+			want:  net.ParseIP("2001:db8::1"),
 		},
 		{
-			name:    "gocql.Duration round-trips as equal gocql.Duration",
-			input:   gocql.Duration{Months: 1, Days: 2, Nanoseconds: 3},
-			want:    gocql.Duration{Months: 1, Days: 2, Nanoseconds: 3},
-			pending: "NATS replay rejects gocql.Duration (CQL duration) at encode time, so the write is dropped instead of replayed",
+			name:  "gocql.Duration round-trips as the equal types.Duration",
+			input: gocql.Duration{Months: 1, Days: 2, Nanoseconds: 3},
+			want:  types.Duration{Months: 1, Days: 2, Nanoseconds: 3},
 		},
 		// An empty blob must stay an empty blob: decoding it as nil makes the
 		// replay write NULL (a tombstone) where the original wrote an empty value.
 		{
-			name:    "empty []byte stays empty and non-nil",
-			input:   []byte{},
-			want:    []byte{},
-			pending: "NATS replay decodes an empty []byte as nil, so the replayed write stores NULL instead of an empty blob",
+			name:  "empty []byte stays empty and non-nil",
+			input: []byte{},
+			want:  []byte{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.pending != "" {
-				t.Skip("pending: " + tt.pending)
-			}
-
 			encoded, err := encodeArgs([]any{tt.input})
 			require.NoError(t, err)
 
@@ -123,8 +111,6 @@ func TestArgRoundtripRegression(t *testing.T) {
 // The NATS backend already fails for these types when it encodes;
 // both backends must apply the same check so callers get the same answer regardless of which replayer is configured.
 func TestMemoryReplayerEnqueueRejectsUnsupportedArgType(t *testing.T) {
-	t.Skip("pending: MemoryReplayer.Enqueue accepts any argument type; the agreed design rejects unsupported types at enqueue on both backends")
-
 	type udt struct {
 		Name string
 		Age  int
@@ -149,7 +135,7 @@ func TestMemoryReplayerEnqueueRejectsUnsupportedArgType(t *testing.T) {
 				Query:         "INSERT INTO t (k, v) VALUES (?, ?)",
 				Args:          []any{"k", tt.arg},
 			})
-			require.Error(t, err, "enqueue must reject %T", tt.arg)
+			require.ErrorIs(t, err, types.ErrUnsupportedReplayArg, "enqueue must reject %T", tt.arg)
 			require.Equal(t, 0, replayer.Len(), "rejected payload must not be queued")
 		})
 	}

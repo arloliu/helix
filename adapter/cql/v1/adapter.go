@@ -111,11 +111,32 @@ func WrapSession(session *gocql.Session) cql.Session {
 // Returns:
 //   - cql.Query: A query builder
 func (s *Session) Query(stmt string, values ...any) cql.Query {
+	values = bindDurations(values)
+
 	return &Query{
 		query:     s.session.Query(stmt, values...),
 		statement: stmt,
 		values:    values,
 	}
+}
+
+// bindDurations converts every [types.Duration] argument, which is how a
+// replayed CQL duration reaches the adapter, into the driver's own duration
+// type. The common case, no duration argument, allocates nothing.
+func bindDurations(values []any) []any {
+	converted := values
+	for i, v := range values {
+		d, ok := v.(types.Duration)
+		if !ok {
+			continue
+		}
+		if &converted[0] == &values[0] {
+			converted = append([]any(nil), values...)
+		}
+		converted[i] = gocql.Duration{Months: d.Months, Days: d.Days, Nanoseconds: d.Nanoseconds}
+	}
+
+	return converted
 }
 
 // Batch creates a new batch of the given type.
@@ -300,7 +321,7 @@ type Batch struct {
 
 // Query adds a statement to the batch.
 func (b *Batch) Query(stmt string, args ...any) cql.Batch {
-	b.batch.Query(stmt, args...)
+	b.batch.Query(stmt, bindDurations(args)...)
 	return b
 }
 
