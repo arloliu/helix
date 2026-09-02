@@ -127,10 +127,11 @@ oldSession.Close()
 - **In-flight ops on the old session — `SwapSession` only.** Operations that have already resolved their session (in-flight `Iter` or CAS, mid-execution synchronous calls, fire-and-forget writes captured into a goroutine) continue against the session they captured. Only operations that resolve the session AFTER the swap observe the new one. This preserves "the write was dispatched to cluster X" semantics — but it relies on the caller deferring `oldSession.Close()` until in-flights have drained, which is `SwapSession`'s contract.
 - **`RefreshSession` does not preserve in-flights.** The old session is closed immediately after the atomic swap (the refresh contract implies the old one is dead). Drivers that abort outstanding work on `Close()` will fail any in-flight ops that captured the old session reference. Only call `RefreshSession` when the old session is already non-functional, or use `SwapSession` if you need to drain.
 - `SwapSession` and `RefreshSession` reject calls on a closed client (`types.ErrSessionClosed`).
+- `RefreshSession` only replaces the session it set out to replace. If `SwapSession` or another refresh installs a different session while the refresher is running, `RefreshSession` closes the refresher's session, leaves the newer one installed, and returns `types.ErrSessionReplaced`.
 - `SwapSession` rejects nil sessions (`types.ErrNilSession`) and `ClusterB` on a single-cluster client (`types.ErrInvalidCluster`).
 - `RefreshSession` returns `types.ErrNoSessionRefresher` if no refresher was registered.
-- `client.Close()` cancels the auto-refresh detector goroutine before closing sessions.
-- Concurrent `Close` and `Swap`/`Refresh` are documented as undefined: synchronize externally if you need a deterministic order.
+- `client.Close()` cancels the auto-refresh detector and topology watcher goroutines and waits for both to exit before closing sessions, so no refresh or drain update of theirs runs after `Close` returns. A refresh in flight sees its context cancelled; a refresher that ignores its context delays `Close`.
+- A `RefreshSession` that is still running when `Close` is called closes the session it built and returns `types.ErrSessionClosed`; a concurrent caller-driven `SwapSession` is not synchronized with `Close` and should be avoided.
 
 ---
 

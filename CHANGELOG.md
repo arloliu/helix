@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Close` waits for the auto-refresh detector and topology watcher
+  goroutines to exit before closing the sessions, so a refresh or drain
+  update of theirs can no longer run after `Close` returns.
+- `RefreshSession` only replaces the session it set out to replace. If a
+  `SwapSession` or another refresh installed a different session while the
+  refresher ran, it closes the refresher's session, keeps the newer one,
+  and returns `types.ErrSessionReplaced` instead of closing the newer
+  session.
 - `Iter`, batch `IterContext`, and the CAS operations now avoid a draining
   cluster like every other read, because drain-aware re-selection moved
   into the shared read-target resolver. Previously only Scan, MapScan, and

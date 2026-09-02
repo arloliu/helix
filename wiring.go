@@ -404,7 +404,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		ctx, cancel := context.WithCancel(context.Background())
 		client.topologyCtx = ctx
 		client.topologyClose = cancel
-		go client.watchTopology()
+		client.topologyWG.Go(client.watchTopology)
 	}
 
 	// Start replay worker if configured. On failure, clean up the topology
@@ -437,7 +437,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		ctx, cancel := context.WithCancel(context.Background())
 		client.autoRefreshCtx = ctx
 		client.autoRefreshClose = cancel
-		go client.autoRefreshLoop()
+		client.autoRefreshWG.Go(client.autoRefreshLoop)
 	}
 
 	// Start background recovery probe goroutines when AdaptiveDualWrite is
