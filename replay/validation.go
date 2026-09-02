@@ -3,10 +3,14 @@ package replay
 import (
 	"errors"
 	"fmt"
+	"math/big"
+	"reflect"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"gopkg.in/inf.v0"
 
 	"github.com/arloliu/helix/types"
 )
@@ -189,6 +193,105 @@ func validateNATSSubjectPrefix(prefix string) error {
 	}
 
 	return nil
+}
+
+// validatePayloadArgs rejects a payload whose target cluster is unknown or
+// whose arguments no backend can carry, so both replayers give the same
+// answer at enqueue regardless of which one is configured.
+func validatePayloadArgs(payload types.ReplayPayload) error {
+	if err := validateTargetCluster(payload.TargetCluster); err != nil {
+		return err
+	}
+	if err := validateArgs(payload.Args); err != nil {
+		return err
+	}
+	for _, stmt := range payload.BatchStatements {
+		if err := validateArgs(stmt.Args); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateArgs reports the first argument the replay wire format cannot
+// carry as [types.ErrUnsupportedReplayArg].
+func validateArgs(args []any) error {
+	for i, arg := range args {
+		if !supportedArg(reflect.ValueOf(arg)) {
+			return fmt.Errorf("%w: argument %d is %T", types.ErrUnsupportedReplayArg, i, arg)
+		}
+	}
+
+	return nil
+}
+
+// supportedArg reports whether v can be encoded by appendArg: the scalar
+// kinds msgp handles, byte slices, time.Time, UUID-shaped values, the
+// extension types, and slices, arrays, and string-keyed maps of supported
+// values.
+func supportedArg(v reflect.Value) bool {
+	if !v.IsValid() {
+		return true // nil
+	}
+	if v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return true
+		}
+		if v.Kind() == reflect.Pointer {
+			switch v.Interface().(type) {
+			case *big.Int, *inf.Dec:
+				return true
+			}
+		}
+
+		return supportedArg(v.Elem())
+	}
+
+	switch v.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	case reflect.Slice, reflect.Array:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return true // []byte, net.IP, [16]byte
+		}
+		for i := range v.Len() {
+			if !supportedArg(v.Index(i)) {
+				return false
+			}
+		}
+
+		return true
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String {
+			return false
+		}
+		for _, key := range v.MapKeys() {
+			if !supportedArg(v.MapIndex(key)) {
+				return false
+			}
+		}
+
+		return true
+	case reflect.Struct:
+		if _, ok := v.Interface().(time.Time); ok {
+			return true
+		}
+		if _, ok := durationFromValue(v.Interface()); ok {
+			return true
+		}
+		_, ok := tryConvertToUUID(v.Interface())
+
+		return ok
+	case reflect.Invalid, reflect.Uintptr, reflect.Complex64, reflect.Complex128,
+		reflect.Chan, reflect.Func, reflect.Interface, reflect.Pointer, reflect.UnsafePointer:
+		return false
+	}
+
+	return false
 }
 
 // validateTargetCluster rejects a replay payload whose TargetCluster is

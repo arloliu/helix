@@ -701,7 +701,28 @@ The Replay System relies on client-generated timestamps for idempotency, but cou
 - Implement application-level deduplication using unique operation IDs
 - Use a separate reconciliation strategy that compares counter values between clusters
 
-### 2. Always Set Timestamps
+### 2. Know Which Argument Types Replay Carries
+
+Both replayers accept the same argument types at enqueue and reject
+anything else with `types.ErrUnsupportedReplayArg`, so switching backends
+never changes which writes are reconcilable:
+
+| Go argument | Replayed as |
+|---|---|
+| bool, string, integers, floats | the same value (integers widen to `int64`) |
+| `[]byte` | `[]byte`; nil stays nil, empty stays empty |
+| `time.Time` | the same instant in UTC |
+| `gocql.UUID`, `[16]byte`, `google/uuid.UUID` | a 16-byte slice |
+| `*big.Int` (varint) | an equal `*big.Int` |
+| `*inf.Dec` (decimal) | an equal `*inf.Dec` |
+| `net.IP` (inet) | an equal `net.IP` |
+| a driver `Duration` or `types.Duration` | `types.Duration`; the bundled adapters bind it as the driver's type |
+| slices, arrays, string-keyed maps of the above | `[]any` / `map[string]any` |
+
+Structs, user-defined types (UDTs), and maps with non-string keys are not
+carried; bind them as a driver-supported representation or use `Strict()`.
+
+### 3. Always Set Timestamps
 
 Helix automatically sets timestamps on all writes. This ensures **idempotency** during replay - replaying a write won't overwrite newer data.
 

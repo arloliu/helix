@@ -153,6 +153,18 @@ const (
 	CounterBatch  BatchType = 2
 )
 
+// Duration is a CQL duration value: months, days, and nanoseconds, the
+// same three components the drivers' own duration types carry.
+//
+// Replay carries a duration argument as this type, and the bundled
+// adapters convert it to the driver's duration when binding, so a caller
+// may pass either a Duration or the driver's own type to a query.
+type Duration struct {
+	Months      int32
+	Days        int32
+	Nanoseconds int64
+}
+
 // PriorityLevel defines the priority for replay operations.
 type PriorityLevel int
 
@@ -353,6 +365,12 @@ var (
 	// ErrBothClustersFailed indicates that a write failed on both clusters.
 	// This is returned to the caller as a hard failure.
 	ErrBothClustersFailed = errors.New("helix: write failed on both clusters")
+
+	// ErrUnsupportedReplayArg reports a query argument no replay backend can
+	// carry (a struct or user-defined type, or a map with non-string keys).
+	// Both replayers reject such a payload at enqueue, so the write is
+	// reported as a dropped replay instead of failing later in a worker.
+	ErrUnsupportedReplayArg = errors.New("helix: replay cannot carry an argument of this type")
 
 	// ErrInvalidTimestamp reports a write timestamp of zero, either passed
 	// through WithTimestamp or returned by the client's TimestampProvider.

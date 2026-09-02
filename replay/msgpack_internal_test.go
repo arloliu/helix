@@ -157,7 +157,7 @@ func TestMsgpEncodeDecodeCQLTypes(t *testing.T) {
 		{
 			name:     "empty bytes",
 			input:    []byte{},
-			expected: []byte(nil), // msgp decodes empty bytes as nil
+			expected: []byte{}, // an empty blob must not become NULL on replay
 			desc:     "CQL blob empty",
 		},
 		{
