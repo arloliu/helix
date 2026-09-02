@@ -1435,6 +1435,9 @@ func (c *CQLClient) Session() CQLSession {
 //   - replay.ExecuteFunc: A function that executes replay payloads
 func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 	return func(ctx context.Context, payload types.ReplayPayload) error {
+		if payload.TargetCluster != ClusterA && payload.TargetCluster != ClusterB {
+			return fmt.Errorf("%w: replay target %q", types.ErrInvalidCluster, payload.TargetCluster)
+		}
 		session := c.getSession(payload.TargetCluster)
 
 		if payload.IsBatch {
@@ -1716,24 +1719,6 @@ type writeContext struct {
 	strict       bool         // if true: no replay, returns PartialWriteError on partial failure
 }
 
-// toBatchStatements converts internal batchEntries to types.BatchStatement for replay.
-// This conversion is deferred to the failure path to avoid allocations on success.
-func (wc *writeContext) toBatchStatements() []types.BatchStatement {
-	if len(wc.batchEntries) == 0 {
-		return nil
-	}
-
-	stmts := make([]types.BatchStatement, len(wc.batchEntries))
-	for i, entry := range wc.batchEntries {
-		stmts[i] = types.BatchStatement{
-			Query: entry.statement,
-			Args:  entry.args,
-		}
-	}
-
-	return stmts
-}
-
 // executeWriteWithReplay performs a write operation with optional dual-write and replay support.
 //
 // In single-cluster mode, the write is executed directly on sessionA.
@@ -1858,10 +1843,10 @@ func (c *CQLClient) executeWriteWithDrain(
 		payload := types.ReplayPayload{
 			TargetCluster:   drainingCluster,
 			Query:           wc.statement,
-			Args:            wc.args,
+			Args:            cloneArgs(wc.args),
 			IsBatch:         wc.isBatch,
 			BatchType:       wc.batchType,
-			BatchStatements: wc.toBatchStatements(), // Lazy conversion
+			BatchStatements: cloneBatchEntries(wc.batchEntries),
 			Timestamp:       wc.timestamp,
 			Priority:        wc.priority,
 		}
@@ -2034,13 +2019,15 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 		return
 	}
 
+	// Byte-slice args are copied because the caller may reuse its buffers
+	// as soon as the write returns, while the payload is replayed later.
 	payload := types.ReplayPayload{
 		TargetCluster:   cluster,
 		Query:           wc.statement,
-		Args:            wc.args,
+		Args:            cloneArgs(wc.args),
 		IsBatch:         wc.isBatch,
 		BatchType:       wc.batchType,
-		BatchStatements: wc.toBatchStatements(),
+		BatchStatements: cloneBatchEntries(wc.batchEntries),
 		Timestamp:       wc.timestamp,
 		Priority:        wc.priority,
 	}
