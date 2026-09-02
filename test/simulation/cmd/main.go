@@ -144,8 +144,8 @@ func run() error {
 
 	// Strategy groups build their own replay worker; give them the same
 	// retry policy the main client runs with.
-	if settings != nil && settings.Helix.Replay.RetryPolicy == "retained" {
-		groupWorkerOpts = append(groupWorkerOpts, replay.WithRetryPolicy(replay.RetryWhileRetained))
+	if settings != nil && settings.Helix.Replay.RetryPolicy == "bounded" {
+		groupWorkerOpts = append(groupWorkerOpts, replay.WithRetryPolicy(replay.RetryBounded))
 	}
 
 	// Register scenarios based on profile

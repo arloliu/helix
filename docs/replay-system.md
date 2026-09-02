@@ -533,13 +533,15 @@ func main() {
 ## Retry Policies
 
 A worker decides what happens after a replay attempt fails.
-Both backends offer two policies, selected with `WithRetryPolicy`.
+Both backends offer two policies, selected with `WithRetryPolicy`;
+`RetryWhileRetained` is the default.
 
-### `RetryBounded` (default)
+### `RetryBounded`
 
 Every failed attempt consumes one unit of a fixed budget:
 `WithMaxAttempts` on the memory worker, `WithMaxDeliver` on the NATS replayer.
 When the budget is spent the payload is dropped through `OnDrop`.
+Select it with `replay.WithRetryPolicy(replay.RetryBounded)`.
 
 This is a short retry buffer, not an outage backlog.
 With default settings a payload survives only a few seconds:
@@ -552,7 +554,7 @@ With default settings a payload survives only a few seconds:
 Any outage longer than that leaves the returning cluster permanently behind.
 Use this policy only when replay loss is acceptable.
 
-### `RetryWhileRetained`
+### `RetryWhileRetained` (default)
 
 A payload is retried for as long as it is retained, on an exponential backoff
 starting at `RetryDelay` and capped by `MaxRetryDelay`:
@@ -669,7 +671,7 @@ The reason appears in the worker log and, on collectors implementing
 | `WithPollInterval(d)` | 100ms | Polling interval when idle |
 | `WithRetryDelay(d)` | 100ms | Base retry delay; doubles after every failed attempt |
 | `WithMaxRetryDelay(d)` | 30s | Maximum retry delay |
-| `WithRetryPolicy(p)` | `RetryBounded` | `RetryBounded` or `RetryWhileRetained`, see [Retry Policies](#retry-policies) |
+| `WithRetryPolicy(p)` | `RetryWhileRetained` | `RetryWhileRetained` or `RetryBounded`, see [Retry Policies](#retry-policies) |
 | `WithRetryWindow(d)` | 24h | **Memory only.** How long `RetryWhileRetained` keeps retrying a payload |
 | `WithReplayClassifier(fn)` | `DefaultReplayClassifier` | Maps an execution error to a `ReplayDisposition` under `RetryWhileRetained` |
 | `WithExecuteTimeout(d)` | 30s | Timeout per replay execution |

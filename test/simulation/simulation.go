@@ -342,8 +342,8 @@ func (s *Simulation) setupEnvironment() error {
 		replay.WithWorkerMetrics(mc),
 		replay.WithWorkerLogger(slogLogger{s.logger}),
 	}
-	if s.config.Settings != nil && s.config.Settings.Helix.Replay.RetryPolicy == "retained" {
-		workerOpts = append(workerOpts, replay.WithRetryPolicy(replay.RetryWhileRetained))
+	if s.config.Settings != nil && s.config.Settings.Helix.Replay.RetryPolicy == "bounded" {
+		workerOpts = append(workerOpts, replay.WithRetryPolicy(replay.RetryBounded))
 	}
 	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(), workerOpts...)
 	if err := worker.Start(); err != nil {

@@ -260,6 +260,7 @@ func TestMemoryWorker_BoundedPolicyReportsBacklogMetrics(t *testing.T) {
 		replay.WithRetryDelay(time.Millisecond),
 		replay.WithMaxRetryDelay(2*time.Millisecond),
 		replay.WithMaxAttempts(2),
+		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithWorkerMetrics(mc),
 		replay.WithOnError(func(_ types.ReplayPayload, _ error, attempt int) {
 			if attempt == 1 {
