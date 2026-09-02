@@ -699,7 +699,7 @@ If the override rerouted a CAS to a different cluster, it would silently move co
 1. Cluster A fails → automatic failover (read strategies handle this normally)
 
 2. Operator detects prolonged outage:
-   strategy.ForceDegrade(ClusterA)         → writes: fire-and-forget A, replay safety-net
+   strategy.ForceDegrade(ClusterA)         → writes: fire-and-forget A, replay on failure
    featureFlag.Set("cluster_A_excluded")   → AllowedClusters returns [B]
                                            → reads: only from B
 
@@ -964,7 +964,7 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 )
 
 // When cluster A has an outage:
-writeStrategy.ForceDegrade(helix.ClusterA) // writes: fire-and-forget A, replay safety-net
+writeStrategy.ForceDegrade(helix.ClusterA) // writes: fire-and-forget A, replay on failure
 excludeA.Store(true)                        // reads: only from B
 
 // When A is back and replay queue is drained:

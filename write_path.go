@@ -320,13 +320,15 @@ func (c *CQLClient) executeDualWrite(
 	// At least one cluster had a non-nil result (error, async, dropped, or draining).
 	// Enqueue replay for each affected cluster to ensure eventual consistency.
 	//
-	// ErrWriteAsync:      write is in flight; replay is a safety net (idempotent for Cassandra
-	//                     because both attempts use the same client-generated timestamp).
+	// ErrWriteAsync:      write is in flight; replayed only if the background leg reports
+	//                     failure when the strategy defers its result, otherwise enqueued now
+	//                     as a safety net (idempotent for Cassandra because both attempts use
+	//                     the same client-generated timestamp).
 	// ErrWriteDropped:    write was never attempted; replay is required for reconciliation.
 	// ErrClusterDraining: leg was skipped; replay delivers the write once the drain lifts.
 	// Real error:         write definitively failed; replay is required.
-	replayErrA := c.enqueueReplayIfNeeded(ctx, wc, ClusterA, errA, legA)
-	replayErrB := c.enqueueReplayIfNeeded(ctx, wc, ClusterB, errB, legB)
+	replayErrA := c.replayLeg(ctx, wc, ClusterA, errA, legA)
+	replayErrB := c.replayLeg(ctx, wc, ClusterB, errB, legB)
 
 	// Partial success is success from the caller's perspective: one cluster
 	// holds the write and replay carries it to the other.
@@ -345,6 +347,52 @@ func (c *CQLClient) executeDualWrite(
 	}
 
 	return &types.NoSynchronousAckError{ResultA: errA, ResultB: errB, Replay: replayErr}
+}
+
+// replayLeg arranges replay for one leg. A leg whose strategy reports its
+// result later (see [DeferredWriteResult]) is replayed only if that result
+// is a failure; every other unacknowledged leg is enqueued now.
+func (c *CQLClient) replayLeg(
+	ctx context.Context,
+	wc writeContext,
+	cluster ClusterID,
+	err error,
+	kind writeLegErrKind,
+) error {
+	var deferred DeferredWriteResult
+	if kind != legAsync || !errors.As(err, &deferred) {
+		return c.enqueueReplayIfNeeded(ctx, wc, cluster, err, kind)
+	}
+
+	// Snapshot the write now: the caller may reuse its buffers as soon as
+	// this call returns, while the leg completes later.
+	payload := c.replayPayload(wc, cluster)
+	deferred.OnComplete(func(legErr error) {
+		if legErr == nil {
+			return
+		}
+		// The outcome is already counted and reported inside; nothing is
+		// left to return to a caller that has long since moved on.
+		_ = c.enqueueReplayPayload(context.Background(), payload, legErr, classifyWriteLeg(context.Background(), legErr))
+	})
+
+	return nil
+}
+
+// replayPayload builds the replay payload for one leg of wc. Byte-slice
+// args are copied because the caller may reuse its buffers as soon as the
+// write returns, while the payload is replayed later.
+func (c *CQLClient) replayPayload(wc writeContext, cluster ClusterID) types.ReplayPayload {
+	return types.ReplayPayload{
+		TargetCluster:   cluster,
+		Query:           wc.statement,
+		Args:            cloneArgs(wc.args),
+		IsBatch:         wc.isBatch,
+		BatchType:       wc.batchType,
+		BatchStatements: cloneBatchEntries(wc.batchEntries),
+		Timestamp:       wc.timestamp,
+		Priority:        wc.priority,
+	}
 }
 
 // enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
@@ -368,19 +416,18 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 		return nil
 	}
 
-	// Byte-slice args are copied because the caller may reuse its buffers
-	// as soon as the write returns, while the payload is replayed later.
-	payload := types.ReplayPayload{
-		TargetCluster:   cluster,
-		Query:           wc.statement,
-		Args:            cloneArgs(wc.args),
-		IsBatch:         wc.isBatch,
-		BatchType:       wc.batchType,
-		BatchStatements: cloneBatchEntries(wc.batchEntries),
-		Timestamp:       wc.timestamp,
-		Priority:        wc.priority,
-	}
+	return c.enqueueReplayPayload(ctx, c.replayPayload(wc, cluster), err, kind)
+}
 
+// enqueueReplayPayload enqueues one replay payload and reports the outcome;
+// see enqueueReplayIfNeeded for the return contract.
+func (c *CQLClient) enqueueReplayPayload(
+	ctx context.Context,
+	payload types.ReplayPayload,
+	err error,
+	kind writeLegErrKind,
+) error {
+	cluster := payload.TargetCluster
 	if c.config.Replayer == nil {
 		c.config.Metrics.IncReplayDropped(cluster)
 		c.config.Logger.Error("write not acknowledged by cluster and no replayer is configured; it will not be reconciled",

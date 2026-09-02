@@ -91,7 +91,7 @@ Recovery requires coordinating **reads** (AllowedClusters) and **writes** (Force
 When you detect a prolonged outage, explicitly exclude the cluster from both reads and writes:
 
 ```go
-// Write-side: degrade A to fire-and-forget + replay safety-net
+// Write-side: degrade A to fire-and-forget, replayed on failure
 writeStrategy.ForceDegrade(helix.ClusterA)
 
 // Read-side: override routing to B only

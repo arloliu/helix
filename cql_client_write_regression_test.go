@@ -426,9 +426,6 @@ func TestRecoveryProbe_DoesNotClearForceDegrade(t *testing.T) {
 // be enqueued only when the fire-and-forget leg reports failure, never as a
 // safety net beside a leg that succeeded.
 func TestAdaptiveWrite_DegradedClusterAppliesStatementOnce(t *testing.T) {
-	t.Skip("pending: a write to a degraded cluster is executed by the fire-and-forget leg and " +
-		"again by replay, so counter updates are applied twice")
-
 	sa, sb := newRecordingSession(nil), newRecordingSession(nil)
 	adaptive := policy.NewAdaptiveDualWrite()
 	adaptive.ForceDegrade(ClusterB)

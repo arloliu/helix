@@ -227,23 +227,21 @@ When a cluster is DEGRADED, writes are executed asynchronously:
 The client treats `ErrWriteAsync` as an unacknowledged leg: when the other
 cluster acknowledged the write the call returns `nil`, and when neither did
 it returns `*types.NoSynchronousAckError` (see [Acknowledgement](#acknowledgement)).
-Replay is eagerly enqueued for the async leg as a safety net:
 
-```go
-// This is handled internally by CQLClient
-resultA, resultB := strategy.Execute(ctx, writeA, writeB)
+The result `AdaptiveDualWrite` returns for a fire-and-forget leg implements
+`helix.DeferredWriteResult`: the client snapshots the write and enqueues it
+for replay only if the background goroutine later reports a failure, so a
+statement that lands in the background is applied exactly once on the
+degraded cluster. A custom strategy that returns a plain
+`types.ErrWriteAsync` gets the older behaviour, an immediate replay enqueue
+as a safety net, which relies on the client-generated timestamp for
+idempotency.
 
-if errors.Is(resultB, types.ErrWriteAsync) {
-    // B is degraded, write is running in background
-    // CQLClient immediately enqueues replay as backup
-}
-```
-
-This eager replay means the write may be attempted twice if the background
-goroutine also succeeds. For normal CQL writes, Helix uses a client-generated
-timestamp so the duplicate attempt is idempotent under Cassandra's
-last-write-wins rules. Counter updates are the exception: `CounterBatch`
-operations are additive and can double-count.
+Replay after a real failure can still double-apply a statement that the
+cluster applied before reporting the failure (for example a timeout). For
+counter updates, list appends, and other non-idempotent statements, mark
+the query `NonIdempotent()` or `Strict()` so it is never replayed; a
+`CounterBatch` is treated as non-idempotent automatically.
 
 ### Concurrency Limit (fireForgetLimit)
 
@@ -308,10 +306,10 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 )
 ```
 
-When AdaptiveDualWrite returns `ErrWriteAsync` or `ErrWriteDropped`:
-1. CQLClient immediately enqueues the write to Replayer as a safety net
-2. The background goroutine may still succeed if the write was async
-3. ReplayWorker retries later if reconciliation is still needed
+When AdaptiveDualWrite returns `ErrWriteDropped`, CQLClient enqueues the
+write to the Replayer immediately: it was never attempted. When it returns
+`ErrWriteAsync`, the write is running in the background and is enqueued only
+if that background attempt fails; the ReplayWorker then retries it.
 
 **Without a Replayer**, dropped writes and later fire-and-forget failures are lost permanently.
 Each such leg is counted in `IncReplayDropped` and reported through the replay-dropped
