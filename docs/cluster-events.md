@@ -342,7 +342,9 @@ adw.SetEventEmitter(myEmitter)
 ```
 
 `SetEventEmitter` is available on `CircuitBreaker`, `LatencyCircuitBreaker`,
-and `AdaptiveDualWrite`. The emitter is always invoked outside any policy
+and `AdaptiveDualWrite`; the client wires any strategy or policy that
+implements `helix.EventEmitterSetter`, so a custom policy opts in the same
+way. The emitter is always invoked outside any policy
 state lock, so a slow emitter cannot deadlock or stall a policy transition.
 An emitter that reenters the policy it is receiving events from (calling back
 into it from inside `EmitClusterEvent`) is safe but discouraged.

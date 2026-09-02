@@ -15,8 +15,8 @@ import (
 )
 
 // autoInjectMetricsAndLogger threads the client-level metrics and logger
-// into components that opt into auto-injection via the metricsAware /
-// loggerAware interfaces.
+// into components that opt into auto-injection via the [Instrumentable] /
+// [LoggerSetter] interfaces.
 //
 // The replay worker auto-injects metrics so worker-side replay metrics
 // land in the same collector the client uses. Write strategies follow the
@@ -24,27 +24,19 @@ import (
 // fire-and-forget background goroutine, which would otherwise hit a
 // NopMetrics / NopLogger and be invisible.
 func autoInjectMetricsAndLogger(config *ClientConfig) {
-	type metricsAware interface {
-		MetricsConfigured() bool
-		SetMetrics(types.MetricsCollector)
-	}
-	type loggerAware interface {
-		SetLogger(types.Logger)
-	}
-
 	if config.Metrics != nil {
 		if config.ReplayWorker != nil {
-			if mw, ok := config.ReplayWorker.(metricsAware); ok && !mw.MetricsConfigured() {
+			if mw, ok := config.ReplayWorker.(Instrumentable); ok && !mw.MetricsConfigured() {
 				mw.SetMetrics(config.Metrics)
 			}
 		}
 		if config.WriteStrategy != nil {
-			if ws, ok := config.WriteStrategy.(metricsAware); ok && !ws.MetricsConfigured() {
+			if ws, ok := config.WriteStrategy.(Instrumentable); ok && !ws.MetricsConfigured() {
 				ws.SetMetrics(config.Metrics)
 			}
 		}
 		if config.FailoverPolicy != nil {
-			if fp, ok := config.FailoverPolicy.(metricsAware); ok && !fp.MetricsConfigured() {
+			if fp, ok := config.FailoverPolicy.(Instrumentable); ok && !fp.MetricsConfigured() {
 				fp.SetMetrics(config.Metrics)
 			}
 		}
@@ -52,12 +44,12 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 
 	if config.Logger != nil {
 		if config.WriteStrategy != nil {
-			if ws, ok := config.WriteStrategy.(loggerAware); ok {
+			if ws, ok := config.WriteStrategy.(LoggerSetter); ok {
 				ws.SetLogger(config.Logger)
 			}
 		}
 		if config.FailoverPolicy != nil {
-			if fp, ok := config.FailoverPolicy.(loggerAware); ok {
+			if fp, ok := config.FailoverPolicy.(LoggerSetter); ok {
 				fp.SetLogger(config.Logger)
 			}
 		}
@@ -72,7 +64,7 @@ func warnNoEffectOptions(config *ClientConfig) {
 		config.Logger.Warn("WithMirrorReplayer has no effect without WithMirror; failed mirror writes are only retried in target mode")
 	}
 	if config.RecoveryProbe != nil && !config.recoveryProbeOff {
-		if _, ok := config.WriteStrategy.(probeReporter); !ok {
+		if _, ok := config.WriteStrategy.(ProbeReporter); !ok {
 			config.Logger.Warn("WithRecoveryProbe has no effect: the write strategy does not report degraded clusters, so no probe will run")
 		}
 	}
@@ -99,14 +91,6 @@ func (c *CQLClient) createEventDispatcher() {
 	if cem, ok := config.Metrics.(types.ClusterEventMetrics); ok {
 		c.runtime.events.metrics = cem
 	}
-}
-
-// eventAware is the opt-in contract for emitter auto-injection. It is
-// shared by autoInjectEventEmitter and eventKindUnreachable so the
-// unreachable-kinds log derives reachability from the same assertion
-// that performs the wiring.
-type eventAware interface {
-	SetEventEmitter(types.ClusterEventEmitter)
 }
 
 // orderedClusterEventKinds lists every cluster event kind in the order
@@ -142,10 +126,10 @@ func eventKindUnreachable(kind types.ClusterEventKind, config *ClientConfig, dua
 	case types.EventFailover, types.EventReadDivergence:
 		return !dualCluster
 	case types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed:
-		_, ok := config.FailoverPolicy.(eventAware)
+		_, ok := config.FailoverPolicy.(EventEmitterSetter)
 		return !ok || !dualCluster
 	case types.EventWriteDegraded, types.EventWriteRecovered:
-		_, ok := config.WriteStrategy.(eventAware)
+		_, ok := config.WriteStrategy.(EventEmitterSetter)
 		return !ok || !dualCluster
 	case types.EventDrainEntered, types.EventDrainExited:
 		return config.TopologyWatcher == nil
@@ -219,12 +203,12 @@ func (c *CQLClient) startEventDelivery() {
 func (c *CQLClient) autoInjectEventEmitter() {
 	config := c.config
 	if config.WriteStrategy != nil {
-		if ws, ok := config.WriteStrategy.(eventAware); ok {
+		if ws, ok := config.WriteStrategy.(EventEmitterSetter); ok {
 			ws.SetEventEmitter(c.runtime.events)
 		}
 	}
 	if config.FailoverPolicy != nil {
-		if fp, ok := config.FailoverPolicy.(eventAware); ok {
+		if fp, ok := config.FailoverPolicy.(EventEmitterSetter); ok {
 			fp.SetEventEmitter(c.runtime.events)
 		}
 	}

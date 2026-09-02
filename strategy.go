@@ -3,6 +3,8 @@ package helix
 import (
 	"context"
 	"time"
+
+	"github.com/arloliu/helix/types"
 )
 
 // AllowedClustersFunc returns the ordered list of clusters currently allowed
@@ -164,6 +166,64 @@ type StrictWriter interface {
 		writeA func(context.Context) error,
 		writeB func(context.Context) error,
 	) (errA, errB error)
+}
+
+// ProbeReporter is an optional interface for write strategies that track
+// per-cluster degradation, such as [policy.AdaptiveDualWrite].
+//
+// When the configured [WriteStrategy] implements it, a dual-cluster client
+// runs a background recovery probe against each degraded cluster (see
+// [WithRecoveryProbe]) and credits every successful probe through
+// RecordProbeSuccess. A strategy that does not implement it is never probed.
+//
+// Implementations MUST be safe for concurrent use from multiple goroutines.
+type ProbeReporter interface {
+	// IsDegraded reports whether the strategy currently treats cluster as
+	// degraded, that is, whether a probe should run against it.
+	IsDegraded(cluster ClusterID) bool
+
+	// RecordProbeSuccess credits one successful probe against cluster.
+	RecordProbeSuccess(cluster ClusterID)
+}
+
+// EventEmitterSetter is an optional interface for write strategies and
+// failover policies that emit cluster events (see [WithOnClusterEvent]).
+//
+// When the configured strategy or policy implements it, [NewCQLClient] installs
+// the client's dispatcher before any background goroutine starts, so the
+// component's events reach the registered handler. All built-in policies that
+// emit events implement it.
+type EventEmitterSetter interface {
+	// SetEventEmitter installs the emitter the component reports events to.
+	// A nil emitter disables emission.
+	SetEventEmitter(emitter types.ClusterEventEmitter)
+}
+
+// Instrumentable is an optional interface for components that can adopt the
+// client's [MetricsCollector]: write strategies, failover policies, and
+// replay workers.
+//
+// [NewCQLClient] calls SetMetrics with the client's collector when
+// MetricsConfigured reports false, so a component built without its own
+// collector shares the client's; a collector set through the component's
+// own option is left untouched.
+type Instrumentable interface {
+	// MetricsConfigured reports whether a collector was explicitly set on
+	// the component.
+	MetricsConfigured() bool
+
+	// SetMetrics installs the collector the component records to.
+	SetMetrics(collector types.MetricsCollector)
+}
+
+// LoggerSetter is an optional interface for write strategies and failover
+// policies that can adopt the client's [types.Logger].
+//
+// [NewCQLClient] calls SetLogger with the client's logger on every
+// configured strategy and policy that implements it.
+type LoggerSetter interface {
+	// SetLogger installs the logger the component writes to.
+	SetLogger(logger types.Logger)
 }
 
 // LatencyRecorder is an optional interface for failover policies that track latency.

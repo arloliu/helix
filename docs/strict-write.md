@@ -196,7 +196,8 @@ rather than dispatching a fire-and-forget goroutine. This means strict-only work
 generate the live dual-writes that normally advance `AdaptiveDualWrite`'s recovery counter.
 
 The **background recovery probe** compensates. By default, `CQLClient` starts one probe goroutine
-per cluster when `AdaptiveDualWrite` is detected. While a cluster is degraded, the probe executes
+per cluster when the write strategy implements `helix.ProbeReporter` (`IsDegraded` plus
+`RecordProbeSuccess`), which `AdaptiveDualWrite` does. While a cluster is degraded, the probe executes
 a lightweight read of `system.local` at a configurable interval and calls
 `AdaptiveDualWrite.RecordProbeSuccess` on each success. After `recoveryThreshold` consecutive
 successes the cluster is restored to healthy and subsequent strict writes resume dual-cluster
@@ -314,6 +315,13 @@ All three built-in write strategies (`ConcurrentDualWrite`, `SyncDualWrite`,
 | Built-in strategy                                   | `ExecuteStrict` called — no fire-and-forget, no replay                              |
 | Custom strategy implementing `StrictWriter`         | `ExecuteStrict` called                                                              |
 | Custom strategy **not** implementing `StrictWriter` | Fails immediately with `ErrStrictUnsupported`; no write attempted                   |
+
+The client discovers every optional capability of a custom strategy by
+interface: `helix.StrictWriter` for `Strict()` writes, `helix.ProbeReporter`
+for the recovery probe, `helix.EventEmitterSetter` for cluster events, and
+`helix.Instrumentable` / `helix.LoggerSetter` for metrics and logger
+injection. A strategy that implements none of them still works as a plain
+`WriteStrategy`.
 
 To add strict support to a custom strategy, implement `ExecuteStrict`:
 

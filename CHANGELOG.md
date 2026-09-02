@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `helix.ProbeReporter`, `helix.EventEmitterSetter`, `helix.Instrumentable`,
+  and `helix.LoggerSetter` name the optional capabilities the client
+  discovers on a write strategy, failover policy, or replay worker by type
+  assertion: recovery probing, cluster-event emission, and metrics / logger
+  injection. They were previously unexported, so a custom strategy could
+  not tell from the documentation how to opt in.
+
 ### Changed
 
 - `CQLClient.Config` returns a copy of the effective configuration instead
