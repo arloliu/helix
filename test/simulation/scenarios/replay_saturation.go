@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/test/simulation/types"
+	htypes "github.com/arloliu/helix/types"
 )
 
 type ReplaySaturation struct{}
@@ -52,6 +53,13 @@ func (s *ReplaySaturation) Run(ctx context.Context, env *types.Environment) erro
 	}
 
 	env.Logger.Info("Replay queue drained", "total_replayed", env.Metrics.GetTotalReplaySuccess())
+
+	// An empty queue is not proof of convergence,
+	// because the worker also empties it by giving up on payloads.
+	// Any drop during the outage is data loss.
+	if dropped := env.Metrics.GetReplayDropped(htypes.ClusterB); dropped > 0 {
+		return fmt.Errorf("replay worker dropped %d payloads for cluster B during the outage", dropped)
+	}
 
 	// 5. Wait for additional writes to confirm throughput resumed
 	drainEnd := env.Tracker.TotalWrites()

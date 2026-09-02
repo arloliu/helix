@@ -340,6 +340,7 @@ func (s *Simulation) setupEnvironment() error {
 	// Wire replay worker to the client's default executor so it honors batch payloads.
 	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
 		replay.WithWorkerMetrics(mc),
+		replay.WithWorkerLogger(slogLogger{s.logger}),
 	)
 	if err := worker.Start(); err != nil {
 		client.Close()
@@ -695,6 +696,13 @@ func (s *Simulation) verify() error {
 		})
 	}
 
+	// Every payload the worker gave up on is a row that will be missing
+	// below; report the counts so the failure is attributable.
+	s.logger.Info("Replay drop totals before verification",
+		"droppedA", s.env.Metrics.GetReplayDropped(htypes.ClusterA),
+		"droppedB", s.env.Metrics.GetReplayDropped(htypes.ClusterB),
+	)
+
 	// Wait for eventual consistency (replay to finish).
 	// Use condition-based waiting rather than a fixed sleep to reduce flakiness.
 	deadline := time.Now().Add(30 * time.Second)
@@ -731,4 +739,14 @@ func (s *Simulation) runPruner(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// slogLogger adapts *slog.Logger to types.Logger so the replay worker can
+// share the simulation's logger and its drop decisions land in the run log.
+type slogLogger struct{ *slog.Logger }
+
+// Fatal logs the message at error level and aborts the run.
+func (l slogLogger) Fatal(msg string, keysAndValues ...any) {
+	l.Error(msg, keysAndValues...)
+	panic(msg)
 }
