@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `replay.WithRetryPolicy(replay.RetryWhileRetained)`: an opt-in worker
+  policy that keeps retrying a payload for as long as it is retained (the
+  memory worker's `WithRetryWindow`, default 24 h; the NATS stream's
+  `MaxAge`) instead of dropping it after a fixed number of attempts.
+  Failed attempts are classified by a `replay.ReplayClassifier`
+  (`DefaultReplayClassifier`, override with `WithReplayClassifier`) into
+  `DispositionDefer`, `DispositionRetry`, or `DispositionDeadLetter`; only
+  dead-letter attempts consume the poison budget (`MaxAttempts` on both
+  backends). Under this policy the memory worker holds a
+  payload's queue slot until it succeeds or is dropped, so `Len()` counts
+  waiting payloads and new enqueues fail loudly at capacity; the NATS
+  worker creates its consumers with unlimited deliveries and requests
+  redelivery with `NakWithDelay` on the existing `RetryDelay` /
+  `MaxRetryDelay` schedule. The default policy, `RetryBounded`, is
+  unchanged. See [docs/replay-system.md](docs/replay-system.md#retry-policies).
+- `types.ErrClusterUnreachable`: both CQL adapters wrap driver errors that
+  mean the cluster could not be reached (no connections, closed session,
+  dropped connection, coordinator unavailable) in this sentinel while
+  keeping the driver error reachable through `errors.Is` / `errors.As`.
+- `types.ReplayBacklogMetrics` (optional `MetricsCollector` interface):
+  `{prefix}_replay_oldest_age_seconds{cluster}` and
+  `{prefix}_replay_worker_dropped_total{cluster,reason}`, implemented by
+  `contrib/metrics/vm`.
+- `replay.MemoryReplayer.PendingByCluster` and
+  `replay.NATSReplayer.PendingByCluster` report the per-cluster backlog;
+  `replay.NATSReplayer.Config` returns the effective configuration;
+  `replay.ReplayMessage` gains `NakWithDelay`, `InProgress`, and
+  `StreamSequence`.
+
+### Changed
+
+- Replay payloads copy byte-slice arguments on the failure path, so a
+  caller buffer reused after `Exec` returns can no longer be replayed with
+  the wrong bytes.
+- A replay payload whose `TargetCluster` is neither `A` nor `B` is rejected
+  at enqueue on both backends, terminated at NATS decode like a corrupt
+  message, and refused by `DefaultExecuteFunc` with
+  `types.ErrInvalidCluster`, instead of falling through to cluster B.
+- The bundled workers now publish `{prefix}_replay_queue_depth{cluster}`
+  (previously always 0): slots held per cluster on the memory backend,
+  undelivered plus unacknowledged messages per cluster on the NATS backend.
+- Under `RetryWhileRetained` the NATS worker marks each message in progress
+  before executing it, so a batch that takes longer than `AckWait` is not
+  redelivered while it is still being worked through.
+- `NewCQLClient` logs a warning when a NATS replayer keeps a single stream
+  replica or the `DiscardOld` policy.
+- Memory worker drop reasons in the log are now `max_attempts`,
+  `retry_pool_saturated`, and `shutdown` (previously free-form text), and
+  the worker option docs no longer claim retry jitter, which was never
+  implemented.
+
+### Fixed
+
+- `docs/replay-system.md` stated that NATS retry backoff is controlled by
+  `AckWait`; the bounded policy requests immediate redelivery. The guide
+  now documents each backend's effective survival window, stream isolation
+  per deployment, and how the backlog follows a cluster slot across
+  `SwapSession`.
+
 ## [1.6.0] — 2026-07-30
 
 ### Added

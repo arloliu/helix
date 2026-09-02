@@ -530,52 +530,106 @@ func main() {
 
 ---
 
-## Memory Worker Retries
+## Retry Policies
 
-The memory worker treats the first execution of a payload as a synchronous
-attempt on the dequeue loop. On failure, attempts 2 through `MaxAttempts`
-run in a dedicated retry goroutine, sleeping the configured exponential
-backoff between attempts.
+A worker decides what happens after a replay attempt fails.
+Both backends offer two policies, selected with `WithRetryPolicy`.
 
-This split means the dequeue loop is **never blocked** behind a
-permanently-failing payload. A failing payload targeting cluster A does
-not stall payloads targeting cluster B; both make progress.
+### `RetryBounded` (default)
 
-| Aspect | Behavior |
-|--------|----------|
-| Attempt 1 | Synchronous, on the dequeue goroutine |
-| Attempts 2..N | Asynchronous, in a bounded retry-goroutine pool |
-| Retry pool size | 100 (hardcoded) |
-| Backoff | Exponential, starting at `RetryDelay`, capped by `MaxRetryDelay` |
-| Cap | `WithMaxAttempts(n)`, default 5 |
-| `OnError` | Fires per attempt with the attempt number |
-| `OnDrop` | Fires once per payload after one of: attempts exhausted, retry pool saturated, shutdown |
+Every failed attempt consumes one unit of a fixed budget:
+`WithMaxAttempts` on the memory worker, `WithMaxDeliver` on the NATS replayer.
+When the budget is spent the payload is dropped through `OnDrop`.
 
-### Drop Reasons
+This is a short retry buffer, not an outage backlog.
+With default settings a payload survives only a few seconds:
 
-`OnDrop` is the terminal callback. It fires for one of three reasons,
-distinguishable in the worker's log output by the `reason` field:
+| Backend | Budget | Delay between attempts | Effective survival window |
+|---------|--------|------------------------|---------------------------|
+| Memory | `MaxAttempts` = 5 | 100 ms, 200 ms, 400 ms, 800 ms | about 1.5 s after the first attempt |
+| NATS | `MaxDeliver` = 5 | none (`Nak` requests immediate redelivery) | a handful of fetch cycles |
 
-- `max attempts exceeded` — every retry attempt failed.
-- `retry pool saturated` — too many concurrent failures; the retry pool
-  is full, so further failures drop immediately rather than queue
-  behind in-flight retries. Indicates a sustained failure storm; the
-  pool size is a deliberate safety valve, not a tuning knob.
-- `shutdown` — `Worker.Stop` was called while the payload was either
-  in the queue or sleeping in retry backoff.
+Any outage longer than that leaves the returning cluster permanently behind.
+Use this policy only when replay loss is acceptable.
+
+### `RetryWhileRetained`
+
+A payload is retried for as long as it is retained, on an exponential backoff
+starting at `RetryDelay` and capped by `MaxRetryDelay`:
+
+| Backend | Retained until | What holds the payload |
+|---------|----------------|------------------------|
+| Memory | `WithRetryWindow` elapses (default 24 h) | Its capacity slot, held from dequeue until success or drop |
+| NATS | The stream's `MaxAge` elapses | The stream; the consumer is created with unlimited deliveries and every failed attempt is a delayed `Nak` |
+
+Each failed attempt is classified into a **disposition** by a
+`ReplayClassifier` (`DefaultReplayClassifier` unless `WithReplayClassifier`
+is set):
+
+| Disposition | Produced by default for | Effect |
+|-------------|-------------------------|--------|
+| `DispositionDefer` | `types.ErrClusterUnreachable` (no connections, closed session, coordinator unavailable) | Retry on the backoff schedule; never counts toward the poison budget |
+| `DispositionRetry` | Every other error | Same as defer |
+| `DispositionDeadLetter` | `types.ErrInvalidCluster` | Counts toward the poison budget (`WithMaxAttempts` on either backend); when it is spent the payload is dropped |
+
+The bundled adapters wrap driver connectivity errors in
+`types.ErrClusterUnreachable`, so the default classifier works out of the box
+with `DefaultExecuteFunc`.
+A custom `ExecuteFunc` that returns its own errors is retried until the
+retention bound unless a custom classifier dead-letters them.
+
+```go
+worker := replay.NewMemoryWorker(replayer, client.DefaultExecuteFunc(),
+    replay.WithRetryPolicy(replay.RetryWhileRetained),
+    replay.WithRetryWindow(6*time.Hour), // memory only
+    replay.WithReplayClassifier(func(err error) replay.ReplayDisposition {
+        if errors.Is(err, myPoisonErr) {
+            return replay.DispositionDeadLetter
+        }
+        return replay.DefaultReplayClassifier(err)
+    }),
+)
+```
+
+Under this policy the NATS worker keeps a dead-letter count per stream
+sequence in memory.
+A worker restart resets that count; the message is simply retried again.
+
+### Memory worker execution model
+
+The first attempt for a payload runs inline on the dequeue loop.
+Later attempts run in a bounded pool of goroutines (100), so a failing
+payload never blocks payloads for the other cluster.
+
+| Aspect | `RetryBounded` | `RetryWhileRetained` |
+|--------|----------------|----------------------|
+| Waiting between attempts | One goroutine per waiting payload | A timer queue; goroutines are used only while executing |
+| Pool full | Payload dropped with reason `retry_pool_saturated` | Attempt waits for a free slot |
+| Capacity slot | Released at dequeue; `Len()` excludes in-flight payloads | Held until success or drop; `Len()` and `PendingByCluster()` count queued, executing, and waiting payloads, and new enqueues fail with `ErrReplayQueueFull` when the backlog is full |
+
+### Drop reasons
+
+`OnDrop` fires once per dropped payload.
+The reason appears in the worker log and, on collectors implementing
+`types.ReplayBacklogMetrics`, as the `reason` label of
+`{prefix}_replay_worker_dropped_total{cluster,reason}`:
+
+- `max_attempts`: the bounded budget was exhausted.
+- `retry_pool_saturated`: bounded policy only, see above.
+- `shutdown`: `Worker.Stop` was called while the payload was queued or waiting.
+- `dead_letter`: the classifier dead-lettered the payload enough times.
+- `retry_window_expired`: memory only, `RetryWindow` elapsed.
 
 ### Comparing Memory and NATS
 
 | Concern | Memory backend | NATS backend |
 |---------|----------------|--------------|
-| Retry budget | `WithMaxAttempts(n)` (worker config, default 5) | `WithMaxDeliver(n)` (replayer config, default 5) |
-| Backoff | Inline exponential between attempts | Server-side, controlled by `AckWait` |
-| Where retries run | In-process retry goroutine pool | NATS server re-delivery |
+| Poison budget | `WithMaxAttempts(n)` (worker config, default 5) | `RetryBounded`: `WithMaxDeliver(n)` (replayer config, default 5); `RetryWhileRetained`: `WithMaxAttempts(n)` |
+| Retention bound | `WithRetryWindow(d)` (default 24 h) | Stream `MaxAge` (default 24 h) |
+| Backoff | `RetryDelay` doubling up to `MaxRetryDelay` | Same schedule, carried by delayed `Nak`; under `RetryBounded` the `Nak` has no delay |
+| Where retries run | In-process goroutine pool | NATS server redelivery |
 | Survives process crash | No (in-memory) | Yes (JetStream durable) |
 | Drop visibility | `OnDrop` callback | `OnDrop` callback |
-
-If you need durable replay or more sophisticated retry semantics, use
-`NATSReplayer` + `NATSWorker`.
 
 ---
 
@@ -605,7 +659,7 @@ If you need durable replay or more sophisticated retry semantics, use
 | `WithMaxAckPending(n)` | 1000 | Max unacked messages per consumer (backpressure) |
 | `WithMaxRequestBatch(n)` | 100 | Max batch size per pull request |
 | `WithAckWait(d)` | 30s | Time before unacked message is redelivered |
-| `WithMaxDeliver(n)` | 5 | Max delivery attempts before dropping message |
+| `WithMaxDeliver(n)` | 5 | Max delivery attempts before dropping message (`RetryBounded` only; `RetryWhileRetained` sets the consumer to unlimited deliveries) |
 
 ### Worker Options
 
@@ -613,10 +667,13 @@ If you need durable replay or more sophisticated retry semantics, use
 |--------|---------|-------------|
 | `WithBatchSize(n)` | 100 | Messages per dequeue (NATS only) |
 | `WithPollInterval(d)` | 100ms | Polling interval when idle |
-| `WithRetryDelay(d)` | 100ms | Base retry delay (memory only — NATS uses `AckWait`) |
-| `WithMaxRetryDelay(d)` | 30s | Maximum retry delay (memory only) |
+| `WithRetryDelay(d)` | 100ms | Base retry delay; doubles after every failed attempt |
+| `WithMaxRetryDelay(d)` | 30s | Maximum retry delay |
+| `WithRetryPolicy(p)` | `RetryBounded` | `RetryBounded` or `RetryWhileRetained`, see [Retry Policies](#retry-policies) |
+| `WithRetryWindow(d)` | 24h | **Memory only.** How long `RetryWhileRetained` keeps retrying a payload |
+| `WithReplayClassifier(fn)` | `DefaultReplayClassifier` | Maps an execution error to a `ReplayDisposition` under `RetryWhileRetained` |
 | `WithExecuteTimeout(d)` | 30s | Timeout per replay execution |
-| `WithMaxAttempts(n)` | 5 | **Memory only.** Total attempts (1 inline + N-1 retried) before drop via `OnDrop`. NATS uses `WithMaxDeliver` on the replayer config instead. |
+| `WithMaxAttempts(n)` | 5 | `RetryBounded`: memory only, total attempts (1 inline + N-1 retried) before drop via `OnDrop`, NATS uses `WithMaxDeliver` instead. `RetryWhileRetained`: the poison budget on both backends. |
 | `WithHighPriorityRatio(n)` | 10 | Memory: per-message ratio. NATS: per-batch ratio (10 high batches : 1 low batch). |
 | `WithStrictPriority(bool)` | false | Drain all high-priority before any low-priority |
 | `WithWorkerMetrics(m)` | nil | Metrics collector for statistics |
@@ -624,7 +681,7 @@ If you need durable replay or more sophisticated retry semantics, use
 | `WithWorkerClusterNames(n)` | A/B | Custom cluster display names |
 | `WithOnSuccess(fn)` | nil | Callback on successful replay |
 | `WithOnError(fn)` | nil | Callback on failed replay (fires per attempt) |
-| `WithOnDrop(fn)` | nil | Callback when message dropped (memory: after `MaxAttempts`, retry-pool saturation, or shutdown; NATS: after `MaxDeliver` exhaustion) |
+| `WithOnDrop(fn)` | nil | Callback when a payload is permanently dropped, see [Drop reasons](#drop-reasons) |
 
 ---
 
@@ -654,7 +711,16 @@ client.Query("INSERT INTO users (id, name) VALUES (?, ?)", id, name).
 
 ### 2. Monitor Replay Queue Depth
 
-For production, monitor the NATS stream to detect replay backlogs:
+Both workers publish `{prefix}_replay_queue_depth{cluster}`: the memory
+worker reports the slots held per cluster after every dequeue, the NATS
+worker reports undelivered plus unacknowledged messages per cluster once a
+second.
+Collectors implementing `types.ReplayBacklogMetrics` also receive
+`{prefix}_replay_oldest_age_seconds{cluster}`, the age of the payload most
+recently taken for execution measured from its write timestamp, and the
+per-reason drop counter described above.
+
+For NATS you can also inspect the stream directly:
 
 ```bash
 # Check stream info
@@ -691,17 +757,15 @@ In either mode, `MaxAge` still bounds replay durability by time.
 
 ### 4. Handle Poison Messages
 
-Both backends bound retry attempts and surface terminal failures via the
-`OnDrop` callback. The cap differs:
-
-- **NATS:** consumer-side via `WithMaxDeliver` on the replayer config
-  (default 5). After exhaustion the message is `Term`'d and `OnDrop`
-  fires with the final error.
-- **Memory:** worker-side via `WithMaxAttempts` on the worker config
-  (default 5). The first attempt runs inline on the dequeue loop;
-  attempts 2..MaxAttempts run in a bounded goroutine pool (default 100).
-  `OnDrop` fires for three reasons: max attempts exhausted, retry pool
-  saturated under sustained failure, or shutdown.
+Both backends bound poison messages and surface terminal failures via the
+`OnDrop` callback.
+Under `RetryBounded` every failed attempt counts, against
+`WithMaxDeliver` on the NATS replayer config or `WithMaxAttempts` on the
+memory worker config (default 5 each).
+Under `RetryWhileRetained` only attempts the classifier marks
+`DispositionDeadLetter` count, against `WithMaxAttempts` on either backend,
+so an unreachable cluster never burns the budget.
+See [Retry Policies](#retry-policies).
 
 Wire `OnDrop` to a dead-letter store and alerting on either backend:
 
@@ -789,6 +853,28 @@ for the same messages to be non-overlapping. The built-in `NATSWorker` uses
 `DequeueByPriority()` exclusively.
 
 ---
+
+### 6. Isolate Streams per Deployment
+
+Every message is routed by subject prefix, priority, and target cluster
+(`{prefix}.{priority}.{A|B}`).
+Two deployments sharing one JetStream server must use distinct
+`WithSubjectPrefix` and `WithStreamName` values; otherwise one deployment's
+workers replay the other's writes against their own clusters.
+Nothing in the payload identifies the deployment, so this isolation is a
+configuration rule, not something the worker can check.
+
+### 7. Backlog Follows the Cluster Slot
+
+A payload records which logical cluster (`A` or `B`) it targets, not which
+session.
+`DefaultExecuteFunc` resolves the session at execution time, so after
+`SwapSession` or an automatic session refresh the backlog is replayed
+against the new session in that slot.
+Point a slot at a different physical cluster only after its backlog has
+drained, or the old cluster's missing writes land on the new one.
+A payload whose target is neither `A` nor `B` is rejected at enqueue and,
+on NATS, terminated at decode like a corrupt message.
 
 ## Troubleshooting
 
