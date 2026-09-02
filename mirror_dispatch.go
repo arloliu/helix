@@ -57,19 +57,17 @@ func (c *CQLClient) stopMirrorComponents() {
 //     captures to a Replayer; a separate consumer binary built via
 //     NewMirrorWorker performs the actual writes.
 //
-// Returns an error if both modes are configured or when worker startup
-// fails. Topology rollback is the caller's responsibility.
+// Mode conflicts and nil targets were already rejected by
+// validateRootMirrorMode; the only error left is worker startup.
 func (c *CQLClient) setupMirror() error {
 	config := c.config
-	if config.mirrorTargetSet && config.mirrorPublisherSet {
-		return types.ErrMirrorModeConflict
-	}
-
 	switch {
 	case config.mirrorTargetSet:
 		return c.setupMirrorTargetMode()
 	case config.mirrorPublisherSet:
-		return c.setupMirrorPublisherMode()
+		c.setupMirrorPublisherMode()
+
+		return nil
 	default:
 		return nil
 	}
@@ -77,10 +75,6 @@ func (c *CQLClient) setupMirror() error {
 
 func (c *CQLClient) setupMirrorTargetMode() error {
 	config := c.config
-	if config.MirrorTarget == nil {
-		return types.ErrNilMirrorTarget
-	}
-
 	execute := mirrorExecuteFunc(config.MirrorTarget)
 
 	opts := defaultMirrorOptions(config)
@@ -116,17 +110,11 @@ func (c *CQLClient) setupMirrorTargetMode() error {
 	return nil
 }
 
-func (c *CQLClient) setupMirrorPublisherMode() error {
+func (c *CQLClient) setupMirrorPublisherMode() {
 	config := c.config
-	if config.MirrorPublisher == nil {
-		return types.ErrNilMirrorPublisher
-	}
-
 	opts := append(defaultMirrorOptions(config), config.MirrorOptions...)
 	c.runtime.mirrorEngine = mirror.NewEngine(config.MirrorPublisher.Enqueue, opts...)
 	c.runtime.mirrorEngine.Start()
-
-	return nil
 }
 
 // defaultMirrorOptions returns the mirror engine options that helix injects
