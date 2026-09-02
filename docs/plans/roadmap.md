@@ -158,6 +158,20 @@ new series, or new event kinds. Existing series keep their meaning and gain no n
 **Exit criteria:** every Phase 1–4 finding has a skipped or failing test named in plain language;
 nightly CI runs simulation.
 
+**Status (2026-09-02):**
+
+- 0.1 done.
+  With the default memory worker both scenarios pass their own checks,
+  but the end-of-run consistency check fails
+  (`quick`: 1412 rows missing on A after the 15 s outage; `comprehensive`: 1410 missing on A, 125 on B).
+  Nothing masks the loss; the scenario-level "queue drained" check was simply satisfied by drops.
+  The harness now wires the worker logger and both scenarios fail on any replay drop,
+  so the loss is attributable per scenario.
+- 0.2 done for R-2, R-3, R-4, FO-1, FO-2, FO-3, FB-1, FB-2, FB-3, FB-5, D-3
+  (skipped tests in the root and replay packages).
+  R-1 and D-5 land with their fixes in Phase 1.
+- 0.3 and 0.4 not started.
+
 ---
 
 ## Phase 1 — Replay durability, patch release (`v1.6.1`)

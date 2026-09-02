@@ -2,9 +2,11 @@ package scenarios
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/arloliu/helix/test/simulation/types"
+	htypes "github.com/arloliu/helix/types"
 )
 
 // CompleteFailure simulates a complete failure of one cluster.
@@ -39,6 +41,12 @@ func (s *CompleteFailure) Run(ctx context.Context, env *types.Environment) error
 	_ = waitUntil(ctx, 10*time.Second, func() bool {
 		return env.Tracker.TotalWrites() > startCount
 	})
+
+	// Every write acknowledged during the outage was backed only by the
+	// replay queue; a dropped payload is a row that never reaches A.
+	if dropped := env.Metrics.GetReplayDropped(htypes.ClusterA); dropped > 0 {
+		return fmt.Errorf("replay worker dropped %d payloads for cluster A during a 15s outage", dropped)
+	}
 	env.Logger.Info("CompleteFailure scenario completed")
 
 	return nil
