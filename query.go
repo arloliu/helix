@@ -202,7 +202,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 	if q.mirror {
 		defer func() {
 			if err == nil {
-				q.client.dispatchMirrorQuery(q.statement, q.values, ts, priority)
+				q.client.dispatchMirrorQuery(q, ts, priority)
 			}
 		}()
 	}
@@ -232,7 +232,9 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		priority:  priority,
 		// A non-idempotent statement takes the strict path: synchronous on
 		// both clusters, no fire-and-forget, no replay.
-		strict: q.strict || q.nonIdempotent,
+		strict:            q.strict || q.nonIdempotent,
+		consistency:       q.consistency,
+		serialConsistency: q.serialConsistency,
 	}
 
 	err = q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {

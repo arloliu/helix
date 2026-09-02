@@ -722,7 +722,33 @@ never changes which writes are reconcilable:
 Structs, user-defined types (UDTs), and maps with non-string keys are not
 carried; bind them as a driver-supported representation or use `Strict()`.
 
-### 3. Always Set Timestamps
+### 3. What a Replay Preserves
+
+A replay re-executes the original statement with its original arguments and
+client timestamp, at the consistency and serial consistency the original
+write set (`Query.Consistency`, `SerialConsistency`, and the batch
+equivalents). A write that used the session default replays at the
+worker session's default.
+
+Two things are not preserved:
+
+- **TTL.** `USING TTL` text is replayed as written, but the server computes
+  expiry from the time it applies the write, not from `USING TIMESTAMP`. A
+  row replayed after a long outage therefore expires later on the replayed
+  cluster than on the one that took the original write; the drift equals
+  the delay between the original write and the replay.
+- **Deployment identity.** Nothing in the payload names the deployment; see
+  the stream isolation rule below.
+
+**Envelope versions and rollout.** NATS messages carry an envelope version.
+Version 2 adds the consistency levels; a version 1 message, or a version 2
+message for a session-default write, decodes with no level and replays at
+the worker's default. Workers read every version, so upgrade the workers
+before the publishers: an older worker that receives a version 2 message
+ignores the levels and replays at its session default, exactly as it did
+before.
+
+### 4. Always Set Timestamps
 
 Helix automatically sets timestamps on all writes. This ensures **idempotency** during replay - replaying a write won't overwrite newer data.
 
@@ -733,7 +759,7 @@ client.Query("INSERT INTO users (id, name) VALUES (?, ?)", id, name).
     Exec()
 ```
 
-### 2. Monitor Replay Queue Depth
+### 5. Monitor Replay Queue Depth
 
 Both workers publish `{prefix}_replay_queue_depth{cluster}`: the memory
 worker reports the slots held per cluster after every dequeue, the NATS
@@ -754,7 +780,7 @@ nats stream info helix-replay
 nats stream info helix-replay --json | jq '.state.messages'
 ```
 
-### 3. Set Appropriate Retention and Overflow Policy
+### 6. Set Appropriate Retention and Overflow Policy
 
 Configure retention based on your recovery requirements:
 
@@ -779,7 +805,7 @@ replay.NewNATSReplayer(js,
 
 In either mode, `MaxAge` still bounds replay durability by time.
 
-### 4. Handle Poison Messages
+### 7. Handle Poison Messages
 
 Both backends bound poison messages and surface terminal failures via the
 `OnDrop` callback.
@@ -814,7 +840,7 @@ replay.NewMemoryWorker(replayer, executeFunc,
 )
 ```
 
-### 5. Use Priority Levels
+### 8. Use Priority Levels
 
 Helix supports two priority levels for replay operations:
 
@@ -878,7 +904,7 @@ for the same messages to be non-overlapping. The built-in `NATSWorker` uses
 
 ---
 
-### 6. Isolate Streams per Deployment
+### 9. Isolate Streams per Deployment
 
 Every message is routed by subject prefix, priority, and target cluster
 (`{prefix}.{priority}.{A|B}`).
@@ -888,7 +914,7 @@ workers replay the other's writes against their own clusters.
 Nothing in the payload identifies the deployment, so this isolation is a
 configuration rule, not something the worker can check.
 
-### 7. Backlog Follows the Cluster Slot
+### 10. Backlog Follows the Cluster Slot
 
 A payload records which logical cluster (`A` or `B`) it targets, not which
 session.

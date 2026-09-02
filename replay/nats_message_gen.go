@@ -246,6 +246,36 @@ func (z *natsReplayMessage) DecodeMsg(dc *msgp.Reader) (err error) {
 					}
 				}
 			}
+		case "version":
+			z.Version, err = dc.ReadUint8()
+			if err != nil {
+				err = msgp.WrapError(err, "Version")
+				return
+			}
+		case "has_consistency":
+			z.HasConsistency, err = dc.ReadBool()
+			if err != nil {
+				err = msgp.WrapError(err, "HasConsistency")
+				return
+			}
+		case "consistency":
+			z.Consistency, err = dc.ReadUint16()
+			if err != nil {
+				err = msgp.WrapError(err, "Consistency")
+				return
+			}
+		case "has_serial_consistency":
+			z.HasSerialConsistency, err = dc.ReadBool()
+			if err != nil {
+				err = msgp.WrapError(err, "HasSerialConsistency")
+				return
+			}
+		case "serial_consistency":
+			z.SerialConsistency, err = dc.ReadUint16()
+			if err != nil {
+				err = msgp.WrapError(err, "SerialConsistency")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -259,9 +289,9 @@ func (z *natsReplayMessage) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *natsReplayMessage) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 8
+	// map header, size 13
 	// write "target_cluster"
-	err = en.Append(0x88, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
+	err = en.Append(0x8d, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
 	if err != nil {
 		return
 	}
@@ -363,15 +393,65 @@ func (z *natsReplayMessage) EncodeMsg(en *msgp.Writer) (err error) {
 			return
 		}
 	}
+	// write "version"
+	err = en.Append(0xa7, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint8(z.Version)
+	if err != nil {
+		err = msgp.WrapError(err, "Version")
+		return
+	}
+	// write "has_consistency"
+	err = en.Append(0xaf, 0x68, 0x61, 0x73, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	if err != nil {
+		return
+	}
+	err = en.WriteBool(z.HasConsistency)
+	if err != nil {
+		err = msgp.WrapError(err, "HasConsistency")
+		return
+	}
+	// write "consistency"
+	err = en.Append(0xab, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint16(z.Consistency)
+	if err != nil {
+		err = msgp.WrapError(err, "Consistency")
+		return
+	}
+	// write "has_serial_consistency"
+	err = en.Append(0xb6, 0x68, 0x61, 0x73, 0x5f, 0x73, 0x65, 0x72, 0x69, 0x61, 0x6c, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	if err != nil {
+		return
+	}
+	err = en.WriteBool(z.HasSerialConsistency)
+	if err != nil {
+		err = msgp.WrapError(err, "HasSerialConsistency")
+		return
+	}
+	// write "serial_consistency"
+	err = en.Append(0xb2, 0x73, 0x65, 0x72, 0x69, 0x61, 0x6c, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint16(z.SerialConsistency)
+	if err != nil {
+		err = msgp.WrapError(err, "SerialConsistency")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *natsReplayMessage) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 8
+	// map header, size 13
 	// string "target_cluster"
-	o = append(o, 0x88, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
+	o = append(o, 0x8d, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
 	o = msgp.AppendString(o, z.TargetCluster)
 	// string "query"
 	o = append(o, 0xa5, 0x71, 0x75, 0x65, 0x72, 0x79)
@@ -411,6 +491,21 @@ func (z *natsReplayMessage) MarshalMsg(b []byte) (o []byte, err error) {
 			return
 		}
 	}
+	// string "version"
+	o = append(o, 0xa7, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e)
+	o = msgp.AppendUint8(o, z.Version)
+	// string "has_consistency"
+	o = append(o, 0xaf, 0x68, 0x61, 0x73, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	o = msgp.AppendBool(o, z.HasConsistency)
+	// string "consistency"
+	o = append(o, 0xab, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	o = msgp.AppendUint16(o, z.Consistency)
+	// string "has_serial_consistency"
+	o = append(o, 0xb6, 0x68, 0x61, 0x73, 0x5f, 0x73, 0x65, 0x72, 0x69, 0x61, 0x6c, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	o = msgp.AppendBool(o, z.HasSerialConsistency)
+	// string "serial_consistency"
+	o = append(o, 0xb2, 0x73, 0x65, 0x72, 0x69, 0x61, 0x6c, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
+	o = msgp.AppendUint16(o, z.SerialConsistency)
 	return
 }
 
@@ -522,6 +617,36 @@ func (z *natsReplayMessage) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					}
 				}
 			}
+		case "version":
+			z.Version, bts, err = msgp.ReadUint8Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "Version")
+				return
+			}
+		case "has_consistency":
+			z.HasConsistency, bts, err = msgp.ReadBoolBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "HasConsistency")
+				return
+			}
+		case "consistency":
+			z.Consistency, bts, err = msgp.ReadUint16Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "Consistency")
+				return
+			}
+		case "has_serial_consistency":
+			z.HasSerialConsistency, bts, err = msgp.ReadBoolBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "HasSerialConsistency")
+				return
+			}
+		case "serial_consistency":
+			z.SerialConsistency, bts, err = msgp.ReadUint16Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "SerialConsistency")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -540,5 +665,6 @@ func (z *natsReplayMessage) Msgsize() (s int) {
 	for za0001 := range z.BatchStatements {
 		s += 1 + 6 + msgp.StringPrefixSize + len(z.BatchStatements[za0001].Query) + 5 + z.BatchStatements[za0001].Args.Msgsize()
 	}
+	s += 8 + msgp.Uint8Size + 16 + msgp.BoolSize + 12 + msgp.Uint16Size + 23 + msgp.BoolSize + 19 + msgp.Uint16Size
 	return
 }

@@ -335,31 +335,35 @@ const mirrorTargetCluster = ClusterA
 
 // dispatchMirrorQuery enqueues a captured single-statement write to the
 // mirror engine. Safe to call when the engine is nil or disabled.
-func (c *CQLClient) dispatchMirrorQuery(stmt string, values []any, ts int64, priority PriorityLevel) {
+func (c *CQLClient) dispatchMirrorQuery(q *cqlQuery, ts int64, priority PriorityLevel) {
 	if c.runtime.mirrorEngine == nil {
 		return
 	}
 	c.runtime.mirrorEngine.TryEnqueue(types.ReplayPayload{
-		TargetCluster: mirrorTargetCluster,
-		Query:         stmt,
-		Args:          cloneArgs(values),
-		Timestamp:     ts,
-		Priority:      priority,
+		TargetCluster:     mirrorTargetCluster,
+		Query:             q.statement,
+		Args:              cloneArgs(q.values),
+		Timestamp:         ts,
+		Priority:          priority,
+		Consistency:       cloneConsistency(q.consistency),
+		SerialConsistency: cloneConsistency(q.serialConsistency),
 	})
 }
 
 // dispatchMirrorBatch enqueues a captured batch write to the mirror engine.
 // Safe to call when the engine is nil or disabled.
-func (c *CQLClient) dispatchMirrorBatch(kind BatchType, entries []batchEntry, ts int64, priority PriorityLevel) {
+func (c *CQLClient) dispatchMirrorBatch(b *cqlBatch, ts int64, priority PriorityLevel) {
 	if c.runtime.mirrorEngine == nil {
 		return
 	}
 	c.runtime.mirrorEngine.TryEnqueue(types.ReplayPayload{
-		IsBatch:         true,
-		TargetCluster:   mirrorTargetCluster,
-		BatchType:       kind,
-		BatchStatements: cloneBatchEntries(entries),
-		Timestamp:       ts,
-		Priority:        priority,
+		IsBatch:           true,
+		TargetCluster:     mirrorTargetCluster,
+		BatchType:         b.kind,
+		BatchStatements:   cloneBatchEntries(b.entries),
+		Timestamp:         ts,
+		Priority:          priority,
+		Consistency:       cloneConsistency(b.consistency),
+		SerialConsistency: cloneConsistency(b.serialConsistency),
 	})
 }

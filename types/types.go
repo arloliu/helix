@@ -214,6 +214,15 @@ type ReplayPayload struct {
 
 	// Priority indicates the importance of this replay.
 	Priority PriorityLevel
+
+	// Consistency is the consistency level the original write used, or nil
+	// when the write used the session default. A replay applies it so the
+	// replayed write is acknowledged under the same rule as the original.
+	Consistency *Consistency
+
+	// SerialConsistency is the serial consistency level the original write
+	// used, or nil when it used the session default.
+	SerialConsistency *Consistency
 }
 
 // NoSynchronousAckError reports a dual-cluster write that no cluster

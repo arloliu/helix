@@ -240,7 +240,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 	if b.mirror {
 		defer func() {
 			if err == nil {
-				b.client.dispatchMirrorBatch(b.kind, b.entries, ts, priority)
+				b.client.dispatchMirrorBatch(b, ts, priority)
 			}
 		}()
 	}
@@ -270,14 +270,16 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 	}
 
 	wc := writeContext{
-		statement:    "", // Empty for batch
-		args:         nil,
-		timestamp:    ts,
-		priority:     priority,
-		isBatch:      true,
-		batchType:    b.kind,
-		batchEntries: b.entries, // Pass directly, convert lazily if needed for replay
-		strict:       b.strict || b.nonIdempotent,
+		statement:         "", // Empty for batch
+		args:              nil,
+		timestamp:         ts,
+		priority:          priority,
+		isBatch:           true,
+		batchType:         b.kind,
+		batchEntries:      b.entries, // Pass directly, convert lazily if needed for replay
+		strict:            b.strict || b.nonIdempotent,
+		consistency:       b.consistency,
+		serialConsistency: b.serialConsistency,
 	}
 
 	err = b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
