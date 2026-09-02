@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Config().ReplayWorker` after building a worker with `DefaultExecuteFunc`
   must instead stop that worker themselves before `Close`, as
   [docs/replay-system.md](docs/replay-system.md) shows.
+- `NewCQLClient` rejects `WithAutoMemoryWorker` combined with `WithReplayer`
+  or `WithReplayWorker` with a `types.OptionError`; previously the
+  auto-built replayer and worker silently replaced the caller's. It also
+  logs a warning for `WithMirrorReplayer` without `WithMirror` and for
+  `WithRecoveryProbe` with a write strategy that does not report degraded
+  clusters, both of which have no effect.
 - `ClientConfig` no longer exposes the components `NewCQLClient` builds:
   the `MirrorEngine` and `MirrorReplayWorker` fields are gone. The mirror
   engine is still available through `CQLClient.Mirror`.

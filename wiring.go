@@ -64,6 +64,20 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 	}
 }
 
+// warnNoEffectOptions logs one warning per option that the rest of the
+// configuration renders inert, so a misconfiguration is discovered at
+// startup rather than during an incident.
+func warnNoEffectOptions(config *ClientConfig) {
+	if config.MirrorReplayer != nil && !config.mirrorTargetSet {
+		config.Logger.Warn("WithMirrorReplayer has no effect without WithMirror; failed mirror writes are only retried in target mode")
+	}
+	if config.RecoveryProbe != nil && !config.recoveryProbeOff {
+		if _, ok := config.WriteStrategy.(probeReporter); !ok {
+			config.Logger.Warn("WithRecoveryProbe has no effect: the write strategy does not report degraded clusters, so no probe will run")
+		}
+	}
+}
+
 // createEventDispatcher installs the client's event dispatcher when a handler
 // is registered, and does nothing otherwise.
 //
@@ -385,6 +399,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	if sessionB != nil && config.Replayer == nil {
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
+	warnNoEffectOptions(config)
 	warnReplayStreamDefaults(config.Logger, "replayer", config.Replayer)
 	warnReplayStreamDefaults(config.Logger, "mirror replayer", config.MirrorReplayer)
 

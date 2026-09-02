@@ -34,7 +34,27 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootMirrorMode(config),
 		validateRootDefaultMaxRows(config),
 		validateRootRecoveryProbe(config),
+		validateRootReplayWiring(config),
 	)
+}
+
+// validateRootReplayWiring rejects [WithAutoMemoryWorker] combined with a
+// caller-supplied replayer or worker: the auto-built pair would silently
+// replace the caller's components.
+func validateRootReplayWiring(config *ClientConfig) error {
+	if !config.AutoMemoryWorker {
+		return nil
+	}
+
+	errList := make([]error, 0, 2)
+	if config.Replayer != nil {
+		errList = append(errList, newRootOptionError("WithAutoMemoryWorker", "cannot be combined with WithReplayer"))
+	}
+	if config.ReplayWorker != nil {
+		errList = append(errList, newRootOptionError("WithAutoMemoryWorker", "cannot be combined with WithReplayWorker"))
+	}
+
+	return joinRootValidationErrors(errList...)
 }
 
 func validateRootClusterNames(config *ClientConfig) error {

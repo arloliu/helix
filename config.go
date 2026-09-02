@@ -357,6 +357,10 @@ func WithSessionRefresher(fn SessionRefresher) Option {
 // automatically for any client whose WriteStrategy is [policy.AdaptiveDualWrite].
 // Use [WithRecoveryProbeDisabled] to suppress all probing.
 //
+// The probe only runs for a write strategy that reports degraded clusters
+// (see [ProbeReporter]); with any other strategy this option has no effect
+// and [NewCQLClient] logs a warning.
+//
 // Returns:
 //   - Option: Configuration option
 func WithRecoveryProbe(p RecoveryProbe) Option {
@@ -539,7 +543,8 @@ func WithMirrorPublisher(publisher Replayer, opts ...mirror.Option) Option {
 //     less elastic — consider [replay.WithMaxAttempts] and lower
 //     concurrency via the appropriate [replay.WorkerOption].
 //
-// Has no effect if [WithMirror] is not also configured.
+// Has no effect if [WithMirror] is not also configured; [NewCQLClient]
+// logs a warning in that case.
 //
 // Parameters:
 //   - replayer:   The durable store for failed mirror writes.
@@ -709,6 +714,10 @@ func WithOnClusterEvent(handler ClusterEventHandler) Option {
 //
 // For production with durable replay, use WithReplayer() with NATSReplayer instead.
 // NATS workers typically run as separate consumer services.
+//
+// This option owns both the replayer and the worker: combining it with
+// [WithReplayer] or [WithReplayWorker] is rejected by [NewCQLClient] with a
+// [types.OptionError].
 //
 // Parameters:
 //   - queueCapacity: Maximum pending replays (0 uses default of 10000)
