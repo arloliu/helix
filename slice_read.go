@@ -229,8 +229,7 @@ func (q *cqlQuery) sliceReadOpts(ctx context.Context) (opts readOptions, useNoFa
 	opts = q.client.resolveReadOptions(ctx, q)
 	if q.pageState != nil {
 		opts.fallbackRead = false
-		opts.preserveSelectedCluster = true
-		opts.pinnedCluster, _ = decodePageState(q.pageState)
+		q.applyPagedRouting(&opts)
 
 		return opts, true
 	}

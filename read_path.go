@@ -93,17 +93,17 @@ func (c *CQLClient) alternativeCluster(cluster ClusterID) ClusterID {
 // and are NOT affected by the AllowedClusters override, but a draining
 // cluster is avoided when the other one is not draining.
 func (c *CQLClient) selectClusterForCAS(ctx context.Context) ClusterID {
-	if c.IsSingleCluster() {
-		return ClusterA
-	}
-
 	return c.avoidDraining(c.normalSelect(ctx))
 }
 
 // avoidDraining returns the other cluster when selected is draining and
 // the other is not; otherwise selected. With both clusters draining the
-// selection stands (best effort).
+// selection stands (best effort). A single-cluster client has nowhere
+// else to go.
 func (c *CQLClient) avoidDraining(selected ClusterID) ClusterID {
+	if c.IsSingleCluster() {
+		return selected
+	}
 	drainA, drainB := c.getDrainStates()
 	if !c.clusterIsDraining(selected, drainA, drainB) {
 		return selected
@@ -164,23 +164,12 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) rea
 		return c.resolveReadTargetPinned(opts.pinnedCluster)
 	}
 
-	fn := c.config.AllowedClusters
-	if fn == nil {
-		return c.resolveReadTargetNormal(ctx, opts)
-	}
-
-	raw, err := callAllowedClusters(fn)
+	raw, err := c.allowedClusters()
 	if err != nil {
-		if c.shouldLogOverrideErr() {
-			c.config.Logger.Error("cluster override function panicked",
-				"error", err.Error(),
-			)
-		}
-
 		return readTarget{err: err}
 	}
 
-	// nil or empty = explicit opt-out, normal behavior
+	// No override function, nil, or empty = normal behavior
 	if len(raw) == 0 {
 		return c.resolveReadTargetNormal(ctx, opts)
 	}
@@ -264,12 +253,30 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) rea
 	}
 }
 
+// allowedClusters calls the AllowedClusters override, if any, with panic
+// recovery and rate-limited logging. An empty result means no override is
+// in effect.
+func (c *CQLClient) allowedClusters() ([]ClusterID, error) {
+	fn := c.config.AllowedClusters
+	if fn == nil {
+		return nil, nil
+	}
+	raw, err := callAllowedClusters(fn)
+	if err != nil && c.shouldLogOverrideErr() {
+		c.config.Logger.Error("cluster override function panicked",
+			"error", err.Error(),
+		)
+	}
+
+	return raw, err
+}
+
 // resolveReadTargetNormal is the no-override branch of resolveReadTarget:
 // the strategy's selection, moved away from a draining cluster unless the
 // caller asked to preserve it (paged reads must not move the cursor).
 func (c *CQLClient) resolveReadTargetNormal(ctx context.Context, opts readOptions) readTarget {
 	selected := c.normalSelect(ctx)
-	if !c.IsSingleCluster() && !opts.preserveSelectedCluster {
+	if !opts.preserveSelectedCluster {
 		selected = c.avoidDraining(selected)
 	}
 
@@ -287,18 +294,8 @@ func (c *CQLClient) resolveReadTargetPinned(cluster ClusterID) readTarget {
 		return readTarget{err: types.ErrInvalidCluster}
 	}
 
-	fn := c.config.AllowedClusters
-	if fn == nil {
-		return readTarget{cluster: cluster}
-	}
-	raw, err := callAllowedClusters(fn)
+	raw, err := c.allowedClusters()
 	if err != nil {
-		if c.shouldLogOverrideErr() {
-			c.config.Logger.Error("cluster override function panicked",
-				"error", err.Error(),
-			)
-		}
-
 		return readTarget{err: err}
 	}
 	if len(raw) == 0 {
@@ -404,6 +401,16 @@ func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOpt
 	return readOptions{
 		fallbackRead: enabled,
 		fallbackOpts: fallbackReadOptions{readDrainingAlt: c.config.FallbackReadOnDrainingCluster},
+	}
+}
+
+// recordReadFailure records a cluster fault on a read leg: the error
+// metric, the auto-refresh counter, and the failover policy.
+func (c *CQLClient) recordReadFailure(cluster ClusterID, err error) {
+	c.config.Metrics.IncReadError(cluster)
+	c.recordOpOutcome(cluster, err)
+	if c.config.FailoverPolicy != nil {
+		c.config.FailoverPolicy.RecordFailure(cluster)
 	}
 }
 
@@ -623,10 +630,11 @@ func (c *CQLClient) executeReadNoFailover(
 	// is gated on dual-cluster + a configured FailoverPolicy to preserve
 	// today's single-cluster behavior (no RecordFailure when there is no
 	// alternative cluster to fail over to).
-	c.config.Metrics.IncReadError(res.selected)
-	c.recordOpOutcome(res.selected, res.err)
-	if !c.IsSingleCluster() && c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(res.selected)
+	if c.IsSingleCluster() {
+		c.config.Metrics.IncReadError(res.selected)
+		c.recordOpOutcome(res.selected, res.err)
+	} else {
+		c.recordReadFailure(res.selected, res.err)
 	}
 
 	return res.err
@@ -760,27 +768,13 @@ func (c *CQLClient) tryFallbackCluster(
 		return err
 	}
 
-	c.config.Metrics.IncReadError(fallback)
-	c.recordOpOutcome(fallback, err)
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(fallback)
-	}
+	c.recordReadFailure(fallback, err)
 
 	if selected == ClusterA {
 		return &types.DualClusterError{ErrorA: primaryErr, ErrorB: err}
 	}
 
 	return &types.DualClusterError{ErrorA: err, ErrorB: primaryErr}
-}
-
-// isCtxErr reports whether err originated from caller-side context
-// cancellation or deadline expiry. Slice methods use this in both
-// fallbackReadOptions predicates: ctx errors propagate to the caller AND
-// skip per-cluster health recording, because long-running drains see a
-// disproportionate rate of caller-driven cancellation that would otherwise
-// poison the failover-policy view of cluster health.
-func isCtxErr(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // fallbackReadOptions customizes executeFallbackRead's alt-leg semantics.
@@ -906,11 +900,7 @@ func (c *CQLClient) executeFallbackRead(
 	}
 
 	// Alternative returned a real error: record health on the alt.
-	c.config.Metrics.IncReadError(alternativeCluster)
-	c.recordOpOutcome(alternativeCluster, err)
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
-	}
+	c.recordReadFailure(alternativeCluster, err)
 
 	// Propagation is governed independently: opts.propagateAltErr lets the
 	// SliceScan caller surface "scanFn was invoked on alt" to the caller.

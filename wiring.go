@@ -163,12 +163,12 @@ func unreachableEventKinds(config *ClientConfig, dualCluster bool) []string {
 // during an incident. No-op when every kind is reachable or no handler
 // is registered. Follows the "dual-cluster mode with no Replayer" warning
 // precedent: one concise line, not one per kind.
-func (c *CQLClient) logUnreachableEventKinds(dualCluster bool) {
+func (c *CQLClient) logUnreachableEventKinds() {
 	if c.runtime.events == nil {
 		return
 	}
 	config := c.config
-	kinds := unreachableEventKinds(config, dualCluster)
+	kinds := unreachableEventKinds(config, !c.singleCluster)
 	if len(kinds) == 0 {
 		return
 	}
@@ -383,7 +383,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	// Must run before mirror setup: the mirror error handler captures the
 	// dispatcher by value when it is built below.
 	client.createEventDispatcher()
-	client.logUnreachableEventKinds(sessionB != nil)
+	client.logUnreachableEventKinds()
 
 	// Auto-inject client metrics/logger into components that opt in via
 	// type-assertion-based interfaces (replay.Worker, AdaptiveDualWrite).

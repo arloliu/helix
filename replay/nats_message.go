@@ -1,6 +1,9 @@
 package replay
 
-import "github.com/tinylib/msgp/msgp"
+import (
+	"github.com/arloliu/helix/types"
+	"github.com/tinylib/msgp/msgp"
+)
 
 //go:generate go run -modfile=../linter.go.mod github.com/tinylib/msgp -unexported -file $GOFILE
 
@@ -31,6 +34,27 @@ type natsReplayMessage struct {
 	Consistency          uint16           `msg:"consistency"`
 	HasSerialConsistency bool             `msg:"has_serial_consistency"`
 	SerialConsistency    uint16           `msg:"serial_consistency"`
+}
+
+// consistencyToWire splits an optional consistency level into the envelope's
+// presence flag and value.
+func consistencyToWire(c *types.Consistency) (present bool, value uint16) {
+	if c == nil {
+		return false, 0
+	}
+
+	return true, uint16(*c)
+}
+
+// consistencyFromWire rebuilds an optional consistency level. A version 1
+// message, or a write that used the session default, has no level.
+func consistencyFromWire(present bool, value uint16) *types.Consistency {
+	if !present {
+		return nil
+	}
+	c := types.Consistency(value)
+
+	return &c
 }
 
 // batchStatement represents a single statement in a batch for msgp serialization.
