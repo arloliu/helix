@@ -88,6 +88,7 @@ type CQLClient struct {
 	drainB        atomic.Bool
 	topologyCtx   context.Context
 	topologyClose context.CancelFunc
+	topologyWG    sync.WaitGroup // joins watchTopology on Close
 
 	// overrideErrSeq counts consecutive override errors for power-of-2 log backoff.
 	// Prevents log storms when the AllowedClusters provider is misconfigured.
@@ -107,6 +108,7 @@ type CQLClient struct {
 	// detector cannot do anything useful without a refresher).
 	autoRefreshCtx   context.Context
 	autoRefreshClose context.CancelFunc
+	autoRefreshWG    sync.WaitGroup // joins autoRefreshLoop on Close
 
 	// recoveryProbeCtx / recoveryProbeClose / recoveryProbeWG control the
 	// lifecycle of the background recovery probe goroutines (one per cluster).

@@ -429,6 +429,12 @@ var (
 	// is retained instead of counting the attempt against a poison budget.
 	ErrClusterUnreachable = errors.New("helix: cluster unreachable")
 
+	// ErrSessionReplaced reports that RefreshSession found a different
+	// session installed for the cluster than the one it set out to replace:
+	// SwapSession or another refresh landed while the refresher ran. The
+	// refresher's session is closed and the newer installed session kept.
+	ErrSessionReplaced = errors.New("helix: session was replaced while the refresher ran")
+
 	// ErrNoSessionRefresher indicates RefreshSession was called but no
 	// SessionRefresher was registered via WithSessionRefresher. The caller
 	// must either register one at construction or use the lower-level
