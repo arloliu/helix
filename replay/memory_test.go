@@ -87,8 +87,8 @@ func TestMemoryReplayerQueueFull(t *testing.T) {
 	replayer := NewMemoryReplayer(WithQueueCapacity(4))
 	defer replayer.Close()
 
-	highPayload := types.ReplayPayload{Query: "SELECT 1", Priority: types.PriorityHigh}
-	lowPayload := types.ReplayPayload{Query: "SELECT 2", Priority: types.PriorityLow}
+	highPayload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 1", Priority: types.PriorityHigh}
+	lowPayload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 2", Priority: types.PriorityLow}
 
 	// Fill the shared capacity entirely with high-priority items.
 	require.NoError(t, replayer.Enqueue(context.Background(), highPayload))
@@ -109,7 +109,7 @@ func TestMemoryReplayerContextCancellation(t *testing.T) {
 	defer replayer.Close()
 
 	// Fill the shared queue
-	payload := types.ReplayPayload{Query: "SELECT 1", Priority: types.PriorityHigh}
+	payload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 1", Priority: types.PriorityHigh}
 	require.NoError(t, replayer.Enqueue(context.Background(), payload))
 
 	// Cancel context and try to enqueue (queue is full)
@@ -151,10 +151,11 @@ func TestMemoryReplayerDrainAll(t *testing.T) {
 			priority = types.PriorityLow
 		}
 		payload := types.ReplayPayload{
-			Query:     "SELECT ?",
-			Args:      []any{i},
-			Timestamp: int64(i),
-			Priority:  priority,
+			TargetCluster: types.ClusterA,
+			Query:         "SELECT ?",
+			Args:          []any{i},
+			Timestamp:     int64(i),
+			Priority:      priority,
 		}
 		require.NoError(t, replayer.Enqueue(context.Background(), payload))
 	}
@@ -183,7 +184,7 @@ func TestMemoryReplayerDrainAll(t *testing.T) {
 func TestMemoryReplayerClose(t *testing.T) {
 	replayer := NewMemoryReplayer()
 
-	payload := types.ReplayPayload{Query: "SELECT 1"}
+	payload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 1"}
 	require.NoError(t, replayer.Enqueue(context.Background(), payload))
 
 	replayer.Close()
@@ -206,7 +207,7 @@ func TestMemoryReplayerOddCapacityPreserved(t *testing.T) {
 
 	require.Equal(t, 3, replayer.Cap())
 
-	payload := types.ReplayPayload{Query: "SELECT 1", Priority: types.PriorityHigh}
+	payload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 1", Priority: types.PriorityHigh}
 	require.NoError(t, replayer.Enqueue(context.Background(), payload))
 	require.NoError(t, replayer.Enqueue(context.Background(), payload))
 	require.NoError(t, replayer.Enqueue(context.Background(), payload))
@@ -219,8 +220,8 @@ func TestMemoryReplayerPriorityRouting(t *testing.T) {
 	defer replayer.Close()
 
 	// Enqueue high and low priority messages
-	high := types.ReplayPayload{Query: "HIGH", Priority: types.PriorityHigh}
-	low := types.ReplayPayload{Query: "LOW", Priority: types.PriorityLow}
+	high := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "HIGH", Priority: types.PriorityHigh}
+	low := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "LOW", Priority: types.PriorityLow}
 
 	require.NoError(t, replayer.Enqueue(context.Background(), high))
 	require.NoError(t, replayer.Enqueue(context.Background(), low))
@@ -238,9 +239,9 @@ func TestMemoryReplayerStrictPriority(t *testing.T) {
 	defer replayer.Close()
 
 	// Enqueue: low, high, high
-	low := types.ReplayPayload{Query: "LOW", Priority: types.PriorityLow}
-	high1 := types.ReplayPayload{Query: "HIGH1", Priority: types.PriorityHigh}
-	high2 := types.ReplayPayload{Query: "HIGH2", Priority: types.PriorityHigh}
+	low := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "LOW", Priority: types.PriorityLow}
+	high1 := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "HIGH1", Priority: types.PriorityHigh}
+	high2 := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "HIGH2", Priority: types.PriorityHigh}
 
 	require.NoError(t, replayer.Enqueue(context.Background(), low))
 	require.NoError(t, replayer.Enqueue(context.Background(), high1))
@@ -275,8 +276,8 @@ func TestMemoryReplayerRatioBasedFairness(t *testing.T) {
 
 	// Enqueue 3 high and 3 low
 	for i := range 3 {
-		high := types.ReplayPayload{Query: "HIGH", Priority: types.PriorityHigh, Timestamp: int64(i)}
-		low := types.ReplayPayload{Query: "LOW", Priority: types.PriorityLow, Timestamp: int64(i)}
+		high := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "HIGH", Priority: types.PriorityHigh, Timestamp: int64(i)}
+		low := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "LOW", Priority: types.PriorityLow, Timestamp: int64(i)}
 		require.NoError(t, replayer.Enqueue(context.Background(), high))
 		require.NoError(t, replayer.Enqueue(context.Background(), low))
 	}
@@ -318,11 +319,11 @@ func TestMemoryReplayerHighLenLowLen(t *testing.T) {
 	defer replayer.Close()
 
 	for i := range 5 {
-		p := types.ReplayPayload{Query: "HIGH", Priority: types.PriorityHigh, Timestamp: int64(i)}
+		p := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "HIGH", Priority: types.PriorityHigh, Timestamp: int64(i)}
 		require.NoError(t, replayer.Enqueue(context.Background(), p))
 	}
 	for i := range 3 {
-		p := types.ReplayPayload{Query: "LOW", Priority: types.PriorityLow, Timestamp: int64(i)}
+		p := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "LOW", Priority: types.PriorityLow, Timestamp: int64(i)}
 		require.NoError(t, replayer.Enqueue(context.Background(), p))
 	}
 

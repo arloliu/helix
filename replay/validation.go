@@ -183,3 +183,15 @@ func validateNATSSubjectPrefix(prefix string) error {
 
 	return nil
 }
+
+// validateTargetCluster rejects a replay payload whose TargetCluster is
+// neither ClusterA nor ClusterB.
+// Such a payload cannot be routed by any client,
+// so it is refused before it can occupy queue capacity.
+func validateTargetCluster(cluster types.ClusterID) error {
+	if cluster == types.ClusterA || cluster == types.ClusterB {
+		return nil
+	}
+
+	return fmt.Errorf("%w: replay target %q", types.ErrInvalidCluster, cluster)
+}

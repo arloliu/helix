@@ -407,6 +407,10 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 	}
 	n.mu.RUnlock()
 
+	if err := validateTargetCluster(payload.TargetCluster); err != nil {
+		return err
+	}
+
 	// Serialize Args to msgp.Raw
 	argsRaw, err := encodeArgs(payload.Args)
 	if err != nil {
@@ -628,6 +632,13 @@ msgLoop:
 		var natsMsg natsReplayMessage
 		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
 			// Permanently corrupt — Term immediately; no retry will fix bad bytes.
+			n.handleCorrupt(msg, err)
+
+			continue
+		}
+
+		// A target no client can resolve is as unprocessable as bad bytes.
+		if err := validateTargetCluster(types.ClusterID(natsMsg.TargetCluster)); err != nil {
 			n.handleCorrupt(msg, err)
 
 			continue

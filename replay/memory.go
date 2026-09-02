@@ -220,6 +220,9 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 	if m.closed.Load() {
 		return types.ErrSessionClosed
 	}
+	if err := validateTargetCluster(payload.TargetCluster); err != nil {
+		return err
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
