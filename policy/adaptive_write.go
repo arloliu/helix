@@ -625,17 +625,59 @@ func (a *AdaptiveDualWrite) Execute(
 	return resultA, resultB
 }
 
+// deferredWriteError is the result of a fire-and-forget leg: it matches
+// [types.ErrWriteAsync] through errors.Is and reports the leg's final
+// error to the one callback registered through OnComplete.
+type deferredWriteError struct {
+	mu   sync.Mutex
+	done bool
+	err  error
+	fn   func(error)
+}
+
+// Error implements error.
+func (d *deferredWriteError) Error() string { return types.ErrWriteAsync.Error() }
+
+// Is reports the result as [types.ErrWriteAsync] to errors.Is.
+func (d *deferredWriteError) Is(target error) bool { return target == types.ErrWriteAsync }
+
+// OnComplete registers fn to run once with the leg's final error. If the
+// leg already completed, fn runs immediately.
+func (d *deferredWriteError) OnComplete(fn func(err error)) {
+	d.mu.Lock()
+	if d.done {
+		d.mu.Unlock()
+		fn(d.err)
+
+		return
+	}
+	d.fn = fn
+	d.mu.Unlock()
+}
+
+// complete records the leg's final error and runs the registered callback.
+func (d *deferredWriteError) complete(err error) {
+	d.mu.Lock()
+	d.done, d.err = true, err
+	fn := d.fn
+	d.fn = nil
+	d.mu.Unlock()
+	if fn != nil {
+		fn(err)
+	}
+}
+
 // fireAndForget executes a write in a background goroutine with its own timeout.
 // It tracks latency to enable recovery of degraded clusters via delta comparison.
 //
 // On a real error (not ErrWriteAsync/ErrWriteDropped, which are not raised
 // here anyway), the goroutine emits IncWriteError + a Warn log so the
-// background failure is visible. The replay safety net was already enqueued
-// by the caller based on the foreground ErrWriteAsync result; this is the
-// observability complement.
+// background failure is visible, and reports the error through the
+// returned deferred result so the client can enqueue replay for it.
 //
 // Returns:
-//   - types.ErrWriteAsync if the write was accepted for background execution
+//   - a deferred result matching types.ErrWriteAsync if the write was
+//     accepted for background execution
 //   - types.ErrWriteDropped if the concurrency limit was reached
 //   - the write's own result if fireForgetSem is nil — only possible on an
 //     uninitialized zero-value AdaptiveDualWrite{}; see the type doc
@@ -665,6 +707,7 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		return types.ErrWriteDropped
 	}
 
+	result := &deferredWriteError{}
 	go func() {
 		defer func() { <-a.fireForgetSem }() // Release semaphore
 
@@ -674,6 +717,7 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		start := time.Now()
 		err := safeWrite(ctx, write, a.clusterName(cluster))
 		latency := time.Since(start)
+		defer result.complete(err)
 
 		// Track latency for potential recovery
 		if isSkippedErr(err) {
@@ -685,8 +729,8 @@ func (a *AdaptiveDualWrite) fireAndForget(
 			// Surface the background failure: IncWriteError makes it
 			// visible to dashboards, and the Warn log gives operators a
 			// breadcrumb that "the cluster you flagged degraded is
-			// actually erroring on its background writes." Replay
-			// reconciliation has already been enqueued by the caller.
+			// actually erroring on its background writes." The deferred
+			// result hands the error to the client for replay.
 			a.metrics.IncWriteError(cluster)
 			a.logger.Warn("adaptive: fire-and-forget write failed on degraded cluster",
 				"cluster", a.clusterName(cluster),
@@ -730,7 +774,7 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		a.recordFast(state)
 	}()
 
-	return types.ErrWriteAsync
+	return result
 }
 
 // updateHealthState updates cluster health based on write results.

@@ -226,6 +226,28 @@ type LoggerSetter interface {
 	SetLogger(logger types.Logger)
 }
 
+// DeferredWriteResult is the optional interface on the error a
+// [WriteStrategy] returns for a leg it completes in the background.
+//
+// A strategy that dispatches a leg without waiting returns
+// [types.ErrWriteAsync] for it. When that error also implements this
+// interface, the client defers the leg's replay: it snapshots the write
+// and enqueues it for replay only if the background leg later reports a
+// failure, so a statement that lands in the background is applied once.
+// A plain [types.ErrWriteAsync] without this interface is enqueued for
+// replay immediately, as a safety net. [policy.AdaptiveDualWrite]
+// implements it for its fire-and-forget legs.
+type DeferredWriteResult interface {
+	error
+
+	// OnComplete registers fn to run exactly once with the leg's final
+	// error, nil on success. If the leg has already completed, fn runs
+	// immediately on the caller's goroutine; otherwise it runs on the
+	// goroutine that completes the leg, so it must be quick and must not
+	// block on the strategy.
+	OnComplete(fn func(err error))
+}
+
 // LatencyRecorder is an optional interface for failover policies that track latency.
 //
 // For a policy that implements it, the client calls RecordLatency in place

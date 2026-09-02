@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A write to a cluster that `AdaptiveDualWrite` has degraded is applied
+  once. The fire-and-forget leg's result now implements the new
+  `helix.DeferredWriteResult` interface, and the client enqueues replay
+  for that leg only if the background write reports a failure, instead of
+  eagerly as a safety net beside a write that then succeeds. A custom
+  strategy that returns a plain `types.ErrWriteAsync` keeps the immediate
+  enqueue.
 - `Close` waits for the auto-refresh detector and topology watcher
   goroutines to exit before closing the sessions, so a refresh or drain
   update of theirs can no longer run after `Close` returns.
@@ -94,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `helix.DeferredWriteResult`: the optional interface on a write strategy's
+  fire-and-forget leg result through which the client learns the leg's
+  final outcome.
 - `helix.ProbeReporter`, `helix.EventEmitterSetter`, `helix.Instrumentable`,
   and `helix.LoggerSetter` name the optional capabilities the client
   discovers on a write strategy, failover policy, or replay worker by type
