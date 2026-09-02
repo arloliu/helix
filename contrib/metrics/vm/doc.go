@@ -74,8 +74,20 @@
 //   - {prefix}_replay_dropped_total{cluster} - Counter of payloads that could
 //     not be enqueued by the client, plus payloads permanently dropped by a
 //     replay worker after exhausting its retry budget
-//   - {prefix}_replay_queue_depth{cluster} - Gauge of current queue depth
+//   - {prefix}_replay_queue_depth{cluster} - Gauge of payloads not yet
+//     replayed, published by the bundled workers: slots held per cluster
+//     for the memory backend, undelivered plus unacknowledged messages per
+//     cluster for the NATS backend
 //   - {prefix}_replay_duration_seconds{cluster} - Histogram of replay latencies
+//
+// Replay backlog (optional types.ReplayBacklogMetrics):
+//   - {prefix}_replay_oldest_age_seconds{cluster} - Gauge of the age of the
+//     payload most recently taken for execution, measured from its write
+//     timestamp; 0 when nothing is pending
+//   - {prefix}_replay_worker_dropped_total{cluster,reason} - Counter of
+//     payloads a worker gave up on, by reason (max_attempts,
+//     retry_pool_saturated, shutdown, dead_letter, retry_window_expired);
+//     unlike replay_dropped_total it never counts enqueue failures
 //
 // Cluster health:
 //   - {prefix}_cluster_draining{cluster} - Gauge (1=draining, 0=healthy)
