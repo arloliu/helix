@@ -73,6 +73,28 @@ func DefaultTimestampProvider() int64 {
 	return time.Now().UnixMicro()
 }
 
+// AckMode selects when a dual-cluster write that no cluster acknowledged
+// synchronously is reported as success.
+//
+// See [WithAckMode].
+type AckMode int
+
+const (
+	// RequireSynchronousAck is the default: a write returns nil only when at
+	// least one cluster acknowledged it before the call returned. A write
+	// whose every leg was dispatched in the background, dropped, skipped,
+	// or failed returns a [types.NoSynchronousAckError] even when it was
+	// enqueued for replay.
+	RequireSynchronousAck AckMode = iota
+
+	// AckOnReplayAdmission returns nil for a write with no synchronous
+	// acknowledgement as long as every leg that needed replay was enqueued.
+	// The write then exists only in the replay queue until the worker
+	// delivers it, so this mode is only sound with a durable replayer.
+	// A failed replay enqueue is always an error.
+	AckOnReplayAdmission
+)
+
 // ReplayDroppedHandler is called when a replay payload cannot be enqueued.
 // This callback allows applications to handle potential data loss scenarios.
 //
@@ -140,6 +162,10 @@ type ClientConfig struct {
 	//
 	// Default: 0.
 	DefaultMaxRows int
+
+	// AckMode selects whether a write with no synchronous acknowledgement
+	// may return nil. Default: RequireSynchronousAck. Set via [WithAckMode].
+	AckMode AckMode
 
 	// AutoMemoryWorker enables automatic in-process replay with MemoryReplayer.
 	// When true, a MemoryReplayer and Worker are created automatically.
@@ -557,6 +583,36 @@ func WithMirrorReplayer(replayer Replayer, workerOpts ...replay.WorkerOption) Op
 	return func(c *ClientConfig) {
 		c.MirrorReplayer = replayer
 		c.MirrorReplayWorkerOpts = workerOpts
+	}
+}
+
+// WithAckMode selects when a write with no synchronous acknowledgement
+// returns nil.
+//
+// With the default [RequireSynchronousAck], nil means at least one cluster
+// acknowledged the write before the call returned; a write whose legs were
+// all dispatched in the background, dropped, skipped, or failed returns a
+// [types.NoSynchronousAckError] that names each leg's result and whether
+// the write was enqueued for replay. [AckOnReplayAdmission] restores the
+// previous behaviour of returning nil once every leg that needed replay
+// was enqueued; use it only with a durable replayer such as the NATS
+// replayer, because the write then exists nowhere but in the queue.
+//
+// Parameters:
+//   - mode: The acknowledgement mode
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	client, _ := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithReplayer(natsReplayer),
+//	    helix.WithAckMode(helix.AckOnReplayAdmission),
+//	)
+func WithAckMode(mode AckMode) Option {
+	return func(c *ClientConfig) {
+		c.AckMode = mode
 	}
 }
 

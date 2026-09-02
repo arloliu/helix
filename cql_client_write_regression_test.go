@@ -210,9 +210,6 @@ func (i *recordingIter) Warnings() []string                  { return nil }
 // nil would tell the caller the write exists somewhere
 // when it is backed by nothing (no Replayer) or only by an in-memory queue.
 func TestAdaptiveWrite_ZeroSynchronousAckIsAnError(t *testing.T) {
-	t.Skip("pending: a write with zero synchronous acknowledgements currently returns nil; " +
-		"once NoSynchronousAckError exists, tighten require.Error to require.ErrorAs on that type")
-
 	cases := []struct {
 		name string
 		opts []Option
@@ -244,8 +241,11 @@ func TestAdaptiveWrite_ZeroSynchronousAckIsAnError(t *testing.T) {
 			waitForExecs(t, sa, 1)
 			waitForExecs(t, sb, 1)
 
-			require.Error(t, writeErr,
+			var noAck *types.NoSynchronousAckError
+			require.ErrorAs(t, writeErr, &noAck,
 				"a write acknowledged by neither cluster must not be reported as success")
+			require.ErrorIs(t, noAck.ResultA, types.ErrWriteAsync)
+			require.ErrorIs(t, noAck.ResultB, types.ErrWriteAsync)
 		})
 	}
 }

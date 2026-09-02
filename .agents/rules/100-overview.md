@@ -50,7 +50,7 @@ helix/                        # Root = main public package (CQLClient, options)
 
 ## Architecture Notes
 - **Import cycle prevention:** The `types/` package is a leaf — no imports from other helix packages. Shared errors, constants, the metrics and event contracts, and `ReplayPayload` live there. The strategy, policy, replayer, worker, and topology interfaces live in the root package because they use root types; `topology/` therefore imports root rather than `types/`.
-- **Dual-write semantics:** Write operations return `nil` if at least one cluster succeeds; failed writes are enqueued for replay. Both clusters failing returns `*types.DualClusterError`.
+- **Dual-write semantics:** Write operations return `nil` if at least one cluster acknowledged the write synchronously; failed legs are enqueued for replay. No synchronous acknowledgement returns `*types.NoSynchronousAckError` (restore the old `nil` with `WithAckMode(AckOnReplayAdmission)`); both clusters failing returns `*types.DualClusterError`.
 - **Adapter pattern:** `adapter/cql/v1` wraps `gocql.Session`; `adapter/cql/v2` wraps the Apache cassandra-gocql-driver. The root package is driver-agnostic.
 - **Code generation:** `replay/` uses `msgp` for MessagePack serialization. Run `make generate` after changing generated types.
 

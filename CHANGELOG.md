@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behavior change
+
+- A dual-cluster write that no cluster acknowledged synchronously now
+  returns `*types.NoSynchronousAckError` instead of `nil`. This covers every
+  leg pair without an acknowledgement: fire-and-forget plus
+  fire-and-forget (both clusters degraded under `AdaptiveDualWrite`),
+  fire-and-forget or dropped plus a failure, dropped plus dropped, and a
+  draining leg beside any of them. The error names each leg's result and
+  whether the write was admitted to the replay queue, and matches
+  `errors.Is(err, types.ErrNoSynchronousAck)`. A write with one
+  acknowledgement still returns `nil`. Restore the previous result for
+  queued writes with one line: `helix.WithAckMode(helix.AckOnReplayAdmission)`.
+- Without a `Replayer`, a leg that needed replay is now counted in
+  `IncReplayDropped` and reported through `WithOnReplayDropped` and
+  `EventReplayDropped` with `types.ErrNoReplayer`; previously it was
+  silently lost.
+
 ### Fixed
 
 - An error observed after the caller's context was cancelled or expired is
