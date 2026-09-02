@@ -423,12 +423,16 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 			obs.err = errCluster
 		}
 		obs.healthFail = []ClusterID{served}
+		obs.failures = []ClusterID{served}
 		if isIter {
-			// Iterator Close feeds only the auto-refresh counter.
+			// Iterator Close reports the failure to the policy and the
+			// strategy but cannot retry, and emits no read-error metric.
+			if mode != modeOverride {
+				obs.onFailure = []ClusterID{served}
+			}
 			break
 		}
 		obs.readErrors = []ClusterID{served}
-		obs.failures = []ClusterID{served}
 		if entry == entrySliceScan {
 			// SliceScan never fails over: the caller's callback already ran.
 			break

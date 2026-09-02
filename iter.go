@@ -19,19 +19,39 @@ func (i *cqlIter) Scan(dest ...any) bool {
 	return i.iter.Scan(dest...)
 }
 
+// Close closes the iterator and reports its outcome like any other read:
+// a clean close is a success for the read strategy and the failover
+// policy, a cluster error is a failure for both (the strategy's suggested
+// alternative is ignored because an iterator cannot be retried), and data
+// sentinels or a caller-context error are neither. Auto-refresh accounting
+// sees every outcome except a caller-context error.
 func (i *cqlIter) Close() error {
 	err := i.iter.Close()
 	kind := classifyReadErr(i.ctx, err)
-	// Auto-refresh accounting must see iterator outcomes too — without
-	// this the detector is blind to iterator-driven workloads. Iterators
-	// still don't fail over (no OnFailure call) by documented contract.
-	// A caller-context error is not the cluster's failure and is not
-	// recorded.
 	if kind != readCtxErr {
 		i.client.recordOpOutcome(i.cluster, err)
 	}
-	if kind == readOK && !i.overrideActive && i.client.config.ReadStrategy != nil {
-		i.client.config.ReadStrategy.OnSuccess(i.cluster)
+
+	c := i.client
+	switch kind {
+	case readOK:
+		if !i.overrideActive && c.config.ReadStrategy != nil {
+			c.config.ReadStrategy.OnSuccess(i.cluster)
+		}
+		if !c.IsSingleCluster() && c.config.FailoverPolicy != nil {
+			c.config.FailoverPolicy.RecordSuccess(i.cluster)
+		}
+	case readClusterErr:
+		if c.IsSingleCluster() {
+			break
+		}
+		if c.config.FailoverPolicy != nil {
+			c.config.FailoverPolicy.RecordFailure(i.cluster)
+		}
+		if !i.overrideActive && c.config.ReadStrategy != nil {
+			c.config.ReadStrategy.OnFailure(i.cluster, err)
+		}
+	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
 	}
 
 	return err

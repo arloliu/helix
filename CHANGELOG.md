@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Iter.Close` now reports its outcome to the failover policy and the read
+  strategy like every other read: a clean close is a `RecordSuccess`, and a
+  cluster error is a `RecordFailure` plus `OnFailure` (the suggested
+  alternative is ignored because an iterator cannot be retried). Previously
+  an iterator-heavy workload never tripped a circuit breaker, never moved
+  the sticky preference, and a clean close never reset a breaker.
+- `LatencyRecorder` documents that `RecordLatency` stands in for
+  `RecordSuccess` on the read path and must reset the failure counter for a
+  fast sample. Calling both would let `RecordSuccess` erase the slow-read
+  count a latency breaker accumulates, which is why the client calls only
+  `RecordLatency` for such policies.
 - An error observed after the caller's context was cancelled or expired is
   no longer counted as a cluster failure. On every read entry point it is
   returned as-is without `IncReadError`, `RecordFailure`, `OnFailure`, the
