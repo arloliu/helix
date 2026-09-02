@@ -228,18 +228,24 @@ type LoggerSetter interface {
 
 // LatencyRecorder is an optional interface for failover policies that track latency.
 //
-// Policies implementing this interface will have RecordLatency called automatically
-// by the client after successful operations. This enables latency-aware circuit
+// For a policy that implements it, the client calls RecordLatency in place
+// of [FailoverPolicy.RecordSuccess] after every successful read: RecordLatency
+// is the success signal, and the implementation decides whether the sample
+// resets the failure count (a fast read) or counts as a soft failure (a slow
+// read). Calling both would let a fast RecordSuccess erase the slow-read
+// count a latency breaker accumulates. This enables latency-aware circuit
 // breaking where slow responses are treated as "soft failures".
 //
 // Implementations MUST be safe for concurrent use from multiple goroutines.
 //
 // Example implementation: policy.LatencyCircuitBreaker
 type LatencyRecorder interface {
-	// RecordLatency records the latency of a successful operation.
+	// RecordLatency records the latency of a successful operation and
+	// stands in for RecordSuccess on the read path.
 	//
-	// Implementations may treat slow responses (above a threshold) as failures
-	// for circuit breaker purposes.
+	// Implementations must reset the failure counter for a fast sample and
+	// may treat slow responses (above a threshold) as failures for circuit
+	// breaker purposes.
 	//
 	// Parameters:
 	//   - cluster: The cluster that was accessed
