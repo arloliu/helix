@@ -14,6 +14,8 @@ TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./v
 INTEGRATION_DIR := ./test/integration/...
 E2E_DIR         := ./test/e2e/...
 E2E_TIMEOUT     ?= 30m
+SIM_PROFILE     ?= quick
+SIM_CONFIG      ?= test/simulation/configs/quick.yaml
 LATEST_GIT_TAG  := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
 
 # Linter configuration
@@ -23,7 +25,7 @@ GOLANGCI_LINT_VERSION := 2.12.2
 # Default target
 .DEFAULT_GOAL := help
 
-.PHONY: help test test-unit test-integration test-all test-quick test-e2e clean-test-results
+.PHONY: help test test-unit test-integration test-all test-quick test-e2e test-simulation clean-test-results
 .PHONY: coverage coverage-html
 .PHONY: lint linter-update linter-version fmt vet
 .PHONY: generate gomod-tidy clean ci
@@ -70,6 +72,11 @@ test-e2e: clean-test-results
 	@# code. Race detection adds significant overhead and the tests do not
 	@# exercise concurrency-sensitive paths beyond what unit/integration cover.
 	@CGO_ENABLED=1 go test -tags e2e $(E2E_DIR) -count=1 -v -timeout=$(E2E_TIMEOUT)
+
+## test-simulation: Run the dual-cluster simulation harness (Docker required; SIM_PROFILE, SIM_CONFIG)
+test-simulation:
+	@echo "Running simulation profile '$(SIM_PROFILE)' with $(SIM_CONFIG) (Docker required)..."
+	@go run ./test/simulation/cmd/main.go -profile $(SIM_PROFILE) -config $(SIM_CONFIG)
 
 ## coverage: Generate test coverage report (unit packages only)
 coverage: clean-test-results
