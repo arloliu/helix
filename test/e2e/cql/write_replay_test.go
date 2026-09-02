@@ -107,7 +107,6 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 			)
 			require.NoError(t, worker.Start())
 			t.Cleanup(worker.Stop)
-			client.Config().ReplayWorker = worker
 
 			ctx := context.Background()
 			require.NoError(t, a.Pause(ctx))

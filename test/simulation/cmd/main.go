@@ -202,7 +202,7 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 func makeStrategyGroupClientWithMetrics(
 	policyFactory func(mc *testutil.TestMetricsCollector) (helix.WriteStrategy, helix.ReadStrategy, helix.FailoverPolicy),
 ) simulation.StrategyGroupSetupFunc {
-	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
+	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
 		writeStrategy, readStrategy, failoverPolicy := policyFactory(mc)
 		return makeStrategyGroupClient(writeStrategy, readStrategy, failoverPolicy)(sessionA, sessionB, mc)
 	}
@@ -217,7 +217,7 @@ func makeStrategyGroupClient(
 	readStrategy helix.ReadStrategy,
 	failoverPolicy helix.FailoverPolicy,
 ) simulation.StrategyGroupSetupFunc {
-	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
+	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
 		memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
 		topo := topology.NewLocal()
 
@@ -230,7 +230,7 @@ func makeStrategyGroupClient(
 			helix.WithMetrics(mc),
 		)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to create client: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to create client: %w", err)
 		}
 
 		worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
@@ -238,11 +238,10 @@ func makeStrategyGroupClient(
 		)
 		if err := worker.Start(); err != nil {
 			client.Close()
-			return nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
 		}
-		client.Config().ReplayWorker = worker
 
-		return client, memReplayer, nil
+		return client, memReplayer, worker, nil
 	}
 }
 
@@ -362,7 +361,7 @@ func stickyCooldownGroup() simulation.StrategyGroup {
 func fallbackReadGroup() simulation.StrategyGroup {
 	return simulation.StrategyGroup{
 		Name: "fallback-read",
-		SetupFunc: func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error) {
+		SetupFunc: func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
 			memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
 			topo := topology.NewLocal()
 
@@ -383,7 +382,7 @@ func fallbackReadGroup() simulation.StrategyGroup {
 				helix.WithDefaultFallbackRead(true),
 			)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to create client: %w", err)
+				return nil, nil, nil, fmt.Errorf("failed to create client: %w", err)
 			}
 
 			worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
@@ -391,11 +390,10 @@ func fallbackReadGroup() simulation.StrategyGroup {
 			)
 			if err := worker.Start(); err != nil {
 				client.Close()
-				return nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
+				return nil, nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
 			}
-			client.Config().ReplayWorker = worker
 
-			return client, memReplayer, nil
+			return client, memReplayer, worker, nil
 		},
 		Scenarios: []simtypes.Scenario{
 			&scenarios.FallbackReadDivergence{},

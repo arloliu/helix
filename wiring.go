@@ -72,17 +72,18 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 // dispatcher buffers events until startEventDelivery runs, which happens after
 // the constructor's last step that can fail, so an error path never leaves a
 // delivery goroutine behind.
-func createEventDispatcher(config *ClientConfig) {
+func (c *CQLClient) createEventDispatcher() {
+	config := c.config
 	if config.OnClusterEvent == nil {
 		return
 	}
 
-	config.events = newEventDispatcher(config.OnClusterEvent, config.Logger)
+	c.runtime.events = newEventDispatcher(config.OnClusterEvent, config.Logger)
 	// Attach the optional drop-total metric. The dispatcher reconciles it
 	// from its own goroutine, never from the emit hot path, so an
 	// arbitrary collector implementation cannot slow emitters down.
 	if cem, ok := config.Metrics.(types.ClusterEventMetrics); ok {
-		config.events.metrics = cem
+		c.runtime.events.metrics = cem
 	}
 }
 
@@ -164,10 +165,11 @@ func unreachableEventKinds(config *ClientConfig, dualCluster bool) []string {
 // during an incident. No-op when every kind is reachable or no handler
 // is registered. Follows the "dual-cluster mode with no Replayer" warning
 // precedent: one concise line, not one per kind.
-func logUnreachableEventKinds(config *ClientConfig, dualCluster bool) {
-	if config.events == nil {
+func (c *CQLClient) logUnreachableEventKinds(dualCluster bool) {
+	if c.runtime.events == nil {
 		return
 	}
+	config := c.config
 	kinds := unreachableEventKinds(config, dualCluster)
 	if len(kinds) == 0 {
 		return
@@ -186,13 +188,13 @@ func logUnreachableEventKinds(config *ClientConfig, dualCluster bool) {
 // recovery-probe goroutines start: a probe that succeeds on its first tick
 // reports a recovery, and injecting the emitter afterwards would race that
 // report and lose the event.
-func startEventDelivery(config *ClientConfig) {
-	if config.events == nil {
+func (c *CQLClient) startEventDelivery() {
+	if c.runtime.events == nil {
 		return
 	}
 
-	autoInjectEventEmitter(config)
-	config.events.start()
+	c.autoInjectEventEmitter()
+	c.runtime.events.start()
 }
 
 // autoInjectEventEmitter threads the client's event dispatcher into
@@ -200,15 +202,16 @@ func startEventDelivery(config *ClientConfig) {
 // type-assertion pattern autoInjectMetricsAndLogger uses. Called after the
 // constructor's last step that can fail and before any background goroutine
 // starts, so a component never observes a half-installed emitter.
-func autoInjectEventEmitter(config *ClientConfig) {
+func (c *CQLClient) autoInjectEventEmitter() {
+	config := c.config
 	if config.WriteStrategy != nil {
 		if ws, ok := config.WriteStrategy.(eventAware); ok {
-			ws.SetEventEmitter(config.events)
+			ws.SetEventEmitter(c.runtime.events)
 		}
 	}
 	if config.FailoverPolicy != nil {
 		if fp, ok := config.FailoverPolicy.(eventAware); ok {
-			fp.SetEventEmitter(config.events)
+			fp.SetEventEmitter(c.runtime.events)
 		}
 	}
 }
@@ -225,7 +228,7 @@ func (c *CQLClient) shouldLogOverrideErr() bool {
 // emitClusterEvent forwards ev to the event dispatcher. Safe when no handler
 // is registered: the dispatcher is then nil and every method no-ops.
 func (c *CQLClient) emitClusterEvent(ev types.ClusterEvent) {
-	c.config.events.EmitClusterEvent(ev)
+	c.runtime.events.EmitClusterEvent(ev)
 }
 
 // emitReplayDropped invokes the legacy OnReplayDropped callback, if any, and
@@ -247,8 +250,8 @@ func (c *CQLClient) emitReplayDropped(cluster ClusterID, payload types.ReplayPay
 // NewCQLClient on a constructor error path, so any event already buffered is
 // counted as dropped instead of sitting undelivered forever. Safe to call on
 // a never-started dispatcher.
-func abortEventDispatcher(config *ClientConfig) {
-	config.events.stop()
+func (c *CQLClient) abortEventDispatcher() {
+	c.runtime.events.stop()
 }
 
 // NewCQLClient creates a new Helix CQL client.
@@ -281,6 +284,19 @@ func abortEventDispatcher(config *ClientConfig) {
 //     error from starting configured background components such as replay
 //     workers or topology watchers
 func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, error) {
+	client, err := buildCQLClient(sessionA, sessionB, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+// buildCQLClient is NewCQLClient without the final nil-on-error guard: when
+// a step after the client value exists fails, the partially built client is
+// returned together with the error so its already-stopped components can be
+// inspected. Only NewCQLClient and this package's tests call it.
+func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, error) {
 	if sessionA == nil {
 		return nil, types.ErrNilSession
 	}
@@ -374,8 +390,8 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 
 	// Must run before mirror setup: the mirror error handler captures the
 	// dispatcher by value when it is built below.
-	createEventDispatcher(config)
-	logUnreachableEventKinds(config, sessionB != nil)
+	client.createEventDispatcher()
+	client.logUnreachableEventKinds(sessionB != nil)
 
 	// Auto-inject client metrics/logger into components that opt in via
 	// type-assertion-based interfaces (replay.Worker, AdaptiveDualWrite).
@@ -383,13 +399,13 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// expanding the public ReplayWorker / WriteStrategy interfaces.
 	autoInjectMetricsAndLogger(config)
 
-	if err := setupMirror(config); err != nil {
+	if err := client.setupMirror(); err != nil {
 		if client.topologyClose != nil {
 			client.topologyClose()
 		}
-		abortEventDispatcher(config)
+		client.abortEventDispatcher()
 
-		return nil, err
+		return client, err
 	}
 
 	// Start topology watcher if configured. The cancel function is stashed so
@@ -411,10 +427,10 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 			if client.topologyClose != nil {
 				client.topologyClose()
 			}
-			stopMirrorComponents(config)
-			abortEventDispatcher(config)
+			client.stopMirrorComponents()
+			client.abortEventDispatcher()
 
-			return nil, err
+			return client, err
 		}
 	}
 
@@ -423,7 +439,7 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	// before the auto-refresh and recovery-probe goroutines below start
 	// (so a fast successful probe cannot race the emitter installation and
 	// lose an event).
-	startEventDelivery(config)
+	client.startEventDelivery()
 
 	// Start the auto-refresh detector if enabled AND a refresher is
 	// registered. Without a refresher the detector cannot do anything

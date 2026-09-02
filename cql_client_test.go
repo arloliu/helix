@@ -2037,49 +2037,45 @@ func TestNewCQLClient_MirrorComponentsStoppedOnReplayWorkerStartFailure(t *testi
 	mirrorReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(16))
 	workerErr := errors.New("worker already running")
 
-	var config *ClientConfig
-	_, err = NewCQLClient(newMockSession(), nil,
-		WithConfigCaptureForTest(&config),
+	client, err := buildCQLClient(newMockSession(), nil,
 		WithMirror(mirrorTarget),
 		WithMirrorReplayer(mirrorReplayer),
 		WithReplayWorker(newMockReplayWorker(workerErr)),
 	)
 	require.ErrorIs(t, err, workerErr)
-	require.NotNil(t, config)
+	require.NotNil(t, client)
 
-	require.NotNil(t, config.MirrorEngine)
-	require.False(t, config.MirrorEngine.TryEnqueue(types.ReplayPayload{Query: "after failed construction"}),
+	require.NotNil(t, client.runtime.mirrorEngine)
+	require.False(t, client.runtime.mirrorEngine.TryEnqueue(types.ReplayPayload{Query: "after failed construction"}),
 		"mirror engine must be stopped, not leaked, when ReplayWorker.Start() fails")
 
-	require.NotNil(t, config.MirrorReplayWorker)
-	require.False(t, config.MirrorReplayWorker.IsRunning(),
+	require.NotNil(t, client.runtime.mirrorReplayWorker)
+	require.False(t, client.runtime.mirrorReplayWorker.IsRunning(),
 		"mirror replay worker must be stopped, not leaked, when ReplayWorker.Start() fails")
 }
 
 // TestNewCQLClient_MirrorPublisherEngineStoppedOnReplayWorkerStartFailure
 // verifies the same leak-on-failure guard for publisher-mode mirroring
-// (WithMirrorPublisher): setupMirrorPublisherMode only ever populates
-// config.MirrorEngine (there is no auto-built MirrorReplayWorker in this
+// (WithMirrorPublisher): setupMirrorPublisherMode only ever builds the
+// mirror engine (there is no auto-built mirror replay worker in this
 // mode), so stopMirrorComponents must still stop that engine when the later
 // config.ReplayWorker.Start() call fails during initialization.
 func TestNewCQLClient_MirrorPublisherEngineStoppedOnReplayWorkerStartFailure(t *testing.T) {
 	pub := &recordingReplayer{}
 	workerErr := errors.New("worker already running")
 
-	var config *ClientConfig
-	_, err := NewCQLClient(newMockSession(), nil,
-		WithConfigCaptureForTest(&config),
+	client, err := buildCQLClient(newMockSession(), nil,
 		WithMirrorPublisher(pub),
 		WithReplayWorker(newMockReplayWorker(workerErr)),
 	)
 	require.ErrorIs(t, err, workerErr)
-	require.NotNil(t, config)
+	require.NotNil(t, client)
 
-	require.NotNil(t, config.MirrorEngine)
-	require.False(t, config.MirrorEngine.TryEnqueue(types.ReplayPayload{Query: "after failed construction"}),
+	require.NotNil(t, client.runtime.mirrorEngine)
+	require.False(t, client.runtime.mirrorEngine.TryEnqueue(types.ReplayPayload{Query: "after failed construction"}),
 		"publisher-mode mirror engine must be stopped, not leaked, when ReplayWorker.Start() fails")
-	require.Nil(t, config.MirrorReplayWorker,
-		"publisher mode never sets MirrorReplayWorker; stopMirrorComponents must nil-guard it")
+	require.Nil(t, client.runtime.mirrorReplayWorker,
+		"publisher mode never sets the mirror replay worker; stopMirrorComponents must nil-guard it")
 }
 
 // Compile-time assertion: errorIter implements Iter.

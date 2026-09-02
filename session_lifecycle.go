@@ -335,7 +335,7 @@ func (c *CQLClient) Close() {
 		// Stop the mirror engine first so it stops generating new failure
 		// captures, then drain any failures that landed in the mirror
 		// replayer through its worker.
-		stopMirrorComponents(c.config)
+		c.stopMirrorComponents()
 
 		// Stop replay worker
 		if c.config.ReplayWorker != nil {
@@ -355,7 +355,7 @@ func (c *CQLClient) Close() {
 		// joined, so a terminal event of theirs can still arrive after this
 		// point; such events are dropped and counted, as documented on
 		// WithOnClusterEvent.
-		c.config.events.stop()
+		c.runtime.events.stop()
 
 		c.loadSessionA().Close()
 		if !c.singleCluster {
