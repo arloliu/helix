@@ -74,6 +74,7 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
 - FallbackRead applies to `Scan`, `ScanContext`, `MapScan`, `MapScanContext`, `SliceMap`, `SliceMapContext`, `SliceScan`, and `SliceScanContext`. It has no effect on `Iter` (streaming cursors have no not-found signal) or `Exec` (write operations).
 - Not-found is never treated as a cluster failure. It never triggers `IncReadError`, `RecordFailure`, or failover — regardless of whether FallbackRead is enabled.
 - When the primary returns a real error (timeout, connection refused), the normal failover path handles it. FallbackRead only activates on not-found.
+- An error observed after the caller's own context was cancelled or expired is the caller's, not the cluster's: it is returned as-is, records no `IncReadError` or `RecordFailure`, and never triggers failover or the FallbackRead probe. A driver-side timeout while the caller's context is still live is a cluster error like any other.
 - FallbackRead bypasses drain state: the caller opted in to checking both clusters, and a draining cluster may still hold the data.
 - The fallback attempt reuses the same statement, bound values, and query options on the alternative cluster.
 - Both attempts share the same context and deadline. FallbackRead does not create a fresh timeout for the second read.
@@ -183,6 +184,7 @@ Helix is an AP system. FallbackRead favors availability over strict consistency:
 | Both missing | not-found | not-found | ErrNotFound | none |
 | Primary missing, alt down | not-found | error | **ErrNotFound** | IncReadError(alt), RecordFailure(alt) |
 | Primary down, alt missing | error | not-found | **ErrNotFound** | IncReadError(primary), RecordFailure(primary) |
+| Caller's context ended | any | context error | the context error | none |
 | Primary down, alt has data | error | success | return data via normal failover | IncReadError(primary), RecordFailure(primary), OnSuccess(alt) |
 | Both have real failures | error | error | DualClusterError | failure recorded on both |
 

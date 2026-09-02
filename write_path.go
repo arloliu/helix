@@ -57,12 +57,19 @@ const (
 	legDraining
 	// legSkipped is [types.ErrClusterDegraded]: a strict write skipped a degraded cluster.
 	legSkipped
+	// legCanceled is a failure observed after the caller's context was
+	// cancelled or expired: the caller's doing, not the cluster's. The leg
+	// is still unacknowledged and is replayed like a failed leg, but it is
+	// neither counted as a write error nor as a health signal.
+	legCanceled
 	// legFailed is any other error: the cluster rejected or failed the write.
 	legFailed
 )
 
-// classifyWriteLeg assigns the kind of one leg's result.
-func classifyWriteLeg(err error) writeLegErrKind {
+// classifyWriteLeg assigns the kind of one leg's result for a write issued
+// with ctx. Classification is by provenance: once ctx is done, a failure is
+// attributed to the caller rather than to the cluster.
+func classifyWriteLeg(ctx context.Context, err error) writeLegErrKind {
 	switch {
 	case err == nil:
 		return legOK
@@ -74,9 +81,17 @@ func classifyWriteLeg(err error) writeLegErrKind {
 		return legDraining
 	case errors.Is(err, types.ErrClusterDegraded):
 		return legSkipped
+	case ctx.Err() != nil:
+		return legCanceled
 	default:
 		return legFailed
 	}
+}
+
+// failed reports whether the leg's result is a failure the caller must see
+// when the other leg gave no acknowledgement either.
+func (k writeLegErrKind) failed() bool {
+	return k == legFailed || k == legCanceled
 }
 
 // recordWriteLegMetrics emits the per-leg write metrics for one cluster.
@@ -88,7 +103,7 @@ func (c *CQLClient) recordWriteLegMetrics(cluster ClusterID, leg writeLegErrKind
 		c.config.Metrics.ObserveWriteDuration(cluster, float64(nowNano-startNano)/float64(time.Second))
 	}
 	switch leg {
-	case legOK:
+	case legOK, legCanceled:
 	case legAsync:
 		c.config.Metrics.IncWriteAsync(cluster)
 	case legDropped:
@@ -100,6 +115,21 @@ func (c *CQLClient) recordWriteLegMetrics(cluster ClusterID, leg writeLegErrKind
 	case legFailed:
 		c.config.Metrics.IncWriteError(cluster)
 	}
+}
+
+// recordWriteOutcome feeds one leg's outcome to the auto-refresh detector.
+// A failure observed after the caller's context ended is the caller's
+// doing, not the cluster's, and is not recorded.
+func (c *CQLClient) recordWriteOutcome(ctx context.Context, cluster ClusterID, err error) {
+	c.recordWriteOutcomeAt(ctx, cluster, err, 0)
+}
+
+// recordWriteOutcomeAt is recordWriteOutcome with a caller-captured clock.
+func (c *CQLClient) recordWriteOutcomeAt(ctx context.Context, cluster ClusterID, err error, nowNano int64) {
+	if err != nil && ctx.Err() != nil {
+		return
+	}
+	c.recordOpOutcomeAt(cluster, err, nowNano)
 }
 
 // executeWriteWithReplay performs a write operation with optional dual-write and replay support.
@@ -127,7 +157,7 @@ func (c *CQLClient) executeWriteWithReplay(
 	// cluster-A outcomes — no other code path observes err for stats.
 	if c.IsSingleCluster() {
 		err := writeFunc(ctx, c.loadSessionA())
-		c.recordOpOutcome(ClusterA, err)
+		c.recordWriteOutcome(ctx, ClusterA, err)
 
 		return err
 	}
@@ -244,8 +274,9 @@ func (c *CQLClient) executeDualWrite(
 	// ErrWriteAsync     — write is in flight via fire-and-forget (not a cluster error).
 	// ErrWriteDropped   — write was not attempted due to concurrency limit (not a cluster error).
 	// ErrClusterDraining — leg skipped because the cluster is draining (not a cluster error).
-	legA := classifyWriteLeg(errA)
-	legB := classifyWriteLeg(errB)
+	// A failure after the caller's context ended is the caller's, not the cluster's.
+	legA := classifyWriteLeg(ctx, errA)
+	legB := classifyWriteLeg(ctx, errB)
 
 	// Record metrics for both clusters.
 	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines.
@@ -259,10 +290,11 @@ func (c *CQLClient) executeDualWrite(
 	// (A=ok, B=err) correctly advances A's lastSuccess while accumulating
 	// failures on B. recordOpOutcomeAt internally skips ErrWriteAsync /
 	// ErrWriteDropped / ErrNotFound so operational states don't poison
-	// the failure counters. Reuse the already-captured nowNano so the
-	// helper does not re-sample the clock.
-	c.recordOpOutcomeAt(ClusterA, errA, nowNano)
-	c.recordOpOutcomeAt(ClusterB, errB, nowNano)
+	// the failure counters, and a caller-cancelled leg is skipped here.
+	// Reuse the already-captured nowNano so the helper does not re-sample
+	// the clock.
+	c.recordWriteOutcomeAt(ctx, ClusterA, errA, nowNano)
+	c.recordWriteOutcomeAt(ctx, ClusterB, errB, nowNano)
 
 	// Both succeeded definitively.
 	if errA == nil && errB == nil {
@@ -270,15 +302,15 @@ func (c *CQLClient) executeDualWrite(
 	}
 
 	// Both clusters had real (non-operational) failures — hard error, no replay.
-	if legA == legFailed && legB == legFailed {
+	if legA.failed() && legB.failed() {
 		return &types.DualClusterError{ErrorA: errA, ErrorB: errB}
 	}
 
 	// A draining leg never acknowledges, so a real failure on the other
 	// cluster leaves the write unacknowledged: report that failure and
 	// leave reconciliation to the caller's retry.
-	if (legA == legFailed && legB == legDraining) || (legB == legFailed && legA == legDraining) {
-		if legA == legFailed {
+	if (legA.failed() && legB == legDraining) || (legB.failed() && legA == legDraining) {
+		if legA.failed() {
 			return errA
 		}
 
@@ -347,7 +379,7 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 			c.config.Logger.Info("write skipped on draining cluster, enqueued for replay",
 				"cluster", c.clusterName(cluster),
 			)
-		case legOK, legSkipped, legFailed:
+		case legOK, legSkipped, legCanceled, legFailed:
 			c.config.Logger.Warn("write failed on cluster, enqueued for replay",
 				"cluster", c.clusterName(cluster),
 				"error", err.Error(),
@@ -404,11 +436,11 @@ func (c *CQLClient) executeStrictDualWrite(
 	now := time.Now()
 	nowNano := now.UnixNano()
 
-	c.recordWriteLegMetrics(ClusterA, classifyWriteLeg(errA), startA.Load(), nowNano)
-	c.recordWriteLegMetrics(ClusterB, classifyWriteLeg(errB), startB.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterA, classifyWriteLeg(ctx, errA), startA.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterB, classifyWriteLeg(ctx, errB), startB.Load(), nowNano)
 
-	c.recordOpOutcomeAt(ClusterA, errA, nowNano)
-	c.recordOpOutcomeAt(ClusterB, errB, nowNano)
+	c.recordWriteOutcomeAt(ctx, ClusterA, errA, nowNano)
+	c.recordWriteOutcomeAt(ctx, ClusterB, errB, nowNano)
 
 	if errA == nil && errB == nil {
 		return nil

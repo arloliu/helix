@@ -189,7 +189,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		query = query.WithTimestamp(ts)
 
 		err = query.ExecContext(ctx)
-		q.client.recordOpOutcome(ClusterA, err)
+		q.client.recordWriteOutcome(ctx, ClusterA, err)
 
 		return err
 	}
@@ -263,6 +263,7 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 		iter:           query.IterContext(ctx),
 		client:         q.client,
 		cluster:        rt.cluster,
+		ctx:            ctx,
 		overrideActive: rt.snap.active,
 	}
 }

@@ -28,15 +28,21 @@ const (
 	// readCallerNotFound is a not-found the caller's own scan callback returned.
 	// It terminates the read without a health signal and without a FallbackRead probe.
 	readCallerNotFound
-	// readCtxErr is a context cancellation or deadline error.
-	// It is still handled exactly like readClusterErr on every path.
+	// readCtxErr is an error observed after the caller's context was
+	// cancelled or expired. It is the caller's doing, not the cluster's:
+	// it is surfaced verbatim, never counted against the cluster's health,
+	// and never followed by a failover attempt.
 	readCtxErr
-	// readClusterErr is any other error: a cluster fault.
+	// readClusterErr is any other error: a cluster fault. A context error
+	// returned by the driver while the caller's context is still live is a
+	// driver-side timeout and falls in this kind.
 	readClusterErr
 )
 
-// classifyReadErr assigns the read-pipeline kind of err.
-func classifyReadErr(err error) readErrKind {
+// classifyReadErr assigns the read-pipeline kind of err for a read issued
+// with ctx. Classification is by provenance: when ctx is already done, any
+// error is attributed to the caller rather than to the cluster.
+func classifyReadErr(ctx context.Context, err error) readErrKind {
 	switch {
 	case err == nil:
 		return readOK
@@ -46,7 +52,7 @@ func classifyReadErr(err error) readErrKind {
 		return readRowLimit
 	case isShieldedScanFnNotFound(err):
 		return readCallerNotFound
-	case isCtxErr(err):
+	case ctx.Err() != nil:
 		return readCtxErr
 	default:
 		return readClusterErr
@@ -55,7 +61,7 @@ func classifyReadErr(err error) readErrKind {
 
 // isHealthSignal reports whether the kind counts against the cluster's health.
 func (k readErrKind) isHealthSignal() bool {
-	return k == readCtxErr || k == readClusterErr
+	return k == readClusterErr
 }
 
 // getDrainStates returns the current drain state for both clusters.
@@ -461,10 +467,11 @@ func (c *CQLClient) executeRead(
 		return nil
 	}
 
-	kind := classifyReadErr(res.err)
-	// Data sentinels are not health signals — the cluster responded
-	// correctly. Only not-found triggers the FallbackRead probe, and only
-	// in dual-cluster mode (single-cluster has no alternative session).
+	kind := classifyReadErr(ctx, res.err)
+	// Data sentinels and caller-context errors are not health signals —
+	// the cluster responded correctly, or the caller gave up. Only
+	// not-found triggers the FallbackRead probe, and only in dual-cluster
+	// mode (single-cluster has no alternative session).
 	if !kind.isHealthSignal() {
 		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
 			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
@@ -525,11 +532,12 @@ func (c *CQLClient) executeReadNoFailover(
 		return nil
 	}
 
-	kind := classifyReadErr(res.err)
-	// Data sentinels, including a not-found returned by the caller's own
-	// scan callback, terminate the read without a health signal. Only a
-	// genuine not-found triggers the FallbackRead probe; SliceScanContext
-	// unwraps the caller's not-found at the public boundary.
+	kind := classifyReadErr(ctx, res.err)
+	// Data sentinels, a not-found returned by the caller's own scan
+	// callback, and caller-context errors terminate the read without a
+	// health signal. Only a genuine not-found triggers the FallbackRead
+	// probe; SliceScanContext unwraps the caller's not-found at the public
+	// boundary.
 	if !kind.isHealthSignal() {
 		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
 			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
@@ -576,6 +584,11 @@ func (c *CQLClient) executeOverrideFailover(
 		return primaryErr
 	}
 
+	// A dead caller context cannot succeed on the other cluster either.
+	if ctx.Err() != nil {
+		return primaryErr
+	}
+
 	return c.tryFallbackCluster(ctx, selected, rt.snap.fallback, primaryErr, true, readFunc)
 }
 
@@ -614,6 +627,11 @@ func (c *CQLClient) executeNormalFailover(
 	}
 
 	if !shouldFailover {
+		return primaryErr
+	}
+
+	// A dead caller context cannot succeed on the other cluster either.
+	if ctx.Err() != nil {
 		return primaryErr
 	}
 
@@ -659,12 +677,13 @@ func (c *CQLClient) tryFallbackCluster(
 		return nil
 	}
 
-	// Data sentinels (ErrNotFound, ErrRowLimitExceeded) propagate as-is —
-	// neither describes a cluster fault, so we do not record health and we
-	// do not wrap them in DualClusterError. ErrRowLimitExceeded reaching
-	// this site means the failover cluster also exceeded the application
-	// cap; the caller wants to see that, not a wrapped two-cluster error.
-	if !classifyReadErr(err).isHealthSignal() {
+	// Data sentinels (ErrNotFound, ErrRowLimitExceeded) and caller-context
+	// errors propagate as-is — none describes a cluster fault, so we do not
+	// record health and we do not wrap them in DualClusterError.
+	// ErrRowLimitExceeded reaching this site means the failover cluster
+	// also exceeded the application cap; the caller wants to see that, not
+	// a wrapped two-cluster error.
+	if !classifyReadErr(ctx, err).isHealthSignal() {
 		return err
 	}
 
@@ -693,9 +712,8 @@ func isCtxErr(err error) bool {
 
 // fallbackReadOptions customizes executeFallbackRead's alt-leg semantics.
 // The zero value reproduces Scan / MapScan behavior — no drain skip, suppress
-// real alt errors to ErrNotFound, record health on every real alt error. Slice
-// methods pass non-zero values to opt into drain-aware skip, ctx-error
-// propagation, and ctx-error health suppression.
+// real alt errors to ErrNotFound. Slice methods pass non-zero values to opt
+// into drain-aware skip and error propagation.
 //
 //   - skipDrainingAlt: when true, executeFallbackRead returns ErrNotFound
 //     immediately without contacting the alt session if the alt is draining
@@ -704,19 +722,12 @@ func isCtxErr(err error) bool {
 //     state, and a "try harder" empty-retry must not introduce that risk.
 //   - propagateAltErr: when non-nil and it returns true for a given alt
 //     error, executeFallbackRead returns that error to the caller instead of
-//     suppressing it to ErrNotFound. Health classification is governed
-//     independently by nonHealthAltErr — propagating an error does NOT skip
-//     health recording on its own.
-//   - nonHealthAltErr: when non-nil and it returns true for a given alt
-//     error, executeFallbackRead skips IncReadError + recordOpOutcome +
-//     RecordFailure on the alt for that error. Layered above the existing
-//     isReadTerminalNonHealth filter (which already excludes ErrNotFound and
-//     ErrRowLimitExceeded). Slice methods use this to mark ctx errors as
-//     caller-driven rather than cluster faults.
+//     suppressing it to ErrNotFound. Health is recorded for every real alt
+//     error regardless of propagation; caller-context errors never reach
+//     the predicate because classifyReadErr returns them to the caller first.
 type fallbackReadOptions struct {
 	skipDrainingAlt bool
 	propagateAltErr func(error) bool
-	nonHealthAltErr func(error) bool
 }
 
 // executeFallbackRead attempts a single silent read on the alternative cluster
@@ -736,8 +747,9 @@ type fallbackReadOptions struct {
 //   - types.ErrNotFound when both clusters confirm the row is absent, OR when
 //     the alternative cluster is unreachable AND opts.propagateAltErr did not
 //     opt into propagation (health metrics are still recorded on the
-//     unreachable cluster unless opts.nonHealthAltErr suppresses them)
-//   - the alt's error verbatim when opts.propagateAltErr returns true
+//     unreachable cluster)
+//   - the alt's error verbatim when opts.propagateAltErr returns true, or
+//     when the caller's context ended during the probe
 func (c *CQLClient) executeFallbackRead(
 	ctx context.Context,
 	snap overrideSnapshot,
@@ -792,14 +804,14 @@ func (c *CQLClient) executeFallbackRead(
 		return nil
 	}
 
-	switch classifyReadErr(err) {
+	switch classifyReadErr(ctx, err) {
 	case readNotFound:
 		// Both clusters confirmed the row is absent — definitively not found.
 		c.config.Logger.Debug("fallback read: alternative cluster also returned not-found",
 			"cluster", c.clusterName(alternativeCluster),
 		)
 		return err
-	case readRowLimit, readCallerNotFound:
+	case readRowLimit, readCallerNotFound, readCtxErr:
 		// ErrRowLimitExceeded is an application-level cap, not a cluster fault.
 		// Propagate as-is: no IncReadError, no recordOpOutcome failure, no
 		// RecordFailure. Suppressing it to ErrNotFound would silently truncate
@@ -812,27 +824,25 @@ func (c *CQLClient) executeFallbackRead(
 		// caller still sees it: SliceScanContext's propagateAltErr always
 		// returns true once scanFn ran on the alt, and unwraps the shield
 		// before returning.
+		//
+		// A caller whose context ended while the alternative was being
+		// asked sees its own context error, again with no health impact.
 		return err
-	case readOK, readCtxErr, readClusterErr:
+	case readOK, readClusterErr:
 	}
 
-	// Alternative returned a real error. Health classification is gated by
-	// opts.nonHealthAltErr: slice callers may mark ctx errors as caller-driven
-	// (no health impact). All other real errors record health on alt as
-	// today's Scan / MapScan behavior.
-	if opts.nonHealthAltErr == nil || !opts.nonHealthAltErr(err) {
-		c.config.Metrics.IncReadError(alternativeCluster)
-		c.recordOpOutcome(alternativeCluster, err)
-		if c.config.FailoverPolicy != nil {
-			c.config.FailoverPolicy.RecordFailure(alternativeCluster)
-		}
+	// Alternative returned a real error: record health on the alt.
+	c.config.Metrics.IncReadError(alternativeCluster)
+	c.recordOpOutcome(alternativeCluster, err)
+	if c.config.FailoverPolicy != nil {
+		c.config.FailoverPolicy.RecordFailure(alternativeCluster)
 	}
 
-	// Propagation is governed independently: opts.propagateAltErr lets slice
-	// callers surface ctx errors / ErrRowLimitExceeded / "scanFn was invoked
-	// on alt" to the caller. Default (nil) preserves today's Scan / MapScan
-	// suppression to ErrNotFound — primary already returned a healthy
-	// not-found, so the fallback must not decrease availability.
+	// Propagation is governed independently: opts.propagateAltErr lets the
+	// SliceScan caller surface "scanFn was invoked on alt" to the caller.
+	// Default (nil) preserves Scan / MapScan suppression to ErrNotFound —
+	// primary already returned a healthy not-found, so the fallback must
+	// not decrease availability.
 	if opts.propagateAltErr != nil && opts.propagateAltErr(err) {
 		c.config.Logger.Warn("fallback read: alternative cluster returned error, propagating to caller",
 			"cluster", c.clusterName(alternativeCluster),

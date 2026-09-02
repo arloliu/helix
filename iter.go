@@ -1,6 +1,8 @@
 package helix
 
 import (
+	"context"
+
 	"github.com/arloliu/helix/adapter/cql"
 )
 
@@ -9,7 +11,8 @@ type cqlIter struct {
 	iter           cql.Iter
 	client         *CQLClient
 	cluster        ClusterID
-	overrideActive bool // captured from readTarget at creation, not re-evaluated
+	ctx            context.Context // the caller's context, for error provenance on Close
+	overrideActive bool            // captured from readTarget at creation, not re-evaluated
 }
 
 func (i *cqlIter) Scan(dest ...any) bool {
@@ -18,11 +21,16 @@ func (i *cqlIter) Scan(dest ...any) bool {
 
 func (i *cqlIter) Close() error {
 	err := i.iter.Close()
+	kind := classifyReadErr(i.ctx, err)
 	// Auto-refresh accounting must see iterator outcomes too — without
 	// this the detector is blind to iterator-driven workloads. Iterators
 	// still don't fail over (no OnFailure call) by documented contract.
-	i.client.recordOpOutcome(i.cluster, err)
-	if classifyReadErr(err) == readOK && !i.overrideActive && i.client.config.ReadStrategy != nil {
+	// A caller-context error is not the cluster's failure and is not
+	// recorded.
+	if kind != readCtxErr {
+		i.client.recordOpOutcome(i.cluster, err)
+	}
+	if kind == readOK && !i.overrideActive && i.client.config.ReadStrategy != nil {
 		i.client.config.ReadStrategy.OnSuccess(i.cluster)
 	}
 

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An error observed after the caller's context was cancelled or expired is
+  no longer counted as a cluster failure. On every read entry point it is
+  returned as-is without `IncReadError`, `RecordFailure`, `OnFailure`, the
+  auto-refresh failure counter, or a failover attempt with the dead context;
+  on writes the leg is still replayed but neither `IncWriteError`, the
+  auto-refresh counter, nor an `AdaptiveDualWrite` strike records it; a
+  failover attempt is skipped once the caller's context has ended. A
+  context error the driver reports while the caller's context is still
+  live is a cluster error like any other. Previously one cancelled request
+  counted as a failure on both clusters and could flip the sticky read
+  preference.
+
 ### Added
 
 - `helix.ProbeReporter`, `helix.EventEmitterSetter`, `helix.Instrumentable`,

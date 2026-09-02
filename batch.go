@@ -248,7 +248,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		batch = batch.WithTimestamp(ts)
 
 		err = batch.ExecContext(ctx)
-		b.client.recordOpOutcome(ClusterA, err)
+		b.client.recordWriteOutcome(ctx, ClusterA, err)
 
 		return err
 	}
@@ -317,6 +317,7 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 		iter:           batch.IterContext(ctx),
 		client:         b.client,
 		cluster:        rt.cluster,
+		ctx:            ctx,
 		overrideActive: rt.snap.active,
 	}
 }
@@ -356,6 +357,7 @@ func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied boo
 		iter:    cqlItr,
 		client:  b.client,
 		cluster: selectedCluster,
+		ctx:     ctx,
 	}, err
 }
 
@@ -394,5 +396,6 @@ func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (
 		iter:    cqlItr,
 		client:  b.client,
 		cluster: selectedCluster,
+		ctx:     ctx,
 	}, err
 }

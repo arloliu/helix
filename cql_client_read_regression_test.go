@@ -157,8 +157,6 @@ func (i *readProbeIter) Close() error { return i.closeErr }
 // the sticky preference does not move, no cluster records a failure, and the
 // other cluster is never contacted with a dead context.
 func TestRead_CallerContextErrorIsNotClusterFailure(t *testing.T) {
-	t.Skip("pending: a cancelled or expired caller context is still counted as a cluster failure, flips the sticky preference, and triggers a failover attempt on the other cluster with the same dead context")
-
 	type fixture struct {
 		client *CQLClient
 		sa, sb *readProbeSession

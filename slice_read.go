@@ -277,7 +277,7 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 		// off OR alt also drained empty OR alt was draining-and-skipped OR
 		// PageState suppressed the empty-retry). All of those collapse to
 		// the "empty but successful" return shape for callers.
-		if classifyReadErr(err) == readNotFound {
+		if classifyReadErr(ctx, err) == readNotFound {
 			return nil, nil
 		}
 		// drainIterToSliceMapWithLimit's discard-on-error contract already nils
@@ -293,13 +293,11 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 // is stateless (no closure capture), so a package-level value avoids the
 // per-call allocation that building it inline would incur.
 //
-// ErrRowLimitExceeded is intentionally NOT listed in propagateAltErr:
-// executeFallbackRead already propagates readRowLimit before the predicate
-// is consulted.
+// ErrRowLimitExceeded and caller-context errors need no propagation
+// predicate: executeFallbackRead returns both before the predicate is
+// consulted.
 var sliceMapFallbackOpts = fallbackReadOptions{
 	skipDrainingAlt: true,
-	propagateAltErr: isCtxErr,
-	nonHealthAltErr: isCtxErr,
 }
 
 func (q *cqlQuery) SliceScan(scanFn func(r RowScanner) error) (int, error) {
@@ -365,14 +363,13 @@ func (q *cqlQuery) SliceScanContext(
 
 	opts.fallbackOpts = fallbackReadOptions{
 		skipDrainingAlt: true,
-		propagateAltErr: func(err error) bool {
+		propagateAltErr: func(error) bool {
 			// Any invocation of scanFn on the alt — successful or not —
 			// either mutated the caller's accumulator or surfaced a scanFn
 			// error that the public API contract requires to propagate.
 			// Suppression to ErrNotFound would silently hide either.
-			return scanFnInvokedOnAlt || isCtxErr(err)
+			return scanFnInvokedOnAlt
 		},
-		nonHealthAltErr: isCtxErr,
 	}
 
 	err := q.client.executeReadNoFailover(ctx, opts, readFunc)
@@ -383,7 +380,7 @@ func (q *cqlQuery) SliceScanContext(
 		// the unwrapped value.
 		return rowCount, shielded.err
 	}
-	if classifyReadErr(err) == readNotFound {
+	if classifyReadErr(ctx, err) == readNotFound {
 		// rowCount is zero by construction: synthetic ErrNotFound only
 		// fires when the drain produced no rows, and executeFallbackRead
 		// returns ErrNotFound only when alt also drained empty.
