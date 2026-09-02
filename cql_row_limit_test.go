@@ -1,7 +1,9 @@
 package helix
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/arloliu/helix/types"
@@ -190,15 +192,35 @@ func TestErrRowLimitExceeded_RootReExport(t *testing.T) {
 		"the helper must distinguish from other sentinels")
 }
 
-// TestIsReadTerminalNonHealth verifies the helper covers exactly the two
-// data sentinels (ErrNotFound and ErrRowLimitExceeded) and rejects
-// ctx errors / unrelated errors.
-func TestIsReadTerminalNonHealth(t *testing.T) {
-	require.True(t, isReadTerminalNonHealth(types.ErrNotFound))
-	require.True(t, isReadTerminalNonHealth(types.ErrRowLimitExceeded))
-	require.False(t, isReadTerminalNonHealth(nil),
-		"nil err must not be treated as terminal-non-health")
-	require.False(t, isReadTerminalNonHealth(errors.New("real cluster error")))
-	require.False(t, isReadTerminalNonHealth(types.ErrSessionClosed),
-		"non-data sentinels must not be classified as terminal-non-health")
+// TestClassifyReadErr verifies the single read classification function
+// assigns each error family its own kind and that only context and cluster
+// errors count as health signals.
+func TestClassifyReadErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want readErrKind
+	}{
+		{"nil", nil, readOK},
+		{"not-found", types.ErrNotFound, readNotFound},
+		{"wrapped not-found", fmt.Errorf("wrap: %w", types.ErrNotFound), readNotFound},
+		{"row-limit", types.ErrRowLimitExceeded, readRowLimit},
+		{"caller not-found", &scanFnNotFoundShieldError{err: types.ErrNotFound}, readCallerNotFound},
+		{"canceled", context.Canceled, readCtxErr},
+		{"deadline", fmt.Errorf("wrap: %w", context.DeadlineExceeded), readCtxErr},
+		{"cluster", errors.New("real cluster error"), readClusterErr},
+		{"session closed", types.ErrSessionClosed, readClusterErr},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, classifyReadErr(tc.err))
+		})
+	}
+
+	require.False(t, readOK.isHealthSignal())
+	require.False(t, readNotFound.isHealthSignal())
+	require.False(t, readRowLimit.isHealthSignal())
+	require.False(t, readCallerNotFound.isHealthSignal())
+	require.True(t, readCtxErr.isHealthSignal())
+	require.True(t, readClusterErr.isHealthSignal())
 }

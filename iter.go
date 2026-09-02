@@ -22,7 +22,7 @@ func (i *cqlIter) Close() error {
 	// this the detector is blind to iterator-driven workloads. Iterators
 	// still don't fail over (no OnFailure call) by documented contract.
 	i.client.recordOpOutcome(i.cluster, err)
-	if err == nil && !i.overrideActive && i.client.config.ReadStrategy != nil {
+	if classifyReadErr(err) == readOK && !i.overrideActive && i.client.config.ReadStrategy != nil {
 		i.client.config.ReadStrategy.OnSuccess(i.cluster)
 	}
 

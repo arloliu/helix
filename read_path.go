@@ -11,12 +11,51 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
-// isReadTerminalNonHealth reports whether err is a read-pipeline data
-// sentinel — [types.ErrNotFound] or [types.ErrRowLimitExceeded] — that
-// terminates the read but MUST NOT count as a cluster-health failure.
-func isReadTerminalNonHealth(err error) bool {
-	return errors.Is(err, types.ErrNotFound) ||
-		errors.Is(err, types.ErrRowLimitExceeded)
+// readErrKind classifies the result of one read attempt against one cluster.
+// classifyReadErr is the only place that assigns a kind;
+// every read entry point switches on the kind rather than on the error.
+type readErrKind uint8
+
+const (
+	// readOK is a successful read.
+	readOK readErrKind = iota
+	// readNotFound is [types.ErrNotFound]: data, not a health signal,
+	// and the only kind that may trigger a FallbackRead probe.
+	readNotFound
+	// readRowLimit is [types.ErrRowLimitExceeded]: an application cap,
+	// never a health signal, never retried on another cluster.
+	readRowLimit
+	// readCallerNotFound is a not-found the caller's own scan callback returned.
+	// It terminates the read without a health signal and without a FallbackRead probe.
+	readCallerNotFound
+	// readCtxErr is a context cancellation or deadline error.
+	// It is still handled exactly like readClusterErr on every path.
+	readCtxErr
+	// readClusterErr is any other error: a cluster fault.
+	readClusterErr
+)
+
+// classifyReadErr assigns the read-pipeline kind of err.
+func classifyReadErr(err error) readErrKind {
+	switch {
+	case err == nil:
+		return readOK
+	case errors.Is(err, types.ErrNotFound):
+		return readNotFound
+	case errors.Is(err, types.ErrRowLimitExceeded):
+		return readRowLimit
+	case isShieldedScanFnNotFound(err):
+		return readCallerNotFound
+	case isCtxErr(err):
+		return readCtxErr
+	default:
+		return readClusterErr
+	}
+}
+
+// isHealthSignal reports whether the kind counts against the cluster's health.
+func (k readErrKind) isHealthSignal() bool {
+	return k == readCtxErr || k == readClusterErr
 }
 
 // getDrainStates returns the current drain state for both clusters.
@@ -422,12 +461,12 @@ func (c *CQLClient) executeRead(
 		return nil
 	}
 
-	// Data sentinels (ErrNotFound, ErrRowLimitExceeded) are not health
-	// signals — the cluster responded correctly. Only ErrNotFound triggers
-	// FallbackRead empty-retry, and only in dual-cluster mode (single-
-	// cluster has no alternative session).
-	if isReadTerminalNonHealth(res.err) {
-		if types.IsNotFound(res.err) && opts.fallbackRead && !c.IsSingleCluster() {
+	kind := classifyReadErr(res.err)
+	// Data sentinels are not health signals — the cluster responded
+	// correctly. Only not-found triggers the FallbackRead probe, and only
+	// in dual-cluster mode (single-cluster has no alternative session).
+	if !kind.isHealthSignal() {
+		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
 			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
 		}
 		return res.err
@@ -486,19 +525,15 @@ func (c *CQLClient) executeReadNoFailover(
 		return nil
 	}
 
-	if isReadTerminalNonHealth(res.err) {
-		if types.IsNotFound(res.err) && opts.fallbackRead && !c.IsSingleCluster() {
+	kind := classifyReadErr(res.err)
+	// Data sentinels, including a not-found returned by the caller's own
+	// scan callback, terminate the read without a health signal. Only a
+	// genuine not-found triggers the FallbackRead probe; SliceScanContext
+	// unwraps the caller's not-found at the public boundary.
+	if !kind.isHealthSignal() {
+		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
 			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
 		}
-		return res.err
-	}
-
-	// A scanFn-returned ErrNotFound (shielded so it does not match
-	// isReadTerminalNonHealth above and misfire the empty-retry path) is
-	// still a data sentinel, not a cluster fault — exclude it from health
-	// recording the same way a genuine ErrNotFound is, without unwrapping it
-	// (SliceScanContext does that at the public boundary).
-	if isShieldedScanFnNotFound(res.err) {
 		return res.err
 	}
 
@@ -629,7 +664,7 @@ func (c *CQLClient) tryFallbackCluster(
 	// do not wrap them in DualClusterError. ErrRowLimitExceeded reaching
 	// this site means the failover cluster also exceeded the application
 	// cap; the caller wants to see that, not a wrapped two-cluster error.
-	if isReadTerminalNonHealth(err) {
+	if !classifyReadErr(err).isHealthSignal() {
 		return err
 	}
 
@@ -757,33 +792,28 @@ func (c *CQLClient) executeFallbackRead(
 		return nil
 	}
 
-	if types.IsNotFound(err) {
+	switch classifyReadErr(err) {
+	case readNotFound:
 		// Both clusters confirmed the row is absent — definitively not found.
 		c.config.Logger.Debug("fallback read: alternative cluster also returned not-found",
 			"cluster", c.clusterName(alternativeCluster),
 		)
 		return err
-	}
-
-	// ErrRowLimitExceeded is an application-level cap, not a cluster fault.
-	// Propagate as-is: no IncReadError, no recordOpOutcome failure, no
-	// RecordFailure. Suppressing it to ErrNotFound would silently truncate
-	// when the partition genuinely contains more rows than MaxRows. The
-	// primary's empty-result already triggered fallback, so the alt is the
-	// one that overflowed — surface it.
-	if errors.Is(err, types.ErrRowLimitExceeded) {
+	case readRowLimit, readCallerNotFound:
+		// ErrRowLimitExceeded is an application-level cap, not a cluster fault.
+		// Propagate as-is: no IncReadError, no recordOpOutcome failure, no
+		// RecordFailure. Suppressing it to ErrNotFound would silently truncate
+		// when the partition genuinely contains more rows than MaxRows. The
+		// primary's empty-result already triggered fallback, so the alt is the
+		// one that overflowed — surface it.
+		//
+		// A not-found returned by the caller's own scan callback on the alt
+		// leg is likewise the caller's data, not an alt-cluster fault. The
+		// caller still sees it: SliceScanContext's propagateAltErr always
+		// returns true once scanFn ran on the alt, and unwraps the shield
+		// before returning.
 		return err
-	}
-
-	// A scanFn-returned ErrNotFound on the alt leg (shielded so the
-	// types.IsNotFound check above does not misfire the "both confirmed
-	// not-found" branch and re-triggering issues) is a data sentinel from
-	// the caller's own callback, not an alt-cluster fault — exclude it from
-	// health recording like the ErrRowLimitExceeded case above. The caller
-	// still sees it: SliceScanContext's propagateAltErr always returns true
-	// once scanFn ran on the alt, and unwraps the shield before returning.
-	if isShieldedScanFnNotFound(err) {
-		return err
+	case readOK, readCtxErr, readClusterErr:
 	}
 
 	// Alternative returned a real error. Health classification is gated by
