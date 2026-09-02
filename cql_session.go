@@ -77,6 +77,13 @@ type Query interface {
 
 	// PageState sets the pagination state for resuming iteration.
 	//
+	// A token from [Iter.PageState] names the cluster that issued it, and
+	// the resumed read is sent to that cluster regardless of the read
+	// strategy or drain state; an AllowedClusters override that excludes
+	// that cluster fails the read with [types.ErrNoValidClusters]. A token
+	// produced by a driver directly resumes on whatever cluster the
+	// strategy selects, without drain-aware re-selection.
+	//
 	// Parameters:
 	//   - state: Opaque pagination token from a previous Iter.PageState()
 	//
@@ -696,6 +703,11 @@ type Iter interface {
 	SliceMap() ([]map[string]any, error)
 
 	// PageState returns the pagination token for resuming iteration.
+	//
+	// The token is Helix-specific: it wraps the driver's paging state with
+	// the cluster that issued it, so it must be handed back to
+	// [Query.PageState] on a Helix client rather than to a driver session.
+	// It is nil or empty when no pages remain.
 	//
 	// Returns:
 	//   - []byte: Opaque pagination token

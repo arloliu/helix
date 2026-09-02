@@ -211,7 +211,8 @@ func (q *cqlQuery) applyMaxRowsClamp(query cql.Query, limit int) cql.Query {
 // is the single source of truth for the PageState short-circuit.
 //
 // When q.pageState != nil, all four cluster-switching mechanisms must be
-// disabled together because an opaque cursor is unsound on the wrong cluster:
+// disabled together because an opaque cursor is unsound on the wrong cluster,
+// and a token that names its issuing cluster pins the read to it:
 //
 //   - opts.fallbackRead = false → wrapper's executeFallbackRead empty-retry
 //     gate stays closed.
@@ -229,8 +230,11 @@ func (q *cqlQuery) sliceReadOpts(ctx context.Context) (opts readOptions, useNoFa
 	if q.pageState != nil {
 		opts.fallbackRead = false
 		opts.preserveSelectedCluster = true
+		opts.pinnedCluster, _ = decodePageState(q.pageState)
+
 		return opts, true
 	}
+
 	return opts, false
 }
 

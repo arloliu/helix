@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
@@ -138,6 +139,10 @@ func callAllowedClusters(fn AllowedClustersFunc) (raw []ClusterID, err error) {
 // types.ErrNoValidClusters rather than shipping a paging cursor to a
 // different cluster.
 func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) readTarget {
+	if opts.pinnedCluster != "" {
+		return c.resolveReadTargetPinned(opts.pinnedCluster)
+	}
+
 	fn := c.config.AllowedClusters
 	if fn == nil {
 		return readTarget{cluster: c.normalSelect(ctx)}
@@ -238,6 +243,52 @@ func (c *CQLClient) resolveReadTarget(ctx context.Context, opts readOptions) rea
 	}
 }
 
+// resolveReadTargetPinned routes a read that carries a paging token to the
+// cluster that issued it. The read strategy and drain state are not
+// consulted: the token is meaningless anywhere else. An AllowedClusters
+// override still fences the read: when the issuing cluster is excluded the
+// read fails closed with types.ErrNoValidClusters rather than shipping the
+// cursor to a different cluster.
+func (c *CQLClient) resolveReadTargetPinned(cluster ClusterID) readTarget {
+	if c.IsSingleCluster() && cluster != ClusterA {
+		return readTarget{err: types.ErrInvalidCluster}
+	}
+
+	fn := c.config.AllowedClusters
+	if fn == nil {
+		return readTarget{cluster: cluster}
+	}
+	raw, err := callAllowedClusters(fn)
+	if err != nil {
+		if c.shouldLogOverrideErr() {
+			c.config.Logger.Error("cluster override function panicked",
+				"error", err.Error(),
+			)
+		}
+
+		return readTarget{err: err}
+	}
+	if len(raw) == 0 {
+		return readTarget{cluster: cluster}
+	}
+	if !slices.Contains(raw, cluster) {
+		if c.shouldLogOverrideErr() {
+			c.config.Logger.Error("cluster override excludes the cluster that issued the paging cursor; refusing to ship it elsewhere",
+				"cluster", string(cluster),
+				"overrideClusters", raw,
+			)
+		}
+
+		return readTarget{err: types.ErrNoValidClusters}
+	}
+	c.overrideErrSeq.Store(0)
+
+	return readTarget{
+		cluster: cluster,
+		snap:    overrideSnapshot{active: true, primary: cluster},
+	}
+}
+
 // resolveReadTargetPreserved implements the preserveSelectedCluster=true
 // branch of resolveReadTarget: take the first known override entry as-is,
 // fail closed with ErrNoValidClusters if it is draining, and never fall
@@ -308,7 +359,10 @@ func (c *CQLClient) normalSelect(ctx context.Context) ClusterID {
 type readOptions struct {
 	fallbackRead            bool
 	preserveSelectedCluster bool
-	fallbackOpts            fallbackReadOptions
+	// pinnedCluster, when set, is the cluster that issued the paging token
+	// this read carries; the read goes there regardless of the strategy.
+	pinnedCluster ClusterID
+	fallbackOpts  fallbackReadOptions
 }
 
 func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOptions {
