@@ -45,6 +45,10 @@ type TestMetricsCollector struct {
 	ReplayQueueDepth map[types.ClusterID]int
 	ReplayDuration   map[types.ClusterID][]float64
 
+	// Replay backlog (optional types.ReplayBacklogMetrics)
+	ReplayOldestAge     map[types.ClusterID]float64
+	ReplayWorkerDropped map[types.ClusterID]map[string]int64
+
 	// Drain mode
 	ClusterDraining  map[types.ClusterID]bool
 	DrainModeEntered map[types.ClusterID]int64
@@ -93,6 +97,8 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		ReplayErrors:            make(map[types.ClusterID]int64),
 		ReplayDropped:           make(map[types.ClusterID]int64),
 		ReplayQueueDepth:        make(map[types.ClusterID]int),
+		ReplayOldestAge:         make(map[types.ClusterID]float64),
+		ReplayWorkerDropped:     make(map[types.ClusterID]map[string]int64),
 		ReplayDuration:          make(map[types.ClusterID][]float64),
 		ClusterDraining:         make(map[types.ClusterID]bool),
 		DrainModeEntered:        make(map[types.ClusterID]int64),
@@ -287,6 +293,54 @@ func (m *TestMetricsCollector) ObserveReplayDuration(cluster types.ClusterID, se
 	defer m.mu.Unlock()
 	m.ReplayDuration[cluster] = append(m.ReplayDuration[cluster], seconds)
 }
+
+// ----------------------
+// Replay backlog (optional types.ReplayBacklogMetrics)
+// ----------------------
+
+func (m *TestMetricsCollector) SetReplayOldestAge(cluster types.ClusterID, seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReplayOldestAge[cluster] = seconds
+}
+
+func (m *TestMetricsCollector) IncReplayWorkerDropped(cluster types.ClusterID, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ReplayWorkerDropped[cluster] == nil {
+		m.ReplayWorkerDropped[cluster] = make(map[string]int64)
+	}
+	m.ReplayWorkerDropped[cluster][reason]++
+}
+
+// GetReplayQueueDepth returns the last queue depth reported for a cluster.
+func (m *TestMetricsCollector) GetReplayQueueDepth(cluster types.ClusterID) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.ReplayQueueDepth[cluster]
+}
+
+// GetReplayWorkerDropped returns the worker drop count for one cluster and
+// reason.
+func (m *TestMetricsCollector) GetReplayWorkerDropped(cluster types.ClusterID, reason string) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.ReplayWorkerDropped[cluster][reason]
+}
+
+// GetReplayOldestAge returns the last backlog-head age reported for a cluster.
+func (m *TestMetricsCollector) GetReplayOldestAge(cluster types.ClusterID) float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.ReplayOldestAge[cluster]
+}
+
+// Compile-time assertion that TestMetricsCollector implements the
+// optional types.ReplayBacklogMetrics interface.
+var _ types.ReplayBacklogMetrics = (*TestMetricsCollector)(nil)
 
 // ----------------------
 // Cluster Health
@@ -519,6 +573,8 @@ func (m *TestMetricsCollector) Reset() {
 	m.ReplayDropped = make(map[types.ClusterID]int64)
 	m.ReplayQueueDepth = make(map[types.ClusterID]int)
 	m.ReplayDuration = make(map[types.ClusterID][]float64)
+	m.ReplayOldestAge = make(map[types.ClusterID]float64)
+	m.ReplayWorkerDropped = make(map[types.ClusterID]map[string]int64)
 	m.ClusterDraining = make(map[types.ClusterID]bool)
 	m.DrainModeEntered = make(map[types.ClusterID]int64)
 	m.DrainModeExited = make(map[types.ClusterID]int64)

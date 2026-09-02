@@ -24,14 +24,9 @@ func TestMemoryReplayerEnqueueRejectsUnknownTargetCluster(t *testing.T) {
 
 func TestNATSReplayerEnqueueRejectsUnknownTargetCluster(t *testing.T) {
 	js := startNATSForTest(t)
-	r, err := NewNATSReplayer(js,
-		WithStreamName("test-target-cluster-enqueue"),
-		WithSubjectPrefix("test.target.enqueue"),
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = r.Close() })
+	r := newTestReplayer(t, js, "test-target-cluster-enqueue", "test.target.enqueue")
 
-	err = r.Enqueue(t.Context(), types.ReplayPayload{TargetCluster: "C", Query: "INSERT"})
+	err := r.Enqueue(t.Context(), types.ReplayPayload{TargetCluster: "C", Query: "INSERT"})
 
 	require.ErrorIs(t, err, types.ErrInvalidCluster)
 	pending, err := r.Pending(t.Context())
@@ -44,16 +39,12 @@ func TestNATSReplayerDequeueTerminatesUnknownTargetCluster(t *testing.T) {
 
 	var corrupt atomic.Int32
 	const prefix = "test.target.decode"
-	r, err := NewNATSReplayer(js,
-		WithStreamName("test-target-cluster-decode"),
-		WithSubjectPrefix(prefix),
+	r := newTestReplayer(t, js, "test-target-cluster-decode", prefix,
 		WithOnCorruptMessage(func(cbErr error) {
 			assert.ErrorIs(t, cbErr, types.ErrInvalidCluster)
 			corrupt.Add(1)
 		}),
 	)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = r.Close() })
 
 	// Bypass Enqueue so the unknown target reaches the decoder.
 	publishRawBatch(t, js, highSubject(prefix), natsReplayMessage{

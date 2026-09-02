@@ -214,7 +214,7 @@ func TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown(t *testing.T) {
 		stopCh:  stopCh,
 	}
 
-	b.processMessages(msgs)
+	b.processMessages(msgs, false)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -262,7 +262,7 @@ func TestNATSBackend_ProcessMessages_NakErrorsAreNonBlocking(t *testing.T) {
 		execute: func(_ context.Context, _ types.ReplayPayload) error { return nil },
 		stopCh:  stopCh,
 	}
-	b.processMessages(msgs)
+	b.processMessages(msgs, false)
 
 	assert.Equal(t, int32(3), nakedCount.Load(),
 		"every message in the batch must have its Nak attempted, errors don't abort the loop")
@@ -297,7 +297,7 @@ func TestNATSBackend_ProcessMessages_AckFailureIsReportedAsError(t *testing.T) {
 		execute: func(_ context.Context, _ types.ReplayPayload) error { return nil },
 		stopCh:  make(chan struct{}),
 	}
-	b.processMessages([]ReplayMessage{msg})
+	b.processMessages([]ReplayMessage{msg}, false)
 
 	assert.Equal(t, int32(0), success.Load(), "ack failure makes broker state uncertain; do not report success")
 	assert.Equal(t, int32(1), errorCount.Load())
@@ -327,7 +327,7 @@ func TestNATSBackend_ProcessMessages_TermFailureDoesNotReportDrop(t *testing.T) 
 		execute: func(_ context.Context, _ types.ReplayPayload) error { return errors.New("execute failed") },
 		stopCh:  make(chan struct{}),
 	}
-	b.processMessages([]ReplayMessage{msg})
+	b.processMessages([]ReplayMessage{msg}, false)
 
 	assert.Equal(t, int32(0), dropped.Load(), "failed Term means the broker did not confirm the message was dropped")
 	assert.Equal(t, int32(1), logger.errorCount.Load())

@@ -225,6 +225,12 @@ type fakeFetchConsumer struct {
 	events  chan testEvent
 }
 
+// Info satisfies the worker's periodic backlog-depth refresh; the fake has
+// no server-side state to report.
+func (f *fakeFetchConsumer) Info(context.Context) (*jetstream.ConsumerInfo, error) {
+	return &jetstream.ConsumerInfo{}, nil
+}
+
 func (f *fakeFetchConsumer) Fetch(int, ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
 	batch := f.batches[0]
 	if len(f.batches) > 1 {
@@ -270,6 +276,10 @@ func (m *fakeMsg) Ack() error { return nil }
 
 func (m *fakeMsg) Nak() error { return nil }
 
+func (m *fakeMsg) NakWithDelay(time.Duration) error { return nil }
+
+func (m *fakeMsg) InProgress() error { return nil }
+
 func (m *fakeMsg) Term() error { return nil }
 
 // fakeTrackedMsg is a fakeMsg variant that reports every Ack/Nak/Term call
@@ -294,6 +304,10 @@ func (m *fakeTrackedMsg) Ack() error {
 
 	return nil
 }
+
+func (m *fakeTrackedMsg) NakWithDelay(time.Duration) error { return m.Nak() }
+
+func (m *fakeTrackedMsg) InProgress() error { return nil }
 
 func (m *fakeTrackedMsg) Nak() error {
 	m.events <- testEvent{kind: "nak", id: m.id}

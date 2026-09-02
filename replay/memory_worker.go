@@ -35,6 +35,15 @@ type memoryBackend struct {
 
 	retrySem chan struct{} // bounds concurrent retry goroutines
 	retryWG  sync.WaitGroup
+
+	// firstAttempt runs a freshly dequeued payload under the configured
+	// retry policy; chosen once at construction.
+	firstAttempt func(types.ReplayPayload)
+
+	// sched holds payloads waiting for their next attempt under
+	// RetryWhileRetained; schedWG joins the goroutine that dispatches them.
+	sched   *retainedScheduler
+	schedWG sync.WaitGroup
 }
 
 // Compile-time assertion that memoryBackend implements workerBackend.
@@ -59,14 +68,32 @@ func (b *memoryBackend) backendType() string {
 // dequeue worker.
 func (b *memoryBackend) start(_ types.ClusterID) {
 	defer b.wg.Done()
-	// Order of teardown (innermost first):
-	//   1. drainAndDrop — flush any payloads still in the queue.
-	//   2. retryWG.Wait — wait for in-flight retry goroutines to finish.
-	//      Each one observes stopCh during its backoff sleep and exits
-	//      via the drop path with its accumulated error.
-	defer b.retryWG.Wait()
-	defer b.drainAndDrop()
 
+	if b.retained() {
+		b.schedWG.Add(1)
+		go b.runRetained()
+	}
+
+	b.dequeueLoop()
+
+	// Teardown, innermost first:
+	//   1. schedWG.Wait — the scheduler stops dispatching retries.
+	//   2. drainAndDrop — flush any payloads still in the queue.
+	//   3. retryWG.Wait — in-flight retry goroutines finish. Bounded ones
+	//      observe stopCh during their backoff sleep; retained ones settle
+	//      their last outcome as a shutdown drop.
+	//   4. drainRetained — report payloads still waiting for an attempt.
+	b.schedWG.Wait()
+	b.drainAndDrop()
+	b.retryWG.Wait()
+	if b.retained() {
+		b.drainRetained()
+	}
+}
+
+// dequeueLoop pulls payloads until the worker stops, running each first
+// attempt inline and keeping the backlog gauges current.
+func (b *memoryBackend) dequeueLoop() {
 	for {
 		select {
 		case <-b.stopCh:
@@ -74,7 +101,12 @@ func (b *memoryBackend) start(_ types.ClusterID) {
 		default:
 		}
 
-		payload, ok := b.replayer.TryDequeue()
+		payload, ok := b.replayer.tryDequeueRetained()
+		if ok && !b.retained() {
+			// The bounded policy stops counting a payload once it is taken.
+			b.replayer.releaseSlot(payload.TargetCluster)
+		}
+		b.reportBacklog()
 		if !ok {
 			select {
 			case <-b.stopCh:
@@ -84,7 +116,20 @@ func (b *memoryBackend) start(_ types.ClusterID) {
 			}
 		}
 
-		b.handleFirstAttempt(payload)
+		b.config.observeAge(payload)
+		b.firstAttempt(payload)
+	}
+}
+
+// reportBacklog publishes the per-cluster slot counts as the queue depth
+// gauge and clears the age gauge of every cluster with nothing pending.
+func (b *memoryBackend) reportBacklog() {
+	for _, cluster := range []types.ClusterID{types.ClusterA, types.ClusterB} {
+		pending := b.replayer.PendingByCluster(cluster)
+		b.config.Metrics.SetReplayQueueDepth(cluster, pending)
+		if pending == 0 {
+			b.config.observeIdle(cluster)
+		}
 	}
 }
 
@@ -106,7 +151,7 @@ func (b *memoryBackend) handleFirstAttempt(payload types.ReplayPayload) {
 
 	// No retries configured — drop now.
 	if maxAttempts == 1 {
-		b.dropPayload(payload, err, maxAttempts, "max attempts exceeded")
+		b.dropPayload(payload, err, maxAttempts, types.ReplayDropMaxAttempts)
 		return
 	}
 
@@ -118,7 +163,7 @@ func (b *memoryBackend) handleFirstAttempt(payload types.ReplayPayload) {
 	select {
 	case b.retrySem <- struct{}{}:
 	default:
-		b.dropPayload(payload, err, maxAttempts, "retry pool saturated")
+		b.dropPayload(payload, err, maxAttempts, types.ReplayDropRetryPoolSaturated)
 		return
 	}
 
@@ -145,7 +190,7 @@ func (b *memoryBackend) retryAsync(payload types.ReplayPayload, prevErr error, m
 		select {
 		case <-b.stopCh:
 			timer.Stop()
-			b.dropPayload(payload, prevErr, maxAttempts, "shutdown")
+			b.dropPayload(payload, prevErr, maxAttempts, types.ReplayDropShutdown)
 			return
 		case <-timer.C:
 		}
@@ -157,7 +202,7 @@ func (b *memoryBackend) retryAsync(payload types.ReplayPayload, prevErr error, m
 		prevErr = err
 	}
 
-	b.dropPayload(payload, prevErr, maxAttempts, "max attempts exceeded")
+	b.dropPayload(payload, prevErr, maxAttempts, types.ReplayDropMaxAttempts)
 }
 
 // runAttempt performs a single execution attempt and emits all the
@@ -194,20 +239,10 @@ func (b *memoryBackend) runAttempt(payload types.ReplayPayload, attempt, maxAtte
 	return err
 }
 
-// dropPayload records a single drop event with metrics, log, and the
-// OnDrop callback. The reason string is attached to the log so an
-// operator can distinguish exhaustion, shutdown, and saturation drops.
+// dropPayload records a single drop event; the reason is one of the
+// types.ReplayDrop constants.
 func (b *memoryBackend) dropPayload(payload types.ReplayPayload, err error, maxAttempts int, reason string) {
-	b.config.Metrics.IncReplayDropped(payload.TargetCluster)
-	b.config.Logger.Error("replay message dropped",
-		"cluster", b.clusterName(payload.TargetCluster),
-		"reason", reason,
-		"maxAttempts", maxAttempts,
-		"error", errString(err),
-	)
-	if b.config.OnDrop != nil {
-		b.config.OnDrop(payload, err)
-	}
+	b.config.observeDrop(payload, err, reason, "maxAttempts", maxAttempts)
 }
 
 // errString returns the error message or "<nil>" so the log emits a
@@ -229,7 +264,7 @@ func (b *memoryBackend) drainAndDrop() {
 		if !ok {
 			return
 		}
-		b.dropPayload(payload, nil, b.config.MaxAttempts, "shutdown")
+		b.dropPayload(payload, nil, b.config.MaxAttempts, types.ReplayDropShutdown)
 	}
 }
 
@@ -255,9 +290,16 @@ func (b *memoryBackend) clusterName(cluster types.ClusterID) string {
 // so the dequeue loop is never blocked behind a permanently-failing
 // payload — including payloads targeting a different cluster.
 //
-// Concurrent in-flight retries are capped (default 100). When the cap is
-// reached, further failures drop immediately via OnDrop with the reason
-// "retry pool saturated" rather than queuing behind running retries.
+// Concurrent in-flight retries are capped (default 100). Under the default
+// [RetryBounded] policy, further failures drop immediately via OnDrop with
+// the reason "retry_pool_saturated" rather than queuing behind running
+// retries.
+//
+// Under [RetryWhileRetained] a failed payload keeps its queue slot and waits
+// for its next attempt instead of occupying a goroutine, the pool only
+// bounds attempts that are executing, and the payload is retried until it
+// succeeds, the RetryWindow elapses, or the classifier dead-letters it
+// MaxAttempts times.
 //
 // # Shutdown semantics
 //
@@ -327,14 +369,20 @@ func newMemoryWorkerWithConfig(
 		startupErr: startupErr,
 	}
 
-	w.backend = &memoryBackend{
+	b := &memoryBackend{
 		replayer: replayer,
 		config:   &w.config,
 		execute:  execute,
 		stopCh:   w.stopCh,
 		wg:       &w.wg,
 		retrySem: make(chan struct{}, defaultMemoryRetryConcurrency),
+		sched:    newRetainedScheduler(),
 	}
+	b.firstAttempt = b.handleFirstAttempt
+	if b.retained() {
+		b.firstAttempt = b.handleFirstAttemptRetained
+	}
+	w.backend = b
 
 	return w
 }
@@ -355,6 +403,10 @@ func finalizeWorkerConfig(config *WorkerConfig) {
 	if config.Logger == nil {
 		config.Logger = logging.NewNopLogger()
 	}
+	if config.Classifier == nil {
+		config.Classifier = DefaultReplayClassifier
+	}
+	config.resolveBacklog()
 }
 
 func validateWorkerInputs(hasReplayer bool, execute ExecuteFunc) error {
@@ -390,5 +442,11 @@ func normalizeWorkerConfig(config *WorkerConfig) {
 	}
 	if config.MaxAttempts <= 0 {
 		config.MaxAttempts = 1
+	}
+	if config.RetryWindow <= 0 {
+		config.RetryWindow = defaults.RetryWindow
+	}
+	if !config.RetryPolicy.valid() {
+		config.RetryPolicy = defaults.RetryPolicy
 	}
 }

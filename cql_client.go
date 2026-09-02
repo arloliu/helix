@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
@@ -871,6 +873,8 @@ func NewCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient, e
 	if sessionB != nil && config.Replayer == nil {
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
+	warnReplayStreamDefaults(config.Logger, "replayer", config.Replayer)
+	warnReplayStreamDefaults(config.Logger, "mirror replayer", config.MirrorReplayer)
 
 	// Must run before mirror setup: the mirror error handler captures the
 	// dispatcher by value when it is built below.
@@ -2002,6 +2006,32 @@ func (c *CQLClient) executeDualWrite(
 
 	// Partial success (or all-async) is still success from the caller's perspective.
 	return nil
+}
+
+// warnReplayStreamDefaults logs once per client when a NATS replayer keeps a
+// stream default that silently narrows the replay recovery window: a single
+// replica on file storage, or evicting the oldest unreplayed messages when
+// the stream is full.
+func warnReplayStreamDefaults(logger types.Logger, component string, replayer Replayer) {
+	nr, ok := replayer.(*replay.NATSReplayer)
+	if !ok {
+		return
+	}
+	cfg := nr.Config()
+	if cfg.Replicas == 1 {
+		logger.Warn("replay stream has a single replica on file storage; losing that node's disk loses the whole replay backlog",
+			"component", component,
+			"stream", cfg.StreamName,
+			"fix", "replay.WithReplicas(3)",
+		)
+	}
+	if cfg.DiscardPolicy == jetstream.DiscardOld {
+		logger.Warn("replay stream evicts the oldest unreplayed messages when MaxMsgs or MaxBytes is reached",
+			"component", component,
+			"stream", cfg.StreamName,
+			"fix", "replay.WithRejectNewOnLimit()",
+		)
+	}
 }
 
 // enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
