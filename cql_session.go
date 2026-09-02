@@ -181,6 +181,24 @@ type Query interface {
 	//   - Query: The same query for chaining
 	Strict() Query
 
+	// NonIdempotent marks the statement as unsafe to apply twice, such as a
+	// counter update or a collection append, and excludes it from replay.
+	//
+	// The write is executed synchronously on both clusters, never
+	// dispatched fire-and-forget, and never enqueued for replay: replaying
+	// a statement the cluster may already have applied would apply it
+	// again. A partial failure surfaces as [*types.PartialWriteError] and a
+	// total failure as [*types.DualClusterError], exactly like [Query.Strict].
+	// Unlike Strict, NonIdempotent may be combined with [Query.Mirror]: the
+	// mirror destination receives the statement once, on its own pair.
+	//
+	// Batches created with [types.CounterBatch] are non-idempotent
+	// automatically.
+	//
+	// Returns:
+	//   - Query: The same query for chaining
+	NonIdempotent() Query
+
 	// FallbackRead enables best-effort read from both clusters for this query.
 	//
 	// When the selected cluster returns not-found (zero rows), Helix silently
@@ -551,6 +569,15 @@ type Batch interface {
 	// Returns:
 	//   - Batch: The same batch for chaining
 	Strict() Batch
+
+	// NonIdempotent marks the batch as unsafe to apply twice and excludes
+	// it from replay. A [types.CounterBatch] is marked automatically.
+	//
+	// See [Query.NonIdempotent] for full semantics.
+	//
+	// Returns:
+	//   - Batch: The same batch for chaining
+	NonIdempotent() Batch
 
 	// Size returns the number of statements in the batch.
 	//

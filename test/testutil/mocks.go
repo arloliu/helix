@@ -217,6 +217,11 @@ func (m *MockQuery) Mirror() helix.Query {
 	return m
 }
 
+// NonIdempotent marks this query as unsafe to replay (no-op in mock).
+func (m *MockQuery) NonIdempotent() helix.Query {
+	return m
+}
+
 // Strict marks this query for strict dual-write semantics (no-op in mock).
 func (m *MockQuery) Strict() helix.Query {
 	return m
@@ -530,6 +535,11 @@ func (m *MockBatch) WithTimestamp(ts int64) helix.Batch {
 
 // Mirror marks this batch for async mirror dispatch (no-op in mock).
 func (m *MockBatch) Mirror() helix.Batch {
+	return m
+}
+
+// NonIdempotent marks this batch as unsafe to replay (no-op in mock).
+func (m *MockBatch) NonIdempotent() helix.Batch {
 	return m
 }
 
