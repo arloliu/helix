@@ -593,36 +593,35 @@ func TestFallback_BothNotFound_NoHealthImpact(t *testing.T) {
 // Drain state bypass tests
 // ─────────────────────────────────────────────
 
-// TestFallback_DrainStateBypass verifies that FallbackRead attempts the alternative
-// cluster even when it is in drain mode (drain state is bypassed for fallback).
-func TestFallback_DrainStateBypass(t *testing.T) {
-	sessionA := newMockSession()
-	sessionA.scanErr = types.ErrNotFound
-	sessionB := newMockSession()
-	// sessionB returns success (has data despite being draining)
+// TestFallback_DrainingAlternativeIsSkipped verifies that a FallbackRead
+// probe does not contact a draining alternative by default, and that
+// WithFallbackReadOnDrainingCluster opts back into reading it.
+func TestFallback_DrainingAlternativeIsSkipped(t *testing.T) {
+	newClient := func(t *testing.T, opts ...Option) (*CQLClient, *mockSession) {
+		t.Helper()
+		sessionA := newMockSession()
+		sessionA.scanErr = types.ErrNotFound
+		sessionB := newMockSession() // has the row, but is draining
 
-	watcher := newMockTopologyWatcher()
-	watcher.drainB = true // cluster B is draining
+		client, err := NewCQLClient(sessionA, sessionB, opts...)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+		client.drainB.Store(true)
 
-	client, err := NewCQLClient(sessionA, sessionB,
-		WithTopologyWatcher(watcher),
-	)
-	require.NoError(t, err)
-	defer client.Close()
+		return client, sessionB
+	}
 
-	// Without FallbackRead: A returns not-found, no fallback
-	scanErr := client.Query("SELECT 1").Scan()
-	require.ErrorIs(t, scanErr, types.ErrNotFound)
-	require.Empty(t, sessionB.queries, "cluster B must not be tried without FallbackRead")
+	t.Run("skipped by default", func(t *testing.T) {
+		client, sessionB := newClient(t)
+		require.ErrorIs(t, client.Query("SELECT 1").FallbackRead().Scan(), types.ErrNotFound)
+		require.Empty(t, sessionB.queries, "a draining alternative must not be asked")
+	})
 
-	// Reset queries
-	sessionB.queries = nil
-
-	// With FallbackRead: should bypass drain state and find data on B
-	scanErr = client.Query("SELECT 1").FallbackRead().Scan()
-	require.NoError(t, scanErr,
-		"FallbackRead must bypass drain state and find data on B")
-	require.NotEmpty(t, sessionB.queries, "cluster B must be tried with FallbackRead even while draining")
+	t.Run("read when opted in", func(t *testing.T) {
+		client, sessionB := newClient(t, WithFallbackReadOnDrainingCluster(true))
+		require.NoError(t, client.Query("SELECT 1").FallbackRead().Scan())
+		require.Len(t, sessionB.queries, 1, "the opt-in lets the probe read the draining cluster")
+	})
 }
 
 // ─────────────────────────────────────────────

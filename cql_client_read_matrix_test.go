@@ -381,10 +381,9 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 	isIter := entry == entryIter || entry == entryBatchIter
 	isSlice := entry == entrySliceMap || entry == entrySliceScan
 
-	// Iterator reads never re-select away from a draining cluster;
-	// every other entry point moves the primary attempt to the other cluster.
+	// Every entry point moves the primary attempt away from a draining cluster.
 	served := ClusterA
-	if mode == modeDrain && !isIter {
+	if mode == modeDrain {
 		served = ClusterB
 	}
 	alt := ClusterB

@@ -51,8 +51,8 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
                         ▼
            ┌──────────────────────────────────────────┐
            │  Read from cluster B                     │
-           │  (bypasses drain state; SliceMap /       │
-           │   SliceScan skip if alt is draining)     │
+           │  (skipped if alt is draining, unless      │
+           │   WithFallbackReadOnDrainingCluster)     │
            └────────────┬─────────────────────────────┘
                         │
               ┌─────────┼─────────┐
@@ -75,7 +75,7 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
 - Not-found is never treated as a cluster failure. It never triggers `IncReadError`, `RecordFailure`, or failover — regardless of whether FallbackRead is enabled.
 - When the primary returns a real error (timeout, connection refused), the normal failover path handles it. FallbackRead only activates on not-found.
 - An error observed after the caller's own context was cancelled or expired is the caller's, not the cluster's: it is returned as-is, records no `IncReadError` or `RecordFailure`, and never triggers failover or the FallbackRead probe. A driver-side timeout while the caller's context is still live is a cluster error like any other.
-- FallbackRead bypasses drain state: the caller opted in to checking both clusters, and a draining cluster may still hold the data.
+- FallbackRead does not read a draining alternative: drain is the operator's "do not read here" signal, so the probe returns not-found without asking. `helix.WithFallbackReadOnDrainingCluster(true)` restores the old behaviour for `Scan` and `MapScan` when a draining cluster is known to hold current data.
 - The fallback attempt reuses the same statement, bound values, and query options on the alternative cluster.
 - Both attempts share the same context and deadline. FallbackRead does not create a fresh timeout for the second read.
 
@@ -93,7 +93,7 @@ FallbackRead works with all four bounded multi-row read methods — `SliceMap`, 
 | `SliceMap` / `SliceMapContext` | `(nil, nil)` |
 | `SliceScan` / `SliceScanContext` | `(0, nil)` |
 
-**Drain-aware skip on alt.** When the alternative cluster is currently draining, `Scan`/`MapScan` still attempt it. Slice methods skip the alternative: a draining cluster cannot provide a consistent paged result, so falling back would risk returning a partial page from the wrong origin.
+**Drain-aware skip on alt.** When the alternative cluster is currently draining, every method skips it and returns not-found. `Scan`/`MapScan` can be told to read it anyway with `helix.WithFallbackReadOnDrainingCluster(true)`; slice methods never do, because a draining cluster cannot provide a consistent paged result and falling back would risk returning a partial page from the wrong origin.
 
 ### MaxRows and overflow
 

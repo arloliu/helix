@@ -300,9 +300,7 @@ func (q *cqlQuery) SliceMapContext(ctx context.Context) ([]map[string]any, error
 // ErrRowLimitExceeded and caller-context errors need no propagation
 // predicate: executeFallbackRead returns both before the predicate is
 // consulted.
-var sliceMapFallbackOpts = fallbackReadOptions{
-	skipDrainingAlt: true,
-}
+var sliceMapFallbackOpts = fallbackReadOptions{}
 
 func (q *cqlQuery) SliceScan(scanFn func(r RowScanner) error) (int, error) {
 	return q.SliceScanContext(q.getContext(), scanFn)
@@ -366,7 +364,6 @@ func (q *cqlQuery) SliceScanContext(
 	}
 
 	opts.fallbackOpts = fallbackReadOptions{
-		skipDrainingAlt: true,
 		propagateAltErr: func(error) bool {
 			// Any invocation of scanFn on the alt — successful or not —
 			// either mutated the caller's accumulator or surfaced a scanFn
