@@ -191,6 +191,13 @@ caller-visible success semantics change.
 **Verification:** with the new policy selected, a 30 s outage with default capacity loses zero
 payloads on both backends; with the policy not selected, existing tests are unchanged.
 
+**Status (2026-09-03):** 1.1 to 1.6 implemented on branch `fix/replay-durability`.
+The policy is `replay.WithRetryPolicy(replay.RetryWhileRetained)`;
+the poison budget is `MaxAttempts` on both backends under that policy.
+Simulation `comprehensive` profile with `test/simulation/configs/quick-retained.yaml`
+passes every scenario and strategy group with zero replay drops;
+with the default policy it still fails as recorded under Phase 0.
+
 ---
 
 ## Phase 2 — Root package restructure (`v1.7.0`)
