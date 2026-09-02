@@ -413,17 +413,9 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 		return nil, types.ErrNilSession
 	}
 
-	var slot *atomic.Pointer[sessionHolder]
-	switch cluster {
-	case ClusterA:
-		slot = &c.sessionA
-	case ClusterB:
-		if c.singleCluster {
-			return nil, types.ErrInvalidCluster
-		}
-		slot = &c.sessionB
-	default:
-		return nil, types.ErrInvalidCluster
+	slot, err := c.sessionSlot(cluster)
+	if err != nil {
+		return nil, err
 	}
 
 	old := slot.Swap(&sessionHolder{s: newSession})
@@ -488,11 +480,9 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 	}
 
 	// Validate cluster before calling the (potentially expensive) refresher.
-	if cluster != ClusterA && cluster != ClusterB {
-		return types.ErrInvalidCluster
-	}
-	if cluster == ClusterB && c.singleCluster {
-		return types.ErrInvalidCluster
+	slot, err := c.sessionSlot(cluster)
+	if err != nil {
+		return err
 	}
 
 	// Thread the most recently observed failure for this cluster through
@@ -508,7 +498,6 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 	// Capture the holder the refresher is replacing. If anyone installs a
 	// different session while the refresher runs, that session is newer
 	// than what the refresher saw and must not be closed underneath them.
-	slot := c.sessionSlot(cluster)
 	holder := slot.Load()
 
 	newSession, err := c.config.SessionRefresher(ctx, cluster, lastErr)
@@ -543,12 +532,20 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 	return nil
 }
 
-// sessionSlot returns the atomic holder for cluster. The cluster has been
-// validated by the caller.
-func (c *CQLClient) sessionSlot(cluster ClusterID) *atomic.Pointer[sessionHolder] {
-	if cluster == ClusterA {
-		return &c.sessionA
-	}
+// sessionSlot returns the atomic holder for cluster, or
+// [types.ErrInvalidCluster] for an unknown cluster or for ClusterB on a
+// single-cluster client.
+func (c *CQLClient) sessionSlot(cluster ClusterID) (*atomic.Pointer[sessionHolder], error) {
+	switch cluster {
+	case ClusterA:
+		return &c.sessionA, nil
+	case ClusterB:
+		if c.singleCluster {
+			return nil, types.ErrInvalidCluster
+		}
 
-	return &c.sessionB
+		return &c.sessionB, nil
+	default:
+		return nil, types.ErrInvalidCluster
+	}
 }

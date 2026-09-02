@@ -34,12 +34,20 @@ func (c *CQLClient) Query(stmt string, values ...any) Query {
 // drain-aware re-selection is suppressed either way. Without a PageState
 // the zero options apply.
 func (q *cqlQuery) pagedReadOptions() readOptions {
-	if q.pageState == nil {
-		return readOptions{}
-	}
-	cluster, _ := decodePageState(q.pageState)
+	var opts readOptions
+	q.applyPagedRouting(&opts)
 
-	return readOptions{preserveSelectedCluster: true, pinnedCluster: cluster}
+	return opts
+}
+
+// applyPagedRouting sets the PageState routing fields on opts; see
+// pagedReadOptions.
+func (q *cqlQuery) applyPagedRouting(opts *readOptions) {
+	if q.pageState == nil {
+		return
+	}
+	opts.preserveSelectedCluster = true
+	opts.pinnedCluster, _ = decodePageState(q.pageState)
 }
 
 // cqlQuery implements the Query interface for CQLClient.
@@ -144,19 +152,10 @@ func (q *cqlQuery) getContext() context.Context {
 	return context.Background()
 }
 
-// writeTimestamp returns the client-side timestamp for this write.
-// Zero is rejected: the drivers treat it as "use the current time", which
-// would let a replayed write outrank data written after the original.
+// writeTimestamp returns the client-side timestamp for this write; see
+// resolveWriteTimestamp.
 func (q *cqlQuery) writeTimestamp() (int64, error) {
-	ts := q.client.config.TimestampProvider()
-	if q.timestamp != nil {
-		ts = *q.timestamp
-	}
-	if ts == 0 {
-		return 0, types.ErrInvalidTimestamp
-	}
-
-	return ts, nil
+	return resolveWriteTimestamp(q.timestamp, q.client.config.TimestampProvider)
 }
 
 func (q *cqlQuery) getPriority() PriorityLevel {
@@ -199,10 +198,22 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		return types.ErrStrictMirrorUnsupported
 	}
 
+	wc := writeContext{
+		statement: q.statement,
+		args:      q.values,
+		timestamp: ts,
+		priority:  priority,
+		// A non-idempotent statement takes the strict path: synchronous on
+		// both clusters, no fire-and-forget, no replay.
+		strict:            q.strict || q.nonIdempotent,
+		consistency:       q.consistency,
+		serialConsistency: q.serialConsistency,
+	}
+
 	if q.mirror {
 		defer func() {
 			if err == nil {
-				q.client.dispatchMirrorQuery(q, ts, priority)
+				q.client.dispatchMirror(wc)
 			}
 		}()
 	}
@@ -223,18 +234,6 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		q.client.recordWriteOutcome(ctx, ClusterA, err)
 
 		return err
-	}
-
-	wc := writeContext{
-		statement: q.statement,
-		args:      q.values,
-		timestamp: ts,
-		priority:  priority,
-		// A non-idempotent statement takes the strict path: synchronous on
-		// both clusters, no fire-and-forget, no replay.
-		strict:            q.strict || q.nonIdempotent,
-		consistency:       q.consistency,
-		serialConsistency: q.serialConsistency,
 	}
 
 	err = q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {

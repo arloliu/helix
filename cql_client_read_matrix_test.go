@@ -295,7 +295,7 @@ func classifyMatrixErr(err error) errClass {
 		return errNotFound
 	case errors.Is(err, types.ErrRowLimitExceeded):
 		return errRowLimit
-	case isCtxErr(err):
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errCtx
 	case errors.Is(err, errMatrixCluster):
 		return errCluster

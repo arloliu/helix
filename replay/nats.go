@@ -415,14 +415,14 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 	}
 	n.mu.RUnlock()
 
-	if err := validatePayloadArgs(payload); err != nil {
+	if err := validateTargetCluster(payload.TargetCluster); err != nil {
 		return err
 	}
 
 	// Serialize Args to msgp.Raw
 	argsRaw, err := encodeArgs(payload.Args)
 	if err != nil {
-		return fmt.Errorf("helix: failed to encode args: %w", err)
+		return err
 	}
 
 	// Build batch statements if this is a batch
@@ -432,7 +432,7 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 		for i, stmt := range payload.BatchStatements {
 			stmtArgsRaw, err := encodeArgs(stmt.Args)
 			if err != nil {
-				return fmt.Errorf("helix: failed to encode batch args: %w", err)
+				return err
 			}
 			batchStmts[i] = batchStatement{
 				Query: stmt.Query,
@@ -453,14 +453,8 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 		BatchStatements: batchStmts,
 		Version:         replayEnvelopeVersion,
 	}
-	if payload.Consistency != nil {
-		msg.HasConsistency = true
-		msg.Consistency = uint16(*payload.Consistency)
-	}
-	if payload.SerialConsistency != nil {
-		msg.HasSerialConsistency = true
-		msg.SerialConsistency = uint16(*payload.SerialConsistency)
-	}
+	msg.HasConsistency, msg.Consistency = consistencyToWire(payload.Consistency)
+	msg.HasSerialConsistency, msg.SerialConsistency = consistencyToWire(payload.SerialConsistency)
 
 	// Use msgp for efficient serialization
 	data, err := msg.MarshalMsg(nil)
@@ -709,16 +703,8 @@ msgLoop:
 			BatchType:       types.BatchType(natsMsg.BatchType),
 			BatchStatements: batchStmts,
 		}
-		// A version 1 message, or a write that used the session default,
-		// carries no consistency: leave the fields nil.
-		if natsMsg.HasConsistency {
-			c := types.Consistency(natsMsg.Consistency)
-			payload.Consistency = &c
-		}
-		if natsMsg.HasSerialConsistency {
-			c := types.Consistency(natsMsg.SerialConsistency)
-			payload.SerialConsistency = &c
-		}
+		payload.Consistency = consistencyFromWire(natsMsg.HasConsistency, natsMsg.Consistency)
+		payload.SerialConsistency = consistencyFromWire(natsMsg.HasSerialConsistency, natsMsg.SerialConsistency)
 
 		result = append(result, ReplayMessage{
 			Payload:          payload,
@@ -816,11 +802,11 @@ func encodeArgs(args []any) (msgp.Raw, error) {
 	//nolint:gosec // overflow checked above
 	buf = msgp.AppendArrayHeader(buf, uint32(len(args)))
 
-	for _, arg := range args {
+	for i, arg := range args {
 		var err error
 		buf, err = appendArg(buf, arg)
 		if err != nil {
-			return nil, fmt.Errorf("helix: failed to encode argument: %w", err)
+			return nil, fmt.Errorf("%w: argument %d is %T: %w", types.ErrUnsupportedReplayArg, i, arg, err)
 		}
 	}
 
@@ -834,14 +820,11 @@ func encodeArgs(args []any) (msgp.Raw, error) {
 // value the driver expects. A nil byte slice is encoded as nil and an empty
 // one as an empty binary, so a replayed empty blob stays an empty blob.
 func appendArg(buf []byte, arg any) ([]byte, error) {
-	if uuid, ok := tryConvertToUUID(arg); ok {
-		return msgp.AppendExtension(buf, &uuid)
-	}
-	if d, ok := durationFromValue(arg); ok {
-		return msgp.AppendExtension(buf, &durationExt{value: d})
-	}
-
 	switch v := arg.(type) {
+	case nil, bool, string, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,
+		float32, float64, time.Time:
+		// The common scalars take msgp's own path without any reflection.
+		return msgp.AppendIntf(buf, arg)
 	case *big.Int:
 		if v == nil {
 			return msgp.AppendNil(buf), nil
@@ -870,6 +853,13 @@ func appendArg(buf []byte, arg any) ([]byte, error) {
 		}
 
 		return msgp.AppendBytes(buf, v), nil
+	}
+
+	if uuid, ok := tryConvertToUUID(arg); ok {
+		return msgp.AppendExtension(buf, &uuid)
+	}
+	if d, ok := durationFromValue(arg); ok {
+		return msgp.AppendExtension(buf, &durationExt{value: d})
 	}
 
 	// Fall back to standard msgp encoding

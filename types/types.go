@@ -558,12 +558,7 @@ type ClusterError struct {
 //
 // If Cause is nil, "<nil>" is substituted in its place rather than panicking.
 func (e *ClusterError) Error() string {
-	cause := "<nil>"
-	if e.Cause != nil {
-		cause = e.Cause.Error()
-	}
-
-	return "helix: cluster " + e.Cluster + " " + e.Operation + " failed: " + cause
+	return "helix: cluster " + e.Cluster + " " + e.Operation + " failed: " + errString(e.Cause)
 }
 
 // Unwrap returns the underlying cause for errors.Is/As compatibility.
@@ -585,19 +580,7 @@ type DualClusterError struct {
 // If either ErrorA or ErrorB is nil, the corresponding part is omitted from
 // the message rather than panicking.
 func (e *DualClusterError) Error() string {
-	var msgA, msgB string
-	if e.ErrorA != nil {
-		msgA = e.ErrorA.Error()
-	} else {
-		msgA = "<nil>"
-	}
-	if e.ErrorB != nil {
-		msgB = e.ErrorB.Error()
-	} else {
-		msgB = "<nil>"
-	}
-
-	return "helix: both clusters failed - A: " + msgA + ", B: " + msgB
+	return "helix: both clusters failed - A: " + errString(e.ErrorA) + ", B: " + errString(e.ErrorB)
 }
 
 // Unwrap returns the wrapped errors for errors.Is/As compatibility.

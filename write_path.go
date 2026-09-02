@@ -47,6 +47,24 @@ type writeContext struct {
 	serialConsistency *Consistency
 }
 
+// resolveWriteTimestamp returns the client-side timestamp for a write: the
+// per-statement override when set, otherwise the provider's value. Zero is
+// rejected: the drivers treat it as "use the current time", which would let
+// a replayed write outrank data written after the original.
+func resolveWriteTimestamp(override *int64, provider TimestampProvider) (int64, error) {
+	var ts int64
+	if override != nil {
+		ts = *override
+	} else {
+		ts = provider()
+	}
+	if ts == 0 {
+		return 0, types.ErrInvalidTimestamp
+	}
+
+	return ts, nil
+}
+
 // writeLegErrKind classifies the result of one cluster leg of a dual write.
 type writeLegErrKind uint8
 
@@ -313,11 +331,10 @@ func (c *CQLClient) executeDualWrite(
 	// A draining leg never acknowledges, so a real failure on the other
 	// cluster leaves the write unacknowledged: report that failure and
 	// leave reconciliation to the caller's retry.
-	if (legA.failed() && legB == legDraining) || (legB.failed() && legA == legDraining) {
-		if legA.failed() {
-			return errA
-		}
-
+	if legA.failed() && legB == legDraining {
+		return errA
+	}
+	if legB.failed() && legA == legDraining {
 		return errB
 	}
 
@@ -363,9 +380,12 @@ func (c *CQLClient) replayLeg(
 	err error,
 	kind writeLegErrKind,
 ) error {
+	if kind == legOK {
+		return nil
+	}
 	var deferred DeferredWriteResult
 	if kind != legAsync || !errors.As(err, &deferred) {
-		return c.enqueueReplayIfNeeded(ctx, wc, cluster, err, kind)
+		return c.enqueueReplayPayload(ctx, c.replayPayload(wc, cluster), err, kind)
 	}
 
 	// Snapshot the write now: the caller may reuse its buffers as soon as
@@ -412,32 +432,15 @@ func cloneConsistency(c *Consistency) *Consistency {
 	return &v
 }
 
-// enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
-// kind distinguishes the operational sentinel states so the log message
-// accurately reflects what happened: async means the write is in flight;
-// dropped means the write was never attempted because the concurrency limit
-// was full; draining means the leg was skipped because the cluster is draining.
+// enqueueReplayPayload enqueues one replay payload for a leg whose result
+// was err, classified as kind. kind selects the log message: async means the
+// write is in flight; dropped means it was never attempted because the
+// concurrency limit was full; draining means the leg was skipped.
 //
-// It returns nil when the leg needed no replay or was enqueued, and the
-// enqueue error, or [types.ErrNoReplayer] when the client has no replayer,
-// otherwise. Either failure is counted as a dropped replay and reported
-// through the replay-dropped callback and event.
-func (c *CQLClient) enqueueReplayIfNeeded(
-	ctx context.Context,
-	wc writeContext,
-	cluster ClusterID,
-	err error,
-	kind writeLegErrKind,
-) error {
-	if kind == legOK {
-		return nil
-	}
-
-	return c.enqueueReplayPayload(ctx, c.replayPayload(wc, cluster), err, kind)
-}
-
-// enqueueReplayPayload enqueues one replay payload and reports the outcome;
-// see enqueueReplayIfNeeded for the return contract.
+// It returns nil when the payload was enqueued, and the enqueue error, or
+// [types.ErrNoReplayer] when the client has no replayer, otherwise. Either
+// failure is counted as a dropped replay and reported through the
+// replay-dropped callback and event.
 func (c *CQLClient) enqueueReplayPayload(
 	ctx context.Context,
 	payload types.ReplayPayload,

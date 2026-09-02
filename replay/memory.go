@@ -222,7 +222,7 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 	if m.closed.Load() {
 		return types.ErrSessionClosed
 	}
-	if err := validatePayloadArgs(payload); err != nil {
+	if err := validatePayload(payload); err != nil {
 		return err
 	}
 	select {

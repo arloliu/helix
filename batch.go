@@ -201,18 +201,10 @@ func (b *cqlBatch) getContext() context.Context {
 	return context.Background()
 }
 
-// writeTimestamp returns the client-side timestamp for this batch.
-// Zero is rejected for the reason given on [cqlQuery.writeTimestamp].
+// writeTimestamp returns the client-side timestamp for this batch; see
+// resolveWriteTimestamp.
 func (b *cqlBatch) writeTimestamp() (int64, error) {
-	ts := b.client.config.TimestampProvider()
-	if b.timestamp != nil {
-		ts = *b.timestamp
-	}
-	if ts == 0 {
-		return 0, types.ErrInvalidTimestamp
-	}
-
-	return ts, nil
+	return resolveWriteTimestamp(b.timestamp, b.client.config.TimestampProvider)
 }
 
 func (b *cqlBatch) getPriority() PriorityLevel {
@@ -237,10 +229,23 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		return types.ErrStrictMirrorUnsupported
 	}
 
+	wc := writeContext{
+		statement:         "", // Empty for batch
+		args:              nil,
+		timestamp:         ts,
+		priority:          priority,
+		isBatch:           true,
+		batchType:         b.kind,
+		batchEntries:      b.entries, // Pass directly, convert lazily if needed for replay
+		strict:            b.strict || b.nonIdempotent,
+		consistency:       b.consistency,
+		serialConsistency: b.serialConsistency,
+	}
+
 	if b.mirror {
 		defer func() {
 			if err == nil {
-				b.client.dispatchMirrorBatch(b, ts, priority)
+				b.client.dispatchMirror(wc)
 			}
 		}()
 	}
@@ -267,19 +272,6 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		b.client.recordWriteOutcome(ctx, ClusterA, err)
 
 		return err
-	}
-
-	wc := writeContext{
-		statement:         "", // Empty for batch
-		args:              nil,
-		timestamp:         ts,
-		priority:          priority,
-		isBatch:           true,
-		batchType:         b.kind,
-		batchEntries:      b.entries, // Pass directly, convert lazily if needed for replay
-		strict:            b.strict || b.nonIdempotent,
-		consistency:       b.consistency,
-		serialConsistency: b.serialConsistency,
 	}
 
 	err = b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {

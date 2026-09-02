@@ -1,6 +1,7 @@
 package helix
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/arloliu/helix/adapter/cql"
@@ -57,13 +58,9 @@ func (i *cqlIter) Close() error {
 	return err
 }
 
-// pageStatePrefixLen is the length of the routing header Helix prepends to
-// a driver paging token: a magic, a version, and the cluster letter.
-const pageStatePrefixLen = 4
-
-// pageStateMagic identifies a paging token issued by Helix; the byte after
-// it is the format version, followed by the cluster letter.
-var pageStateMagic = []byte{'h', 'x'}
+// pageStateHeader identifies a paging token issued by Helix: a magic and a
+// format version, followed by the issuing cluster's letter.
+const pageStateHeader = "hx1"
 
 // encodePageState prepends the issuing cluster to a driver paging token.
 // An empty token (no more pages) is returned unchanged so callers keep the
@@ -72,10 +69,9 @@ func encodePageState(cluster ClusterID, raw []byte) []byte {
 	if len(raw) == 0 {
 		return raw
 	}
-	out := make([]byte, 0, pageStatePrefixLen+len(raw))
-	out = append(out, pageStateMagic...)
-	out = append(out, '1')
-	out = append(out, cluster.String()...)
+	out := make([]byte, 0, len(pageStateHeader)+len(cluster)+len(raw))
+	out = append(out, pageStateHeader...)
+	out = append(out, cluster...)
 
 	return append(out, raw...)
 }
@@ -85,16 +81,16 @@ func encodePageState(cluster ClusterID, raw []byte) []byte {
 // (one produced by a driver directly, or by an older Helix) is returned
 // as-is with an empty cluster.
 func decodePageState(state []byte) (cluster ClusterID, raw []byte) {
-	if len(state) <= pageStatePrefixLen ||
-		state[0] != pageStateMagic[0] || state[1] != pageStateMagic[1] || state[2] != '1' {
+	prefix := len(pageStateHeader) + 1
+	if len(state) <= prefix || !bytes.HasPrefix(state, []byte(pageStateHeader)) {
 		return "", state
 	}
-	cluster = ClusterID(state[3:4])
+	cluster = ClusterID(state[len(pageStateHeader):prefix])
 	if cluster != ClusterA && cluster != ClusterB {
 		return "", state
 	}
 
-	return cluster, state[pageStatePrefixLen:]
+	return cluster, state[prefix:]
 }
 
 // errorIter is returned when resolveReadTarget fails. It defers the error
