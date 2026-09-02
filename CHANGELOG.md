@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A write to a dual cluster with one cluster draining now runs through the
+  configured `WriteStrategy` like every other write: the draining cluster's
+  leg returns `types.ErrClusterDraining` without contacting the session and
+  is enqueued for replay, while the other leg is executed by the strategy.
+  Previously the healthy cluster was written directly, bypassing the
+  strategy. Observable differences: the draining cluster now counts in
+  `IncWriteTotal` and, when the collector implements `types.StrictMetrics`,
+  in `IncWriteSkipped` (previously only strict writes did); the replay log
+  line reads "write skipped on draining cluster, enqueued for replay".
+  `AdaptiveDualWrite` no longer counts a draining leg as a background write
+  error.
+
 ## [1.6.1] — 2026-09-03
 
 ### Added

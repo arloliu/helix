@@ -1,0 +1,87 @@
+package helix
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/arloliu/helix/types"
+	"github.com/stretchr/testify/require"
+)
+
+// legRecordingStrategy runs both legs and keeps what each returned, so a
+// test can see exactly what the write strategy observed.
+type legRecordingStrategy struct {
+	errA, errB error
+}
+
+func (s *legRecordingStrategy) Execute(
+	ctx context.Context,
+	writeA func(context.Context) error,
+	writeB func(context.Context) error,
+) (resultA, resultB error) {
+	s.errA = writeA(ctx)
+	s.errB = writeB(ctx)
+
+	return s.errA, s.errB
+}
+
+// TestWrite_DrainingLegIsSkippedInsideTheStrategy asserts that a draining
+// cluster is skipped by its own write leg: the strategy still runs, sees
+// ErrClusterDraining for that leg, the session is never contacted, the
+// skipped leg is counted, and the write is enqueued for replay to the
+// draining cluster.
+func TestWrite_DrainingLegIsSkippedInsideTheStrategy(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	strategy := &legRecordingStrategy{}
+	replayer := &mockReplayer{}
+	metrics := &strictMetricsCollector{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithWriteStrategy(strategy),
+		WithReplayer(replayer),
+		WithMetrics(metrics),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	client.drainA.Store(true)
+
+	require.NoError(t, client.Query("INSERT INTO t (id) VALUES (1)").Exec())
+
+	require.ErrorIs(t, strategy.errA, types.ErrClusterDraining)
+	require.NoError(t, strategy.errB)
+	require.Empty(t, sessionA.queries, "draining cluster must not be contacted")
+	require.Len(t, sessionB.queries, 1)
+	require.Equal(t, int32(1), metrics.skippedA.Load())
+	require.Equal(t, int32(0), metrics.skippedB.Load())
+
+	replayer.Lock()
+	defer replayer.Unlock()
+	require.Len(t, replayer.payloads, 1)
+	require.Equal(t, ClusterA, replayer.payloads[0].TargetCluster)
+}
+
+// TestWrite_HealthyLegFailsWhileOtherDrains asserts that when the only
+// cluster that can acknowledge the write fails, the caller gets that
+// cluster's error and nothing is enqueued for replay.
+func TestWrite_HealthyLegFailsWhileOtherDrains(t *testing.T) {
+	errB := errors.New("cluster B rejected the write")
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	sessionB.execErr = errB
+	replayer := &mockReplayer{}
+
+	client, err := NewCQLClient(sessionA, sessionB, WithReplayer(replayer))
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	client.drainA.Store(true)
+
+	err = client.Query("INSERT INTO t (id) VALUES (1)").Exec()
+	require.ErrorIs(t, err, errB)
+	require.Empty(t, sessionA.queries)
+
+	replayer.Lock()
+	defer replayer.Unlock()
+	require.Empty(t, replayer.payloads, "an unacknowledged write is not replayed")
+}

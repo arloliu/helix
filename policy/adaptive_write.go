@@ -676,6 +676,11 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		latency := time.Since(start)
 
 		// Track latency for potential recovery
+		if isSkippedErr(err) {
+			// The leg was skipped (for example, the cluster is draining):
+			// neither a failure nor a latency sample.
+			return
+		}
 		if err != nil {
 			// Surface the background failure: IncWriteError makes it
 			// visible to dashboards, and the Warn log gives operators a

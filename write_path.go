@@ -43,14 +43,76 @@ type writeContext struct {
 	strict       bool         // if true: no replay, returns PartialWriteError on partial failure
 }
 
+// writeLegErrKind classifies the result of one cluster leg of a dual write.
+type writeLegErrKind uint8
+
+const (
+	// legOK is an acknowledged write.
+	legOK writeLegErrKind = iota
+	// legAsync is [types.ErrWriteAsync]: the write is in flight on a degraded cluster.
+	legAsync
+	// legDropped is [types.ErrWriteDropped]: the write was never attempted (concurrency limit).
+	legDropped
+	// legDraining is [types.ErrClusterDraining]: the leg was skipped because the cluster is draining.
+	legDraining
+	// legSkipped is [types.ErrClusterDegraded]: a strict write skipped a degraded cluster.
+	legSkipped
+	// legFailed is any other error: the cluster rejected or failed the write.
+	legFailed
+)
+
+// classifyWriteLeg assigns the kind of one leg's result.
+func classifyWriteLeg(err error) writeLegErrKind {
+	switch {
+	case err == nil:
+		return legOK
+	case errors.Is(err, types.ErrWriteAsync):
+		return legAsync
+	case errors.Is(err, types.ErrWriteDropped):
+		return legDropped
+	case errors.Is(err, types.ErrClusterDraining):
+		return legDraining
+	case errors.Is(err, types.ErrClusterDegraded):
+		return legSkipped
+	default:
+		return legFailed
+	}
+}
+
+// recordWriteLegMetrics emits the per-leg write metrics for one cluster.
+// startNano is 0 when the leg never started (skipped or draining), in which
+// case no duration is observed.
+func (c *CQLClient) recordWriteLegMetrics(cluster ClusterID, leg writeLegErrKind, startNano, nowNano int64) {
+	c.config.Metrics.IncWriteTotal(cluster)
+	if startNano > 0 {
+		c.config.Metrics.ObserveWriteDuration(cluster, float64(nowNano-startNano)/float64(time.Second))
+	}
+	switch leg {
+	case legOK:
+	case legAsync:
+		c.config.Metrics.IncWriteAsync(cluster)
+	case legDropped:
+		c.config.Metrics.IncWriteDropped(cluster)
+	case legDraining, legSkipped:
+		if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
+			sm.IncWriteSkipped(cluster)
+		}
+	case legFailed:
+		c.config.Metrics.IncWriteError(cluster)
+	}
+}
+
 // executeWriteWithReplay performs a write operation with optional dual-write and replay support.
 //
 // In single-cluster mode, the write is executed directly on sessionA.
 // In dual-cluster mode, writes are executed concurrently on both clusters with replay
 // for partial failures.
 //
-// If a cluster is in drain mode, writes to that cluster are skipped and enqueued
-// for replay instead. If both clusters are draining, the write fails with ErrBothClustersDraining.
+// A draining cluster's leg is skipped: its write closure returns
+// [types.ErrClusterDraining] without contacting the session, the write
+// strategy sees that result like any other skipped leg, and the write is
+// enqueued for replay to that cluster. If both clusters are draining, the
+// write fails with ErrBothClustersDraining.
 func (c *CQLClient) executeWriteWithReplay(
 	ctx context.Context,
 	wc writeContext,
@@ -70,9 +132,7 @@ func (c *CQLClient) executeWriteWithReplay(
 		return err
 	}
 
-	// Check drain mode
-	drainA := c.drainA.Load()
-	drainB := c.drainB.Load()
+	drainA, drainB := c.getDrainStates()
 
 	// If both clusters are draining, fail immediately
 	if drainA && drainB {
@@ -90,104 +150,44 @@ func (c *CQLClient) executeWriteWithReplay(
 		return types.ErrBothClustersDraining
 	}
 
-	// If only one cluster is draining, write to the healthy one and enqueue replay
-	if drainA || drainB {
-		return c.executeWriteWithDrain(ctx, wc, writeFunc, drainA, drainB)
-	}
-
-	// Normal dual-cluster mode: concurrent writes with replay support
-	return c.executeDualWrite(ctx, wc, writeFunc)
+	return c.executeDualWrite(ctx, wc, writeFunc, drainA, drainB)
 }
 
-// executeWriteWithDrain handles writes when one cluster is draining.
-// Invariant: Exactly one of drainA or drainB is true when this function is called.
-func (c *CQLClient) executeWriteWithDrain(
-	ctx context.Context,
-	wc writeContext,
+// writeLegs builds the per-cluster write closures shared by the replaying
+// and strict dual-write paths.
+//
+// Session refs are resolved at call time inside the closure body so a
+// concurrent SwapSession or RefreshSession is observed by the next
+// dispatch. In-flight closures that have already loaded their session
+// continue against that captured ref; this preserves "the write was
+// dispatched to cluster X" semantics for fire-and-forget strategies.
+//
+// A draining cluster's closure returns [types.ErrClusterDraining] before
+// touching the session or the start time, so the leg is neither timed nor
+// counted as an error; the callers classify it as a skipped leg.
+func (c *CQLClient) writeLegs(
 	writeFunc func(context.Context, cql.Session) error,
-	drainA, _ bool,
-) error {
-	var session cql.Session
-	var healthyCluster, drainingCluster ClusterID
+	drainA, drainB bool,
+	startA, startB *atomic.Int64,
+) (writeA, writeB func(context.Context) error) {
+	writeA = func(ctx context.Context) error {
+		if drainA {
+			return types.ErrClusterDraining
+		}
+		startA.Store(time.Now().UnixNano())
 
-	if drainA {
-		session = c.loadSessionB()
-		healthyCluster = ClusterB
-		drainingCluster = ClusterA
-	} else {
-		session = c.loadSessionA()
-		healthyCluster = ClusterA
-		drainingCluster = ClusterB
+		return writeFunc(ctx, c.loadSessionA())
+	}
+	writeB = func(ctx context.Context) error {
+		if drainB {
+			return types.ErrClusterDraining
+		}
+		startB.Store(time.Now().UnixNano())
+
+		return writeFunc(ctx, c.loadSessionB())
 	}
 
-	// Execute write on the healthy cluster
-	start := time.Now()
-	err := writeFunc(ctx, session)
-	elapsed := time.Since(start).Seconds()
-
-	if err != nil {
-		c.config.Metrics.IncWriteTotal(healthyCluster)
-		c.config.Metrics.IncWriteError(healthyCluster)
-		c.config.Metrics.ObserveWriteDuration(healthyCluster, elapsed)
-		c.recordOpOutcome(healthyCluster, err)
-
-		if wc.strict {
-			// Healthy cluster also failed: draining cluster was still skipped.
-			if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
-				sm.IncWriteSkipped(drainingCluster)
-			}
-			if drainA {
-				return &types.DualClusterError{ErrorA: types.ErrClusterDraining, ErrorB: err}
-			}
-
-			return &types.DualClusterError{ErrorA: err, ErrorB: types.ErrClusterDraining}
-		}
-
-		return err
-	}
-
-	c.config.Metrics.IncWriteTotal(healthyCluster)
-	c.config.Metrics.ObserveWriteDuration(healthyCluster, elapsed)
-	c.recordOpOutcome(healthyCluster, nil)
-
-	if wc.strict {
-		// Strict: draining cluster is a skip, not a replay target.
-		if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
-			sm.IncWriteSkipped(drainingCluster)
-		}
-		return &types.PartialWriteError{
-			Acknowledged:   healthyCluster,
-			Unacknowledged: drainingCluster,
-			Cause:          types.ErrClusterDraining,
-		}
-	}
-
-	// Enqueue for replay to the draining cluster
-	if c.config.Replayer != nil {
-		payload := types.ReplayPayload{
-			TargetCluster:   drainingCluster,
-			Query:           wc.statement,
-			Args:            cloneArgs(wc.args),
-			IsBatch:         wc.isBatch,
-			BatchType:       wc.batchType,
-			BatchStatements: cloneBatchEntries(wc.batchEntries),
-			Timestamp:       wc.timestamp,
-			Priority:        wc.priority,
-		}
-		// Use context.WithoutCancel to ensure replay is enqueued even if the request context is cancelled
-		if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
-			c.config.Metrics.IncReplayEnqueued(drainingCluster)
-		} else {
-			c.config.Metrics.IncReplayDropped(drainingCluster)
-			c.config.Logger.Error("failed to enqueue write for replay during drain",
-				"cluster", c.clusterName(drainingCluster),
-				"enqueueError", enqueueErr.Error(),
-			)
-			c.emitReplayDropped(drainingCluster, payload, enqueueErr)
-		}
-	}
-
-	return nil
+	return writeA, writeB
 }
 
 // executeDualWrite performs the normal dual-cluster write.
@@ -203,28 +203,16 @@ func (c *CQLClient) executeDualWrite(
 	ctx context.Context,
 	wc writeContext,
 	writeFunc func(context.Context, cql.Session) error,
+	drainA, drainB bool,
 ) error {
 	if wc.strict {
-		return c.executeStrictDualWrite(ctx, writeFunc)
+		return c.executeStrictDualWrite(ctx, writeFunc, drainA, drainB)
 	}
 	// Dual-cluster mode: concurrent writes with replay support
 	// Note: We capture start times outside the write functions to avoid data races
 	// when WriteStrategy uses fire-and-forget (background goroutines).
 	var startA, startB atomic.Int64
-
-	// Session refs are resolved at call time inside the closure body so a
-	// concurrent SwapSession or RefreshSession is observed by the next
-	// dispatch. In-flight closures that have already loaded their session
-	// continue against that captured ref; this preserves "the write was
-	// dispatched to cluster X" semantics for fire-and-forget strategies.
-	writeA := func(ctx context.Context) error {
-		startA.Store(time.Now().UnixNano())
-		return writeFunc(ctx, c.loadSessionA())
-	}
-	writeB := func(ctx context.Context) error {
-		startB.Store(time.Now().UnixNano())
-		return writeFunc(ctx, c.loadSessionB())
-	}
+	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &startA, &startB)
 
 	var errA, errB error
 
@@ -253,43 +241,19 @@ func (c *CQLClient) executeDualWrite(
 	}
 
 	// Classify results: distinguish operational sentinel states from real errors.
-	// ErrWriteAsync  — write is in flight via fire-and-forget (not a cluster error).
-	// ErrWriteDropped — write was not attempted due to concurrency limit (not a cluster error).
-	isAsyncA := errors.Is(errA, types.ErrWriteAsync)
-	isDroppedA := errors.Is(errA, types.ErrWriteDropped)
-	isAsyncB := errors.Is(errB, types.ErrWriteAsync)
-	isDroppedB := errors.Is(errB, types.ErrWriteDropped)
+	// ErrWriteAsync     — write is in flight via fire-and-forget (not a cluster error).
+	// ErrWriteDropped   — write was not attempted due to concurrency limit (not a cluster error).
+	// ErrClusterDraining — leg skipped because the cluster is draining (not a cluster error).
+	legA := classifyWriteLeg(errA)
+	legB := classifyWriteLeg(errB)
 
 	// Record metrics for both clusters.
 	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines.
 	now := time.Now()
 	nowNano := now.UnixNano()
 
-	c.config.Metrics.IncWriteTotal(ClusterA)
-	if startANano := startA.Load(); startANano > 0 {
-		c.config.Metrics.ObserveWriteDuration(ClusterA, float64(nowNano-startANano)/float64(time.Second))
-	}
-	switch {
-	case isAsyncA:
-		c.config.Metrics.IncWriteAsync(ClusterA)
-	case isDroppedA:
-		c.config.Metrics.IncWriteDropped(ClusterA)
-	case errA != nil:
-		c.config.Metrics.IncWriteError(ClusterA)
-	}
-
-	c.config.Metrics.IncWriteTotal(ClusterB)
-	if startBNano := startB.Load(); startBNano > 0 {
-		c.config.Metrics.ObserveWriteDuration(ClusterB, float64(nowNano-startBNano)/float64(time.Second))
-	}
-	switch {
-	case isAsyncB:
-		c.config.Metrics.IncWriteAsync(ClusterB)
-	case isDroppedB:
-		c.config.Metrics.IncWriteDropped(ClusterB)
-	case errB != nil:
-		c.config.Metrics.IncWriteError(ClusterB)
-	}
+	c.recordWriteLegMetrics(ClusterA, legA, startA.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterB, legB, startB.Load(), nowNano)
 
 	// Auto-refresh stat tracking — invoked PER cluster so partial-success
 	// (A=ok, B=err) correctly advances A's lastSuccess while accumulating
@@ -306,22 +270,32 @@ func (c *CQLClient) executeDualWrite(
 	}
 
 	// Both clusters had real (non-operational) failures — hard error, no replay.
-	realErrA := errA != nil && !isAsyncA && !isDroppedA
-	realErrB := errB != nil && !isAsyncB && !isDroppedB
-	if realErrA && realErrB {
+	if legA == legFailed && legB == legFailed {
 		return &types.DualClusterError{ErrorA: errA, ErrorB: errB}
 	}
 
-	// At least one cluster had a non-nil result (error, async, or dropped).
+	// A draining leg never acknowledges, so a real failure on the other
+	// cluster leaves the write unacknowledged: report that failure and
+	// leave reconciliation to the caller's retry.
+	if (legA == legFailed && legB == legDraining) || (legB == legFailed && legA == legDraining) {
+		if legA == legFailed {
+			return errA
+		}
+
+		return errB
+	}
+
+	// At least one cluster had a non-nil result (error, async, dropped, or draining).
 	// Enqueue replay for each affected cluster to ensure eventual consistency.
 	//
-	// ErrWriteAsync:   write is in flight; replay is a safety net (idempotent for Cassandra
-	//                  because both attempts use the same client-generated timestamp).
-	// ErrWriteDropped: write was never attempted; replay is required for reconciliation.
-	// Real error:      write definitively failed; replay is required.
+	// ErrWriteAsync:      write is in flight; replay is a safety net (idempotent for Cassandra
+	//                     because both attempts use the same client-generated timestamp).
+	// ErrWriteDropped:    write was never attempted; replay is required for reconciliation.
+	// ErrClusterDraining: leg was skipped; replay delivers the write once the drain lifts.
+	// Real error:         write definitively failed; replay is required.
 	if c.config.Replayer != nil {
-		c.enqueueReplayIfNeeded(ctx, wc, ClusterA, errA, isAsyncA, isDroppedA)
-		c.enqueueReplayIfNeeded(ctx, wc, ClusterB, errB, isAsyncB, isDroppedB)
+		c.enqueueReplayIfNeeded(ctx, wc, ClusterA, errA, legA)
+		c.enqueueReplayIfNeeded(ctx, wc, ClusterB, errB, legB)
 	}
 
 	// Partial success (or all-async) is still success from the caller's perspective.
@@ -329,17 +303,18 @@ func (c *CQLClient) executeDualWrite(
 }
 
 // enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
-// isAsync and isDropped distinguish the two operational sentinel states so the log message
-// accurately reflects what happened: async means the write is in flight; dropped means the
-// write was never attempted because the concurrency limit was full.
+// kind distinguishes the operational sentinel states so the log message
+// accurately reflects what happened: async means the write is in flight;
+// dropped means the write was never attempted because the concurrency limit
+// was full; draining means the leg was skipped because the cluster is draining.
 func (c *CQLClient) enqueueReplayIfNeeded(
 	ctx context.Context,
 	wc writeContext,
 	cluster ClusterID,
 	err error,
-	isAsync, isDropped bool,
+	kind writeLegErrKind,
 ) {
-	if err == nil {
+	if kind == legOK {
 		return
 	}
 
@@ -359,16 +334,20 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 	// Use context.WithoutCancel so the enqueue succeeds even if the request context is cancelled.
 	if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
 		c.config.Metrics.IncReplayEnqueued(cluster)
-		switch {
-		case isDropped:
+		switch kind {
+		case legDropped:
 			c.config.Logger.Info("write dropped (concurrency limit reached) on degraded cluster, enqueued for replay",
 				"cluster", c.clusterName(cluster),
 			)
-		case isAsync:
+		case legAsync:
 			c.config.Logger.Info("write dispatched asynchronously to degraded cluster, enqueued for replay",
 				"cluster", c.clusterName(cluster),
 			)
-		default:
+		case legDraining:
+			c.config.Logger.Info("write skipped on draining cluster, enqueued for replay",
+				"cluster", c.clusterName(cluster),
+			)
+		case legOK, legSkipped, legFailed:
 			c.config.Logger.Warn("write failed on cluster, enqueued for replay",
 				"cluster", c.clusterName(cluster),
 				"error", err.Error(),
@@ -397,17 +376,10 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 func (c *CQLClient) executeStrictDualWrite(
 	ctx context.Context,
 	writeFunc func(context.Context, cql.Session) error,
+	drainA, drainB bool,
 ) error {
 	var startA, startB atomic.Int64
-
-	writeA := func(ctx context.Context) error {
-		startA.Store(time.Now().UnixNano())
-		return writeFunc(ctx, c.loadSessionA())
-	}
-	writeB := func(ctx context.Context) error {
-		startB.Store(time.Now().UnixNano())
-		return writeFunc(ctx, c.loadSessionB())
-	}
+	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &startA, &startB)
 
 	var errA, errB error
 
@@ -432,30 +404,8 @@ func (c *CQLClient) executeStrictDualWrite(
 	now := time.Now()
 	nowNano := now.UnixNano()
 
-	isSkippedA := errors.Is(errA, types.ErrClusterDegraded) || errors.Is(errA, types.ErrClusterDraining)
-	isSkippedB := errors.Is(errB, types.ErrClusterDegraded) || errors.Is(errB, types.ErrClusterDraining)
-
-	sm, _ := c.config.Metrics.(types.StrictMetrics)
-
-	c.config.Metrics.IncWriteTotal(ClusterA)
-	if startANano := startA.Load(); startANano > 0 {
-		c.config.Metrics.ObserveWriteDuration(ClusterA, float64(nowNano-startANano)/float64(time.Second))
-	}
-	if errA != nil && !isSkippedA {
-		c.config.Metrics.IncWriteError(ClusterA)
-	} else if isSkippedA && sm != nil {
-		sm.IncWriteSkipped(ClusterA)
-	}
-
-	c.config.Metrics.IncWriteTotal(ClusterB)
-	if startBNano := startB.Load(); startBNano > 0 {
-		c.config.Metrics.ObserveWriteDuration(ClusterB, float64(nowNano-startBNano)/float64(time.Second))
-	}
-	if errB != nil && !isSkippedB {
-		c.config.Metrics.IncWriteError(ClusterB)
-	} else if isSkippedB && sm != nil {
-		sm.IncWriteSkipped(ClusterB)
-	}
+	c.recordWriteLegMetrics(ClusterA, classifyWriteLeg(errA), startA.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterB, classifyWriteLeg(errB), startB.Load(), nowNano)
 
 	c.recordOpOutcomeAt(ClusterA, errA, nowNano)
 	c.recordOpOutcomeAt(ClusterB, errB, nowNano)
