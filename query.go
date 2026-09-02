@@ -236,12 +236,13 @@ func (q *cqlQuery) Iter() Iter {
 // IterContext executes the query and returns an iterator.
 //
 // NOTE: Iterators do NOT support automatic failover. If the selected cluster
-// fails during iteration, the error is returned to the caller.
-// ReadStrategy.OnSuccess is only called if the iterator is closed successfully
-// and no AllowedClusters override is active. Auto-refresh accounting is
-// updated on Close regardless of outcome (success or error), so iterator
-// failures advance the same consecutiveFailures / lastErr stats as Exec
-// reads — only failover and OnFailure routing are skipped.
+// fails during iteration, the error is returned to the caller. Close still
+// reports the outcome: a clean Close is a success for the read strategy
+// (unless an AllowedClusters override is active) and the failover policy,
+// and a cluster error is a failure for both, so an iterator-heavy workload
+// trips the breaker and moves the sticky preference like Scan traffic does.
+// Only the retry itself is skipped. Auto-refresh accounting is updated on
+// Close for every outcome except a caller-context error.
 //
 // If resolveReadTarget returns an error (fail-closed), an errorIter is returned
 // that defers the error to Close(). Always call Close() and check its error.

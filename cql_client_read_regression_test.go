@@ -323,8 +323,6 @@ func TestIter_PageStatePinsClusterAcrossPreferenceChange(t *testing.T) {
 // and the read strategy like any other read failure, and that a clean Close
 // reports a success that resets the breaker's failure count.
 func TestIter_CloseErrorReachesFailoverPolicyAndReadStrategy(t *testing.T) {
-	t.Skip("pending: iterator Close errors are never reported to the failover policy or the read strategy, so an Iter-heavy workload neither trips the breaker nor moves reads, and a clean Close does not reset the breaker either")
-
 	sa, sb := newReadProbeSession(), newReadProbeSession()
 	sticky := policy.NewStickyRead(policy.WithPreferredCluster(ClusterA), policy.WithStickyReadCooldown(0))
 	cb := policy.NewCircuitBreaker(policy.WithThreshold(1))
@@ -333,19 +331,17 @@ func TestIter_CloseErrorReachesFailoverPolicyAndReadStrategy(t *testing.T) {
 		WithFailoverPolicy(cb),
 	)
 
-	// Five iterators on A whose Close fails.
+	// One iterator on A whose Close fails.
 	sa.setIterCloseErr(errReadProbeCluster)
-	for range 5 {
-		it := client.Query("SELECT v FROM t").IterContext(t.Context())
-		require.ErrorIs(t, it.Close(), errReadProbeCluster)
-	}
+	it := client.Query("SELECT v FROM t").IterContext(t.Context())
+	require.ErrorIs(t, it.Close(), errReadProbeCluster)
 	require.Positive(t, cb.Failures(ClusterA), "iterator Close errors must be recorded as failures on cluster A")
 	require.Equal(t, ClusterB, sticky.Preferred(), "iterator Close errors must move the sticky preference to cluster B")
 
 	// One failing iterator on B moves the preference back to A, so the
 	// next iterator is served by A again.
 	sb.setIterCloseErr(errReadProbeCluster)
-	it := client.Query("SELECT v FROM t").IterContext(t.Context())
+	it = client.Query("SELECT v FROM t").IterContext(t.Context())
 	require.ErrorIs(t, it.Close(), errReadProbeCluster)
 	require.Equal(t, int64(1), sb.iters.Load(), "the iterator after the preference moved must be served by cluster B")
 	require.Equal(t, ClusterA, sticky.Preferred(), "a Close error on cluster B must move the sticky preference back to cluster A")
@@ -354,6 +350,6 @@ func TestIter_CloseErrorReachesFailoverPolicyAndReadStrategy(t *testing.T) {
 	sa.setIterCloseErr(nil)
 	it = client.Query("SELECT v FROM t").IterContext(t.Context())
 	require.NoError(t, it.Close())
-	require.Equal(t, int64(6), sa.iters.Load(), "the clean iterator must be served by cluster A")
+	require.Equal(t, int64(2), sa.iters.Load(), "the clean iterator must be served by cluster A")
 	require.Zero(t, cb.Failures(ClusterA), "a clean iterator Close must reset cluster A's failure count")
 }
