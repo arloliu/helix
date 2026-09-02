@@ -224,6 +224,12 @@ with the default policy it still fails as recorded under Phase 0.
 **Verification:** 2a shows an empty behavioural diff in the Phase 0 matrix; each 2b PR states its
 observable effect.
 
+**Status (2026-09-03):** 2a and 2b.1 to 2b.7 done on branch `feat/root-restructure`.
+The read matrix was unchanged by 2a and 2b.1.
+Observable 2b changes (drain leg metrics, `Config()` copy, removed runtime fields,
+new option rejection and warnings, exported capability interfaces) are recorded in
+`CHANGELOG.md` under Unreleased.
+
 ---
 
 ## Phase 3 — Category 1 and 2 defaults, path correctness (`v1.7.0`)

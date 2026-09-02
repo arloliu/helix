@@ -18,6 +18,7 @@ Driver adaptation belongs to `adapter/cql`; policy decisions belong to `policy`;
 
 # Entry points
 
-- client construction: `client.go` → `NewClient`
-- CQL client construction: `cql_client.go` → `NewCQLClient`
-- CQL query execution: `cql_client.go` → `(*CQLClient).Query`
+- CQL client construction: `wiring.go` → `NewCQLClient`
+- CQL query execution: `query.go` → `(*CQLClient).Query`
+- read routing and classification: `read_path.go` → `resolveReadTarget`, `classifyReadErr`
+- dual-write orchestration: `write_path.go` → `executeDualWrite`

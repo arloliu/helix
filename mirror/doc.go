@@ -23,9 +23,11 @@
 // the optional WithOnDrop callback is invoked. The hot path never stalls
 // on the mirror queue.
 //
-// # Durability (Phase 2)
+// # Durability
 //
-// Phase 1 of v1.4.0 ships in-memory workers only; failed mirror writes are
-// logged and counted but not retried. Phase 2 wires the engine to a
-// [types.Replayer] so failed mirror writes are durably retried.
+// On its own the engine retries nothing: a failed mirror write is logged,
+// counted in [Stats], and handed to the configured [ErrorHandler]. The helix
+// client's WithMirrorReplayer option installs a handler that pushes the
+// failed payload onto a replayer and, for the bundled replayer types, runs a
+// [replay.Worker] that drains it back into the mirror destination.
 package mirror

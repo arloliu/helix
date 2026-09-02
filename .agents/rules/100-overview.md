@@ -12,6 +12,13 @@ Helix is a high-availability dual-database client library designed for "Shared N
 ## Project Structure
 ```
 helix/                        # Root = main public package (CQLClient, options)
+├── cql_client.go             # CQLClient struct and session accessors
+├── wiring.go                 # NewCQLClient, component injection, event dispatcher
+├── session_lifecycle.go      # Close, SwapSession, RefreshSession, auto-refresh, health stats
+├── read_path.go              # Read routing, failover, FallbackRead, classifyReadErr
+├── write_path.go             # Dual-write orchestration, replay enqueue, strict writes
+├── slice_read.go, query.go, batch.go, iter.go   # Query, Batch, Iter implementations
+├── strategy.go               # ReadStrategy, WriteStrategy, FailoverPolicy, capability interfaces
 ├── adapter/                  # CQL adapter shims
 │   └── cql/
 │       ├── v1/               # gocql adapter (NewSession)
@@ -42,7 +49,7 @@ helix/                        # Root = main public package (CQLClient, options)
 ```
 
 ## Architecture Notes
-- **Import cycle prevention:** The `types/` package is a leaf — no imports from other helix packages. All shared interfaces, errors, and constants live there.
+- **Import cycle prevention:** The `types/` package is a leaf — no imports from other helix packages. Shared errors, constants, the metrics and event contracts, and `ReplayPayload` live there. The strategy, policy, replayer, worker, and topology interfaces live in the root package because they use root types; `topology/` therefore imports root rather than `types/`.
 - **Dual-write semantics:** Write operations return `nil` if at least one cluster succeeds; failed writes are enqueued for replay. Both clusters failing returns `*types.DualClusterError`.
 - **Adapter pattern:** `adapter/cql/v1` wraps `gocql.Session`; `adapter/cql/v2` wraps the Apache cassandra-gocql-driver. The root package is driver-agnostic.
 - **Code generation:** `replay/` uses `msgp` for MessagePack serialization. Run `make generate` after changing generated types.
