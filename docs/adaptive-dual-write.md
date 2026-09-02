@@ -224,8 +224,10 @@ When a cluster is DEGRADED, writes are executed asynchronously:
 
 ### Handling ErrWriteAsync
 
-The client automatically handles `ErrWriteAsync` as a partial success and
-eagerly enqueues replay as a safety net:
+The client treats `ErrWriteAsync` as an unacknowledged leg: when the other
+cluster acknowledged the write the call returns `nil`, and when neither did
+it returns `*types.NoSynchronousAckError` (see [Acknowledgement](#acknowledgement)).
+Replay is eagerly enqueued for the async leg as a safety net:
 
 ```go
 // This is handled internally by CQLClient
@@ -312,6 +314,18 @@ When AdaptiveDualWrite returns `ErrWriteAsync` or `ErrWriteDropped`:
 3. ReplayWorker retries later if reconciliation is still needed
 
 **Without a Replayer**, dropped writes and later fire-and-forget failures are lost permanently.
+Each such leg is counted in `IncReplayDropped` and reported through the replay-dropped
+callback and `EventReplayDropped` with `types.ErrNoReplayer`, so the loss is visible.
+
+### Acknowledgement
+
+With both clusters degraded, every leg is fire-and-forget and no cluster has
+acknowledged the write when `Exec` returns. The client reports that as
+`*types.NoSynchronousAckError`: `ResultA` and `ResultB` carry each leg's
+result and `Replay` is nil when the write was admitted to the replay queue.
+A caller that runs a durable replayer and accepts "queued" as success selects
+`helix.WithAckMode(helix.AckOnReplayAdmission)`, which returns `nil` for that
+case; a failed enqueue is always an error.
 
 ## Decision Flowchart
 

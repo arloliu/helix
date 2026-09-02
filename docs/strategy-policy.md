@@ -764,7 +764,7 @@ Is write-path latency a primary concern?
 | `SyncDualWrite` | Highest (sequential) | Strong — waits for both | No¹ | Debugging, ordered writes |
 | `AdaptiveDualWrite` | Lowest tail (async degraded) | Eventual on degraded cluster | **Yes** | Latency-SLA-bound production |
 
-> ¹ A `Replayer` is optional for `ConcurrentDualWrite` and `SyncDualWrite`. Both strategies wait for both writes to complete synchronously, so a partial failure is immediately visible as an error. Without a replayer the failed write is not retried, but the caller at least knows about it and can handle it. `AdaptiveDualWrite` is different: writes to a degraded cluster are fire-and-forget and the caller receives `ErrWriteAsync` instead of a real error, so **without a replayer those writes are silently lost**.
+> ¹ A `Replayer` is optional for `ConcurrentDualWrite` and `SyncDualWrite`. Both strategies wait for both writes to complete synchronously, so a partial failure is immediately visible as an error. Without a replayer the failed write is not retried, but the caller at least knows about it and can handle it. `AdaptiveDualWrite` is different: writes to a degraded cluster are fire-and-forget, so **without a replayer a fire-and-forget leg that fails is lost**; the client counts each such leg as a dropped replay and reports it with `types.ErrNoReplayer`, and a write with no synchronous acknowledgement at all returns `*types.NoSynchronousAckError`.
 
 ---
 

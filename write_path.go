@@ -325,13 +325,26 @@ func (c *CQLClient) executeDualWrite(
 	// ErrWriteDropped:    write was never attempted; replay is required for reconciliation.
 	// ErrClusterDraining: leg was skipped; replay delivers the write once the drain lifts.
 	// Real error:         write definitively failed; replay is required.
-	if c.config.Replayer != nil {
-		c.enqueueReplayIfNeeded(ctx, wc, ClusterA, errA, legA)
-		c.enqueueReplayIfNeeded(ctx, wc, ClusterB, errB, legB)
+	replayErrA := c.enqueueReplayIfNeeded(ctx, wc, ClusterA, errA, legA)
+	replayErrB := c.enqueueReplayIfNeeded(ctx, wc, ClusterB, errB, legB)
+
+	// Partial success is success from the caller's perspective: one cluster
+	// holds the write and replay carries it to the other.
+	if legA == legOK || legB == legOK {
+		return nil
 	}
 
-	// Partial success (or all-async) is still success from the caller's perspective.
-	return nil
+	// No cluster acknowledged the write. It exists, at best, in the replay
+	// queue; the caller decides through AckMode whether that counts.
+	replayErr := replayErrA
+	if replayErr == nil {
+		replayErr = replayErrB
+	}
+	if c.config.AckMode == AckOnReplayAdmission && replayErr == nil {
+		return nil
+	}
+
+	return &types.NoSynchronousAckError{ResultA: errA, ResultB: errB, Replay: replayErr}
 }
 
 // enqueueReplayIfNeeded enqueues a replay payload when a cluster write had a non-nil result.
@@ -339,15 +352,20 @@ func (c *CQLClient) executeDualWrite(
 // accurately reflects what happened: async means the write is in flight;
 // dropped means the write was never attempted because the concurrency limit
 // was full; draining means the leg was skipped because the cluster is draining.
+//
+// It returns nil when the leg needed no replay or was enqueued, and the
+// enqueue error, or [types.ErrNoReplayer] when the client has no replayer,
+// otherwise. Either failure is counted as a dropped replay and reported
+// through the replay-dropped callback and event.
 func (c *CQLClient) enqueueReplayIfNeeded(
 	ctx context.Context,
 	wc writeContext,
 	cluster ClusterID,
 	err error,
 	kind writeLegErrKind,
-) {
+) error {
 	if kind == legOK {
-		return
+		return nil
 	}
 
 	// Byte-slice args are copied because the caller may reuse its buffers
@@ -363,8 +381,20 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 		Priority:        wc.priority,
 	}
 
+	if c.config.Replayer == nil {
+		c.config.Metrics.IncReplayDropped(cluster)
+		c.config.Logger.Error("write not acknowledged by cluster and no replayer is configured; it will not be reconciled",
+			"cluster", c.clusterName(cluster),
+			"writeError", err.Error(),
+		)
+		c.emitReplayDropped(cluster, payload, types.ErrNoReplayer)
+
+		return types.ErrNoReplayer
+	}
+
 	// Use context.WithoutCancel so the enqueue succeeds even if the request context is cancelled.
-	if enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload); enqueueErr == nil {
+	enqueueErr := c.config.Replayer.Enqueue(context.WithoutCancel(ctx), payload)
+	if enqueueErr == nil {
 		c.config.Metrics.IncReplayEnqueued(cluster)
 		switch kind {
 		case legDropped:
@@ -385,15 +415,19 @@ func (c *CQLClient) enqueueReplayIfNeeded(
 				"error", err.Error(),
 			)
 		}
-	} else {
-		c.config.Metrics.IncReplayDropped(cluster)
-		c.config.Logger.Error("failed to enqueue write for replay",
-			"cluster", c.clusterName(cluster),
-			"writeError", err.Error(),
-			"enqueueError", enqueueErr.Error(),
-		)
-		c.emitReplayDropped(cluster, payload, enqueueErr)
+
+		return nil
 	}
+
+	c.config.Metrics.IncReplayDropped(cluster)
+	c.config.Logger.Error("failed to enqueue write for replay",
+		"cluster", c.clusterName(cluster),
+		"writeError", err.Error(),
+		"enqueueError", enqueueErr.Error(),
+	)
+	c.emitReplayDropped(cluster, payload, enqueueErr)
+
+	return enqueueErr
 }
 
 // executeStrictDualWrite performs dual-cluster writes with Strict() semantics:

@@ -299,3 +299,21 @@ func TestPriorityLevelConstants(t *testing.T) {
 	assert.Equal(t, PriorityLevel(0), PriorityHigh)
 	assert.Equal(t, PriorityLevel(1), PriorityLow)
 }
+
+func TestNoSynchronousAckError(t *testing.T) {
+	err := &NoSynchronousAckError{ResultA: ErrWriteAsync, ResultB: ErrWriteDropped}
+	assert.ErrorIs(t, err, ErrNoSynchronousAck)
+	assert.ErrorIs(t, err, ErrWriteAsync)
+	assert.ErrorIs(t, err, ErrWriteDropped)
+	assert.NotErrorIs(t, err, ErrNoReplayer)
+	assert.Contains(t, err.Error(), ErrWriteAsync.Error())
+	assert.NotContains(t, err.Error(), "replay:")
+
+	var target *NoSynchronousAckError
+	assert.True(t, errors.As(fmt.Errorf("wrap: %w", err), &target))
+
+	withReplay := &NoSynchronousAckError{ResultA: ErrWriteAsync, ResultB: nil, Replay: ErrNoReplayer}
+	assert.ErrorIs(t, withReplay, ErrNoReplayer)
+	assert.Contains(t, withReplay.Error(), "B: <nil>")
+	assert.Contains(t, withReplay.Error(), "replay: "+ErrNoReplayer.Error())
+}

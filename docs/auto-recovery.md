@@ -290,16 +290,21 @@ The override exists specifically to prevent this race. Don't remove it early bec
 ✅ Drain replay → verify consistency → remove read override → ForceRecover
 ```
 
-### Ignoring ErrWriteAsync
+### Reading NoSynchronousAckError
 
-`ErrWriteAsync` is not a real error — it means the write is running in a background goroutine while the caller continues. However, callers that treat any non-nil error as a failure may unnecessarily retry, creating duplicate work.
+`ErrWriteAsync` never reaches the caller on its own: a write with one
+acknowledged cluster returns `nil`, and a write with none returns
+`*types.NoSynchronousAckError`. That error means the write is at best in the
+replay queue, so retrying it is safe only for idempotent statements; with a
+durable replayer, `helix.WithAckMode(helix.AckOnReplayAdmission)` makes the
+queued case `nil` again.
 
 ```go
 err := client.Query("INSERT ...").Exec()
-if err != nil && !errors.Is(err, types.ErrWriteAsync) {
-    // Actual failure — handle it
+var noAck *types.NoSynchronousAckError
+if errors.As(err, &noAck) && noAck.Replay == nil {
+    // Both clusters degraded; the write is queued for replay.
 }
-// ErrWriteAsync — write is in-flight, replay safety-net is enqueued
 ```
 
 ---

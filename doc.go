@@ -44,8 +44,14 @@
 // # Write Operation Errors
 //
 // Write operations (Exec, ExecContext, batch.Exec) follow this error model:
-//   - nil: At least one cluster succeeded (partial writes are queued for replay)
-//   - error: Both clusters failed (operation completely failed)
+//   - nil: At least one cluster acknowledged the write before the call
+//     returned (a partial write is queued for replay to the other cluster)
+//   - *types.NoSynchronousAckError: No cluster acknowledged the write; every
+//     leg was dispatched in the background, dropped, skipped, or failed. The
+//     error names each leg's result and whether the write was admitted to
+//     the replay queue. WithAckMode(AckOnReplayAdmission) turns the admitted
+//     case back into nil.
+//   - *types.DualClusterError: Both clusters failed (operation completely failed)
 //
 // When both clusters fail, a types.DualClusterError is returned:
 //
@@ -68,6 +74,8 @@
 //   - types.ErrBothClustersDraining: Both clusters in drain mode, writes rejected
 //   - types.ErrWriteAsync: Write sent async to degraded cluster (AdaptiveDualWrite only)
 //   - types.ErrWriteDropped: Write dropped due to concurrency limit (AdaptiveDualWrite only)
+//   - types.ErrNoSynchronousAck: Wrapped by every NoSynchronousAckError
+//   - types.ErrNoReplayer: A failed leg could not be replayed because no Replayer is configured
 //
 // Check for sentinel errors using errors.Is:
 //

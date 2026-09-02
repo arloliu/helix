@@ -211,11 +211,14 @@ type Query interface {
 	// Exec executes a write query using the Write Strategy.
 	//
 	// This triggers concurrent dual-write to both clusters.
-	// Returns nil if at least one cluster succeeds (partial writes
-	// are handled via the Replayer).
+	// Returns nil if at least one cluster acknowledges the write (partial
+	// writes are handled via the Replayer). A write no cluster acknowledged
+	// synchronously returns [types.NoSynchronousAckError] unless the client
+	// runs with [AckOnReplayAdmission]; both clusters failing returns
+	// [types.DualClusterError].
 	//
 	// Returns:
-	//   - error: nil on success (at least one cluster), error if both fail
+	//   - error: nil when at least one cluster acknowledged the write
 	Exec() error
 
 	// ExecContext executes a write query with the given context.
@@ -224,7 +227,7 @@ type Query interface {
 	//   - ctx: Context for cancellation and timeout
 	//
 	// Returns:
-	//   - error: nil on success, error if both clusters fail
+	//   - error: nil when at least one cluster acknowledged the write; see [Query.Exec]
 	ExecContext(ctx context.Context) error
 
 	// Scan executes a read query and scans a single row into dest.
@@ -547,7 +550,7 @@ type Batch interface {
 	// This triggers concurrent dual-write to both clusters.
 	//
 	// Returns:
-	//   - error: nil on success, error if both clusters fail
+	//   - error: nil when at least one cluster acknowledged the write; see [Query.Exec]
 	Exec() error
 
 	// ExecContext executes the batch with the given context.
@@ -556,7 +559,7 @@ type Batch interface {
 	//   - ctx: Context for cancellation and timeout
 	//
 	// Returns:
-	//   - error: nil on success, error if both clusters fail
+	//   - error: nil when at least one cluster acknowledged the write; see [Query.Exec]
 	ExecContext(ctx context.Context) error
 
 	// IterContext executes the batch with context and returns an iterator.

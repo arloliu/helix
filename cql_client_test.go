@@ -1524,6 +1524,21 @@ func (s *mockWriteStrategy) Execute(
 // TestExecuteDualWrite_BothAsync verifies that when both clusters are degraded
 // and return ErrWriteAsync, the client returns nil (writes in flight) and
 // enqueues replay for both clusters — not a DualClusterError.
+// requireNoSynchronousAck asserts that err reports a write no cluster
+// acknowledged, carrying both leg results, and that the write was admitted
+// to the replay queue.
+func requireNoSynchronousAck(t *testing.T, err, wantA, wantB error) {
+	t.Helper()
+	var noAck *types.NoSynchronousAckError
+	require.ErrorAs(t, err, &noAck, "a write with no synchronous acknowledgement must be reported")
+	require.ErrorIs(t, err, types.ErrNoSynchronousAck)
+	require.ErrorIs(t, noAck.ResultA, wantA)
+	require.ErrorIs(t, noAck.ResultB, wantB)
+	require.NoError(t, noAck.Replay, "the write must have been admitted to the replay queue")
+	var dual *types.DualClusterError
+	require.False(t, errors.As(err, &dual), "a write that reached the replay queue is not a two-cluster failure")
+}
+
 func TestExecuteDualWrite_BothAsync(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
@@ -1537,7 +1552,7 @@ func TestExecuteDualWrite_BothAsync(t *testing.T) {
 	defer client.Close()
 
 	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
-	require.NoError(t, err, "both-async must not return an error to caller")
+	requireNoSynchronousAck(t, err, types.ErrWriteAsync, types.ErrWriteAsync)
 
 	// Both clusters must have replay enqueued
 	payloads := replayer.payloads
@@ -1551,8 +1566,8 @@ func TestExecuteDualWrite_BothAsync(t *testing.T) {
 }
 
 // TestExecuteDualWrite_BothDropped verifies that when both clusters are at the
-// fire-and-forget concurrency limit, the client returns nil and enqueues replay
-// for both clusters — not a DualClusterError.
+// fire-and-forget concurrency limit, the client enqueues replay for both
+// clusters and reports the missing acknowledgement — not a DualClusterError.
 func TestExecuteDualWrite_BothDropped(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
@@ -1566,7 +1581,7 @@ func TestExecuteDualWrite_BothDropped(t *testing.T) {
 	defer client.Close()
 
 	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
-	require.NoError(t, err, "both-dropped must not return an error to caller")
+	requireNoSynchronousAck(t, err, types.ErrWriteDropped, types.ErrWriteDropped)
 
 	require.Len(t, replayer.payloads, 2, "replay must be enqueued for both clusters")
 }
@@ -1587,13 +1602,13 @@ func TestExecuteDualWrite_AsyncPlusRealError(t *testing.T) {
 	defer client.Close()
 
 	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
-	require.NoError(t, err, "async+error must not return DualClusterError")
+	requireNoSynchronousAck(t, err, types.ErrWriteAsync, realErr)
 
 	require.Len(t, replayer.payloads, 2, "replay must be enqueued for both A (async) and B (error)")
 }
 
 // TestExecuteDualWrite_DroppedPlusRealError verifies that one dropped + one real error
-// enqueues replay for both and returns nil.
+// enqueues replay for both and reports the missing acknowledgement.
 func TestExecuteDualWrite_DroppedPlusRealError(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
@@ -1608,7 +1623,7 @@ func TestExecuteDualWrite_DroppedPlusRealError(t *testing.T) {
 	defer client.Close()
 
 	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
-	require.NoError(t, err, "dropped+error must not return DualClusterError")
+	requireNoSynchronousAck(t, err, types.ErrWriteDropped, realErr)
 
 	require.Len(t, replayer.payloads, 2)
 }

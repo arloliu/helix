@@ -204,6 +204,61 @@ type ReplayPayload struct {
 	Priority PriorityLevel
 }
 
+// NoSynchronousAckError reports a dual-cluster write that no cluster
+// acknowledged before the call returned: every leg was dispatched in the
+// background ([ErrWriteAsync]), dropped ([ErrWriteDropped]), skipped
+// ([ErrClusterDraining]), or failed.
+//
+// The write may still land through the replay queue: Replay is nil when
+// every leg that needed replay was enqueued, and carries the enqueue error
+// (or [ErrNoReplayer]) otherwise. Callers that accept a replay admission as
+// success select that mode on the client instead of inspecting Replay.
+//
+// errors.Is(err, ErrNoSynchronousAck) matches every value of this type;
+// errors.Is also reaches the individual leg results.
+type NoSynchronousAckError struct {
+	// ResultA is cluster A's leg result.
+	ResultA error
+
+	// ResultB is cluster B's leg result.
+	ResultB error
+
+	// Replay is nil when the write was admitted to the replay queue for
+	// every leg that needed it, otherwise the reason it was not.
+	Replay error
+}
+
+// Error implements the error interface.
+func (e *NoSynchronousAckError) Error() string {
+	msg := ErrNoSynchronousAck.Error() + " (A: " + errString(e.ResultA) + ", B: " + errString(e.ResultB) + ")"
+	if e.Replay != nil {
+		msg += ", replay: " + e.Replay.Error()
+	}
+
+	return msg
+}
+
+// Unwrap exposes [ErrNoSynchronousAck], both leg results, and the replay
+// error to errors.Is and errors.As.
+func (e *NoSynchronousAckError) Unwrap() []error {
+	errs := []error{ErrNoSynchronousAck}
+	for _, err := range []error{e.ResultA, e.ResultB, e.Replay} {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errs
+}
+
+func errString(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+
+	return err.Error()
+}
+
 // PartialWriteError indicates that a Strict() write was acknowledged by exactly
 // one cluster. The other cluster did not respond OK before the deadline; the
 // mutation MAY OR MAY NOT have applied there.
@@ -298,6 +353,14 @@ var (
 	// ErrBothClustersFailed indicates that a write failed on both clusters.
 	// This is returned to the caller as a hard failure.
 	ErrBothClustersFailed = errors.New("helix: write failed on both clusters")
+
+	// ErrNoSynchronousAck is wrapped by every [NoSynchronousAckError]: no
+	// cluster acknowledged the write before the call returned.
+	ErrNoSynchronousAck = errors.New("helix: write was not acknowledged synchronously by any cluster")
+
+	// ErrNoReplayer reports that a write leg which needed replay could not
+	// be enqueued because the client has no Replayer configured.
+	ErrNoReplayer = errors.New("helix: no replayer configured, failed write cannot be replayed")
 
 	// ErrBothClustersDraining indicates both clusters are in drain mode.
 	// No writes can be performed until at least one cluster exits drain mode.
