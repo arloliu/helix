@@ -21,6 +21,9 @@ type Environment struct {
 	Logger      *slog.Logger
 	Metrics     *testutil.TestMetricsCollector
 	MemReplayer *replay.MemoryReplayer
+	// ReplayWorker drains MemReplayer. The harness starts it after the
+	// client exists and stops it before closing the client.
+	ReplayWorker *replay.Worker
 }
 
 // Scenario defines a test scenario interface.

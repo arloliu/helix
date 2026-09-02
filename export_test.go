@@ -35,11 +35,9 @@ func AutoRefreshCtxForTest(c *CQLClient) context.Context {
 }
 
 // WithConfigCaptureForTest returns an Option that stashes the *ClientConfig
-// NewCQLClient builds into dst. All Options mutate the same *ClientConfig
-// instance NewCQLClient threads through setupMirror and the ReplayWorker
-// startup, so capturing it lets tests inspect components such as
-// MirrorEngine or MirrorReplayWorker even when construction later fails and
-// NewCQLClient returns a nil client.
+// NewCQLClient builds into dst, so a test can inspect the effective
+// configuration even when construction later fails and NewCQLClient
+// returns a nil client.
 func WithConfigCaptureForTest(dst **ClientConfig) Option {
 	return func(c *ClientConfig) {
 		*dst = c

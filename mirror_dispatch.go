@@ -37,12 +37,12 @@ func mirrorExecuteFunc(target *CQLClient) replay.ExecuteFunc {
 // regardless of which mirror mode (if any) was configured. Callers use this
 // to unwind mirror startup when a later NewCQLClient initialization step
 // fails after setupMirror has already succeeded.
-func stopMirrorComponents(config *ClientConfig) {
-	if config.MirrorEngine != nil {
-		config.MirrorEngine.Stop()
+func (c *CQLClient) stopMirrorComponents() {
+	if c.runtime.mirrorEngine != nil {
+		c.runtime.mirrorEngine.Stop()
 	}
-	if config.MirrorReplayWorker != nil {
-		config.MirrorReplayWorker.Stop()
+	if c.runtime.mirrorReplayWorker != nil {
+		c.runtime.mirrorReplayWorker.Stop()
 	}
 }
 
@@ -59,22 +59,24 @@ func stopMirrorComponents(config *ClientConfig) {
 //
 // Returns an error if both modes are configured or when worker startup
 // fails. Topology rollback is the caller's responsibility.
-func setupMirror(config *ClientConfig) error {
+func (c *CQLClient) setupMirror() error {
+	config := c.config
 	if config.mirrorTargetSet && config.mirrorPublisherSet {
 		return types.ErrMirrorModeConflict
 	}
 
 	switch {
 	case config.mirrorTargetSet:
-		return setupMirrorTargetMode(config)
+		return c.setupMirrorTargetMode()
 	case config.mirrorPublisherSet:
-		return setupMirrorPublisherMode(config)
+		return c.setupMirrorPublisherMode()
 	default:
 		return nil
 	}
 }
 
-func setupMirrorTargetMode(config *ClientConfig) error {
+func (c *CQLClient) setupMirrorTargetMode() error {
+	config := c.config
 	if config.MirrorTarget == nil {
 		return types.ErrNilMirrorTarget
 	}
@@ -83,12 +85,12 @@ func setupMirrorTargetMode(config *ClientConfig) error {
 
 	opts := defaultMirrorOptions(config)
 	if config.MirrorReplayer != nil {
-		opts = append(opts, mirror.WithOnError(mirrorReplayOnError(config)))
+		opts = append(opts, mirror.WithOnError(c.mirrorReplayOnError()))
 	}
 	opts = append(opts, config.MirrorOptions...)
 
-	config.MirrorEngine = mirror.NewEngine(execute, opts...)
-	config.MirrorEngine.Start()
+	c.runtime.mirrorEngine = mirror.NewEngine(execute, opts...)
+	c.runtime.mirrorEngine.Start()
 
 	if config.MirrorReplayer == nil {
 		return nil
@@ -105,23 +107,24 @@ func setupMirrorTargetMode(config *ClientConfig) error {
 		return nil
 	}
 	if err := worker.Start(); err != nil {
-		config.MirrorEngine.Stop()
+		c.runtime.mirrorEngine.Stop()
 
 		return fmt.Errorf("start mirror replay worker: %w", err)
 	}
-	config.MirrorReplayWorker = worker
+	c.runtime.mirrorReplayWorker = worker
 
 	return nil
 }
 
-func setupMirrorPublisherMode(config *ClientConfig) error {
+func (c *CQLClient) setupMirrorPublisherMode() error {
+	config := c.config
 	if config.MirrorPublisher == nil {
 		return types.ErrNilMirrorPublisher
 	}
 
 	opts := append(defaultMirrorOptions(config), config.MirrorOptions...)
-	config.MirrorEngine = mirror.NewEngine(config.MirrorPublisher.Enqueue, opts...)
-	config.MirrorEngine.Start()
+	c.runtime.mirrorEngine = mirror.NewEngine(config.MirrorPublisher.Enqueue, opts...)
+	c.runtime.mirrorEngine.Start()
 
 	return nil
 }
@@ -150,7 +153,8 @@ func defaultMirrorOptions(config *ClientConfig) []mirror.Option {
 // Caller-supplied [mirror.Option] values are applied after this handler, so
 // a caller's own mirror.WithOnError replaces it entirely — taking the
 // replay enqueue, the metric, and the event with it.
-func mirrorReplayOnError(config *ClientConfig) mirror.ErrorHandler {
+func (c *CQLClient) mirrorReplayOnError() mirror.ErrorHandler {
+	config := c.config
 	replayer := config.MirrorReplayer
 	logger := config.Logger
 	onDropped := config.OnReplayDropped
@@ -159,7 +163,7 @@ func mirrorReplayOnError(config *ClientConfig) mirror.ErrorHandler {
 	mrm, _ := config.Metrics.(types.MirrorReplayMetrics)
 	// The dispatcher is created before mirror setup, so capturing it here
 	// is safe; it is nil when no handler is registered and no-ops then.
-	events := config.events
+	events := c.runtime.events
 
 	return func(p types.ReplayPayload, writeErr error) {
 		enqErr := replayer.Enqueue(context.Background(), p)
@@ -283,7 +287,7 @@ func buildMirrorReplayWorker(
 // The engine's lifecycle (start / stop) is managed by the helix client; do
 // not call Start or Stop on the returned value.
 func (c *CQLClient) Mirror() *mirror.Engine {
-	return c.config.MirrorEngine
+	return c.runtime.mirrorEngine
 }
 
 // cloneArgs returns a copy of args that is safe for the mirror engine to
@@ -344,10 +348,10 @@ const mirrorTargetCluster = ClusterA
 // dispatchMirrorQuery enqueues a captured single-statement write to the
 // mirror engine. Safe to call when the engine is nil or disabled.
 func (c *CQLClient) dispatchMirrorQuery(stmt string, values []any, ts int64, priority PriorityLevel) {
-	if c.config.MirrorEngine == nil {
+	if c.runtime.mirrorEngine == nil {
 		return
 	}
-	c.config.MirrorEngine.TryEnqueue(types.ReplayPayload{
+	c.runtime.mirrorEngine.TryEnqueue(types.ReplayPayload{
 		TargetCluster: mirrorTargetCluster,
 		Query:         stmt,
 		Args:          cloneArgs(values),
@@ -359,10 +363,10 @@ func (c *CQLClient) dispatchMirrorQuery(stmt string, values []any, ts int64, pri
 // dispatchMirrorBatch enqueues a captured batch write to the mirror engine.
 // Safe to call when the engine is nil or disabled.
 func (c *CQLClient) dispatchMirrorBatch(kind BatchType, entries []batchEntry, ts int64, priority PriorityLevel) {
-	if c.config.MirrorEngine == nil {
+	if c.runtime.mirrorEngine == nil {
 		return
 	}
-	c.config.MirrorEngine.TryEnqueue(types.ReplayPayload{
+	c.runtime.mirrorEngine.TryEnqueue(types.ReplayPayload{
 		IsBatch:         true,
 		TargetCluster:   mirrorTargetCluster,
 		BatchType:       kind,

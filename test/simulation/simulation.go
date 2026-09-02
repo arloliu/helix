@@ -37,7 +37,7 @@ type Config struct {
 // StrategyGroupSetupFunc creates a CQLClient with a specific strategy combination.
 // It receives the chaos-wrapped sessions and a fresh metrics collector.
 // The returned MemoryReplayer must belong to the returned client.
-type StrategyGroupSetupFunc func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, error)
+type StrategyGroupSetupFunc func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error)
 
 // StrategyGroup is a set of scenarios that share a specific client configuration.
 // The simulation runs all strategy groups sequentially after the main scenario set,
@@ -350,19 +350,18 @@ func (s *Simulation) setupEnvironment() error {
 		client.Close()
 		return err
 	}
-	client.Config().ReplayWorker = worker
-
 	tracker := workload.NewWriteTracker()
 
 	s.env = &simtypes.Environment{
-		Client:      client,
-		ChaosA:      sessionA,
-		ChaosB:      sessionB,
-		Tracker:     tracker,
-		Stats:       workload.NewWorkloadStats(),
-		Logger:      s.logger,
-		Metrics:     mc,
-		MemReplayer: memReplayer,
+		Client:       client,
+		ChaosA:       sessionA,
+		ChaosB:       sessionB,
+		Tracker:      tracker,
+		Stats:        workload.NewWorkloadStats(),
+		Logger:       s.logger,
+		Metrics:      mc,
+		MemReplayer:  memReplayer,
+		ReplayWorker: worker,
 	}
 
 	// Initialize Schema
@@ -381,8 +380,21 @@ func (s *Simulation) teardown() {
 	if s.stopWorkload != nil {
 		s.stopWorkload()
 	}
-	if s.env != nil && s.env.Client != nil {
+	if s.env != nil {
+		s.closeClient()
+	}
+}
+
+// closeClient stops the replay worker, then closes the client, mirroring the
+// order the library documents for a caller-managed worker.
+func (s *Simulation) closeClient() {
+	if s.env.ReplayWorker != nil {
+		s.env.ReplayWorker.Stop()
+		s.env.ReplayWorker = nil
+	}
+	if s.env.Client != nil {
 		s.env.Client.Close()
+		s.env.Client = nil
 	}
 }
 
@@ -564,19 +576,18 @@ func (s *Simulation) runStrategyGroup(ctx context.Context, group *StrategyGroup)
 	// Close the previous client after truncation.
 	// chaos.Session.Close() is a no-op, so the underlying gocql sessions remain
 	// open and the chaos sessions can be reused by the new client below.
-	if s.env.Client != nil {
-		s.env.Client.Close()
-	}
+	s.closeClient()
 
 	// Create fresh metrics collector and new client.
 	mc := testutil.NewTestMetricsCollector()
-	client, memReplayer, err := group.SetupFunc(s.env.ChaosA, s.env.ChaosB, mc)
+	client, memReplayer, worker, err := group.SetupFunc(s.env.ChaosA, s.env.ChaosB, mc)
 	if err != nil {
 		return []error{fmt.Errorf("strategy group %s setup failed: %w", group.Name, err)}
 	}
 	s.env.Client = client
 	s.env.Metrics = mc
 	s.env.MemReplayer = memReplayer
+	s.env.ReplayWorker = worker
 
 	// Start a dedicated workload for this group so that scenarios have live traffic
 	// to observe. Wait for enough writes to accumulate before running scenarios.

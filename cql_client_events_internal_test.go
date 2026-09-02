@@ -247,12 +247,11 @@ func TestClusterEvents_UnreachableKindsLoggedAtConstruction(t *testing.T) {
 // goroutine was spawned, the handler was never invoked, and SetEventEmitter
 // was never called on the caller-owned policy.
 func TestClusterEvents_ConstructorFailureLeaksNothing(t *testing.T) {
-	var capturedCfg *ClientConfig
 	handlerCalled := make(chan struct{}, 1)
 	workerErr := errors.New("worker start failed")
 	spy := &emitterSpyPolicy{FailoverPolicy: policy.NewActiveFailover()}
 
-	_, err := NewCQLClient(
+	client, err := buildCQLClient(
 		newMockSession(), newMockSession(),
 		WithFailoverPolicy(spy),
 		WithReplayWorker(newMockReplayWorker(workerErr)),
@@ -262,17 +261,17 @@ func TestClusterEvents_ConstructorFailureLeaksNothing(t *testing.T) {
 			default:
 			}
 		}),
-		WithConfigCaptureForTest(&capturedCfg),
 	)
 	require.ErrorIs(t, err, workerErr, "constructor must fail when the replay worker cannot start")
-	require.NotNil(t, capturedCfg)
-	require.NotNil(t, capturedCfg.events, "dispatcher must exist (created before mirror setup)")
-	require.False(t, capturedCfg.events.started.Load(), "dispatcher must not start on the failure path")
+	require.NotNil(t, client)
+	events := client.runtime.events
+	require.NotNil(t, events, "dispatcher must exist (created before mirror setup)")
+	require.False(t, events.started.Load(), "dispatcher must not start on the failure path")
 	require.Zero(t, spy.setCalls.Load(),
 		"SetEventEmitter must never be called on a failed construction path")
 
 	stopDone := make(chan struct{})
-	go func() { capturedCfg.events.stop(); close(stopDone) }()
+	go func() { events.stop(); close(stopDone) }()
 	select {
 	case <-stopDone:
 	case <-time.After(5 * time.Second):
@@ -424,18 +423,15 @@ func TestClusterEvents_DropMetricWiredThroughConstructor(t *testing.T) {
 	first := make(chan struct{})
 	var once sync.Once
 
-	var capturedCfg *ClientConfig
 	client, err := NewCQLClient(newMockSession(), newMockSession(),
 		WithMetrics(m),
 		WithOnClusterEvent(func(types.ClusterEvent) {
 			once.Do(func() { close(first) })
 			<-block // wedge the consumer
 		}),
-		WithConfigCaptureForTest(&capturedCfg),
 	)
 	require.NoError(t, err)
-	require.NotNil(t, capturedCfg)
-	d := capturedCfg.events
+	d := client.runtime.events
 	require.NotNil(t, d)
 
 	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventFailover})

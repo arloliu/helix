@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/mirror"
 )
 
 // CQLClient is the main Helix CQL client for single or dual-cluster operations.
@@ -77,6 +78,11 @@ type CQLClient struct {
 	config *ClientConfig
 	closed atomic.Bool
 
+	// runtime holds the components NewCQLClient builds from the
+	// configuration. They are owned by the client, not by the caller, and
+	// are never visible through Config.
+	runtime clientRuntime
+
 	// Drain mode state
 	drainA        atomic.Bool
 	drainB        atomic.Bool
@@ -111,6 +117,25 @@ type CQLClient struct {
 	recoveryProbeCtx   context.Context
 	recoveryProbeClose context.CancelFunc
 	recoveryProbeWG    sync.WaitGroup
+}
+
+// clientRuntime holds the components NewCQLClient constructs and Close
+// tears down.
+type clientRuntime struct {
+	// events is the dispatcher created when OnClusterEvent is set. It is
+	// created before mirror setup so mirror callbacks can capture it, and
+	// started only after the constructor's last step that can fail and
+	// before the background probe and auto-refresh goroutines launch.
+	// Nil when no handler is registered; every method no-ops on nil.
+	events *eventDispatcher
+
+	// mirrorEngine is the mirror engine built when WithMirror or
+	// WithMirrorPublisher is set; otherwise nil.
+	mirrorEngine *mirror.Engine
+
+	// mirrorReplayWorker drains the mirror replayer in target mode when
+	// WithMirrorReplayer names a recognised replayer; otherwise nil.
+	mirrorReplayWorker ReplayWorker
 }
 
 // sessionHolder wraps a cql.Session so it can live in an atomic.Pointer.
@@ -268,10 +293,18 @@ func (c *CQLClient) SessionB() cql.Session {
 	return c.loadSessionB()
 }
 
-// Config returns the current client configuration.
+// Config returns a copy of the effective client configuration.
+//
+// The copy reflects the options the client was built with, including the
+// replayer and worker created by [WithAutoMemoryWorker]. Modifying the
+// returned value has no effect on the client: the configuration is fixed
+// once [NewCQLClient] returns. Slice-typed fields share their backing
+// arrays with the client.
 //
 // Returns:
-//   - *ClientConfig: The client's configuration
+//   - *ClientConfig: A copy of the client's configuration
 func (c *CQLClient) Config() *ClientConfig {
-	return c.config
+	cfg := *c.config
+
+	return &cfg
 }

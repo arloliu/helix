@@ -97,7 +97,6 @@ func TestS11_ReplayOverflow_ConservationLaw(t *testing.T) {
 	)
 	require.NoError(t, worker.Start())
 	t.Cleanup(worker.Stop)
-	client.Config().ReplayWorker = worker
 
 	// Phase 1: pause A. Now every dual-write returns errA=err, errB=nil.
 	// The cql_client enqueues a replay payload for A on each write. With

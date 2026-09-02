@@ -179,10 +179,6 @@ type ClientConfig struct {
 	// MirrorTarget is non-nil. Set via [WithMirror].
 	MirrorOptions []mirror.Option
 
-	// MirrorEngine is the constructed mirror engine. Populated during
-	// NewCQLClient when MirrorTarget is set; otherwise nil.
-	MirrorEngine *mirror.Engine
-
 	// mirrorTargetSet tracks whether [WithMirror] was called. Used to
 	// distinguish "user passed nil" from "option was never called" —
 	// without it, WithMirror(nil) silently disables mirroring instead of
@@ -204,10 +200,6 @@ type ClientConfig struct {
 	// MirrorReplayWorkerOpts configures the auto-built mirror replay worker.
 	// Set via [WithMirrorReplayer].
 	MirrorReplayWorkerOpts []replay.WorkerOption
-
-	// MirrorReplayWorker drains MirrorReplayer. Populated during
-	// NewCQLClient when MirrorReplayer's concrete type is recognized.
-	MirrorReplayWorker ReplayWorker
 
 	// SessionRefresher is an optional caller-supplied factory used by
 	// [CQLClient.RefreshSession] to build a replacement [cql.Session] for a
@@ -237,13 +229,6 @@ type ClientConfig struct {
 	// recoveryProbeOff disables the recovery probe even when AdaptiveDualWrite
 	// is detected. Set via [WithRecoveryProbeDisabled].
 	recoveryProbeOff bool
-
-	// events is the internal dispatcher created by NewCQLClient when
-	// OnClusterEvent is set. It is created before mirror setup so mirror
-	// callbacks can capture it, and started only after the constructor's
-	// last step that can fail and before the background probe and
-	// auto-refresh goroutines launch.
-	events *eventDispatcher
 }
 
 // SessionRefresher builds a fresh [cql.Session] for the given cluster.

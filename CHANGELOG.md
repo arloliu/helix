@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CQLClient.Config` returns a copy of the effective configuration instead
+  of the client's live pointer, so assigning to its fields after
+  construction no longer changes the client. Callers that set
+  `Config().ReplayWorker` after building a worker with `DefaultExecuteFunc`
+  must instead stop that worker themselves before `Close`, as
+  [docs/replay-system.md](docs/replay-system.md) shows.
+- `ClientConfig` no longer exposes the components `NewCQLClient` builds:
+  the `MirrorEngine` and `MirrorReplayWorker` fields are gone. The mirror
+  engine is still available through `CQLClient.Mirror`.
+
 - A write to a dual cluster with one cluster draining now runs through the
   configured `WriteStrategy` like every other write: the draining cluster's
   leg returns `types.ErrClusterDraining` without contacting the session and

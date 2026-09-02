@@ -71,7 +71,7 @@ func installMirrorEngine(t *testing.T, client *CQLClient, exec mirror.ExecuteFun
 	t.Helper()
 	e := mirror.NewEngine(exec, opts...)
 	e.Start()
-	client.config.MirrorEngine = e
+	client.runtime.mirrorEngine = e
 	t.Cleanup(func() { e.Stop() })
 	return e
 }
@@ -436,7 +436,7 @@ func TestMirrorReplayerEndToEndExhaustsRetriesViaOnDrop(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer client.Close()
-	require.NotNil(t, client.config.MirrorReplayWorker)
+	require.NotNil(t, client.runtime.mirrorReplayWorker)
 
 	require.NoError(t, client.Query("INSERT INTO t (k) VALUES (?)", "y").Mirror().ExecContext(context.Background()))
 
@@ -503,7 +503,7 @@ func TestMirrorReplayerUnrecognizedTypeNoWorker(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
-	require.Nil(t, client.config.MirrorReplayWorker, "custom replayer must not auto-build a worker")
+	require.Nil(t, client.runtime.mirrorReplayWorker, "custom replayer must not auto-build a worker")
 }
 
 // recordingReplayer is a Replayer that captures Enqueued payloads, suitable
