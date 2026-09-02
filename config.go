@@ -252,7 +252,7 @@ type SessionRefresher func(ctx context.Context, cluster ClusterID, lastErr error
 //   - TimestampProvider: Uses time.Now().UnixMicro() for idempotent writes
 //   - Metrics: No-op collector (silent, no overhead)
 //   - Logger: No-op logger (silent, no overhead)
-//   - ClusterNames: "ClusterA" and "ClusterB"
+//   - ClusterNames: "A" and "B" (see [types.DefaultClusterNames])
 //
 // Strategy and policy defaults (all nil):
 //   - ReadStrategy: nil - Falls back to ClusterA only (no load balancing)

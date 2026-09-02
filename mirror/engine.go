@@ -18,7 +18,7 @@ import (
 // WithTimestamp(payload.Timestamp).
 //
 // ExecuteFunc is a type alias for [replay.ExecuteFunc] — the mirror engine's
-// initial dispatch and a [replay.Worker] draining a [types.Replayer] share
+// initial dispatch and a [replay.Worker] draining a replayer share
 // the same execution shape.
 type ExecuteFunc = replay.ExecuteFunc
 
@@ -31,9 +31,9 @@ type DropHandler func(payload types.ReplayPayload)
 // ErrorHandler is invoked synchronously by a worker after [ExecuteFunc]
 // returns a non-nil error. It receives the original payload and the error.
 //
-// Typical use is to push the failed payload onto a [types.Replayer] for
-// durable retry; helix wires this internally when [helix.WithMirrorReplayer]
-// is configured. Custom handlers may also implement alerting, escalation,
+// Typical use is to push the failed payload onto a replayer (the helix
+// Replayer interface) for durable retry; the helix client wires this
+// internally when its WithMirrorReplayer option is configured. Custom handlers may also implement alerting, escalation,
 // or alternative durability stores.
 //
 // The handler runs on a worker goroutine and blocks the worker until it
