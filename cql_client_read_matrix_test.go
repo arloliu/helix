@@ -34,11 +34,12 @@ const (
 type readOutcome string
 
 const (
-	outcomeOK         readOutcome = "ok"
-	outcomeNotFound   readOutcome = "not-found"
-	outcomeRowLimit   readOutcome = "row-limit"
-	outcomeCtxErr     readOutcome = "ctx-error"
-	outcomeClusterErr readOutcome = "cluster-error"
+	outcomeOK            readOutcome = "ok"
+	outcomeNotFound      readOutcome = "not-found"
+	outcomeRowLimit      readOutcome = "row-limit"
+	outcomeCtxErr        readOutcome = "ctx-error"      // the caller's context ended before the cluster answered
+	outcomeDriverTimeout readOutcome = "driver-timeout" // the driver reports a context error while the caller's context is live
+	outcomeClusterErr    readOutcome = "cluster-error"
 )
 
 // readMode names the routing mode the client is in.
@@ -70,7 +71,7 @@ var readEntries = []readEntry{
 }
 
 var readOutcomes = []readOutcome{
-	outcomeOK, outcomeNotFound, outcomeRowLimit, outcomeCtxErr, outcomeClusterErr,
+	outcomeOK, outcomeNotFound, outcomeRowLimit, outcomeCtxErr, outcomeDriverTimeout, outcomeClusterErr,
 }
 
 var readModes = []readMode{modePlain, modeOverride, modeDrain, modeFallback}
@@ -234,6 +235,9 @@ func scriptSession(entry readEntry, outcome readOutcome) *matrixSession {
 	case outcomeCtxErr:
 		s.scanErr = context.Canceled
 		s.iterErr = context.Canceled
+	case outcomeDriverTimeout:
+		s.scanErr = context.DeadlineExceeded
+		s.iterErr = context.DeadlineExceeded
 	case outcomeClusterErr:
 		s.scanErr = errMatrixCluster
 		s.iterErr = errMatrixCluster
@@ -246,6 +250,11 @@ func scriptSession(entry readEntry, outcome readOutcome) *matrixSession {
 func runReadEntry(t *testing.T, client *CQLClient, entry readEntry, outcome readOutcome) error {
 	t.Helper()
 	ctx := t.Context()
+	if outcome == outcomeCtxErr {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		cancel()
+	}
 	q := client.Query("SELECT v FROM t WHERE k = ?", 1)
 	if outcome == outcomeRowLimit {
 		q = q.MaxRows(1)
@@ -402,9 +411,13 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 	case outcomeRowLimit:
 		// The row cap is an application limit: no health, no second cluster.
 		obs.err = errRowLimit
-	case outcomeCtxErr, outcomeClusterErr:
-		// A caller-cancelled context is classified exactly like a cluster
-		// fault today on every entry point.
+	case outcomeCtxErr:
+		// The caller gave up: its context error comes back verbatim and
+		// nothing is recorded against either cluster on any entry point.
+		obs.err = errCtx
+	case outcomeDriverTimeout, outcomeClusterErr:
+		// A driver-side timeout with a live caller context is a cluster
+		// fault and is classified exactly like any other cluster error.
 		obs.err = errCtx
 		if outcome == outcomeClusterErr {
 			obs.err = errCluster

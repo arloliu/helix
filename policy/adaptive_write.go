@@ -620,7 +620,7 @@ func (a *AdaptiveDualWrite) Execute(
 	}
 
 	// Update health state based on results
-	a.updateHealthState(latencyA, latencyB, resultA, resultB, degradedA, degradedB)
+	a.updateHealthState(ctx, latencyA, latencyB, resultA, resultB)
 
 	return resultA, resultB
 }
@@ -734,13 +734,18 @@ func (a *AdaptiveDualWrite) fireAndForget(
 }
 
 // updateHealthState updates cluster health based on write results.
+//
+// Failures observed after the caller's context ended are the caller's
+// doing and record no strike; successes still count as latency samples.
 func (a *AdaptiveDualWrite) updateHealthState(
+	ctx context.Context,
 	latencyA, latencyB time.Duration,
 	errA, errB error,
-	_, _ bool, // degradedA, degradedB - reserved for future use
 ) {
 	// Handle errors as strikes (but not ErrWriteAsync which is expected for degraded clusters)
-	a.handleErrors(errA, errB)
+	if ctx.Err() == nil {
+		a.handleErrors(errA, errB)
+	}
 
 	// Track which clusters have valid latency data
 	hasLatencyA := errA == nil
@@ -1276,7 +1281,7 @@ func (a *AdaptiveDualWrite) ExecuteStrict(
 
 	// Pass ErrClusterDegraded for skipped clusters — handleErrors excludes it
 	// from strike accounting, and updateHealthState treats non-nil as no latency.
-	a.updateHealthState(latencyA, latencyB, errA, errB, degradedA, degradedB)
+	a.updateHealthState(ctx, latencyA, latencyB, errA, errB)
 
 	return errA, errB
 }

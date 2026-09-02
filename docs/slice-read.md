@@ -22,7 +22,7 @@ Drains the query into a `[]map[string]any` — one map per row, keyed by column 
 | `(rows, nil)` | N > 0 rows |
 | `(nil, nil)` | Zero rows on all attempted clusters |
 | `(nil, ErrRowLimitExceeded)` | Row cap exceeded before drain completed |
-| `(nil, err)` | Cluster or context error |
+| `(nil, err)` | Cluster error, or the caller's own context error (never counted against the cluster) |
 
 ### `SliceScan` / `SliceScanContext`
 

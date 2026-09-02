@@ -193,27 +193,36 @@ func TestErrRowLimitExceeded_RootReExport(t *testing.T) {
 }
 
 // TestClassifyReadErr verifies the single read classification function
-// assigns each error family its own kind and that only context and cluster
+// assigns each error family its own kind, attributes any error observed
+// after the caller's context ended to the caller, and that only cluster
 // errors count as health signals.
 func TestClassifyReadErr(t *testing.T) {
+	live := t.Context()
+	dead, cancel := context.WithCancel(t.Context())
+	cancel()
+
 	cases := []struct {
 		name string
+		ctx  context.Context
 		err  error
 		want readErrKind
 	}{
-		{"nil", nil, readOK},
-		{"not-found", types.ErrNotFound, readNotFound},
-		{"wrapped not-found", fmt.Errorf("wrap: %w", types.ErrNotFound), readNotFound},
-		{"row-limit", types.ErrRowLimitExceeded, readRowLimit},
-		{"caller not-found", &scanFnNotFoundShieldError{err: types.ErrNotFound}, readCallerNotFound},
-		{"canceled", context.Canceled, readCtxErr},
-		{"deadline", fmt.Errorf("wrap: %w", context.DeadlineExceeded), readCtxErr},
-		{"cluster", errors.New("real cluster error"), readClusterErr},
-		{"session closed", types.ErrSessionClosed, readClusterErr},
+		{"nil", live, nil, readOK},
+		{"not-found", live, types.ErrNotFound, readNotFound},
+		{"wrapped not-found", live, fmt.Errorf("wrap: %w", types.ErrNotFound), readNotFound},
+		{"row-limit", live, types.ErrRowLimitExceeded, readRowLimit},
+		{"caller not-found", live, &scanFnNotFoundShieldError{err: types.ErrNotFound}, readCallerNotFound},
+		{"driver timeout with live context", live, context.DeadlineExceeded, readClusterErr},
+		{"cluster", live, errors.New("real cluster error"), readClusterErr},
+		{"session closed", live, types.ErrSessionClosed, readClusterErr},
+		{"context error after cancel", dead, context.Canceled, readCtxErr},
+		{"cluster error after cancel", dead, errors.New("real cluster error"), readCtxErr},
+		{"not-found after cancel", dead, types.ErrNotFound, readNotFound},
+		{"success after cancel", dead, nil, readOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, classifyReadErr(tc.err))
+			require.Equal(t, tc.want, classifyReadErr(tc.ctx, tc.err))
 		})
 	}
 
@@ -221,6 +230,6 @@ func TestClassifyReadErr(t *testing.T) {
 	require.False(t, readNotFound.isHealthSignal())
 	require.False(t, readRowLimit.isHealthSignal())
 	require.False(t, readCallerNotFound.isHealthSignal())
-	require.True(t, readCtxErr.isHealthSignal())
+	require.False(t, readCtxErr.isHealthSignal())
 	require.True(t, readClusterErr.isHealthSignal())
 }

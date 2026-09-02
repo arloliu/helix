@@ -108,6 +108,17 @@ func TestSliceScan_BothEmpty_ReturnsZeroNil(t *testing.T) {
 // Phase 4: propagateAltErr — SliceMap
 // ─────────────────────────────────────────────
 
+// canceledContext returns a context that is already done, standing in for
+// a caller that gave up. The slice fixtures ignore the context, so the
+// scripted rows still play back.
+func canceledContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	return ctx
+}
+
 func TestSliceMap_AltCtxCanceled_PropagatesWithoutHealthImpact(t *testing.T) {
 	specA := &sliceSpec{cols: []string{"id"}}
 	specB := &sliceSpec{cols: []string{"id"}, closeErr: context.Canceled}
@@ -118,12 +129,12 @@ func TestSliceMap_AltCtxCanceled_PropagatesWithoutHealthImpact(t *testing.T) {
 		WithFailoverPolicy(policy),
 	)
 
-	rows, err := client.Query("SELECT id FROM t").FallbackRead().SliceMapContext(context.Background())
+	rows, err := client.Query("SELECT id FROM t").FallbackRead().SliceMapContext(canceledContext(t))
 	require.ErrorIs(t, err, context.Canceled, "ctx errors on the alt leg propagate to caller")
 	assert.Nil(t, rows, "discard-on-error contract: no partial rows leak")
 
 	assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterB),
-		"ctx errors are caller-driven (nonHealthAltErr) → no IncReadError on alt")
+		"ctx errors are caller-driven → no IncReadError on alt")
 	assert.Empty(t, policy.RecordFailureCalls,
 		"ctx errors on alt do not advance per-cluster health")
 }
@@ -268,7 +279,7 @@ func TestSliceScan_AltCtxCanceledBeforeScanFn_PropagatesWithoutHealthImpact(t *t
 	)
 
 	rowCount, err := client.Query("SELECT id FROM t").FallbackRead().SliceScanContext(
-		context.Background(), func(_ RowScanner) error {
+		canceledContext(t), func(_ RowScanner) error {
 			t.Fatal("scanFn must not be invoked when alt errors before any row")
 			return nil
 		})
@@ -296,7 +307,7 @@ func TestSliceScan_AltCtxCanceledAfterScanFn_PropagatesViaScanFnInvokedFlag(t *t
 	)
 
 	rowCount, err := client.Query("SELECT id FROM t").FallbackRead().SliceScanContext(
-		context.Background(), func(r RowScanner) error {
+		canceledContext(t), func(r RowScanner) error {
 			var v int
 			return r.Scan(&v)
 		})
