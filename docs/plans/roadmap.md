@@ -170,7 +170,8 @@ nightly CI runs simulation.
 - 0.2 done for R-2, R-3, R-4, FO-1, FO-2, FO-3, FB-1, FB-2, FB-3, FB-5, D-3
   (skipped tests in the root and replay packages).
   R-1 and D-5 land with their fixes in Phase 1.
-- 0.3 and 0.4 not started.
+- 0.3 done: `cql_client_read_matrix_test.go` pins all six entry points × five results × four modes.
+- 0.4 done: `make test-simulation` and `.github/workflows/nightly.yml` (e2e + simulation quick profile).
 
 ---
 

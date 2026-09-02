@@ -1,0 +1,53 @@
+name: Nightly
+
+on:
+  schedule:
+    # 18:00 UTC every day
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run e2e tests
+        run: make test-e2e
+
+  simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run simulation quick profile
+        run: make test-simulation
+
+      - name: Upload simulation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-reports
+          path: reports/
+          if-no-files-found: ignore
