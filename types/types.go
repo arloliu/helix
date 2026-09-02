@@ -142,11 +142,11 @@ type BatchType byte
 
 // Batch types matching gocql.
 //
-// WARNING: CounterBatch operations are NOT idempotent. Counter updates
+// CounterBatch operations are NOT idempotent: counter updates
 // (e.g., "UPDATE ... SET counter = counter + 1") are additive, so replaying
-// them after a partial failure will cause double-counting. Do not use
-// CounterBatch with the Helix Replay System if you require exactly-once
-// semantics. Consider using a separate reconciliation strategy for counters.
+// them after a partial failure would double-count. The Helix client treats
+// a CounterBatch as non-idempotent automatically: it is never replayed and
+// a partial failure is reported to the caller as a PartialWriteError.
 const (
 	LoggedBatch   BatchType = 0
 	UnloggedBatch BatchType = 1

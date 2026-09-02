@@ -101,6 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Query.NonIdempotent` and `Batch.NonIdempotent` mark a statement that
+  must not be applied twice, such as a counter update or a collection
+  append. The write takes the strict path (synchronous on both clusters,
+  no fire-and-forget, no replay) and a partial failure surfaces as
+  `*types.PartialWriteError`; unlike `Strict`, it may be combined with
+  `Mirror`. A `CounterBatch` is non-idempotent automatically, so it is
+  no longer replayed.
 - `helix.DeferredWriteResult`: the optional interface on a write strategy's
   fire-and-forget leg result through which the client learns the leg's
   final outcome.

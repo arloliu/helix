@@ -10,12 +10,10 @@ import (
 
 // Batch creates a new Batch for grouping multiple mutations.
 //
-// WARNING: CounterBatch operations are NOT idempotent. If a counter update
-// partially fails (succeeds on one cluster, fails on another), or if
-// AdaptiveDualWrite returns ErrWriteAsync and the client eagerly enqueues a replay
-// safety net while the background write also succeeds, the Replay System can
-// apply the same increment twice. Avoid using CounterBatch with dual-cluster mode
-// if you require exactly-once semantics.
+// A CounterBatch is non-idempotent (see [Batch.NonIdempotent]): it is
+// written synchronously to both clusters, never replayed, and a partial
+// failure surfaces as [*types.PartialWriteError] so the caller decides how
+// to reconcile the counter.
 //
 // Parameters:
 //   - kind: Type of batch (Logged, Unlogged, or Counter)
@@ -27,6 +25,8 @@ func (c *CQLClient) Batch(kind BatchType) Batch {
 		client:  c,
 		kind:    kind,
 		entries: make([]batchEntry, 0),
+		// Counter updates are additive: a replay could apply them twice.
+		nonIdempotent: kind == CounterBatch,
 	}
 }
 
@@ -131,6 +131,7 @@ type cqlBatch struct {
 	priority          *PriorityLevel
 	mirror            bool
 	strict            bool
+	nonIdempotent     bool
 }
 
 func (b *cqlBatch) Query(stmt string, args ...any) Batch {
@@ -185,6 +186,11 @@ func (b *cqlBatch) Mirror() Batch {
 
 func (b *cqlBatch) Strict() Batch {
 	b.strict = true
+	return b
+}
+
+func (b *cqlBatch) NonIdempotent() Batch {
+	b.nonIdempotent = true
 	return b
 }
 
@@ -271,7 +277,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		isBatch:      true,
 		batchType:    b.kind,
 		batchEntries: b.entries, // Pass directly, convert lazily if needed for replay
-		strict:       b.strict,
+		strict:       b.strict || b.nonIdempotent,
 	}
 
 	err = b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {

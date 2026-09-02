@@ -58,6 +58,7 @@ type cqlQuery struct {
 	fallbackRead      bool
 	mirror            bool
 	strict            bool
+	nonIdempotent     bool
 }
 
 func (q *cqlQuery) WithContext(ctx context.Context) Query {
@@ -115,6 +116,11 @@ func (q *cqlQuery) Mirror() Query {
 
 func (q *cqlQuery) Strict() Query {
 	q.strict = true
+	return q
+}
+
+func (q *cqlQuery) NonIdempotent() Query {
+	q.nonIdempotent = true
 	return q
 }
 
@@ -224,7 +230,9 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		args:      q.values,
 		timestamp: ts,
 		priority:  priority,
-		strict:    q.strict,
+		// A non-idempotent statement takes the strict path: synchronous on
+		// both clusters, no fire-and-forget, no replay.
+		strict: q.strict || q.nonIdempotent,
 	}
 
 	err = q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {

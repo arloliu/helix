@@ -304,6 +304,17 @@ if errors.Is(err, helix.ErrClusterDraining) {
 
 ---
 
+## NonIdempotent Writes
+
+`Query.NonIdempotent()` and `Batch.NonIdempotent()` take the same write path
+as `Strict()` — synchronous on both clusters, no fire-and-forget, no replay,
+`*types.PartialWriteError` on partial failure — but express a different
+intent: the statement must not be applied twice. Use it for counter updates
+and collection appends. A `CounterBatch` is marked automatically. The one
+difference from `Strict()` is that `NonIdempotent()` may be combined with
+`Mirror()`, because the mirror destination applies the statement once on
+its own pair.
+
 ## Custom Write Strategy Support
 
 All three built-in write strategies (`ConcurrentDualWrite`, `SyncDualWrite`,
