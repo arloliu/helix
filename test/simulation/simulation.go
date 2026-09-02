@@ -338,10 +338,14 @@ func (s *Simulation) setupEnvironment() error {
 	}
 
 	// Wire replay worker to the client's default executor so it honors batch payloads.
-	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
+	workerOpts := []replay.WorkerOption{
 		replay.WithWorkerMetrics(mc),
 		replay.WithWorkerLogger(slogLogger{s.logger}),
-	)
+	}
+	if s.config.Settings != nil && s.config.Settings.Helix.Replay.RetryPolicy == "retained" {
+		workerOpts = append(workerOpts, replay.WithRetryPolicy(replay.RetryWhileRetained))
+	}
+	worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(), workerOpts...)
 	if err := worker.Start(); err != nil {
 		client.Close()
 		return err
