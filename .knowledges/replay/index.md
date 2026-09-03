@@ -14,7 +14,7 @@ The root package decides when to enqueue a partial write; replay payload contrac
 
 # Entries
 
-* None yet.
+* [Cluster gate](/replay/cluster-gate.md) - how a worker holds replay back per cluster without spending attempts or deliveries.
 
 # Entry points
 
