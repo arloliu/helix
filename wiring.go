@@ -10,6 +10,7 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/internal/metrics"
+	"github.com/arloliu/helix/internal/typeutil"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/types"
 )
@@ -30,7 +31,7 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 				mw.SetMetrics(config.Metrics)
 			}
 		}
-		if config.ReadStrategy != nil {
+		if !typeutil.IsNilInterface(config.ReadStrategy) {
 			if rs, ok := config.ReadStrategy.(Instrumentable); ok && !rs.MetricsConfigured() {
 				rs.SetMetrics(config.Metrics)
 			}
@@ -237,7 +238,7 @@ func (c *CQLClient) startEventDelivery() {
 // starts, so a component never observes a half-installed emitter.
 func (c *CQLClient) autoInjectEventEmitter() {
 	config := c.config
-	if config.ReadStrategy != nil {
+	if !typeutil.IsNilInterface(config.ReadStrategy) {
 		if rs, ok := config.ReadStrategy.(EventEmitterSetter); ok {
 			rs.SetEventEmitter(c.runtime.events)
 		}
@@ -281,6 +282,25 @@ func (c *CQLClient) emitReplayDropped(cluster ClusterID, payload types.ReplayPay
 		Cluster: cluster,
 		Err:     enqueueErr,
 	})
+}
+
+// startReplayWorker hands the configured replay worker the event
+// dispatcher and starts it. The worker is an event source, so it holds the
+// dispatcher before its goroutines can emit; without a handler there is no
+// dispatcher and a caller-supplied worker keeps its own emitter. A failed
+// Start takes the dispatcher back, because the constructor stops it next.
+func (c *CQLClient) startReplayWorker() error {
+	es, emits := c.config.ReplayWorker.(EventEmitterSetter)
+	inject := emits && c.runtime.events != nil
+	if inject {
+		es.SetEventEmitter(c.runtime.events)
+	}
+	err := c.config.ReplayWorker.Start()
+	if err != nil && inject {
+		es.SetEventEmitter(nil)
+	}
+
+	return err
 }
 
 // abortEventDispatcher stops the event dispatcher created earlier in
@@ -460,12 +480,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	// following the same shutdown order as Close: topology watcher, then
 	// mirror engine, then mirror replay worker.
 	if config.ReplayWorker != nil {
-		// The worker is an event source, so it receives the dispatcher
-		// before its goroutines can emit.
-		if es, ok := config.ReplayWorker.(EventEmitterSetter); ok {
-			es.SetEventEmitter(client.runtime.events)
-		}
-		if err := config.ReplayWorker.Start(); err != nil {
+		if err := client.startReplayWorker(); err != nil {
 			if client.topologyClose != nil {
 				client.topologyClose()
 			}

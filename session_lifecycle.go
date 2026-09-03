@@ -261,8 +261,10 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // a hard upper bound on Close latency.
 //
 // Close also drains the mirror engine synchronously, which on a full
-// queue can take minutes; mirror.WithDrainTimeout bounds it. A replay or
-// mirror callback (replay.WithOnDrop, replay.WithOnError, mirror.WithOnDrop,
+// queue can take minutes. mirror.WithDrainTimeout bounds only how long
+// queued captures keep starting; Close still waits for the executions and
+// synchronous callbacks in flight. A replay or mirror callback
+// (replay.WithOnDrop, replay.WithOnError, mirror.WithOnDrop,
 // mirror.WithOnError) must not call Close either: Close waits for the
 // worker that invoked it.
 //
