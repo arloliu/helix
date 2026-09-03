@@ -269,7 +269,7 @@ func TestPrimaryOnlyRead_FailoverB_ProbesA(t *testing.T) {
 	require.True(t, ok, "should provide failover target when B fails in failed-over state")
 	require.Equal(t, types.ClusterA, alt, "should probe ClusterA")
 	require.True(t, strategy.failedOver.Load(), "failedOver must stay true until A is proven healthy")
-	require.NotEqual(t, int64(0), strategy.failoverTime.Load(), "failoverTime must not be cleared")
+	require.NotEqual(t, int64(0), strategy.nextProbeAt.Load(), "nextProbeAt must not be cleared")
 
 	// Select still returns B because failedOver is still set
 	require.Equal(t, types.ClusterB, strategy.Select(t.Context()))
@@ -277,7 +277,7 @@ func TestPrimaryOnlyRead_FailoverB_ProbesA(t *testing.T) {
 	// OnSuccess(A) completes the recovery — now state resets
 	strategy.OnSuccess(types.ClusterA)
 	require.False(t, strategy.failedOver.Load(), "failedOver should be cleared after OnSuccess(A)")
-	require.Equal(t, int64(0), strategy.failoverTime.Load(), "failoverTime should be reset after OnSuccess(A)")
+	require.Equal(t, int64(0), strategy.nextProbeAt.Load(), "nextProbeAt should be reset after OnSuccess(A)")
 	require.Equal(t, types.ClusterA, strategy.Select(t.Context()))
 }
 
@@ -304,7 +304,7 @@ func TestPrimaryOnlyRead_FailoverBoth_DualFailure(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, types.ClusterB, alt)
 	require.True(t, strategy.failedOver.Load())
-	firstFailoverTime := strategy.failoverTime.Load()
+	firstProbeAt := strategy.nextProbeAt.Load()
 
 	// B fails → probe A (state stays failed-over)
 	alt, ok = strategy.OnFailure(types.ClusterB, nil)
@@ -317,8 +317,8 @@ func TestPrimaryOnlyRead_FailoverBoth_DualFailure(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, types.ClusterB, alt)
 	require.True(t, strategy.failedOver.Load())
-	require.GreaterOrEqual(t, strategy.failoverTime.Load(), firstFailoverTime,
-		"failoverTime should be refreshed on re-failover")
+	require.GreaterOrEqual(t, strategy.nextProbeAt.Load(), firstProbeAt,
+		"nextProbeAt should be refreshed on re-failover")
 }
 
 // TestStickyRead_CooldownStillFailsOver verifies that after A→B failover,

@@ -19,18 +19,24 @@ import (
 // Cooldown only gates future state changes; it does not trigger passive probing
 // back to a recovered cluster in the absence of another read failure.
 //
-// StickyRead has no programmatic way to return the preferred cluster to its
-// original choice once it has failed over (unlike PrimaryOnlyRead.Reset).
-// To force preferred back to a specific cluster, the operator must:
-//   - wait for the current preferred to fail (failover will swap them again,
-//     subject to cooldown), or
-//   - reconstruct a new StickyRead with WithPreferredCluster and rebuild the
-//     CQLClient.
+// Within the cooldown the preferred cluster still moves when the current
+// preferred fails and the other cluster is known good: it has reported a
+// success (OnSuccess) since its own last failure, for example through the
+// per-request failover that ran on it. Two clusters that keep failing in
+// turn therefore do not oscillate, while a preferred that is hard down after
+// a single blip on the other is abandoned on the second failed read.
+//
+// [StickyRead.SetPreferred] and [StickyRead.Reset] let an operator move the
+// preference by hand.
 type StickyRead struct {
 	preferred        atomic.Value // types.ClusterID
+	initial          types.ClusterID
 	mu               sync.RWMutex
 	lastFailoverTime time.Time
 	failoverCooldown time.Duration
+	// knownBad marks a cluster that failed and has not succeeded since;
+	// index 0 is cluster A and index 1 is cluster B.
+	knownBad [2]atomic.Bool
 }
 
 // StickyReadOption configures a StickyRead strategy.
@@ -64,7 +70,7 @@ func WithPreferredCluster(cluster types.ClusterID) StickyReadOption {
 		if !isKnownCluster(cluster) {
 			return
 		}
-		s.preferred.Store(cluster)
+		s.initial = cluster
 	}
 }
 
@@ -87,16 +93,30 @@ func NewStickyRead(opts ...StickyReadOption) *StickyRead {
 	// Use crypto/rand for secure randomness
 	n, err := rand.Int(rand.Reader, big.NewInt(2))
 	if err != nil || n.Int64() == 0 {
-		s.preferred.Store(types.ClusterA)
+		s.initial = types.ClusterA
 	} else {
-		s.preferred.Store(types.ClusterB)
+		s.initial = types.ClusterB
 	}
 
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.preferred.Store(s.initial)
 
 	return s
+}
+
+// knownBadSlot returns the known-bad mark of a cluster, or nil for an
+// unknown cluster.
+func (s *StickyRead) knownBadSlot(cluster types.ClusterID) *atomic.Bool {
+	switch cluster {
+	case types.ClusterA:
+		return &s.knownBad[0]
+	case types.ClusterB:
+		return &s.knownBad[1]
+	default:
+		return nil
+	}
 }
 
 // Select returns the preferred cluster for reading.
@@ -117,18 +137,23 @@ func (s *StickyRead) Select(_ context.Context) types.ClusterID {
 // OnSuccess is called when a read succeeds.
 //
 // Parameters:
-//   - cluster: The cluster that succeeded (unused for sticky reads)
-func (s *StickyRead) OnSuccess(_ types.ClusterID) {
-	// Nothing to do for sticky reads on success
+//   - cluster: The cluster that succeeded; its known-bad mark is cleared
+func (s *StickyRead) OnSuccess(cluster types.ClusterID) {
+	// Store only on the transition so the steady state stays read-only.
+	if bad := s.knownBadSlot(cluster); bad != nil && bad.Load() {
+		bad.Store(false)
+	}
 }
 
 // OnFailure handles read failures and determines failover.
 //
 // If the failed cluster is the preferred one, returns the alternative cluster
 // for failover. When cooldown has passed, the preferred cluster is also
-// switched. When cooldown is still active, the alternative is returned for the
-// current request but preferred is not changed — this prevents reads from
-// failing entirely while still avoiding rapid preferred-cluster oscillation.
+// switched. When cooldown is still active, the preferred cluster is switched
+// only if the alternative is known good (see the type documentation);
+// otherwise the alternative is returned for the current request but preferred
+// is not changed — this prevents reads from failing entirely while still
+// avoiding rapid preferred-cluster oscillation.
 // Cooldown expiry alone does not change the preferred cluster; a later failure
 // on the current preferred cluster is still required to switch back.
 //
@@ -144,6 +169,9 @@ func (s *StickyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterI
 	if !ok {
 		return "", false
 	}
+	if bad := s.knownBadSlot(cluster); bad != nil {
+		bad.Store(true)
+	}
 
 	// Only failover if the preferred cluster failed
 	if cluster != preferred {
@@ -158,30 +186,50 @@ func (s *StickyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterI
 		alternative = types.ClusterA
 	}
 
-	// Check cooldown — if still within cooldown, return the alternative for
-	// this request but do NOT change preferred. This prevents reads from
-	// failing entirely when the current preferred is down and cooldown blocks
-	// a state change (e.g., A failed → switched to B → B fails within cooldown).
-	s.mu.RLock()
-	if time.Since(s.lastFailoverTime) < s.failoverCooldown {
-		s.mu.RUnlock()
-		return alternative, true
-	}
-	s.mu.RUnlock()
-
-	// Update preferred cluster and record failover time
+	// Within the cooldown the preference moves only when the alternative is
+	// known good; otherwise the alternative serves this request alone, so
+	// reads still succeed while two flapping clusters cannot swap the
+	// preference back and forth.
+	alternativeBad := s.knownBadSlot(alternative).Load()
+	now := time.Now()
 	s.mu.Lock()
-	// Double-check cooldown under write lock
-	if time.Since(s.lastFailoverTime) < s.failoverCooldown {
-		s.mu.Unlock()
-		// Still return alternative for this request even under the write-lock re-check
+	defer s.mu.Unlock()
+	if now.Sub(s.lastFailoverTime) < s.failoverCooldown && alternativeBad {
 		return alternative, true
 	}
 	s.preferred.Store(alternative)
-	s.lastFailoverTime = time.Now()
-	s.mu.Unlock()
+	s.lastFailoverTime = now
 
 	return alternative, true
+}
+
+// SetPreferred moves the preferred cluster by hand and restarts the
+// cooldown, for an operator who knows which cluster should serve reads.
+// An unknown cluster is ignored.
+//
+// Parameters:
+//   - cluster: The cluster to prefer from now on
+func (s *StickyRead) SetPreferred(cluster types.ClusterID) {
+	if !isKnownCluster(cluster) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preferred.Store(cluster)
+	s.lastFailoverTime = time.Now()
+}
+
+// Reset returns the preference to the cluster chosen at construction (by
+// [WithPreferredCluster] or at random), clears the cooldown, and forgets
+// which clusters are known bad.
+func (s *StickyRead) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preferred.Store(s.initial)
+	s.lastFailoverTime = time.Time{}
+	for i := range s.knownBad {
+		s.knownBad[i].Store(false)
+	}
 }
 
 // Preferred returns the current preferred cluster.
@@ -202,7 +250,7 @@ func (s *StickyRead) Preferred() types.ClusterID {
 // fails, reads are redirected to Cluster B until one of:
 //   - [PrimaryOnlyRead.Reset] is called manually, or
 //   - The optional recovery timeout (set via [WithPrimaryOnlyRecoveryTimeout])
-//     elapses, after which Select will probe ClusterA again on the next call, or
+//     elapses, after which Select hands ClusterA to one caller as the probe, or
 //   - Cluster B itself fails while in the failed-over state, at which point
 //     OnFailure returns ClusterA as a probe; if that probe succeeds,
 //     [PrimaryOnlyRead.OnSuccess] resets the failover state.
@@ -211,8 +259,12 @@ func (s *StickyRead) Preferred() types.ClusterID {
 // Cluster B also fails — if only ClusterA recovers while B stays healthy, the
 // client stays on ClusterB indefinitely.
 type PrimaryOnlyRead struct {
-	failedOver      atomic.Bool
-	failoverTime    atomic.Int64 // Unix nano of last failover; 0 = not failed over
+	failedOver atomic.Bool
+	// nextProbeAt is the Unix nano after which one caller may be handed
+	// ClusterA as the recovery probe; 0 = not failed over.
+	// The Select that wins the probe re-arms it, so an unreported probe
+	// expires after another recovery timeout.
+	nextProbeAt     atomic.Int64
 	recoveryTimeout time.Duration
 }
 
@@ -222,9 +274,11 @@ type PrimaryOnlyReadOption func(*PrimaryOnlyRead)
 // WithPrimaryOnlyRecoveryTimeout sets the duration after which a failed-over
 // PrimaryOnlyRead will automatically attempt to return reads to ClusterA.
 //
-// When the timeout elapses, the next Select call returns ClusterA as a probe.
-// If that read succeeds (OnSuccess called), the strategy remains on ClusterA.
-// If it fails again (OnFailure called), the failover timer resets.
+// When the timeout elapses, one Select call returns ClusterA as the probe;
+// the other callers keep reading ClusterB until that probe reports, and a
+// probe that never reports expires after another timeout.
+// If the probe read succeeds (OnSuccess called), the strategy returns to
+// ClusterA. If it fails again (OnFailure called), the failover timer resets.
 //
 // A zero or negative value disables auto-recovery (default: disabled).
 //
@@ -269,10 +323,14 @@ func (p *PrimaryOnlyRead) Select(_ context.Context) types.ClusterID {
 	if !p.failedOver.Load() {
 		return types.ClusterA
 	}
-	// Auto-recovery: if recovery timeout is set and has elapsed, probe ClusterA.
+	// Auto-recovery: once the recovery timeout has elapsed, hand cluster A
+	// to exactly one caller as the probe; everyone else keeps reading B
+	// until that probe reports. A probe whose caller never reports (its
+	// context ended) expires after another recovery timeout.
 	if p.recoveryTimeout > 0 {
-		failoverAt := p.failoverTime.Load()
-		if failoverAt > 0 && time.Duration(time.Now().UnixNano()-failoverAt) >= p.recoveryTimeout {
+		nowNs := time.Now().UnixNano()
+		next := p.nextProbeAt.Load()
+		if next > 0 && nowNs >= next && p.nextProbeAt.CompareAndSwap(next, nowNs+int64(p.recoveryTimeout)) {
 			return types.ClusterA
 		}
 	}
@@ -289,8 +347,7 @@ func (p *PrimaryOnlyRead) Select(_ context.Context) types.ClusterID {
 //   - cluster: The cluster that succeeded
 func (p *PrimaryOnlyRead) OnSuccess(cluster types.ClusterID) {
 	if cluster == types.ClusterA && p.failedOver.Load() {
-		p.failedOver.Store(false)
-		p.failoverTime.Store(0)
+		p.Reset()
 	}
 }
 
@@ -314,7 +371,7 @@ func (p *PrimaryOnlyRead) OnSuccess(cluster types.ClusterID) {
 func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterID, bool) {
 	if cluster == types.ClusterA {
 		p.failedOver.Store(true)
-		p.failoverTime.Store(time.Now().UnixNano())
+		p.nextProbeAt.Store(time.Now().Add(p.recoveryTimeout).UnixNano())
 		return types.ClusterB, true
 	}
 
@@ -324,7 +381,7 @@ func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.Clu
 	// may be available again.
 	//
 	// State is NOT reset here. If the probe succeeds, the caller invokes
-	// OnSuccess(ClusterA) which clears failedOver/failoverTime. If A is also
+	// OnSuccess(ClusterA) which resets the failover state. If A is also
 	// down, both attempts fail (DualClusterError) and the next Select() still
 	// returns ClusterB — avoiding request-level A/B flipping.
 	//
@@ -341,7 +398,7 @@ func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.Clu
 // Reset resets the failover state back to primary immediately.
 func (p *PrimaryOnlyRead) Reset() {
 	p.failedOver.Store(false)
-	p.failoverTime.Store(0)
+	p.nextProbeAt.Store(0)
 }
 
 // RoundRobinRead implements a read strategy that alternates between clusters.

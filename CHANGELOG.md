@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.StickyRead.SetPreferred(cluster)` and `policy.StickyRead.Reset()`
+  let an operator move the read preference by hand.
 - `replay.WithClusterGate(func(types.ClusterID) bool)` lets a replay worker
   hold execution back per cluster on both backends: a gated payload is
   parked without consuming an attempt or its retry window, a fetched NATS
@@ -70,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behavior change
 
+- `policy.StickyRead` moves its preference during the cooldown when the
+  current preferred cluster fails and the other cluster is known good (it
+  reported a success since its own last failure). Previously the cooldown
+  pinned reads to a dead preferred for up to five minutes after a single
+  blip on the other cluster; two clusters that keep failing in turn still
+  do not oscillate.
+- `policy.PrimaryOnlyRead` hands cluster A to exactly one caller as the
+  recovery probe once the recovery timeout has elapsed; the other callers
+  keep reading cluster B until that probe reports. Previously every
+  concurrent caller was sent to A at once. A probe whose caller never
+  reports expires after another recovery timeout.
 - `policy.CircuitBreaker` and `policy.LatencyCircuitBreaker` no longer turn
   a caller's read into the recovery probe. Previously, once `resetTimeout`
   had elapsed since the last failure, `ShouldFailover` returned false so the
