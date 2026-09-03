@@ -240,7 +240,7 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 //   adaptive.ForceRecover(helix.ClusterA)
 ```
 
-The probe has no effect when the `WriteStrategy` is not `*policy.AdaptiveDualWrite`. It is
+The probe has no effect when the `WriteStrategy` does not implement `helix.ProbeReporter`. It is
 idle when both clusters are healthy (the ticker still fires, but the probe is not called unless
 `IsDegraded` is true).
 

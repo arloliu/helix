@@ -572,7 +572,7 @@ is set):
 |-------------|-------------------------|--------|
 | `DispositionDefer` | `types.ErrClusterUnreachable` (no connections, closed session, coordinator unavailable) | Retry on the backoff schedule; never counts toward the poison budget |
 | `DispositionRetry` | Every other error | Same as defer |
-| `DispositionDeadLetter` | `types.ErrInvalidCluster` | Counts toward the poison budget (`WithMaxAttempts` on either backend); when it is spent the payload is dropped |
+| `DispositionDeadLetter` | `types.ErrInvalidCluster`, `types.ErrInvalidTimestamp` | Counts toward the poison budget (`WithMaxAttempts` on either backend); when it is spent the payload is dropped |
 
 The bundled adapters wrap driver connectivity errors in
 `types.ErrClusterUnreachable`, so the default classifier works out of the box
@@ -611,7 +611,10 @@ payload never blocks payloads for the other cluster.
 
 ### Drop reasons
 
-`OnDrop` fires once per dropped payload.
+`OnDrop` fires once per payload the worker itself drops.
+It cannot see a NATS message the stream evicts on its own (`MaxAge`
+expiry, or `DiscardOld` under a stream limit); watch those through
+JetStream's stream and consumer metrics.
 The reason appears in the worker log and, on collectors implementing
 `types.ReplayBacklogMetrics`, as the `reason` label of
 `{prefix}_replay_worker_dropped_total{cluster,reason}`:

@@ -61,8 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   level, a nil slice or map replays as NULL, and the bundled adapters bind
   `types.Duration` inside a `[]types.Duration` and inside the decoded
   `[]any` / `map[string]any` collections.
-- A write to a cluster that `AdaptiveDualWrite` has degraded is applied
-  once. The fire-and-forget leg's result now implements the new
+- A write to a cluster that `AdaptiveDualWrite` has degraded is no longer
+  replayed beside a background attempt that succeeds (an ambiguous failure
+  such as a timeout can still lead to a replay of a statement the cluster
+  applied). The fire-and-forget leg's result now implements the new
   `helix.DeferredWriteResult` interface, and the client enqueues replay
   for that leg only if the background write reports a failure, instead of
   eagerly as a safety net beside a write that then succeeds. `Close`

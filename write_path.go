@@ -416,9 +416,9 @@ func (c *CQLClient) replayLeg(
 		}
 		admission.err = dropErr
 		admission.done.Store(true)
-		// Release the leg before reporting so a late report never delays
-		// Close for longer than the admission itself.
-		c.deferred.done()
+		// Report before releasing the leg, so Close returns only after the
+		// drop handler ran and the event was admitted.
+		defer c.deferred.done()
 		if dropErr != nil {
 			c.emitReplayDropped(payload.TargetCluster, payload, dropErr)
 		}
