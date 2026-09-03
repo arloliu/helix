@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/arloliu/helix/adapter/cql"
 	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
 	cqlv2 "github.com/arloliu/helix/adapter/cql/v2"
@@ -206,4 +208,31 @@ func createKVTableOnBoth(t *testing.T, prefix string) string {
 	})
 
 	return tableName
+}
+
+// ensureReachable makes sure the driver's session for cluster can answer a
+// query before a scenario starts, rebuilding the sessions when it cannot.
+//
+// A previous scenario's Pause can leave the v2 driver with an empty
+// connection pool that it does not refill for a long time (see
+// SPIKE_FINDINGS.md section 2), so a later subtest would start against a
+// session that fails every request at once.
+func ensureReachable(t *testing.T, cluster *testutil.CQLCluster, d driverCase) {
+	t.Helper()
+	probe := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var v string
+
+		return d.wrap(cluster).Query("SELECT release_version FROM system.local").ScanContext(ctx, &v) == nil
+	}
+	if probe() {
+		return
+	}
+	t.Logf("[%s] session cannot reach the cluster; rebuilding sessions", d.name)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	require.NoError(t, cluster.Reconnect(ctx))
+	require.Eventually(t, probe, 30*time.Second, 200*time.Millisecond,
+		"[%s] session must answer after the rebuild", d.name)
 }
