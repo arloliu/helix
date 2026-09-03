@@ -231,8 +231,8 @@ it returns `*types.NoSynchronousAckError` (see [Acknowledgement](#acknowledgemen
 The result `AdaptiveDualWrite` returns for a fire-and-forget leg implements
 `helix.DeferredWriteResult`: the client snapshots the write and enqueues it
 for replay only if the background goroutine later reports a failure, so a
-statement that lands in the background is applied exactly once on the
-degraded cluster. A custom strategy that returns a plain
+statement whose background attempt succeeds is not applied a second time
+by an eager replay. A custom strategy that returns a plain
 `types.ErrWriteAsync` gets the older behaviour, an immediate replay enqueue
 as a safety net, which relies on the client-generated timestamp for
 idempotency.

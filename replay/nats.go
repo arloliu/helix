@@ -75,9 +75,11 @@ type NATSReplayerConfig struct {
 	// Default: 30 seconds
 	AckWait time.Duration
 
-	// MaxDeliver is the maximum number of delivery attempts for a message.
-	// After this many failed attempts, the message is dropped by NATS.
-	// The OnDrop callback will be called when this occurs.
+	// MaxDeliver is the maximum number of delivery attempts for a message
+	// under [RetryBounded]: after this many failed attempts NATS stops
+	// redelivering it and the worker's OnDrop callback runs. Under the
+	// default [RetryWhileRetained] it is unused; the consumer is created
+	// with unlimited deliveries and the stream's MaxAge bounds retries.
 	// Default: 5
 	MaxDeliver int
 
@@ -301,10 +303,12 @@ func WithAckWait(d time.Duration) NATSReplayerOption {
 	}
 }
 
-// WithMaxDeliver sets the maximum number of delivery attempts for a message.
+// WithMaxDeliver sets the maximum number of delivery attempts for a message
+// under [RetryBounded].
 //
-// After this many failed delivery attempts (Nak's), the message is dropped by NATS.
-// The OnDrop callback in WorkerConfig will be called when this occurs.
+// After this many failed delivery attempts (Nak's), NATS stops redelivering
+// the message and the OnDrop callback in WorkerConfig runs. The option has
+// no effect under the default [RetryWhileRetained].
 //
 // Parameters:
 //   - n: Maximum delivery attempts (default: 5)

@@ -251,3 +251,41 @@ func TestWrite_DeferredLegCompletedBeforeRegistrationIsSynchronous(t *testing.T)
 	require.ErrorIs(t, noAck.Replay, errFull)
 	require.Equal(t, 2, drops, "both rejected legs are reported")
 }
+
+// TestClose_WaitsForDeferredDropHandler asserts that Close returns only
+// after the replay-dropped handler for a background leg has run.
+func TestClose_WaitsForDeferredDropHandler(t *testing.T) {
+	deferred := &manualDeferredError{}
+	entered, release := make(chan struct{}), make(chan struct{})
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(&deferredStrategy{result: deferred}),
+		WithReplayer(&failingReplayer{err: errors.New("replay queue full")}),
+		WithOnReplayDropped(func(types.ReplayPayload, error) {
+			close(entered)
+			<-release
+		}),
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, client.Query("INSERT INTO t (id) VALUES (1)").Exec())
+	go deferred.complete(errors.New("background failure"))
+	<-entered
+
+	closed := make(chan struct{})
+	go func() {
+		client.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close must wait for the drop handler")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(regressionWaitTimeout):
+		t.Fatal("Close must return once the drop handler finished")
+	}
+}

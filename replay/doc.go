@@ -10,10 +10,10 @@
 // concurrent background retries, and network unreliability (e.g., JetStream Naks)
 // can cause failed writes to be replayed out of order.
 //
-// To prevent older replays from overwriting newer data, you MUST configure
-// [helix.WithTimestampProvider] on your client. This injects client-side
-// timestamps into all writes, ensuring they remain idempotent regardless
-// of execution order.
+// To prevent older replays from overwriting newer data, every write carries
+// a client-side timestamp: the client stamps writes with
+// [helix.DefaultTimestampProvider] unless [helix.WithTimestampProvider]
+// replaces it. That keeps writes idempotent regardless of execution order.
 //
 // # CAS / LWT Safety
 //
