@@ -52,7 +52,7 @@ func TestNewCQLClient_WarnsWhenRecoveryProbeHasNoReportingStrategy(t *testing.T)
 	require.NoError(t, err)
 	t.Cleanup(client.Close)
 
-	require.Contains(t, warnings(logger), "WithRecoveryProbe has no effect: the write strategy does not report degraded clusters, so no probe will run")
+	require.Contains(t, warnings(logger), "WithRecoveryProbe has no effect: neither the write strategy nor the failover policy asks for probes, so no probe will run")
 }
 
 func TestNewCQLClient_RouteVetoWarnings(t *testing.T) {

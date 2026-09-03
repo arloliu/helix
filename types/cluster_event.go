@@ -26,9 +26,9 @@ const (
 
 	// EventCircuitBreakerClosed fires when a previously open circuit
 	// breaker closes. Reason distinguishes the two causes: a successful
-	// operation ("operation succeeded"), or the reset timeout elapsing
-	// with no recovery, which ends the open span on the next recorded
-	// failure ("reset timeout elapsed").
+	// operation on that cluster ("operation succeeded"), or a successful
+	// recovery probe the client ran after the reset timeout ("probe
+	// succeeded").
 	EventCircuitBreakerClosed ClusterEventKind = "circuit_breaker_closed"
 
 	// EventWriteDegraded fires when AdaptiveDualWrite transitions a cluster

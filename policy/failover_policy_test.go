@@ -221,30 +221,33 @@ func TestCircuitBreakerIndependentClusters(t *testing.T) {
 }
 
 func TestCircuitBreakerResetTimeout(t *testing.T) {
-	policy := NewCircuitBreaker(
+	cb := NewCircuitBreaker(
 		WithThreshold(3),
-		WithResetTimeout(10*time.Millisecond),
+		WithResetTimeout(1*time.Hour),
 	)
 
-	// Record failures
-	policy.RecordFailure(types.ClusterA)
-	policy.RecordFailure(types.ClusterA)
-	require.Equal(t, 2, policy.Failures(types.ClusterA))
+	// Failures keep accumulating across a quiet gap: the reset timeout no
+	// longer discards a stale count, it only decides when an open breaker
+	// may be probed.
+	cb.RecordFailure(types.ClusterA)
+	cb.RecordFailure(types.ClusterA)
+	elapseResetTimeout(t, cb, types.ClusterA)
+	_, ok := cb.TryBeginFailoverProbe(types.ClusterA)
+	require.False(t, ok, "a closed breaker never reserves a probe")
+	cb.RecordFailure(types.ClusterA)
+	require.Equal(t, 3, cb.Failures(types.ClusterA))
+	require.True(t, cb.ShouldFailover(types.ClusterA, nil), "the third failure trips the breaker")
 
-	// Wait for reset timeout
-	time.Sleep(20 * time.Millisecond)
-
-	// Next failure should reset counter
-	policy.RecordFailure(types.ClusterA)
-	require.Equal(t, 1, policy.Failures(types.ClusterA))
+	_, ok = cb.TryBeginFailoverProbe(types.ClusterA)
+	require.False(t, ok, "the reset timeout has not elapsed since the last failure")
+	elapseResetTimeout(t, cb, types.ClusterA)
+	_, ok = cb.TryBeginFailoverProbe(types.ClusterA)
+	require.True(t, ok, "an open breaker reserves a probe once the reset timeout has elapsed")
 }
 
 // TestCircuitBreaker_ZeroResetTimeout_AccumulatesFailures verifies that when
-// ResetTimeout is set to 0, the timed half-open transition is disabled and
-// the breaker still trips at threshold. ShouldFailover documents that
-// resetTimeout=0 disables timed transitions, but RecordFailure must honor
-// the same semantics — without this, every failure after the first resets
-// failures to 1 and the breaker can never accumulate to threshold.
+// ResetTimeout is set to 0 the breaker still trips at threshold, never
+// reserves a probe, and stays open until an explicit RecordSuccess.
 func TestCircuitBreaker_ZeroResetTimeout_AccumulatesFailures(t *testing.T) {
 	policy := NewCircuitBreaker(
 		WithThreshold(3),
@@ -259,8 +262,11 @@ func TestCircuitBreaker_ZeroResetTimeout_AccumulatesFailures(t *testing.T) {
 	require.True(t, policy.ShouldFailover(types.ClusterA, nil),
 		"breaker must trip at threshold even with resetTimeout=0")
 
-	// Without an explicit RecordSuccess, the breaker stays open indefinitely.
+	// Without an explicit RecordSuccess, the breaker stays open indefinitely:
+	// a zero reset timeout never reserves a probe either.
 	require.True(t, policy.ShouldFailover(types.ClusterA, nil))
+	_, ok := policy.TryBeginFailoverProbe(types.ClusterA)
+	require.False(t, ok, "resetTimeout=0 never reserves a probe")
 
 	// Explicit success is the only path back to closed.
 	policy.RecordSuccess(types.ClusterA)
@@ -515,39 +521,45 @@ func TestCircuitBreaker_ReentrantEmitterKeepsStateAndMetricConsistent(t *testing
 }
 
 // elapseResetTimeout backdates the cluster's last-failure timestamp far
-// enough that the next RecordFailure takes the reset-timeout branch. The
-// breaker reads the wall clock directly and has no injectable clock, so
+// enough that the next TryBeginFailoverProbe sees an elapsed reset timeout.
+// The breaker reads the wall clock directly and has no injectable clock, so
 // rewinding the timestamp is what makes these tests deterministic — no
 // wall-clock wait, and the configured timeout can stay long enough that a
-// slow machine cannot trip the branch by accident.
+// slow machine cannot reserve a probe by accident.
 func elapseResetTimeout(t *testing.T, cb *CircuitBreaker, cluster types.ClusterID) {
 	t.Helper()
 
-	backdatedNs := time.Now().Add(-2 * cb.resetTimeout).UnixNano()
-	switch cluster {
-	case types.ClusterA:
-		require.NotZero(t, cb.lastFailureA.Load(), "no failure recorded yet: nothing to backdate")
-		cb.lastFailureA.Store(backdatedNs)
-	case types.ClusterB:
-		require.NotZero(t, cb.lastFailureB.Load(), "no failure recorded yet: nothing to backdate")
-		cb.lastFailureB.Store(backdatedNs)
-	default:
-		t.Fatalf("unknown cluster %q", cluster)
-	}
+	state := cb.stateFor(cluster)
+	require.NotNil(t, state, "unknown cluster %q", cluster)
+	require.NotZero(t, state.lastFailure.Load(), "no failure recorded yet: nothing to backdate")
+	state.lastFailure.Store(time.Now().Add(-2 * cb.resetTimeout).UnixNano())
 }
 
-// TestCircuitBreaker_ResetTimeoutClosesOpenBreaker covers a breaker that
-// trips, goes quiet past its reset timeout, and then sees one more failure
-// that is not enough to re-trip. The reset branch ends the open span, so
-// the Open event gets its matching Closed and the state gauge returns to
-// closed instead of staying stuck at open.
-func TestCircuitBreaker_ResetTimeoutClosesOpenBreaker(t *testing.T) {
+// reserveProbe trips nothing and only reserves: it backdates the last
+// failure and returns the token of the reservation it then makes.
+func reserveProbe(t *testing.T, cb *CircuitBreaker, cluster types.ClusterID) uint64 {
+	t.Helper()
+
+	elapseResetTimeout(t, cb, cluster)
+	token, ok := cb.TryBeginFailoverProbe(cluster)
+	require.True(t, ok, "an open breaker past its reset timeout must reserve a probe")
+
+	return token
+}
+
+// TestCircuitBreaker_ProbeSucceededClosesBreaker covers open → half-open →
+// closed through the client-driven probe: the reservation reports half-open
+// on the gauge without an event, and the successful completion closes the
+// breaker with its own reason.
+func TestCircuitBreaker_ProbeSucceededClosesBreaker(t *testing.T) {
 	em := &recordingEmitter{}
 	mc := testutil.NewTestMetricsCollector()
+	logged := make([]string, 0)
 	cb := NewCircuitBreaker(
 		WithThreshold(2),
 		WithResetTimeout(1*time.Hour),
 		WithCircuitBreakerMetrics(mc),
+		WithCircuitBreakerLogger(&captureLogger{messages: &logged}),
 	)
 	cb.SetEventEmitter(em)
 
@@ -556,27 +568,40 @@ func TestCircuitBreaker_ResetTimeoutClosesOpenBreaker(t *testing.T) {
 	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds())
 	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge must report open after the trip")
 
-	elapseResetTimeout(t, cb, types.ClusterA)
-	cb.RecordFailure(types.ClusterA) // resets the counter to 1: closes without re-tripping
+	token := reserveProbe(t, cb, types.ClusterA)
+	require.Equal(t, 1, mc.CircuitBreakerState[types.ClusterA], "a reservation reports half-open")
+	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds(), "half-open emits no event")
+	require.True(t, cb.ShouldFailover(types.ClusterA, nil), "half-open still fails over: the probe is the client's, not the caller's")
+	_, again := cb.TryBeginFailoverProbe(types.ClusterA)
+	require.False(t, again, "one reservation at a time")
+
+	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded)
 
 	events := em.snapshot()
 	require.Equal(t,
 		[]types.ClusterEventKind{types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed},
 		em.kinds(), "the open span must be closed exactly once")
 	require.Equal(t, types.ClusterA, events[1].Cluster)
-	require.Equal(t, "reset timeout elapsed", events[1].Reason)
-	require.Equal(t, 1, cb.Failures(types.ClusterA), "the failure that closed the span starts a new count")
-	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA],
-		"gauge must return to closed, not stay stuck at open")
-	require.EqualValues(t, 1, mc.CircuitBreakerTrips[types.ClusterA], "no re-trip below threshold")
+	require.Equal(t, "probe succeeded", events[1].Reason)
+	require.Equal(t, 0, cb.Failures(types.ClusterA))
+	require.False(t, cb.ShouldFailover(types.ClusterA, nil))
+	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA], "gauge must return to closed")
+	require.EqualValues(t, 1, mc.CircuitBreakerTrips[types.ClusterA])
+	require.Equal(t, []string{
+		"circuit breaker tripped",
+		"circuit breaker half-open: recovery probe reserved",
+		"circuit breaker closed",
+	}, logged)
+
+	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeFailed)
+	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA], "a stale token has no effect")
+	require.Len(t, em.kinds(), 2)
 }
 
-// TestCircuitBreaker_ResetTimeoutClosesOpenBreaker_ClusterB is the cluster B
-// mirror of TestCircuitBreaker_ResetTimeoutClosesOpenBreaker. The reset-timeout
-// branch in RecordFailure is duplicated per cluster rather than shared, so a
-// regression confined to the B branch would otherwise go uncaught by this
-// file's cluster A coverage.
-func TestCircuitBreaker_ResetTimeoutClosesOpenBreaker_ClusterB(t *testing.T) {
+// TestCircuitBreaker_ProbeFailedReopensAndRestartsTimeout covers half-open →
+// open: no event, no new trip, the gauge back at open, and the reset timeout
+// restarted so the next reservation waits again.
+func TestCircuitBreaker_ProbeFailedReopensAndRestartsTimeout(t *testing.T) {
 	em := &recordingEmitter{}
 	mc := testutil.NewTestMetricsCollector()
 	cb := NewCircuitBreaker(
@@ -588,93 +613,95 @@ func TestCircuitBreaker_ResetTimeoutClosesOpenBreaker_ClusterB(t *testing.T) {
 
 	cb.RecordFailure(types.ClusterB)
 	cb.RecordFailure(types.ClusterB) // trips
-	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds())
-	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterB], "gauge must report open after the trip")
+	token := reserveProbe(t, cb, types.ClusterB)
 
-	elapseResetTimeout(t, cb, types.ClusterB)
-	cb.RecordFailure(types.ClusterB) // resets the counter to 1: closes without re-tripping
+	cb.CompleteFailoverProbe(types.ClusterB, token, types.ProbeFailed)
 
-	events := em.snapshot()
-	require.Equal(t,
-		[]types.ClusterEventKind{types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed},
-		em.kinds(), "the open span must be closed exactly once")
-	require.Equal(t, types.ClusterB, events[1].Cluster)
-	require.Equal(t, "reset timeout elapsed", events[1].Reason)
-	require.Equal(t, 1, cb.Failures(types.ClusterB), "the failure that closed the span starts a new count")
-	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterB],
-		"gauge must return to closed, not stay stuck at open")
-	require.EqualValues(t, 1, mc.CircuitBreakerTrips[types.ClusterB], "no re-trip below threshold")
+	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds(), "a failed probe emits nothing")
+	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterB], "gauge returns to open")
+	require.EqualValues(t, 1, mc.CircuitBreakerTrips[types.ClusterB], "a failed probe is not a new trip")
+	require.True(t, cb.ShouldFailover(types.ClusterB, nil))
+	_, ok := cb.TryBeginFailoverProbe(types.ClusterB)
+	require.False(t, ok, "the failed probe restarted the reset timeout")
+
+	// After the timeout elapses again the breaker can be probed again.
+	reserveProbe(t, cb, types.ClusterB)
 }
 
-// TestCircuitBreaker_ResetTimeoutCloseThenImmediateRetrip covers threshold 1,
-// where the reset puts the counter straight back at the threshold. The single
-// call both closes the previous span and opens a new one, so the handler sees
-// Closed then Open and the gauge ends at open. The gauge ending at open is
-// only indirect evidence of that order — a gauge that went closed-then-open
-// or was simply overwritten twice would read the same at rest — so the log
-// order is asserted directly too: "circuit breaker closed" must appear
-// before "circuit breaker tripped" in the same call.
-func TestCircuitBreaker_ResetTimeoutCloseThenImmediateRetrip(t *testing.T) {
-	em := &recordingEmitter{}
+// TestCircuitBreaker_ProbeAbandonedReleasesReservation covers a probe the
+// client cancelled: the breaker returns to open without counting a failure
+// or restarting the timeout, so another client sharing it can reserve at once.
+func TestCircuitBreaker_ProbeAbandonedReleasesReservation(t *testing.T) {
 	mc := testutil.NewTestMetricsCollector()
-	logged := make([]string, 0)
-	cb := NewCircuitBreaker(
-		WithThreshold(1),
-		WithResetTimeout(1*time.Hour),
-		WithCircuitBreakerMetrics(mc),
-		WithCircuitBreakerLogger(&captureLogger{messages: &logged}),
-	)
-	cb.SetEventEmitter(em)
+	cb := NewCircuitBreaker(WithThreshold(1), WithResetTimeout(1*time.Hour), WithCircuitBreakerMetrics(mc))
 
 	cb.RecordFailure(types.ClusterA) // trips
-	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds())
-	require.Equal(t, []string{"circuit breaker tripped"}, logged)
+	token := reserveProbe(t, cb, types.ClusterA)
+	failuresBefore := cb.Failures(types.ClusterA)
 
-	elapseResetTimeout(t, cb, types.ClusterA)
-	cb.RecordFailure(types.ClusterA) // closes the old span, then immediately re-trips
+	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeAbandoned)
 
-	require.Equal(t, []types.ClusterEventKind{
-		types.EventCircuitBreakerOpen,
-		types.EventCircuitBreakerClosed,
-		types.EventCircuitBreakerOpen,
-	}, em.kinds(), "the close must be delivered before the re-open")
-
-	events := em.snapshot()
-	require.Equal(t, "reset timeout elapsed", events[1].Reason)
-	require.Equal(t, 1, events[2].Count, "the re-open carries the reset failure count")
-	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge must end at open")
-	require.EqualValues(t, 2, mc.CircuitBreakerTrips[types.ClusterA], "the re-trip counts as a trip")
-	require.Equal(t,
-		[]string{"circuit breaker tripped", "circuit breaker closed", "circuit breaker tripped"},
-		logged, "the same-call close must be logged before the re-trip")
+	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge returns to open")
+	require.Equal(t, failuresBefore, cb.Failures(types.ClusterA), "abandonment counts nothing")
+	_, ok := cb.TryBeginFailoverProbe(types.ClusterA)
+	require.True(t, ok, "the timeout had already elapsed, so the breaker can be reserved again at once")
 }
 
-// TestCircuitBreaker_ResetTimeoutOnNeverOpenBreakerIsSilent guards against
-// inventing a close for a breaker that was never open. A stale failure count
-// aging out past the reset timeout is bookkeeping, not a state transition:
-// no event, no gauge write, no trip.
-func TestCircuitBreaker_ResetTimeoutOnNeverOpenBreakerIsSilent(t *testing.T) {
-	em := &recordingEmitter{}
+// TestCircuitBreaker_OrdinaryObservationsDuringReservation pins what
+// RecordFailure and RecordSuccess do while a probe is in flight: a failure
+// keeps counting and leaves the reservation valid; a success closes the
+// breaker and makes the reservation stale.
+func TestCircuitBreaker_OrdinaryObservationsDuringReservation(t *testing.T) {
+	t.Run("failure keeps the reservation", func(t *testing.T) {
+		mc := testutil.NewTestMetricsCollector()
+		cb := NewCircuitBreaker(WithThreshold(2), WithResetTimeout(1*time.Hour), WithCircuitBreakerMetrics(mc))
+		cb.RecordFailure(types.ClusterA)
+		cb.RecordFailure(types.ClusterA)
+		token := reserveProbe(t, cb, types.ClusterA)
+
+		cb.RecordFailure(types.ClusterA)
+		require.Equal(t, 3, cb.Failures(types.ClusterA))
+		require.Equal(t, 1, mc.CircuitBreakerState[types.ClusterA], "still half-open")
+
+		cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded)
+		require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA], "the reservation was still valid")
+		require.Equal(t, 0, cb.Failures(types.ClusterA))
+	})
+	t.Run("success closes and makes the reservation stale", func(t *testing.T) {
+		em := &recordingEmitter{}
+		mc := testutil.NewTestMetricsCollector()
+		cb := NewCircuitBreaker(WithThreshold(2), WithResetTimeout(1*time.Hour), WithCircuitBreakerMetrics(mc))
+		cb.SetEventEmitter(em)
+		cb.RecordFailure(types.ClusterA)
+		cb.RecordFailure(types.ClusterA)
+		token := reserveProbe(t, cb, types.ClusterA)
+
+		cb.RecordSuccess(types.ClusterA)
+		events := em.snapshot()
+		require.Equal(t, "operation succeeded", events[1].Reason)
+		require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA])
+
+		cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeFailed)
+		require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA], "a stale completion cannot re-open a closed breaker")
+		require.False(t, cb.ShouldFailover(types.ClusterA, nil))
+		require.Len(t, em.kinds(), 2)
+	})
+}
+
+// TestCircuitBreaker_NeverOpenBreakerNeverReserves guards against probing a
+// breaker that is closed: a stale failure count is bookkeeping, not a state.
+func TestCircuitBreaker_NeverOpenBreakerNeverReserves(t *testing.T) {
 	mc := testutil.NewTestMetricsCollector()
-	cb := NewCircuitBreaker(
-		WithThreshold(3),
-		WithResetTimeout(1*time.Hour),
-		WithCircuitBreakerMetrics(mc),
-	)
-	cb.SetEventEmitter(em)
+	cb := NewCircuitBreaker(WithThreshold(3), WithResetTimeout(1*time.Hour), WithCircuitBreakerMetrics(mc))
 
 	cb.RecordFailure(types.ClusterA)
 	cb.RecordFailure(types.ClusterA) // still below threshold: never open
-	require.Empty(t, em.kinds())
-
 	elapseResetTimeout(t, cb, types.ClusterA)
-	cb.RecordFailure(types.ClusterA)
-
-	require.Empty(t, em.kinds(), "a breaker that was never open closes nothing")
-	require.Equal(t, 1, cb.Failures(types.ClusterA), "the stale count still ages out")
-	require.NotContains(t, mc.CircuitBreakerState, types.ClusterA,
-		"no state transition means no gauge write")
-	require.EqualValues(t, 0, mc.CircuitBreakerTrips[types.ClusterA])
+	_, ok := cb.TryBeginFailoverProbe(types.ClusterA)
+	require.False(t, ok)
+	require.NotContains(t, mc.CircuitBreakerState, types.ClusterA, "no state transition means no gauge write")
+	cb.CompleteFailoverProbe(types.ClusterA, 0, types.ProbeSucceeded)
+	require.Equal(t, 2, cb.Failures(types.ClusterA), "a completion without a reservation is ignored")
 }
 
 // TestCircuitBreaker_SuccessCloseCarriesReason pins the reason on the other
@@ -744,11 +771,10 @@ func (g *gatedStateCollector) IncCircuitBreakerTrip(cluster types.ClusterID) {
 }
 
 // TestCircuitBreaker_ConcurrentRetripKeepsTheStateGaugeOpen covers two
-// same-cluster transitions whose post-unlock side effects overlap. With
-// threshold 2, a timed-out open breaker takes a failure that resets the
-// counter to one and closes the open span; that goroutine is parked inside
-// the closed-state gauge write. While it is parked, a second failure reaches
-// the threshold and re-trips the breaker.
+// same-cluster transitions whose post-unlock side effects overlap. A
+// successful probe closes the breaker; that goroutine is parked inside the
+// closed-state gauge write. While it is parked, two more failures reach the
+// threshold and re-trip the breaker.
 //
 // The breaker ends up open, so the gauge must end at open too. Reporting
 // each transition without checking whether a newer one has landed lets the
@@ -769,8 +795,7 @@ func TestCircuitBreaker_ConcurrentRetripKeepsTheStateGaugeOpen(t *testing.T) {
 	cb.RecordFailure(types.ClusterA) // trips
 	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds())
 	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge must report open after the trip")
-
-	elapseResetTimeout(t, cb, types.ClusterA)
+	token := reserveProbe(t, cb, types.ClusterA)
 
 	// Unpark the gated write at cleanup even if an assertion below fails
 	// first, so neither goroutine started here is ever left stuck.
@@ -779,7 +804,7 @@ func TestCircuitBreaker_ConcurrentRetripKeepsTheStateGaugeOpen(t *testing.T) {
 	mc.armed.Store(true)
 
 	closeDone := make(chan struct{})
-	go func() { cb.RecordFailure(types.ClusterA); close(closeDone) }() // closes; counter back to 1
+	go func() { cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded); close(closeDone) }()
 
 	select {
 	case <-mc.closing:
@@ -788,12 +813,16 @@ func TestCircuitBreaker_ConcurrentRetripKeepsTheStateGaugeOpen(t *testing.T) {
 	}
 
 	retripDone := make(chan struct{})
-	go func() { cb.RecordFailure(types.ClusterA); close(retripDone) }() // reaches the threshold again
+	go func() {
+		cb.RecordFailure(types.ClusterA)
+		cb.RecordFailure(types.ClusterA) // reaches the threshold again
+		close(retripDone)
+	}()
 
 	select {
 	case <-mc.tripped:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the second failure never re-tripped the breaker")
+		t.Fatal("the second pair of failures never re-tripped the breaker")
 	}
 
 	releaseOnce()
@@ -801,7 +830,7 @@ func TestCircuitBreaker_ConcurrentRetripKeepsTheStateGaugeOpen(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("RecordFailure did not return")
+			t.Fatal("a breaker call did not return")
 		}
 	}
 
@@ -837,7 +866,7 @@ func TestCircuitBreaker_SupersededTransitionSkipsItsStateReport(t *testing.T) {
 	)
 
 	cb.RecordFailure(types.ClusterA) // trips
-	tripSeq := cb.seqA.Load()
+	tripSeq := cb.stateA.seq.Load()
 
 	cb.RecordSuccess(types.ClusterA) // closes
 	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA])
@@ -845,7 +874,7 @@ func TestCircuitBreaker_SupersededTransitionSkipsItsStateReport(t *testing.T) {
 
 	// The call the trip would make once rescheduled, with the sequence it
 	// captured while it held the state mutex.
-	cb.applyTransitionReports(types.ClusterA, tripSeq, false, true)
+	cb.report(&cb.stateA, types.ClusterA, transitionTripped, tripSeq)
 
 	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA],
 		"the breaker is closed, so a superseded trip must not put the gauge back to open")
@@ -870,25 +899,22 @@ func (r *reentrantTripEmitter) EmitClusterEvent(ev types.ClusterEvent) {
 	}
 }
 
-// TestCircuitBreaker_ReentrantTripAfterTimeoutCloseKeepsOrder is the
-// timeout-close analogue of
-// TestCircuitBreaker_ReentrantEmitterKeepsStateAndMetricConsistent. The
-// reset timeout elapses, a failure closes the open span, and the handler
-// re-trips the breaker from inside that Closed delivery.
+// TestCircuitBreaker_ReentrantTripAfterProbeCloseKeepsOrder is the
+// probe-close analogue of
+// TestCircuitBreaker_ReentrantEmitterKeepsStateAndMetricConsistent. A
+// successful probe closes the open span, and the handler re-trips the
+// breaker from inside that Closed delivery.
 //
 // Delivering the event as the last side-effect step is what keeps this
 // coherent: the close has already written its gauge and log line by the time
 // the handler runs, so the reentrant trip's own writes land after them and
-// the gauge ends at open. Draining before the close reports would invert
-// that — the reentrant trip would report first and the close would then
-// report a state the breaker had already left, which the log order below
-// catches.
-func TestCircuitBreaker_ReentrantTripAfterTimeoutCloseKeepsOrder(t *testing.T) {
+// the gauge ends at open.
+func TestCircuitBreaker_ReentrantTripAfterProbeCloseKeepsOrder(t *testing.T) {
 	em := &reentrantTripEmitter{}
 	mc := testutil.NewTestMetricsCollector()
 	logged := make([]string, 0)
 	cb := NewCircuitBreaker(
-		WithThreshold(2),
+		WithThreshold(1),
 		WithResetTimeout(1*time.Hour),
 		WithCircuitBreakerMetrics(mc),
 		WithCircuitBreakerLogger(&captureLogger{messages: &logged}),
@@ -896,21 +922,23 @@ func TestCircuitBreaker_ReentrantTripAfterTimeoutCloseKeepsOrder(t *testing.T) {
 	em.cb = cb
 	cb.SetEventEmitter(em)
 
-	cb.RecordFailure(types.ClusterA)
 	cb.RecordFailure(types.ClusterA) // trips
 	require.Equal(t, []string{"circuit breaker tripped"}, logged)
+	token := reserveProbe(t, cb, types.ClusterA)
 
-	elapseResetTimeout(t, cb, types.ClusterA)
-	cb.RecordFailure(types.ClusterA) // closes; the handler re-trips mid-drain
+	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded) // closes; the handler re-trips mid-drain
 
 	require.Equal(t, []types.ClusterEventKind{
 		types.EventCircuitBreakerOpen,
 		types.EventCircuitBreakerClosed,
 		types.EventCircuitBreakerOpen,
 	}, em.kinds(), "the reentrant re-open must be delivered after the close, never before")
-	require.Equal(t,
-		[]string{"circuit breaker tripped", "circuit breaker closed", "circuit breaker tripped"},
-		logged, "the close must report before the handler that re-trips runs")
+	require.Equal(t, []string{
+		"circuit breaker tripped",
+		"circuit breaker half-open: recovery probe reserved",
+		"circuit breaker closed",
+		"circuit breaker tripped",
+	}, logged, "the close must report before the handler that re-trips runs")
 	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA],
 		"final gauge must agree with the final state: open")
 	require.EqualValues(t, 2, mc.CircuitBreakerTrips[types.ClusterA])

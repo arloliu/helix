@@ -311,6 +311,41 @@ type LatencyRecorder interface {
 	RecordLatency(cluster ClusterID, latency time.Duration)
 }
 
+// FailoverProbeReporter is an optional interface for failover policies
+// whose open breaker can be probed for recovery by the client, such as
+// [policy.CircuitBreaker] and [policy.LatencyCircuitBreaker].
+//
+// A dual-cluster client asks TryBeginFailoverProbe on every recovery-probe
+// tick (see [WithRecoveryProbe]); when it returns true the client runs the
+// probe against the cluster's live session and reports the result through
+// CompleteFailoverProbe with the same token, so a breaker closes on a
+// probe the client ran rather than on a caller's read sacrificed to it.
+// A probe the client cancelled (for example on Close) completes as
+// [types.ProbeAbandoned].
+//
+// A write strategy that implements [ProbeReporter] and a failover policy
+// that implements this interface share one physical probe per tick.
+//
+// Implementations MUST be safe for concurrent use from multiple goroutines.
+type FailoverProbeReporter interface {
+	// TryBeginFailoverProbe reserves the breaker for one probe and returns
+	// the reservation token, or false when no probe should run now.
+	TryBeginFailoverProbe(cluster ClusterID) (token uint64, ok bool)
+
+	// CompleteFailoverProbe settles the reservation identified by token.
+	CompleteFailoverProbe(cluster ClusterID, token uint64, outcome types.ProbeOutcome)
+}
+
+// FailoverBelowThresholdReporter is an optional interface for failover
+// policies that own a below-threshold failover setting, such as
+// [policy.WithFailoverBelowThreshold]. The client logs a startup warning
+// while the setting is off, the legacy v1 default.
+type FailoverBelowThresholdReporter interface {
+	// FailoverBelowThreshold reports whether a failed read below the
+	// policy's threshold may fail over.
+	FailoverBelowThreshold() bool
+}
+
 // RouteVeto is an optional interface for failover policies that can steer
 // future reads away from a cluster, such as [policy.LatencyCircuitBreaker]
 // while its breaker is open.

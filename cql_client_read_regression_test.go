@@ -280,12 +280,10 @@ func TestRead_OpenLatencyBreakerReroutesReads(t *testing.T) {
 // failed read be retried on the healthy cluster, so the caller sees a
 // successful read rather than the failing cluster's error.
 func TestRead_CircuitBreakerBelowThresholdRetriesOnHealthyCluster(t *testing.T) {
-	t.Skip("pending: CircuitBreaker returns the first threshold-1 failures straight to the caller instead of retrying on the healthy cluster; the WithFailoverBelowThreshold(true) breaker option does not exist yet and must be added to the breaker built in this test when it lands")
-
 	sa, sb := newReadProbeSession(), newReadProbeSession()
 	sa.setScan(func(context.Context) error { return errReadProbeCluster })
 	sticky := policy.NewStickyRead(policy.WithPreferredCluster(ClusterA), policy.WithStickyReadCooldown(0))
-	cb := policy.NewCircuitBreaker(policy.WithThreshold(3))
+	cb := policy.NewCircuitBreaker(policy.WithThreshold(3), policy.WithFailoverBelowThreshold(true))
 	client := newReadProbeClient(t, sa, sb,
 		WithReadStrategy(sticky),
 		WithFailoverPolicy(cb),
