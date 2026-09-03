@@ -13,7 +13,10 @@
 // To prevent older replays from overwriting newer data, every write carries
 // a client-side timestamp: the client stamps writes with
 // [helix.DefaultTimestampProvider] unless [helix.WithTimestampProvider]
-// replaces it. That keeps writes idempotent regardless of execution order.
+// replaces it. That keeps timestamp-resolved (last-write-wins) mutations
+// idempotent regardless of execution order; counter updates, collection
+// appends, and CAS/LWT statements are not protected by a timestamp and
+// must be excluded from replay with the client's NonIdempotent marker.
 //
 // # CAS / LWT Safety
 //
