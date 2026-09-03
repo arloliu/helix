@@ -30,6 +30,7 @@ type readProbeSession struct {
 	iterCloseErr error
 	scans        atomic.Int64
 	iters        atomic.Int64
+	cas          atomic.Int64
 }
 
 var _ cql.Session = (*readProbeSession)(nil)
@@ -140,8 +141,15 @@ func (q *readProbeQuery) MapScanContext(ctx context.Context, _ map[string]any) e
 func (q *readProbeQuery) Iter() cql.Iter                         { return q.session.newIter() }
 func (q *readProbeQuery) IterContext(_ context.Context) cql.Iter { return q.session.newIter() }
 
-func (q *readProbeQuery) ScanCAS(_ ...any) (applied bool, err error) { return true, nil }
+func (q *readProbeQuery) ScanCAS(_ ...any) (applied bool, err error) {
+	q.session.cas.Add(1)
+
+	return true, nil
+}
+
 func (q *readProbeQuery) ScanCASContext(_ context.Context, _ ...any) (applied bool, err error) {
+	q.session.cas.Add(1)
+
 	return true, nil
 }
 func (q *readProbeQuery) MapScanCAS(_ map[string]any) (applied bool, err error) { return true, nil }
@@ -231,20 +239,26 @@ func TestRead_CallerContextErrorIsNotClusterFailure(t *testing.T) {
 // too slowly, later reads are routed to the other cluster instead of being
 // sent to the slow one again.
 func TestRead_OpenLatencyBreakerReroutesReads(t *testing.T) {
-	t.Skip("pending: an open LatencyCircuitBreaker never moves reads away from the slow cluster because routing only consults the breaker on the error path; the route-veto option that lets the breaker steer routing does not exist yet and must be added and enabled on this client when it lands")
-
 	sa, sb := newReadProbeSession(), newReadProbeSession()
 	sticky := policy.NewStickyRead(policy.WithPreferredCluster(ClusterA))
-	// Any real read takes longer than one nanosecond, so every successful
-	// read on A is a slow success and a single one opens the breaker.
+	// Cluster A answers correctly but slower than the breaker's cap, so a
+	// single successful read on A is a slow success that opens the breaker;
+	// cluster B answers instantly and its breaker stays closed.
+	const slowCap = 20 * time.Millisecond
+	sa.setScan(func(context.Context) error {
+		time.Sleep(2 * slowCap)
+
+		return nil
+	})
 	lcb := policy.NewLatencyCircuitBreaker(
-		policy.WithLatencyAbsoluteMax(time.Nanosecond),
+		policy.WithLatencyAbsoluteMax(slowCap),
 		policy.WithLatencyThreshold(1),
 		policy.WithLatencyResetTimeout(time.Hour),
 	)
 	client := newReadProbeClient(t, sa, sb,
 		WithReadStrategy(sticky),
 		WithFailoverPolicy(lcb),
+		WithRouteVeto(true),
 	)
 
 	var v string

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WithRouteVeto(true)` lets a failover policy that implements the new
+  `RouteVeto` interface steer ordinary reads away from a cluster.
+  `policy.LatencyCircuitBreaker` implements it: while its breaker is open,
+  reads that are not pinned to a paging cursor, not under an
+  `AllowedClusters` override, and not CAS move to the other cluster when
+  that cluster is neither draining nor vetoed, and a FallbackRead probe
+  skips a vetoed alternative. Previously an open latency breaker never moved
+  the next read away from the slow cluster. Off by default in v1; a client
+  whose failover policy can veto logs a startup warning while it is off.
 - `ExcludeWhileReplayBacklog(depth, threshold)` builds an `AllowedClustersFunc`
   that keeps reads away from a cluster while its replay backlog exceeds the
   threshold, so reads return to a recovered cluster only after its backlog

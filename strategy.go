@@ -311,6 +311,28 @@ type LatencyRecorder interface {
 	RecordLatency(cluster ClusterID, latency time.Duration)
 }
 
+// RouteVeto is an optional interface for failover policies that can steer
+// future reads away from a cluster, such as [policy.LatencyCircuitBreaker]
+// while its breaker is open.
+//
+// It is consulted only when [WithRouteVeto] is enabled, after
+// [ReadStrategy.Select] and only for an ordinary read: one that is not
+// pinned to a paging cursor, not preserving a legacy paging token, and
+// not under an [AllowedClusters] override. The veto is advisory: a vetoed
+// selection moves to the other cluster only when that cluster is neither
+// draining nor vetoed, and otherwise the selection stands. A rerouted read
+// never calls [ReadStrategy.OnFailure]; the strategy's ordinary
+// [ReadStrategy.OnSuccess] for the cluster that served the read is
+// unchanged. A FallbackRead probe treats a vetoed alternative like a
+// draining one and returns not-found without asking it.
+//
+// Implementations MUST be non-blocking and safe for concurrent use from
+// multiple goroutines: VetoRoute runs on every ordinary read.
+type RouteVeto interface {
+	// VetoRoute reports whether reads should be routed away from cluster.
+	VetoRoute(cluster ClusterID) bool
+}
+
 // TopologyWatcher monitors cluster topology changes.
 //
 // Implementations include topology.Local (in-memory) and topology.NATS (NATS KV backed).

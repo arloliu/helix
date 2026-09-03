@@ -539,6 +539,16 @@ breaker := policy.NewLatencyCircuitBreaker(
 `SetEventEmitter` is available for standalone use. See the
 [Cluster Events Guide](cluster-events.md).
 
+**Route veto:** an open breaker only decides whether a *failed* read retries on the other
+cluster; on its own it never moves the next read away from the slow cluster. Enable
+`helix.WithRouteVeto(true)` to let the client consult the breaker after the read strategy's
+selection and send ordinary reads to the other cluster while the selected one is open (off by
+default in v1; the client logs a startup warning while it is off). The veto is advisory: pinned
+paging cursors, `AllowedClusters` overrides, and CAS are never rerouted, a read moves only when
+the other cluster is neither draining nor vetoed, and a FallbackRead probe skips a vetoed
+alternative. The veto never calls `OnFailure`; the strategy's ordinary `OnSuccess` for the
+cluster that served the read is unchanged.
+
 **Configuration validation:**
 
 - `NewLatencyCircuitBreaker` is the compatibility constructor. Invalid values fall back to defaults.

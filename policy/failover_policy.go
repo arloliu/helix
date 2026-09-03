@@ -119,6 +119,7 @@ type CircuitBreaker struct {
 
 	muA          sync.Mutex    // serializes compound ops for cluster A
 	trippedA     bool          // circuit open for A; guarded by muA
+	openA        atomic.Bool   // lock-free snapshot of trippedA, read by LatencyCircuitBreaker.VetoRoute
 	failuresA    atomic.Int32  // lock-free for ShouldFailover; written under muA
 	lastFailureA atomic.Int64  // Unix nano; written under muA
 	seqA         atomic.Uint64 // latched transitions for A; incremented under muA
@@ -126,6 +127,7 @@ type CircuitBreaker struct {
 
 	muB          sync.Mutex    // serializes compound ops for cluster B
 	trippedB     bool          // circuit open for B; guarded by muB
+	openB        atomic.Bool   // lock-free snapshot of trippedB, read by LatencyCircuitBreaker.VetoRoute
 	failuresB    atomic.Int32  // lock-free for ShouldFailover; written under muB
 	lastFailureB atomic.Int64  // Unix nano; written under muB
 	seqB         atomic.Uint64 // latched transitions for B; incremented under muB
@@ -462,6 +464,14 @@ func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
 	return true
 }
 
+// setTripped changes a cluster's open latch and its lock-free snapshot
+// together, so VetoRoute always mirrors the latched state.
+// The caller holds the cluster's mutex.
+func setTripped(tripped *bool, open *atomic.Bool, v bool) {
+	*tripped = v
+	open.Store(v)
+}
+
 // RecordFailure increments the failure counter for a cluster.
 //
 // If the reset timeout has passed since the last failure, the counter
@@ -516,14 +526,14 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 			c.failuresA.Store(1)
 			newFailures = 1
 			justClosed = c.trippedA
-			c.trippedA = false
+			setTripped(&c.trippedA, &c.openA, false)
 			seq = c.enqueueTimeoutClose(cluster, justClosed, seq)
 		} else {
 			newFailures = c.failuresA.Add(1)
 		}
 		c.lastFailureA.Store(nowNs)
 		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedA {
-			c.trippedA = true
+			setTripped(&c.trippedA, &c.openA, true)
 			justTripped = true
 			c.events.enqueue(types.ClusterEvent{
 				Kind:    types.EventCircuitBreakerOpen,
@@ -540,14 +550,14 @@ func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
 			c.failuresB.Store(1)
 			newFailures = 1
 			justClosed = c.trippedB
-			c.trippedB = false
+			setTripped(&c.trippedB, &c.openB, false)
 			seq = c.enqueueTimeoutClose(cluster, justClosed, seq)
 		} else {
 			newFailures = c.failuresB.Add(1)
 		}
 		c.lastFailureB.Store(nowNs)
 		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedB {
-			c.trippedB = true
+			setTripped(&c.trippedB, &c.openB, true)
 			justTripped = true
 			c.events.enqueue(types.ClusterEvent{
 				Kind:    types.EventCircuitBreakerOpen,
@@ -588,7 +598,7 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 		wasOpen = c.trippedA
 		c.failuresA.Store(0)
 		c.lastFailureA.Store(0)
-		c.trippedA = false
+		setTripped(&c.trippedA, &c.openA, false)
 		if wasOpen {
 			c.events.enqueue(types.ClusterEvent{
 				Kind:    types.EventCircuitBreakerClosed,
@@ -603,7 +613,7 @@ func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
 		wasOpen = c.trippedB
 		c.failuresB.Store(0)
 		c.lastFailureB.Store(0)
-		c.trippedB = false
+		setTripped(&c.trippedB, &c.openB, false)
 		if wasOpen {
 			c.events.enqueue(types.ClusterEvent{
 				Kind:    types.EventCircuitBreakerClosed,

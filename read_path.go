@@ -101,14 +101,21 @@ func (c *CQLClient) selectClusterForCAS(ctx context.Context) ClusterID {
 // selection stands (best effort). A single-cluster client has nowhere
 // else to go.
 func (c *CQLClient) avoidDraining(selected ClusterID) ClusterID {
-	if c.IsSingleCluster() {
-		return selected
-	}
 	drainA, drainB := c.getDrainStates()
-	if !c.clusterIsDraining(selected, drainA, drainB) {
+
+	return c.reselect(selected, func(cluster ClusterID) bool {
+		return !c.clusterIsDraining(cluster, drainA, drainB)
+	})
+}
+
+// reselect keeps selected when it is eligible, moves to the other cluster
+// when only that one is eligible, and otherwise lets the selection stand.
+// A single-cluster client has nowhere else to go.
+func (c *CQLClient) reselect(selected ClusterID, eligible func(ClusterID) bool) ClusterID {
+	if c.IsSingleCluster() || eligible(selected) {
 		return selected
 	}
-	if alt := c.alternativeCluster(selected); !c.clusterIsDraining(alt, drainA, drainB) {
+	if alt := c.alternativeCluster(selected); eligible(alt) {
 		return alt
 	}
 
@@ -277,10 +284,29 @@ func (c *CQLClient) allowedClusters() ([]ClusterID, error) {
 func (c *CQLClient) resolveReadTargetNormal(ctx context.Context, opts readOptions) readTarget {
 	selected := c.normalSelect(ctx)
 	if !opts.preserveSelectedCluster {
-		selected = c.avoidDraining(selected)
+		selected = c.avoidIneligible(selected)
 	}
 
 	return readTarget{cluster: selected}
+}
+
+// avoidIneligible moves an ordinary read off a cluster that is draining or
+// vetoed by the failover policy when the other cluster is neither. Drain
+// and veto form one eligibility decision, so the two can never bounce the
+// selection between each other; when neither cluster is eligible the
+// strategy's selection stands.
+func (c *CQLClient) avoidIneligible(selected ClusterID) ClusterID {
+	drainA, drainB := c.getDrainStates()
+
+	return c.reselect(selected, func(cluster ClusterID) bool {
+		return !c.clusterIsDraining(cluster, drainA, drainB) && !c.routeVetoed(cluster)
+	})
+}
+
+// routeVetoed reports whether the failover policy vetoes reads to cluster;
+// false when route vetoes are not enabled.
+func (c *CQLClient) routeVetoed(cluster ClusterID) bool {
+	return c.routeVeto != nil && c.routeVeto.VetoRoute(cluster)
 }
 
 // resolveReadTargetPinned routes a read that carries a paging token to the
@@ -847,6 +873,10 @@ func (c *CQLClient) executeFallbackRead(
 		if c.clusterIsDraining(alternativeCluster, drainA, drainB) {
 			return types.ErrNotFound
 		}
+	}
+	// A vetoed alternative is skipped the same way: its breaker is open.
+	if c.routeVetoed(alternativeCluster) {
+		return types.ErrNotFound
 	}
 
 	c.config.Logger.Debug("fallback read: selected cluster returned not-found, trying alternative",
