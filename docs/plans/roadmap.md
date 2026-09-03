@@ -324,6 +324,27 @@ Four items deviate from the table:
 | 5.6 | D-9, A-1 (F-20) | Document synchronous mirror drain in `Close()` with an optional drain timeout; document the no-`Close`-from-callback rule on the replay and mirror callbacks. |
 | 5.7 | Phase 4 review | `write_flapping` counter and breaker probe outcome counter, so every event kind has a metric counterpart. |
 
+**Status (2026-09-04):** 5.1 to 5.7 done on branch `feat/observability`.
+Every item is additive: five new optional collector interfaces (`ReadRouteMetrics`, `ReplayStreamMetrics`,
+`MirrorShutdownMetrics`, `WriteFlappingMetrics`, `BreakerProbeMetrics`), one optional emitter interface
+(`ClusterEventDropReporter`), two new event kinds (`read_route_changed`, `replay_evicted`), and one option each on
+the NATS replayer, the NATS worker, and the mirror engine.
+Verified with `make test-unit`, `go test ./test/integration/`, and `make test-e2e`.
+Five items deviate from the table:
+
+- 5.2 reserves admission in one buffer (per-operation kinds capped at 128 of 160 slots) instead of
+  lanes or coalescing, so the documented enqueue-order contract holds and no restore option is needed;
+  outbox drops are forwarded from the drainer after policy locks are released.
+- 5.3 is opt-in (`replay.WithEvictionWatch`) and best effort: removals are counted from `Msgs` and
+  `LastSeq` deltas minus this process's settlements with a one-interval credit, purges are reported,
+  and another process's acknowledgements count too.
+- 5.4 installs the worker's corrupt-message observer on the replayer when the worker is built, next to
+  the retained-delivery setting, rather than through a registration token.
+- 5.5 hashes a canonical identity built from the encoded envelope fields (not the envelope bytes, so the
+  wire version is excluded) and gives a non-idempotent payload no id at all.
+- 5.6 adds only `mirror.WithDrainTimeout`, a cutoff for starting new executions; `Stop` and `Close`
+  still wait for in-flight executions and callbacks.
+
 ---
 
 ## Phase 6 — Performance (`v1.9.0`)
