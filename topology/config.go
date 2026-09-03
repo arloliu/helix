@@ -88,9 +88,10 @@ func WithKey(key string) WatcherOption {
 //
 // If the NATS watch fails or disconnects, the watcher polls the key at
 // this interval and retries Watch on every tick until it is re-established.
+// NewNATS rejects a zero or negative interval.
 //
 // Parameters:
-//   - d: Polling interval duration
+//   - d: Polling interval duration, must be positive
 //
 // Returns:
 //   - WatcherOption: Configuration option

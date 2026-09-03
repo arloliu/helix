@@ -77,6 +77,9 @@ func NewNATS(kv jetstream.KeyValue, opts ...WatcherOption) (*NATS, error) {
 	for _, opt := range opts {
 		opt(&config)
 	}
+	if config.PollInterval <= 0 {
+		return nil, errors.New("helix/topology: PollInterval must be positive")
+	}
 	// Backstop for WatcherConfig values built directly (bypassing WithLogger,
 	// whose own typed-nil guard normally prevents this): catches both an
 	// untyped nil and a typed nil (e.g. a nil `*myLogger` stored in the
