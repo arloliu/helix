@@ -618,8 +618,9 @@ payload never blocks payloads for the other cluster.
 
 `OnDrop` fires once per payload the worker itself drops.
 It cannot see a NATS message the stream evicts on its own (`MaxAge`
-expiry, or `DiscardOld` under a stream limit); watch those through
-JetStream's stream and consumer metrics.
+expiry, or `DiscardOld` under a stream limit); the opt-in eviction watch
+described below reports those, or watch them through JetStream's stream
+and consumer metrics.
 The reason appears in the worker log and, on collectors implementing
 `types.ReplayBacklogMetrics`, as the `reason` label of
 `{prefix}_replay_worker_dropped_total{cluster,reason}`:
@@ -664,7 +665,7 @@ collectors implementing `types.ReplayStreamMetrics` instead:
 | Backoff | `RetryDelay` doubling up to `MaxRetryDelay` | Same schedule, carried by delayed `Nak`; under `RetryBounded` the `Nak` has no delay |
 | Where retries run | In-process goroutine pool | NATS server redelivery |
 | Survives process crash | No (in-memory) | Yes (JetStream durable) |
-| Drop visibility | `OnDrop` callback | `OnDrop` callback for worker-directed drops; `MaxAge` expiry and `DiscardOld` eviction happen inside JetStream and need its stream and consumer metrics |
+| Drop visibility | `OnDrop` callback | `OnDrop` callback for worker-directed drops; `MaxAge` expiry and `DiscardOld` eviction happen inside JetStream; `WithEvictionWatch()` reports them (best effort), otherwise watch the stream's own metrics |
 
 ---
 

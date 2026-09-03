@@ -6,8 +6,9 @@ breaker open/close, adaptive-write degrade/recover, drain enter/exit, replay
 drops, mirror replay drops, and session refresh attempt/success/error.
 
 Most of these are state transitions, so their volume is bounded by how often
-the state flips. Two are not: `failover` and `read_divergence` fire once per
-affected read. See [Per-operation kinds](#per-operation-kinds).
+the state flips. Four are not: `failover`, `read_divergence`, `replay_dropped`,
+and `mirror_replay_dropped` fire once per affected operation. See
+[Per-operation kinds](#per-operation-kinds).
 
 This is a push-based, best-effort notification stream for driving alerting,
 paging, or an operational dashboard. A handler that cannot keep up loses
@@ -50,11 +51,12 @@ defer client.Close()
 ```
 
 There is no separate start call: registering the handler is enough, and Helix
-installs the emitter into the configured write strategy and failover policy
-for you.
+installs the emitter into the configured read strategy, write strategy,
+failover policy, and replay worker for you.
 
 **Which kinds you receive depends on what else you configure.** The emitter
-reaches only the write strategy and the failover policy, both unset by
+reaches only the components that implement it (the built-in read strategies,
+write strategy, failover policies, and the replay worker), all unset by
 default, and most other kinds come from a component that is also optional. A
 dual-cluster client configured with nothing but the handler can produce only
 `failover`, plus `read_divergence` on queries that opt into FallbackRead.
@@ -339,10 +341,10 @@ evidence that events were dropped. To observe worker-side drops, register
 ## Standalone Policy Usage
 
 `helix.NewCQLClient` wires the event dispatcher into your configured
-`WriteStrategy` and `FailoverPolicy` automatically when you register
-`WithOnClusterEvent`. If you construct a policy directly — outside a
-`CQLClient`, for example in a test harness or a custom strategy — call
-`SetEventEmitter` yourself:
+`ReadStrategy`, `WriteStrategy`, `FailoverPolicy`, and `ReplayWorker`
+automatically when you register `WithOnClusterEvent`. If you construct a
+policy directly — outside a `CQLClient`, for example in a test harness or a
+custom strategy — call `SetEventEmitter` yourself:
 
 ```go
 cb := policy.NewCircuitBreaker(policy.WithThreshold(3))
@@ -353,9 +355,9 @@ adw.SetEventEmitter(myEmitter)
 ```
 
 `SetEventEmitter` is available on `CircuitBreaker`, `LatencyCircuitBreaker`,
-and `AdaptiveDualWrite`; the client wires any strategy or policy that
-implements `helix.EventEmitterSetter`, so a custom policy opts in the same
-way. The emitter is always invoked outside any policy
+`AdaptiveDualWrite`, `StickyRead`, `PrimaryOnlyRead`, and `replay.Worker`;
+the client wires any component that implements `helix.EventEmitterSetter`,
+so a custom policy opts in the same way. The emitter is always invoked outside any policy
 state lock, so a slow emitter cannot deadlock or stall a policy transition.
 An emitter that reenters the policy it is receiving events from (calling back
 into it from inside `EmitClusterEvent`) is safe but discouraged.
@@ -369,9 +371,11 @@ transitions a single unlucky goroutine can end up making other goroutines'
 emitter calls as well, and its delay is not bounded by one call.
 
 **Queue limit.** Each policy queue holds 64 pending events. Past that, the
-newest event is dropped. Drops here are counted internally and never logged or
-exposed, so a wedged custom emitter loses events silently. The same counter
-also absorbs two other cases: events left with nowhere to go when
+newest event is dropped. Drops here are counted and forwarded to the emitter
+when it implements `types.ClusterEventDropReporter` (the client's dispatcher
+does, so they join `{prefix}_cluster_events_dropped_total`); with a custom
+emitter that does not, a wedged emitter loses events silently. The same
+counter also absorbs two other cases: events left with nowhere to go when
 `SetEventEmitter(nil)` removes the emitter while a delivery is in progress,
 and an event whose emitter call panics — the panic is contained and delivery
 continues with the next event, but the panic value is not logged.
