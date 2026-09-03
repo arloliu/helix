@@ -112,6 +112,9 @@
 // Mirror (recorded when mirroring is configured):
 //   - {prefix}_mirror_enqueue_success_total - Counter of captures accepted by the engine queue
 //   - {prefix}_mirror_enqueue_dropped_total - Counter of captures rejected by a full engine queue
+//   - {prefix}_mirror_drain_dropped_total - Counter of captures dropped when
+//     mirror.WithDrainTimeout cut the shutdown drain short (optional
+//     types.MirrorShutdownMetrics)
 //   - {prefix}_mirror_exec_success_total - Counter of successful mirror writes
 //   - {prefix}_mirror_exec_errors_total - Counter of failed mirror writes
 //   - {prefix}_mirror_exec_duration_seconds - Histogram of mirror write latencies

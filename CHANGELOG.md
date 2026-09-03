@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason (`failover`, `alternative known good`, `manual`, `recovered`).
   The client installs its collector and event dispatcher on a read strategy
   that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- `mirror.WithDrainTimeout(d)` cuts the mirror engine's shutdown drain
+  short: the captures still queued after `d` are dropped once through
+  `mirror.WithOnDrop`, `Stats().Dropped`, and the new optional
+  `types.MirrorShutdownMetrics` (`{prefix}_mirror_drain_dropped_total`).
+  The synchronous drain in `Close` and the rule that replay and mirror
+  callbacks must not call `Close` are now documented.
 - `replay.NATSReplayer.Enqueue` publishes every idempotent payload with a
   `Nats-Msg-Id` derived from its identity (cluster, timestamp, priority,
   consistency levels, statement and arguments), so a publish retried after

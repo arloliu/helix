@@ -835,6 +835,12 @@ var _ types.MirrorMetrics = (*Collector)(nil)
 // types.MirrorReplayMetrics interface.
 func (c *Collector) IncMirrorReplayDropped() { c.mirrorReplayDropped.Inc() }
 
+// AddMirrorDrainDropped counts captures the drain timeout dropped at
+// shutdown. Part of the optional types.MirrorShutdownMetrics interface.
+func (c *Collector) AddMirrorDrainDropped(n int) {
+	c.set.GetOrCreateCounter(c.prefix + "_mirror_drain_dropped_total").Add(n)
+}
+
 // AddClusterEventsDropped adds n to the cluster event drop counter.
 // Called by the event dispatcher with the delta accumulated since the
 // previous call. Part of the optional types.ClusterEventMetrics interface.

@@ -146,6 +146,7 @@ the whole batch mirrors or none does.
 | Args | `[]any` args (and batch entries' args) are deep-copied synchronously **before** `Exec` returns to the caller. Caller-side buffer reuse / pooling cannot corrupt mirror payloads. |
 | Disable / Enable | `client.Mirror().Disable()` stops accepting new captures; the in-flight queue continues to drain. `Enable()` mid-drain resumes normal operation. Workers always process queued items regardless of the enabled flag. |
 | Idempotence | Mirror writes may be retried on failure (via `WithMirrorReplayer` or by NATS redelivery in publisher mode). Counter updates and `IF`-clause LWTs are not idempotent under retry — accept divergence on those statements. A `NonIdempotent()` statement (a `CounterBatch` automatically) carries its marker in the payload, so the destination executes it on its strict path and never replays it within its own pair; only the mirror-level retry can repeat it. |
+| Shutdown | `client.Close()` drains the engine synchronously: every queued capture is executed (target mode) or published (publisher mode) before `Close` returns, so a full 8192-slot queue at five seconds per publish can hold `Close` for minutes. `mirror.WithDrainTimeout(d)` bounds how long new executions keep starting: after `d` the queued captures are dropped exactly once (`mirror.WithOnDrop`, `Stats().Dropped`, `{prefix}_mirror_drain_dropped_total`) with one `Warn` line, and `Close` still waits for the executions and callbacks already running. Neither `mirror.WithOnDrop` nor `mirror.WithOnError` may call `Close` or `Stop`: both wait for the worker that invoked the callback. |
 | Consistency | The consistency and serial consistency the original write set are captured and applied by the built-in executor, so the destination acknowledges the write under the same rule. A session-default write runs at the destination's default. |
 
 ## Runtime control
@@ -170,6 +171,7 @@ Exposed metrics:
 |---|---|---|
 | `helix_mirror_enqueue_success_total` | counter | Captures accepted into the queue. |
 | `helix_mirror_enqueue_dropped_total` | counter | Captures dropped (disabled/stopped/full). |
+| `helix_mirror_drain_dropped_total`   | counter | Captures dropped when `mirror.WithDrainTimeout` cut the shutdown drain short (optional `types.MirrorShutdownMetrics`). |
 | `helix_mirror_exec_success_total`    | counter | Engine dispatch returned nil. |
 | `helix_mirror_exec_errors_total`     | counter | Engine dispatch returned error. |
 | `helix_mirror_exec_duration_seconds` | histogram | Engine dispatch duration. |
@@ -207,6 +209,7 @@ destination is recorded against that destination's own metrics namespace
 | Path | Where it lands |
 |---|---|
 | Engine queue full | `mirror_enqueue_dropped_total` + log + `mirror.WithOnDrop`. |
+| Drain timeout at shutdown | `mirror_drain_dropped_total` + one log line + `mirror.WithOnDrop` per capture; see the Shutdown row above. |
 | Target-mode dispatch error | `mirror_exec_errors_total` + log + `mirror.WithOnError`. With `WithMirrorReplayer`, also pushed onto the replayer. |
 | Replayer enqueue failure | `helix.WithOnReplayDropped` (shared with primary replay) + the `mirror_replay_dropped` cluster event + `mirror_replay_dropped_total` (optional `types.MirrorReplayMetrics`). |
 | Publisher-mode `publisher.Enqueue` error | `mirror_exec_errors_total` + log + `mirror.WithOnError`. **Not** routed through `WithOnReplayDropped`. |

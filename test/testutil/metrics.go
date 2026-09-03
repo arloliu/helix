@@ -52,6 +52,9 @@ type TestMetricsCollector struct {
 	ReplayOldestAge     map[types.ClusterID]float64
 	ReplayWorkerDropped map[types.ClusterID]map[string]int64
 
+	// Mirror shutdown (optional types.MirrorShutdownMetrics)
+	MirrorDrainDropped int64
+
 	// Replay stream (optional types.ReplayStreamMetrics)
 	ReplayCorrupt    map[types.ClusterID]int64
 	ReplayTermFailed map[types.ClusterID]int64
@@ -185,6 +188,13 @@ func (m *TestMetricsCollector) ObserveWriteDuration(cluster types.ClusterID, sec
 // ----------------------
 // Adaptive Write Transitions (optional types.AdaptiveWriteMetrics)
 // ----------------------
+
+// AddMirrorDrainDropped implements the optional types.MirrorShutdownMetrics.
+func (m *TestMetricsCollector) AddMirrorDrainDropped(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.MirrorDrainDropped += int64(n)
+}
 
 // IncReplayCorrupt implements the optional types.ReplayStreamMetrics.
 func (m *TestMetricsCollector) IncReplayCorrupt(cluster types.ClusterID) {

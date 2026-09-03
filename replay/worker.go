@@ -255,7 +255,10 @@ func WithOnSuccess(fn func(types.ReplayPayload)) WorkerOption {
 	}
 }
 
-// WithOnError sets the error callback.
+// WithOnError sets the error callback, invoked on the worker goroutine
+// after a failed attempt with the payload, the error, and the attempt
+// number. The callback must not call [Worker.Stop] or the owning client's
+// Close: both wait for the goroutine that invoked it and would deadlock.
 func WithOnError(fn func(types.ReplayPayload, error, int)) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.OnError = fn
@@ -327,7 +330,10 @@ func WithClusterGate(gate func(cluster types.ClusterID) bool) WorkerOption {
 	}
 }
 
-// WithOnDrop sets the drop callback.
+// WithOnDrop sets the drop callback, invoked on the worker goroutine once
+// per payload the worker gives up on. The callback must not call
+// [Worker.Stop] or the owning client's Close: both wait for the goroutine
+// that invoked it and would deadlock.
 func WithOnDrop(fn func(types.ReplayPayload, error)) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.OnDrop = fn
