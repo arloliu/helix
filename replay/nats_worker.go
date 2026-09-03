@@ -355,12 +355,15 @@ func (b *natsBackend) holdWhileGated(tail []ReplayMessage) bool {
 	if b.config.allows(cluster) {
 		return true
 	}
-	// The gate is polled every PollInterval, but the acknowledgement
-	// timers are only refreshed once a third of AckWait has passed, so a
-	// long quarantine does not turn into a stream of InProgress calls.
-	refreshEvery := b.config.PollInterval
+	// The acknowledgement timers are refreshed once a third of AckWait
+	// has passed, so a long quarantine does not turn into a stream of
+	// InProgress calls, and the gate is polled at least that often so a
+	// PollInterval longer than AckWait cannot let a lease expire.
+	pollEvery := b.config.PollInterval
+	refreshEvery := pollEvery
 	if ackWait := b.replayer.config.AckWait; ackWait > 0 {
-		refreshEvery = max(refreshEvery, ackWait/3)
+		refreshEvery = ackWait / 3
+		pollEvery = min(pollEvery, refreshEvery)
 	}
 	var lastRefresh time.Time
 	for {
@@ -378,7 +381,7 @@ func (b *natsBackend) holdWhileGated(tail []ReplayMessage) bool {
 		select {
 		case <-b.stopCh:
 			return false
-		case <-b.after(b.config.PollInterval):
+		case <-b.after(pollEvery):
 		}
 		if b.config.allows(cluster) {
 			return true

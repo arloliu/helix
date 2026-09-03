@@ -114,6 +114,43 @@ func TestNATSBackend_HoldsFetchedBatchWhileGated(t *testing.T) {
 	require.Zero(t, naks.Load())
 }
 
+// TestNATSBackend_HoldPollsWithinAckWait proves a gated batch is refreshed
+// at a fraction of AckWait even when PollInterval is longer than AckWait.
+func TestNATSBackend_HoldPollsWithinAckWait(t *testing.T) {
+	var mu sync.Mutex
+	progress := make([]int, 1)
+	var naks atomic.Int32
+	msgs := gatedNATSMessages(1, &progress, &naks, &mu)
+
+	cfg := newTestNATSBackendConfig()
+	cfg.PollInterval = time.Hour
+	WithClusterGate(func(types.ClusterID) bool { return false })(&cfg)
+	const ackWait = 30 * time.Second
+	waits := make(chan time.Duration, 1)
+	stop := make(chan struct{})
+	b := &natsBackend{
+		replayer: &NATSReplayer{config: NATSReplayerConfig{AckWait: ackWait}},
+		config:   &cfg,
+		stopCh:   stop,
+		backoffWait: func(d time.Duration) <-chan time.Time {
+			waits <- d
+
+			return nil // never fires; the test stops the worker
+		},
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- b.holdWhileGated(msgs) }()
+	select {
+	case d := <-waits:
+		require.LessOrEqual(t, d, ackWait/3, "the gate is polled at least once per third of AckWait")
+	case <-time.After(time.Second):
+		t.Fatal("holdWhileGated never waited")
+	}
+	close(stop)
+	require.False(t, <-done)
+}
+
 // TestNATSBackend_StopWhileGatedNaksTailOnce proves that stopping while a
 // batch is held NAKs each unprocessed message exactly once.
 func TestNATSBackend_StopWhileGatedNaksTailOnce(t *testing.T) {

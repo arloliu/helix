@@ -3,6 +3,7 @@ package replay_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -137,18 +138,10 @@ func TestMemoryWorker_BoundedGateWaitsBetweenAttempts(t *testing.T) {
 func TestMemoryWorker_GateClosingBetweenDequeueAndExecuteRequeues(t *testing.T) {
 	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(8))
 	var executed atomic.Int32
-	// The gate permits the dequeue check, refuses the execute check, then
-	// permits everything: the payload must come back and run once.
-	var calls atomic.Int32
-	gate := func(types.ClusterID) bool {
-		n := calls.Add(1)
-
-		return n != 2
-	}
 	worker := replay.NewMemoryWorker(replayer, countingExecute(&executed, nil),
 		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithPollInterval(2*time.Millisecond),
-		replay.WithClusterGate(gate),
+		replay.WithClusterGate(closeOnceAtExecute(nil)),
 	)
 	enqueueN(t, replayer, 1, types.ClusterA)
 	startWorker(t, worker)
@@ -156,6 +149,64 @@ func TestMemoryWorker_GateClosingBetweenDequeueAndExecuteRequeues(t *testing.T) 
 	require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
 	settle()
 	require.Equal(t, int32(1), executed.Load(), "the requeued payload runs exactly once")
+}
+
+// closeOnceAtExecute builds a cluster A gate that permits the dequeue
+// check, refuses the execute check that follows it (calling onClose first),
+// then permits everything. Cluster B is always permitted.
+func closeOnceAtExecute(onClose func()) func(types.ClusterID) bool {
+	var calls atomic.Int32
+
+	return func(c types.ClusterID) bool {
+		if c != types.ClusterA {
+			return true
+		}
+		if calls.Add(1) != 2 {
+			return true
+		}
+		if onClose != nil {
+			onClose()
+		}
+
+		return false
+	}
+}
+
+// TestMemoryWorker_GatedPayloadKeepsItsSlot proves a payload the gate
+// closes on after dequeue still holds its capacity slot: a producer cannot
+// take its place, it is never dropped, and it holds exactly one slot.
+func TestMemoryWorker_GatedPayloadKeepsItsSlot(t *testing.T) {
+	for _, policy := range []replay.ReplayRetryPolicy{replay.RetryBounded, replay.RetryWhileRetained} {
+		t.Run(fmt.Sprint(policy), func(t *testing.T) {
+			replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(1))
+			var executed, dropped atomic.Int32
+			var producerErr error
+			var pendingWhileGated int
+			gate := closeOnceAtExecute(func() {
+				producerErr = replayer.Enqueue(context.Background(), types.ReplayPayload{
+					TargetCluster: types.ClusterA, Query: "INSERT producer", Timestamp: time.Now().UnixMicro(),
+				})
+				pendingWhileGated = replayer.PendingByCluster(types.ClusterA)
+			})
+			worker := replay.NewMemoryWorker(replayer, countingExecute(&executed, nil),
+				replay.WithRetryPolicy(policy),
+				replay.WithPollInterval(2*time.Millisecond),
+				replay.WithClusterGate(gate),
+				replay.WithOnDrop(func(types.ReplayPayload, error) { dropped.Add(1) }),
+			)
+			enqueueN(t, replayer, 1, types.ClusterA)
+			startWorker(t, worker)
+
+			require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
+			settle()
+			require.ErrorIs(t, producerErr, types.ErrReplayQueueFull, "the gated payload still holds the only slot")
+			require.Equal(t, 1, pendingWhileGated, "a requeue holds one slot, not two")
+			require.Equal(t, int32(1), executed.Load())
+			require.Zero(t, dropped.Load(), "a gated payload is never dropped")
+			require.Eventually(t, func() bool { return replayer.Len() == 0 }, time.Second, time.Millisecond,
+				"the slot is released once the payload has run")
+		})
+	}
 }
 
 func TestMemoryWorker_GateIsPerCluster(t *testing.T) {
