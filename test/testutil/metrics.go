@@ -52,6 +52,11 @@ type TestMetricsCollector struct {
 	ReplayOldestAge     map[types.ClusterID]float64
 	ReplayWorkerDropped map[types.ClusterID]map[string]int64
 
+	// Replay stream (optional types.ReplayStreamMetrics)
+	ReplayCorrupt    map[types.ClusterID]int64
+	ReplayTermFailed map[types.ClusterID]int64
+	ReplayEvicted    int64
+
 	// Drain mode
 	ClusterDraining  map[types.ClusterID]bool
 	DrainModeEntered map[types.ClusterID]int64
@@ -103,6 +108,8 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		ReplayQueueDepth:        make(map[types.ClusterID]int),
 		ReplayOldestAge:         make(map[types.ClusterID]float64),
 		ReplayWorkerDropped:     make(map[types.ClusterID]map[string]int64),
+		ReplayCorrupt:           make(map[types.ClusterID]int64),
+		ReplayTermFailed:        make(map[types.ClusterID]int64),
 		ReplayDuration:          make(map[types.ClusterID][]float64),
 		ClusterDraining:         make(map[types.ClusterID]bool),
 		DrainModeEntered:        make(map[types.ClusterID]int64),
@@ -179,6 +186,27 @@ func (m *TestMetricsCollector) ObserveWriteDuration(cluster types.ClusterID, sec
 // Adaptive Write Transitions (optional types.AdaptiveWriteMetrics)
 // ----------------------
 
+// IncReplayCorrupt implements the optional types.ReplayStreamMetrics.
+func (m *TestMetricsCollector) IncReplayCorrupt(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReplayCorrupt[cluster]++
+}
+
+// IncReplayTermFailed implements the optional types.ReplayStreamMetrics.
+func (m *TestMetricsCollector) IncReplayTermFailed(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReplayTermFailed[cluster]++
+}
+
+// AddReplayEvicted implements the optional types.ReplayStreamMetrics.
+func (m *TestMetricsCollector) AddReplayEvicted(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReplayEvicted += int64(n)
+}
+
 // SetReadPreferred implements the optional types.ReadRouteMetrics.
 func (m *TestMetricsCollector) SetReadPreferred(cluster types.ClusterID, preferred bool) {
 	m.mu.Lock()
@@ -206,6 +234,22 @@ func (m *TestMetricsCollector) IncWriteRecovered(cluster types.ClusterID) {
 
 // GetWriteDegradedState returns the last recorded degraded-state gauge
 // value for the given cluster.
+// GetReplayCorrupt returns the corrupt-message count for a cluster.
+func (m *TestMetricsCollector) GetReplayCorrupt(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.ReplayCorrupt[cluster]
+}
+
+// GetReplayTermFailed returns the refused-Term count for a cluster.
+func (m *TestMetricsCollector) GetReplayTermFailed(cluster types.ClusterID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.ReplayTermFailed[cluster]
+}
+
 func (m *TestMetricsCollector) GetWriteDegradedState(cluster types.ClusterID) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

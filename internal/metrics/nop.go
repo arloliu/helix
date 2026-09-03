@@ -108,6 +108,19 @@ func (m *NopMetrics) IncDrainModeEntered(_ types.ClusterID) {}
 func (m *NopMetrics) IncDrainModeExited(_ types.ClusterID) {}
 
 // ----------------------
+// Replay stream (optional types.ReplayStreamMetrics)
+// ----------------------
+
+// IncReplayCorrupt discards the metric.
+func (m *NopMetrics) IncReplayCorrupt(_ types.ClusterID) {}
+
+// IncReplayTermFailed discards the metric.
+func (m *NopMetrics) IncReplayTermFailed(_ types.ClusterID) {}
+
+// AddReplayEvicted discards the metric.
+func (m *NopMetrics) AddReplayEvicted(_ int) {}
+
+// ----------------------
 // Session Refresh (optional types.SessionRefreshMetrics)
 // ----------------------
 

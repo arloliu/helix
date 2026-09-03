@@ -627,6 +627,20 @@ The reason appears in the worker log and, on collectors implementing
 - `requeue_failed`: memory only, a payload the gate closed on after dequeue could not be
   returned to its queue; the queues are sized so this does not happen.
 
+Two NATS losses are not drops of a payload the worker held and appear on
+collectors implementing `types.ReplayStreamMetrics` instead:
+
+- `{prefix}_replay_corrupt_total{cluster}`: a fetched message did not decode
+  (bad bytes, an unknown target cluster, undecodable arguments) and was
+  terminated at once; the worker logs it at `Error` with the stream sequence
+  and the replayer's `WithOnCorruptMessage` callback still runs.
+  `cluster` is the consumer's cluster, known even when the payload is not.
+- `{prefix}_replay_term_failed_total{cluster}`: the server refused a `Term`.
+  Under `RetryBounded` a refused `Term` on the last permitted delivery is
+  still recorded as a `max_attempts` drop, because the server will not
+  deliver the message again either way; under `RetryWhileRetained` the
+  message comes back and is settled again, so only the refusal is counted.
+
 ### Comparing Memory and NATS
 
 | Concern | Memory backend | NATS backend |
