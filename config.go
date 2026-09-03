@@ -188,6 +188,12 @@ type ClientConfig struct {
 	// Default: 0.
 	DefaultMaxRows int
 
+	// RouteVeto lets a failover policy that implements [RouteVeto] steer
+	// ordinary reads away from a cluster. See [WithRouteVeto].
+	//
+	// Default: false.
+	RouteVeto bool
+
 	// ClusterWriteTimeout bounds each cluster's leg of a dual write
 	// independently of the caller's context. See [WithClusterWriteTimeout].
 	//
@@ -378,6 +384,36 @@ func WithWriteStrategy(strategy WriteStrategy) Option {
 func WithFailoverPolicy(policy FailoverPolicy) Option {
 	return func(c *ClientConfig) {
 		c.FailoverPolicy = policy
+	}
+}
+
+// WithRouteVeto lets a failover policy that implements [RouteVeto] steer
+// ordinary reads away from a cluster whose breaker is open.
+//
+// Without it a [policy.LatencyCircuitBreaker] that has opened on a slow
+// cluster only decides whether a failed read retries on the other cluster;
+// every new read is still sent to the slow cluster first. With it, the
+// client consults the policy after the read strategy's selection and moves
+// an ordinary read to the other cluster while the selected one is vetoed
+// (see [RouteVeto] for the exact precedence). Off by default in v1; a
+// client whose failover policy implements RouteVeto logs a startup Warn
+// while the option is off.
+//
+// Parameters:
+//   - enabled: true to consult the policy's veto on ordinary reads
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	client, err := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithFailoverPolicy(policy.NewLatencyCircuitBreaker()),
+//	    helix.WithRouteVeto(true),
+//	)
+func WithRouteVeto(enabled bool) Option {
+	return func(c *ClientConfig) {
+		c.RouteVeto = enabled
 	}
 }
 

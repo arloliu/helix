@@ -249,6 +249,32 @@ func (l *LatencyCircuitBreaker) RecordLatency(cluster types.ClusterID, latency t
 	}
 }
 
+// VetoRoute reports whether reads should be routed away from cluster
+// because its breaker is open. It implements the optional route-veto
+// interface a helix client consults after the read strategy's selection
+// (see helix.WithRouteVeto); it reads an atomic snapshot of the open state
+// and takes no lock. A zero-value LatencyCircuitBreaker (nil embedded
+// *CircuitBreaker) never vetoes.
+//
+// Parameters:
+//   - cluster: The cluster the read strategy selected
+//
+// Returns:
+//   - bool: true while the breaker for cluster is open
+func (l *LatencyCircuitBreaker) VetoRoute(cluster types.ClusterID) bool {
+	if l.CircuitBreaker == nil {
+		return false
+	}
+	switch cluster {
+	case types.ClusterA:
+		return l.openA.Load()
+	case types.ClusterB:
+		return l.openB.Load()
+	default:
+		return false
+	}
+}
+
 // AbsoluteMax returns the configured latency threshold.
 //
 // Returns:

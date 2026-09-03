@@ -100,6 +100,10 @@ type CQLClient struct {
 	topologyClose context.CancelFunc
 	topologyWG    sync.WaitGroup // joins watchTopology on Close
 
+	// routeVeto is the failover policy's route veto when WithRouteVeto is
+	// enabled and the policy implements RouteVeto; nil otherwise.
+	routeVeto RouteVeto
+
 	// overrideErrSeq counts consecutive override errors for power-of-2 log backoff.
 	// Prevents log storms when the AllowedClusters provider is misconfigured.
 	overrideErrSeq atomic.Uint64

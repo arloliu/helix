@@ -57,8 +57,10 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 }
 
 // warnNoEffectOptions logs one warning per option that the rest of the
-// configuration renders inert, so a misconfiguration is discovered at
-// startup rather than during an incident.
+// configuration renders inert, and one per legacy default that a configured
+// component could improve on (such as a failover policy that can veto
+// routes while WithRouteVeto is off), so a misconfiguration is discovered
+// at startup rather than during an incident.
 func warnNoEffectOptions(config *ClientConfig) {
 	if config.MirrorReplayer != nil && !config.mirrorTargetSet {
 		config.Logger.Warn("WithMirrorReplayer has no effect without WithMirror; failed mirror writes are only retried in target mode")
@@ -67,6 +69,14 @@ func warnNoEffectOptions(config *ClientConfig) {
 		if _, ok := config.WriteStrategy.(ProbeReporter); !ok {
 			config.Logger.Warn("WithRecoveryProbe has no effect: the write strategy does not report degraded clusters, so no probe will run")
 		}
+	}
+	_, canVeto := config.FailoverPolicy.(RouteVeto)
+	switch {
+	case config.RouteVeto && !canVeto:
+		config.Logger.Warn("WithRouteVeto has no effect: the failover policy cannot veto routes")
+	case !config.RouteVeto && canVeto:
+		config.Logger.Warn("the failover policy can veto routes but WithRouteVeto is off (the v1 default): " +
+			"reads keep going to a cluster whose breaker is open; enable it with WithRouteVeto(true)")
 	}
 }
 
@@ -333,6 +343,9 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		config:        config,
 		singleCluster: sessionB == nil,
 		closeDone:     make(chan struct{}),
+	}
+	if config.RouteVeto {
+		client.routeVeto, _ = config.FailoverPolicy.(RouteVeto)
 	}
 	client.storeSessionA(sessionA)
 	// Store sessionB even if nil; in single-cluster mode the holder wraps a
