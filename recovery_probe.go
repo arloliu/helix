@@ -106,7 +106,9 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp Fa
 		// Classify before cancel, which would make every error look like
 		// an expired context. The probe's own deadline expiring is a
 		// connectivity failure by provenance, like an expired write leg.
-		canceled := err != nil && c.recoveryProbeCtx.Err() != nil
+		// A probe the client cancelled is abandoned whatever it returned:
+		// a nil after ctx.Done proves nothing about the cluster.
+		canceled := c.recoveryProbeCtx.Err() != nil
 		err = clusterTimeoutIfExpired(ctx, c.recoveryProbeCtx, err)
 		cancel()
 		if canceled {

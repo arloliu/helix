@@ -17,16 +17,18 @@ import (
 // [policy.AdaptiveDualWrite] cluster recovery and closes an open
 // [policy.CircuitBreaker] or [policy.LatencyCircuitBreaker].
 //
-// The probe fires at each Interval. While the write strategy reports a
-// cluster degraded, a nil (success) result credits one recovery point via
-// [policy.AdaptiveDualWrite.RecordProbeLatency] (or RecordProbeSuccess for
-// a strategy without latency judgement); the cluster returns to healthy
-// state once it accumulates the strategy's recovery threshold of
-// consecutive successes. While the failover policy has an open breaker
-// whose reset timeout has elapsed, the same probe reserves the breaker
-// (half-open) and its outcome closes or re-opens it, so no caller's read
-// is sacrificed to test the cluster. One tick runs at most one probe per
-// cluster for both.
+// The probe fires at each Interval. A nil result means the cluster was
+// reachable; each authority then decides what that is worth. While the
+// write strategy reports a cluster degraded, the probe's latency goes to
+// [policy.AdaptiveDualWrite.RecordProbeLatency] (or a nil result to
+// RecordProbeSuccess for a strategy without latency judgement), and the
+// strategy credits a recovery point only if it judges the probe fast
+// enough; the cluster returns to healthy state once it accumulates the
+// strategy's recovery threshold. While the failover policy has an open
+// breaker whose reset timeout has elapsed, the same probe reserves the
+// breaker (half-open) and a nil result closes it while an error re-opens
+// it, so no caller's read is sacrificed to test the cluster. One tick runs
+// at most one probe per cluster for both.
 //
 // The probe is intentionally lightweight: the default reads a single cell
 // from system.local to verify the driver can reach the cluster, without
@@ -34,12 +36,12 @@ import (
 // failure modes may supply a custom Probe function (e.g., a test write to a
 // dedicated probe table).
 //
-// Recovery probe is default-on for [policy.AdaptiveDualWrite] users. Use
-// [WithRecoveryProbeDisabled] to opt out.
+// The recovery probe is default-on whenever either authority is
+// configured. Use [WithRecoveryProbeDisabled] to opt out.
 type RecoveryProbe struct {
-	// Probe is the health check executed against a degraded cluster's live
-	// session. Return nil to credit a recovery point; return non-nil to
-	// leave the cluster in its current degraded state.
+	// Probe is the health check executed against the live session of a
+	// cluster an authority asks about. Return nil to report the cluster
+	// reachable; return non-nil to leave it degraded or its breaker open.
 	//
 	// The context is bound by Timeout. If nil, the default probe queries
 	// SELECT release_version FROM system.local.
@@ -305,16 +307,17 @@ type ClientConfig struct {
 	// because the caller passes the new session directly.
 	SessionRefresher SessionRefresher
 
-	// RecoveryProbe configures the background probe that runs against degraded
-	// clusters to accelerate recovery for [policy.AdaptiveDualWrite]. When nil
-	// and the write strategy is AdaptiveDualWrite, a default probe is used
+	// RecoveryProbe configures the background probe that serves a write
+	// strategy reporting degraded clusters ([ProbeReporter]) and a failover
+	// policy reserving its open breaker ([FailoverProbeReporter]). When nil
+	// and either authority is configured, a default probe is used
 	// automatically. When recoveryProbeOff is true, no probe is started.
 	//
 	// Set via [WithRecoveryProbe]; disable via [WithRecoveryProbeDisabled].
 	RecoveryProbe *RecoveryProbe
 
-	// recoveryProbeOff disables the recovery probe even when AdaptiveDualWrite
-	// is detected. Set via [WithRecoveryProbeDisabled].
+	// recoveryProbeOff disables the recovery probe even when an authority
+	// would use it. Set via [WithRecoveryProbeDisabled].
 	recoveryProbeOff bool
 
 	// profile is the [BehaviorProfile] selected via [WithBehaviorProfile];
@@ -417,9 +420,9 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 // for the client-owned options whose v1 default is kept only for
 // compatibility.
 //
-// It is pure option expansion: [Safe] is exactly WithRouteVeto(true), and
-// a later option in the same NewCQLClient call overrides it. It adds no
-// behaviour of its own.
+// It is pure option expansion: [Safe] is exactly WithRouteVeto(true) and
+// [Legacy] exactly WithRouteVeto(false), so the last profile or option in
+// the same NewCQLClient call wins. It adds no behaviour of its own.
 //
 // Parameters:
 //   - profile: [Legacy] (the default) or [Safe]
@@ -438,8 +441,13 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 func WithBehaviorProfile(profile BehaviorProfile) Option {
 	return func(c *ClientConfig) {
 		c.profile = profile
-		if profile == Safe {
+		switch profile {
+		case Safe:
 			c.RouteVeto = true
+		case Legacy:
+			c.RouteVeto = false
+		default:
+			// Rejected by NewCQLClient; leave the knobs untouched.
 		}
 	}
 }
@@ -546,8 +554,10 @@ func WithSessionRefresher(fn SessionRefresher) Option {
 // [FailoverProbeReporter], [policy.CircuitBreaker] and
 // [policy.LatencyCircuitBreaker]). On each Interval the probe runs against
 // the live session of a cluster either authority asks about. A nil return
-// credits one recovery point and closes a reserved breaker; a non-nil
-// return leaves the cluster degraded and the breaker open. Zero Interval
+// reports the cluster reachable: it closes a reserved breaker, and the
+// write strategy credits a recovery point if it judges the probe fast
+// enough (see [RecoveryProbe]). A non-nil return leaves the cluster
+// degraded and the breaker open. Zero Interval
 // or Timeout values are replaced with the defaults from
 // [DefaultRecoveryProbe]; negative values are invalid and cause
 // [NewCQLClient] to return a [types.OptionError].

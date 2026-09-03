@@ -23,6 +23,11 @@ func TestBehaviorProfile_SafeIsPureOptionExpansion(t *testing.T) {
 	var legacy ClientConfig
 	WithBehaviorProfile(Legacy)(&legacy)
 	require.False(t, legacy.RouteVeto)
+
+	var reverted ClientConfig
+	WithBehaviorProfile(Safe)(&reverted)
+	WithBehaviorProfile(Legacy)(&reverted)
+	require.False(t, reverted.RouteVeto, "Legacy after Safe restores the v1 knob, as the last option wins")
 }
 
 func TestBehaviorProfile_SafeEnablesRouteVetoOnTheClient(t *testing.T) {

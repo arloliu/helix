@@ -151,6 +151,45 @@ func TestRecoveryProbe_ImmediateNonConnectivityErrorStaysUnwrapped(t *testing.T)
 	require.Nil(t, stats.lastErr.Load(), "nothing was recorded, so nothing was relabelled as a timeout")
 }
 
+// A probe that returns nil after observing the client's cancellation
+// proves nothing about the cluster: it is abandoned, not credited.
+func TestRecoveryProbe_CancelledByCloseIsNotASuccess(t *testing.T) {
+	adaptive := policy.NewAdaptiveDualWrite()
+	breaker := policy.NewCircuitBreaker(policy.WithThreshold(1), policy.WithResetTimeout(time.Millisecond))
+	entered := make(chan struct{}, 1)
+	probe := RecoveryProbe{
+		Probe: func(ctx context.Context, _ cql.Session) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+
+			return nil
+		},
+		Interval: 5 * time.Millisecond,
+		Timeout:  time.Hour,
+	}
+	probes := &probeCounters{}
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(adaptive),
+		WithFailoverPolicy(breaker),
+		WithRecoveryProbe(probe),
+		WithMetrics(probes),
+	)
+	require.NoError(t, err)
+	breaker.RecordFailure(ClusterA) // trips; the probe reserves it after the reset timeout
+	degradeClusterA(t, adaptive)
+	<-entered
+
+	client.Close()
+	require.Zero(t, probes.successA.Load(), "a cancelled probe is not a success")
+	require.True(t, adaptive.IsDegraded(ClusterA), "the write strategy is not credited")
+	require.True(t, breaker.ShouldFailover(ClusterA, nil), "the breaker stays open")
+	_, ok := breaker.TryBeginFailoverProbe(ClusterA)
+	require.True(t, ok, "the abandoned reservation is released")
+}
+
 func TestRecoveryProbe_CancelledByCloseRecordsNothing(t *testing.T) {
 	adaptive := policy.NewAdaptiveDualWrite()
 	entered := make(chan struct{}, 1)
