@@ -529,8 +529,9 @@ func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
 
 // Len returns the number of capacity slots currently held.
 //
-// Under the worker's [RetryBounded] policy a slot is released as
-// soon as a worker dequeues the payload, so Len reports queue depth only:
+// Under the worker's [RetryBounded] policy a slot is released once the
+// cluster gate admits the dequeued payload to its first attempt, so Len
+// reports queue depth only:
 // payloads being attempted or sleeping between attempts are NOT counted,
 // and a worker pulling a payload, failing, and retrying with backoff
 // produces a transient `Len() == 0` window even though work remains.
@@ -559,8 +560,13 @@ func (m *MemoryReplayer) Len() int {
 //   - cluster: The target cluster to count
 //
 // Returns:
-//   - int: Slots held by payloads for that cluster
+//   - int: Slots held by payloads for that cluster; 0 for a cluster other
+//     than A or B
 func (m *MemoryReplayer) PendingByCluster(cluster types.ClusterID) int {
+	if validateTargetCluster(cluster) != nil {
+		return 0
+	}
+
 	return int(m.clusterPending(cluster).Load())
 }
 

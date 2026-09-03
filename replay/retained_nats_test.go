@@ -3,6 +3,7 @@ package replay_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +46,81 @@ func TestNATSReplayer_PendingByClusterSeesDurableBacklog(t *testing.T) {
 	pending, err = fresh.PendingByCluster(t.Context(), types.ClusterB)
 	require.NoError(t, err)
 	assert.Zero(t, pending)
+}
+
+func TestNATSReplayer_PendingByClusterRejectsUnknownCluster(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	replayer := newRetainedNATSReplayer(t, js, "unknown")
+	enqueueN(t, replayer, 1, types.ClusterA)
+
+	for _, cluster := range []types.ClusterID{"C", "*", ">"} {
+		_, err := replayer.PendingByCluster(t.Context(), cluster)
+		require.ErrorIs(t, err, types.ErrInvalidCluster, "cluster %q", cluster)
+	}
+}
+
+// PendingByCluster and Pending share the stream handle; calling them
+// concurrently must not race on its cached info.
+func TestNATSReplayer_PendingCountsAreConcurrencySafe(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	replayer := newRetainedNATSReplayer(t, js, "concurrent")
+	enqueueN(t, replayer, 2, types.ClusterA)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 10 {
+				_, err := replayer.Pending(t.Context())
+				assert.NoError(t, err)
+				_, err = replayer.PendingByCluster(t.Context(), types.ClusterA)
+				assert.NoError(t, err)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// A fetched message counts as pending while its execution is in flight
+// and while it waits for a delayed redelivery, and stops counting once it
+// is acknowledged.
+func TestNATSReplayer_PendingByClusterCountsInFlightAndDelayed(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	replayer := newRetainedNATSReplayer(t, js, "inflight")
+
+	entered := make(chan struct{}, 1)
+	release := make(chan error)
+	worker := replay.NewNATSWorker(replayer,
+		func(context.Context, types.ReplayPayload) error {
+			entered <- struct{}{}
+
+			return <-release
+		},
+		replay.WithRetryPolicy(replay.RetryWhileRetained),
+		replay.WithPollInterval(10*time.Millisecond),
+		replay.WithBatchSize(1),
+		replay.WithRetryDelay(200*time.Millisecond),
+		replay.WithMaxRetryDelay(200*time.Millisecond),
+	)
+	enqueueN(t, replayer, 1, types.ClusterA)
+	require.NoError(t, worker.Start())
+	defer worker.Stop()
+
+	pending := func() int {
+		n, err := replayer.PendingByCluster(t.Context(), types.ClusterA)
+		require.NoError(t, err)
+
+		return n
+	}
+	<-entered
+	assert.Equal(t, 1, pending(), "in flight, not yet acknowledged")
+	release <- fmt.Errorf("%w: pool empty", types.ErrClusterUnreachable)
+	time.Sleep(50 * time.Millisecond) // inside the delayed NAK window
+	assert.Equal(t, 1, pending(), "waiting for redelivery")
+
+	<-entered
+	release <- nil
+	require.Eventually(t, func() bool { return pending() == 0 }, 5*time.Second, 20*time.Millisecond,
+		"acknowledged")
 }
 
 // Under RetryWhileRetained the consumer never drops a message on its own:

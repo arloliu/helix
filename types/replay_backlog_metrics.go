@@ -26,7 +26,9 @@ const (
 
 	// ReplayDropRequeueFailed: the memory worker could not put a payload
 	// back in its queue after the cluster gate closed between dequeue and
-	// execution, because the queue had filled meanwhile.
+	// execution. The payload still holds its capacity slot and the queues
+	// are sized to the full capacity, so this reason marks a broken
+	// accounting invariant rather than queue pressure.
 	ReplayDropRequeueFailed = "requeue_failed"
 )
 

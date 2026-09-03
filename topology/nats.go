@@ -56,7 +56,7 @@ var _ helix.TopologyWatcher = (*NATS)(nil)
 //
 // Returns:
 //   - *NATS: A new watcher instance
-//   - error: Error if kv is nil
+//   - error: Error if kv is nil or the poll interval is not positive
 //
 // Example:
 //

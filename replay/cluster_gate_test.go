@@ -19,11 +19,11 @@ type gateSwitch struct{ open atomic.Bool }
 
 func (g *gateSwitch) allow(types.ClusterID) bool { return g.open.Load() }
 
-func countingExecute(executed *atomic.Int32, err error) replay.ExecuteFunc {
+func countingExecute(executed *atomic.Int32) replay.ExecuteFunc {
 	return func(context.Context, types.ReplayPayload) error {
 		executed.Add(1)
 
-		return err
+		return nil
 	}
 }
 
@@ -41,7 +41,7 @@ func TestMemoryWorker_RetainedGateParksWithoutSpendingWindow(t *testing.T) {
 	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(8))
 	var executed, dropped atomic.Int32
 	gate := &gateSwitch{}
-	worker := replay.NewMemoryWorker(replayer, countingExecute(&executed, nil),
+	worker := replay.NewMemoryWorker(replayer, countingExecute(&executed),
 		replay.WithPollInterval(2*time.Millisecond),
 		replay.WithRetryWindow(40*time.Millisecond),
 		replay.WithClusterGate(gate.allow),
@@ -138,7 +138,7 @@ func TestMemoryWorker_BoundedGateWaitsBetweenAttempts(t *testing.T) {
 func TestMemoryWorker_GateClosingBetweenDequeueAndExecuteRequeues(t *testing.T) {
 	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(8))
 	var executed atomic.Int32
-	worker := replay.NewMemoryWorker(replayer, countingExecute(&executed, nil),
+	worker := replay.NewMemoryWorker(replayer, countingExecute(&executed),
 		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithPollInterval(2*time.Millisecond),
 		replay.WithClusterGate(closeOnceAtExecute(nil)),
@@ -172,6 +172,56 @@ func closeOnceAtExecute(onClose func()) func(types.ClusterID) bool {
 	}
 }
 
+// TestMemoryWorker_StopAfterGateRefusalDropsOnce proves a payload the gate
+// refused after dequeue is reported as one shutdown drop and releases its
+// slot when the worker stops while the gate is still closed.
+func TestMemoryWorker_StopAfterGateRefusalDropsOnce(t *testing.T) {
+	for _, policy := range []replay.ReplayRetryPolicy{replay.RetryBounded, replay.RetryWhileRetained} {
+		t.Run(fmt.Sprint(policy), func(t *testing.T) {
+			replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(1))
+			var executed, dropped atomic.Int32
+			refused := make(chan struct{}, 1)
+			// Permit the dequeue check, then refuse cluster A for good.
+			var calls atomic.Int32
+			gate := func(c types.ClusterID) bool {
+				if c != types.ClusterA || calls.Add(1) == 1 {
+					return true
+				}
+				select {
+				case refused <- struct{}{}:
+				default:
+				}
+
+				return false
+			}
+			worker := replay.NewMemoryWorker(replayer, countingExecute(&executed),
+				replay.WithRetryPolicy(policy),
+				replay.WithPollInterval(2*time.Millisecond),
+				replay.WithClusterGate(gate),
+				replay.WithOnDrop(func(_ types.ReplayPayload, err error) {
+					dropped.Add(1)
+					require.NoError(t, err, "a shutdown drop carries no execution error")
+				}),
+			)
+			enqueueN(t, replayer, 1, types.ClusterA)
+			require.NoError(t, worker.Start())
+			<-refused
+			worker.Stop()
+
+			require.Zero(t, executed.Load())
+			require.Equal(t, int32(1), dropped.Load(), "the requeued payload is dropped once at shutdown")
+			require.Zero(t, replayer.Len(), "its slot is released")
+		})
+	}
+}
+
+func TestMemoryReplayer_PendingByClusterUnknownClusterIsZero(t *testing.T) {
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(4))
+	enqueueN(t, replayer, 2, types.ClusterB)
+	require.Equal(t, 2, replayer.PendingByCluster(types.ClusterB))
+	require.Zero(t, replayer.PendingByCluster("C"), "an unknown cluster does not alias B")
+}
+
 // TestMemoryWorker_GatedPayloadKeepsItsSlot proves a payload the gate
 // closes on after dequeue still holds its capacity slot: a producer cannot
 // take its place, it is never dropped, and it holds exactly one slot.
@@ -188,7 +238,7 @@ func TestMemoryWorker_GatedPayloadKeepsItsSlot(t *testing.T) {
 				})
 				pendingWhileGated = replayer.PendingByCluster(types.ClusterA)
 			})
-			worker := replay.NewMemoryWorker(replayer, countingExecute(&executed, nil),
+			worker := replay.NewMemoryWorker(replayer, countingExecute(&executed),
 				replay.WithRetryPolicy(policy),
 				replay.WithPollInterval(2*time.Millisecond),
 				replay.WithClusterGate(gate),
