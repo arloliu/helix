@@ -334,7 +334,7 @@ returns reads to A only after the queue drains.
 
 ## Working Conventions
 
-- One PR per numbered item unless two items touch the same lines; then combine and say so.
+- One branch and PR per phase, one commit per numbered item; two items share a commit only when they touch the same lines, and the commit says so.
 - Each PR states which item it closes, its compatibility category, and which review scenario
   verifies it.
 - Behaviour changes are recorded in `CHANGELOG.md` under "Behavior change" with the restore
