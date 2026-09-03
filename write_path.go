@@ -225,25 +225,43 @@ func (c *CQLClient) writeLegs(
 	drainA, drainB bool,
 	startA, startB *atomic.Int64,
 ) (writeA, writeB func(context.Context) error) {
-	writeA = func(ctx context.Context) error {
-		if drainA {
-			return types.ErrClusterDraining
-		}
-		startA.Store(time.Now().UnixNano())
-
-		return writeFunc(ctx, c.loadSessionA())
-	}
-	writeB = func(ctx context.Context) error {
-		if drainB {
-			return types.ErrClusterDraining
-		}
-		startB.Store(time.Now().UnixNano())
-
-		return writeFunc(ctx, c.loadSessionB())
-	}
-
-	return writeA, writeB
+	return c.writeLeg(writeFunc, drainA, startA, c.loadSessionA),
+		c.writeLeg(writeFunc, drainB, startB, c.loadSessionB)
 }
+
+// writeLeg builds one cluster's leg: a draining cluster is skipped, the
+// start time is stamped, and the write runs under legContext.
+func (c *CQLClient) writeLeg(
+	writeFunc func(context.Context, cql.Session) error,
+	draining bool,
+	start *atomic.Int64,
+	loadSession func() cql.Session,
+) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if draining {
+			return types.ErrClusterDraining
+		}
+		start.Store(time.Now().UnixNano())
+		ctx, cancel := c.legContext(ctx)
+		defer cancel()
+
+		return writeFunc(ctx, loadSession())
+	}
+}
+
+// legContext bounds one write leg by [ClientConfig.ClusterWriteTimeout].
+// The leg's own deadline expiring leaves the parent context live, so
+// classifyWriteLeg attributes the failure to the cluster.
+func (c *CQLClient) legContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.config.ClusterWriteTimeout <= 0 {
+		return ctx, noopCancel
+	}
+
+	return context.WithTimeout(ctx, c.config.ClusterWriteTimeout)
+}
+
+// noopCancel is the cancel function of a leg that runs on the caller's context.
+func noopCancel() {}
 
 // executeDualWrite performs the normal dual-cluster write.
 //

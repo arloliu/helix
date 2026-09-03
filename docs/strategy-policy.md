@@ -96,6 +96,9 @@ Each interface has a single responsibility. Compose them to express your exact r
 ### ConcurrentDualWrite
 
 Executes writes to both clusters in parallel using two goroutines, then waits for both to complete.
+A slow but healthy cluster therefore holds every write for as long as the caller's context allows;
+`helix.WithClusterWriteTimeout(d)` bounds each leg independently, turning a leg that exceeds `d`
+into a replayed failure while the other leg's acknowledgement stands.
 
 ```go
 strategy := policy.NewConcurrentDualWrite()
