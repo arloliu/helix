@@ -331,3 +331,60 @@ func TestMemoryReplayerHighLenLowLen(t *testing.T) {
 	require.Equal(t, 3, replayer.LowLen())
 	require.Equal(t, 8, replayer.Len())
 }
+
+func TestMemoryReplayerAlternatesClusters(t *testing.T) {
+	replayer := NewMemoryReplayer(WithQueueCapacity(20))
+	defer replayer.Close()
+
+	// A backlog for cluster A is queued before anything for cluster B.
+	for i := range 3 {
+		p := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "A", Timestamp: int64(i + 1)}
+		require.NoError(t, replayer.Enqueue(context.Background(), p))
+	}
+	for i := range 3 {
+		p := types.ReplayPayload{TargetCluster: types.ClusterB, Query: "B", Timestamp: int64(i + 1)}
+		require.NoError(t, replayer.Enqueue(context.Background(), p))
+	}
+
+	// Dequeue must alternate between clusters so A's backlog cannot
+	// delay B's payloads.
+	got := make([]types.ClusterID, 0, 6)
+	for range 6 {
+		p, ok := replayer.TryDequeue()
+		require.True(t, ok)
+		got = append(got, p.TargetCluster)
+	}
+	want := []types.ClusterID{
+		types.ClusterA, types.ClusterB, types.ClusterA,
+		types.ClusterB, types.ClusterA, types.ClusterB,
+	}
+	require.Equal(t, want, got)
+
+	// Each cluster's queue stays FIFO.
+	require.Equal(t, 0, replayer.Len())
+	require.Equal(t, 0, replayer.PendingByCluster(types.ClusterA))
+	require.Equal(t, 0, replayer.PendingByCluster(types.ClusterB))
+}
+
+func TestMemoryReplayerClusterFIFOWithinPriority(t *testing.T) {
+	replayer := NewMemoryReplayer(WithQueueCapacity(20))
+	defer replayer.Close()
+
+	for i := range 3 {
+		p := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "A", Timestamp: int64(i + 1)}
+		require.NoError(t, replayer.Enqueue(context.Background(), p))
+	}
+	p := types.ReplayPayload{TargetCluster: types.ClusterB, Query: "B", Timestamp: 1}
+	require.NoError(t, replayer.Enqueue(context.Background(), p))
+
+	// With B exhausted after one dequeue, A's payloads continue in order.
+	var timestamps []int64
+	for range 4 {
+		p, ok := replayer.TryDequeue()
+		require.True(t, ok)
+		if p.TargetCluster == types.ClusterA {
+			timestamps = append(timestamps, p.Timestamp)
+		}
+	}
+	require.Equal(t, []int64{1, 2, 3}, timestamps)
+}

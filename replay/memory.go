@@ -15,22 +15,35 @@ const (
 	defaultMemoryHighPriorityRate = 10
 )
 
-// MemoryReplayer implements an in-memory replay queue using priority-based buffered channels.
+// MemoryReplayer implements an in-memory replay queue using per-cluster,
+// priority-based buffered channels.
+//
+// # Per-Cluster Queues
+//
+// Each target cluster owns its own pair of priority channels, and dequeue
+// alternates between the clusters that have payloads waiting.
+// A long backlog for one cluster therefore never delays the other
+// cluster's payloads, and each cluster's queue stays first-in first-out
+// within a priority.
 //
 // # Priority Support
 //
-// The replayer uses separate channels for high and low priority messages,
-// sharing a total enforced capacity. Each priority channel is sized to the
-// full configured capacity so an all-high or all-low workload can use the
-// entire budget; a shared atomic counter caps the combined pending across
-// both queues. High-priority messages are preferred during dequeue operations,
+// Within a cluster, high and low priority messages use separate channels.
+// High-priority messages are preferred during dequeue operations,
 // with configurable ratio-based fair scheduling to prevent low-priority
 // starvation.
 //
+// # Capacity
+//
+// All four channels share one enforced capacity: each channel is sized to
+// the full configured capacity so a workload that is all one cluster and
+// one priority can use the entire budget, and a shared atomic counter caps
+// the combined pending count across every queue.
+//
 // # Memory Footprint
 //
-// Because both priority channels are sized to the full capacity, the replayer
-// reserves channel buffer slots for ~2× capacity ReplayPayload structs (the
+// Because every channel is sized to the full capacity, the replayer
+// reserves channel buffer slots for ~4× capacity ReplayPayload structs (the
 // enforced pending limit is still 1× capacity). Size WithQueueCapacity with
 // that overhead in mind for high-capacity deployments.
 //
@@ -49,19 +62,25 @@ const (
 // as closed but does not close the underlying channel, preventing panics from
 // concurrent Enqueue calls during shutdown.
 type MemoryReplayer struct {
-	highQueue chan types.ReplayPayload
-	lowQueue  chan types.ReplayPayload
-	closed    atomic.Bool
-	capacity  int
-	pending   atomic.Int64
-	pendingA  atomic.Int64 // slots held by payloads targeting cluster A
-	pendingB  atomic.Int64 // slots held by payloads targeting cluster B
+	queues   [2]clusterQueues // indexed by clusterIndex
+	closed   atomic.Bool
+	capacity int
+	pending  atomic.Int64 // slots held across both clusters
 
-	// For priority-aware dequeue tracking
+	// Dequeue scheduling state: cluster rotation and priority ratio.
 	mu                sync.Mutex
-	highProcessed     int // Count of high-priority items processed since last low
+	nextQueue         int // Index of the cluster to try first on the next dequeue; guarded by mu
 	highPriorityRatio int // Process N high before 1 low (0 = equal priority)
 	strictPriority    bool
+}
+
+// clusterQueues holds one cluster's priority channels, its slot count, and
+// its share of the ratio bookkeeping.
+type clusterQueues struct {
+	high          chan types.ReplayPayload
+	low           chan types.ReplayPayload
+	pending       atomic.Int64 // slots held by payloads targeting this cluster
+	highProcessed int          // Count of high-priority items processed since last low; guarded by MemoryReplayer.mu
 }
 
 // MemoryReplayerOption configures a MemoryReplayer.
@@ -196,8 +215,20 @@ func normalizeMemoryReplayerForLegacy(m *MemoryReplayer) {
 }
 
 func initializeMemoryReplayerQueues(m *MemoryReplayer) {
-	m.highQueue = make(chan types.ReplayPayload, m.capacity)
-	m.lowQueue = make(chan types.ReplayPayload, m.capacity)
+	for i := range m.queues {
+		m.queues[i].high = make(chan types.ReplayPayload, m.capacity)
+		m.queues[i].low = make(chan types.ReplayPayload, m.capacity)
+	}
+}
+
+// clusterIndex maps a target cluster to its slot in MemoryReplayer.queues.
+// Enqueue has already rejected any target other than A or B.
+func clusterIndex(cluster types.ClusterID) int {
+	if cluster == types.ClusterA {
+		return 0
+	}
+
+	return 1
 }
 
 // Enqueue adds a failed write to the replay queue.
@@ -216,7 +247,7 @@ func initializeMemoryReplayerQueues(m *MemoryReplayer) {
 //     ctx.Err() if ctx is already cancelled or is cancelled while waiting;
 //     [types.ErrReplayQueueFull] if the combined pending count is at capacity.
 func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload) error {
-	if m.highQueue == nil || m.lowQueue == nil {
+	if !m.initialized() {
 		return errors.New("helix: memory replayer not initialized, use NewMemoryReplayer")
 	}
 	if m.closed.Load() {
@@ -234,12 +265,11 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 		return types.ErrReplayQueueFull
 	}
 
-	// Route to appropriate queue based on priority
-	var targetQueue chan types.ReplayPayload
+	// Route to the target cluster's queue for the payload's priority.
+	q := &m.queues[clusterIndex(payload.TargetCluster)]
+	targetQueue := q.low
 	if payload.Priority == types.PriorityHigh {
-		targetQueue = m.highQueue
-	} else {
-		targetQueue = m.lowQueue
+		targetQueue = q.high
 	}
 
 	select {
@@ -270,47 +300,70 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 //   - types.ReplayPayload: The next payload to replay
 //   - bool: true if a payload was retrieved, false if cancelled/closed
 func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool) {
-	if m.highQueue == nil || m.lowQueue == nil {
+	if !m.initialized() {
 		return types.ReplayPayload{}, false
 	}
-	for {
-		// Check for stop condition first
-		select {
-		case <-ctx.Done():
-			return types.ReplayPayload{}, false
-		default:
-		}
 
-		// Determine which queue to try based on priority mode
-		payload, ok := m.tryDequeueWithPriority()
-		if ok {
-			m.releaseSlot(payload.TargetCluster)
-			return payload, true
-		}
-
-		// No messages available; if closed and drained, signal completion.
-		if m.closed.Load() && m.Len() == 0 {
-			return types.ReplayPayload{}, false
-		}
-
-		// Wait for any message or context cancellation
-		select {
-		case <-ctx.Done():
-			return types.ReplayPayload{}, false
-		case payload := <-m.highQueue:
-			m.mu.Lock()
-			m.highProcessed++
-			m.mu.Unlock()
-			m.releaseSlot(payload.TargetCluster)
-			return payload, true
-		case payload := <-m.lowQueue:
-			m.mu.Lock()
-			m.highProcessed = 0 // Reset counter after processing low
-			m.mu.Unlock()
-			m.releaseSlot(payload.TargetCluster)
-			return payload, true
-		}
+	// Check for stop condition first
+	select {
+	case <-ctx.Done():
+		return types.ReplayPayload{}, false
+	default:
 	}
+
+	// Determine which queue to try based on priority mode
+	payload, ok := m.tryDequeueWithPriority()
+	if ok {
+		m.releaseSlot(payload.TargetCluster)
+		return payload, true
+	}
+
+	// No messages available; if closed and drained, signal completion.
+	if m.closed.Load() && m.Len() == 0 {
+		return types.ReplayPayload{}, false
+	}
+
+	// Wait for any message or context cancellation.
+	// Go's select picks a ready channel at random, so no cluster or
+	// priority can starve the others while several have payloads; the
+	// rotation and ratio bookkeeping resume from whichever was taken.
+	var idx int
+	var high bool
+	select {
+	case <-ctx.Done():
+		return types.ReplayPayload{}, false
+	case payload = <-m.queues[0].high:
+		idx, high = 0, true
+	case payload = <-m.queues[0].low:
+		idx = 0
+	case payload = <-m.queues[1].high:
+		idx, high = 1, true
+	case payload = <-m.queues[1].low:
+		idx = 1
+	}
+	m.mu.Lock()
+	m.noteDequeuedLocked(idx, high)
+	m.mu.Unlock()
+	m.releaseSlot(payload.TargetCluster)
+
+	return payload, true
+}
+
+// initialized reports whether the queues were built by a constructor.
+func (m *MemoryReplayer) initialized() bool {
+	return m.queues[0].high != nil
+}
+
+// noteDequeuedLocked records that one payload left the queue at index idx:
+// it advances that cluster's ratio counter and rotates to the other cluster.
+// The caller holds m.mu.
+func (m *MemoryReplayer) noteDequeuedLocked(idx int, high bool) {
+	if high {
+		m.queues[idx].highProcessed++
+	} else {
+		m.queues[idx].highProcessed = 0
+	}
+	m.nextQueue = 1 - idx
 }
 
 func (m *MemoryReplayer) tryReserveSlot(cluster types.ClusterID) bool {
@@ -344,13 +397,8 @@ func (m *MemoryReplayer) releaseSlot(cluster types.ClusterID) {
 }
 
 // clusterPending returns the per-cluster slot counter.
-// Enqueue has already rejected any target other than A or B.
 func (m *MemoryReplayer) clusterPending(cluster types.ClusterID) *atomic.Int64 {
-	if cluster == types.ClusterA {
-		return &m.pendingA
-	}
-
-	return &m.pendingB
+	return &m.queues[clusterIndex(cluster)].pending
 }
 
 // tryDequeueRetained removes the next payload without releasing its
@@ -359,7 +407,7 @@ func (m *MemoryReplayer) clusterPending(cluster types.ClusterID) *atomic.Int64 {
 // replayed or dropped, so capacity keeps counting executing and waiting
 // payloads.
 func (m *MemoryReplayer) tryDequeueRetained() (types.ReplayPayload, bool) {
-	if m.highQueue == nil || m.lowQueue == nil {
+	if !m.initialized() {
 		return types.ReplayPayload{}, false
 	}
 	if m.closed.Load() && m.Len() == 0 {
@@ -369,61 +417,55 @@ func (m *MemoryReplayer) tryDequeueRetained() (types.ReplayPayload, bool) {
 	return m.tryDequeueWithPriority()
 }
 
-// tryDequeueWithPriority attempts to dequeue based on priority settings.
+// tryDequeueWithPriority attempts to dequeue from the next cluster in the
+// rotation, falling back to the other cluster when that one is empty.
 // Returns immediately without blocking.
 func (m *MemoryReplayer) tryDequeueWithPriority() (types.ReplayPayload, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Strict priority mode: drain high completely before low
-	if m.strictPriority {
-		select {
-		case payload := <-m.highQueue:
+	for i := range m.queues {
+		idx := (m.nextQueue + i) % len(m.queues)
+		payload, high, ok := m.tryDequeueCluster(&m.queues[idx])
+		if ok {
+			m.noteDequeuedLocked(idx, high)
+
 			return payload, true
-		default:
-			// High queue empty, try low
-			select {
-			case payload := <-m.lowQueue:
-				return payload, true
-			default:
-				return types.ReplayPayload{}, false
-			}
 		}
 	}
 
-	// Ratio-based fair scheduling
+	return types.ReplayPayload{}, false
+}
+
+// tryDequeueCluster applies the priority settings to one cluster's queues
+// and reports which priority the payload came from.
+// The caller holds m.mu and records the outcome through noteDequeuedLocked.
+func (m *MemoryReplayer) tryDequeueCluster(q *clusterQueues) (payload types.ReplayPayload, high, ok bool) {
+	// Ratio-based scheduling lets low go first once enough high payloads
+	// have been processed; strict priority never does.
 	ratio := m.highPriorityRatio
 	if ratio <= 0 {
 		ratio = 1 // 1:1 equal priority
 	}
-
-	// Check if we should process low priority (based on ratio)
-	shouldProcessLow := m.highProcessed >= ratio
-
-	if shouldProcessLow {
-		// Try low priority first
+	if !m.strictPriority && q.highProcessed >= ratio {
 		select {
-		case payload := <-m.lowQueue:
-			m.highProcessed = 0 // Reset counter
-			return payload, true
+		case payload = <-q.low:
+			return payload, false, true
 		default:
 			// Low queue empty, fall through to try high
 		}
 	}
 
-	// Try high priority
 	select {
-	case payload := <-m.highQueue:
-		m.highProcessed++
-		return payload, true
+	case payload = <-q.high:
+		return payload, true, true
 	default:
 		// High queue empty, try low (don't starve if high is empty)
 		select {
-		case payload := <-m.lowQueue:
-			m.highProcessed = 0
-			return payload, true
+		case payload = <-q.low:
+			return payload, false, true
 		default:
-			return types.ReplayPayload{}, false
+			return types.ReplayPayload{}, false, false
 		}
 	}
 }
@@ -481,20 +523,22 @@ func (m *MemoryReplayer) PendingByCluster(cluster types.ClusterID) int {
 	return int(m.clusterPending(cluster).Load())
 }
 
-// HighLen returns the current number of high-priority pending replays.
+// HighLen returns the current number of high-priority pending replays
+// across both clusters.
 //
 // Returns:
-//   - int: Number of items in the high-priority queue
+//   - int: Number of items in the high-priority queues
 func (m *MemoryReplayer) HighLen() int {
-	return len(m.highQueue)
+	return len(m.queues[0].high) + len(m.queues[1].high)
 }
 
-// LowLen returns the current number of low-priority pending replays.
+// LowLen returns the current number of low-priority pending replays
+// across both clusters.
 //
 // Returns:
-//   - int: Number of items in the low-priority queue
+//   - int: Number of items in the low-priority queues
 func (m *MemoryReplayer) LowLen() int {
-	return len(m.lowQueue)
+	return len(m.queues[0].low) + len(m.queues[1].low)
 }
 
 // Cap returns the total enforced queue capacity across both priority queues.
@@ -524,36 +568,37 @@ func (m *MemoryReplayer) IsClosed() bool {
 	return m.closed.Load()
 }
 
-// DrainAll returns all pending replays and empties both queues.
+// DrainAll returns all pending replays and empties every queue.
 //
 // This is useful for graceful shutdown scenarios where you want
 // to persist pending replays before exiting. High-priority messages
-// are returned first, followed by low-priority messages.
+// are returned first (cluster A, then cluster B), followed by
+// low-priority messages in the same cluster order.
 //
 // Returns:
 //   - []types.ReplayPayload: All pending replay payloads
 func (m *MemoryReplayer) DrainAll() []types.ReplayPayload {
 	var payloads []types.ReplayPayload
-	if m.highQueue == nil || m.lowQueue == nil {
+	if !m.initialized() {
 		return payloads
 	}
 
-	// Drain high priority first
-	for {
-		select {
-		case payload := <-m.highQueue:
-			m.releaseSlot(payload.TargetCluster)
-			payloads = append(payloads, payload)
-		default:
-			goto drainLow
-		}
+	for i := range m.queues {
+		payloads = m.drainChannel(m.queues[i].high, payloads)
+	}
+	for i := range m.queues {
+		payloads = m.drainChannel(m.queues[i].low, payloads)
 	}
 
-drainLow:
-	// Then drain low priority
+	return payloads
+}
+
+// drainChannel appends every payload buffered in ch to payloads,
+// releasing each one's capacity slot.
+func (m *MemoryReplayer) drainChannel(ch chan types.ReplayPayload, payloads []types.ReplayPayload) []types.ReplayPayload {
 	for {
 		select {
-		case payload := <-m.lowQueue:
+		case payload := <-ch:
 			m.releaseSlot(payload.TargetCluster)
 			payloads = append(payloads, payload)
 		default:
