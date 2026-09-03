@@ -644,7 +644,7 @@ The reason appears in the worker log and, on collectors implementing
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithQueueCapacity(n)` | 10,000 | Total capacity shared across high/low priority queues |
+| `WithQueueCapacity(n)` | 10,000 | Total capacity shared across both clusters' high/low priority queues |
 | `WithMemoryHighPriorityRatio(n)` | 10 | Process N high-priority items before 1 low-priority |
 | `WithMemoryStrictPriority(bool)` | false | Drain all high-priority before any low-priority |
 
@@ -908,6 +908,10 @@ worker := replay.NewMemoryWorker(replayer, executeFunc,
 **Starvation Prevention:**
 
 The default ratio-based scheduling ensures low-priority messages are eventually processed even under continuous high-priority load. For every 10 high-priority batches processed, 1 low-priority batch is processed.
+
+The memory replayer also keeps a separate queue pair per target cluster and alternates between clusters on dequeue,
+so a long backlog for one cluster never delays the other cluster's payloads.
+Within one cluster and priority, payloads stay in enqueue order.
 
 The NATS replayer uses separate subjects per priority (`helix.replay.high.A`, `helix.replay.low.B`), enabling independent monitoring and processing.
 
