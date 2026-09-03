@@ -14,7 +14,7 @@ The root package applies policy outputs to CQL operations; shared policy interfa
 
 # Entries
 
-* None yet.
+* [Circuit breaker probe reservation](/policy/circuit-breaker-probe-reservation.md) - how a client-run probe closes an open breaker and how the reservation token works.
 
 # Entry points
 
