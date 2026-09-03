@@ -31,4 +31,7 @@ func TestBindDurations(t *testing.T) {
 	inner, ok := nested[0].([]any)
 	require.True(t, ok)
 	require.IsType(t, types.Duration{}, inner[0], "nested collections are copied, not mutated")
+
+	bound = bindDurations([]any{[]types.Duration(nil)})
+	require.Equal(t, []any{[]gocql.Duration(nil)}, bound, "a nil duration slice stays nil, so it binds as NULL")
 }

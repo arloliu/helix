@@ -256,7 +256,8 @@ type NoSynchronousAckError struct {
 	ResultB error
 
 	// Replay is nil when the write was admitted to the replay queue for
-	// every leg that needed it, otherwise the reason it was not.
+	// every leg that needed it, or a leg is still running in the background
+	// and will be enqueued if it fails; otherwise the reason it was not.
 	Replay error
 }
 

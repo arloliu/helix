@@ -49,8 +49,11 @@
 //   - *types.NoSynchronousAckError: No cluster acknowledged the write; every
 //     leg was dispatched in the background, dropped, skipped, or failed. The
 //     error names each leg's result and whether the write was admitted to
-//     the replay queue. WithAckMode(AckOnReplayAdmission) turns the admitted
-//     case back into nil.
+//     the replay queue; a leg still running in the background counts as
+//     admitted provisionally, and a failure to enqueue it later is reported
+//     only through the replay-dropped callback and event.
+//     WithAckMode(AckOnReplayAdmission) turns the admitted case back into
+//     nil.
 //   - *types.DualClusterError: Both clusters failed (operation completely failed)
 //
 // When both clusters fail, a types.DualClusterError is returned:

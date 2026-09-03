@@ -321,9 +321,16 @@ With both clusters degraded, every leg is fire-and-forget and no cluster has
 acknowledged the write when `Exec` returns. The client reports that as
 `*types.NoSynchronousAckError`: `ResultA` and `ResultB` carry each leg's
 result and `Replay` is nil when the write was admitted to the replay queue.
-A caller that runs a durable replayer and accepts "queued" as success selects
-`helix.WithAckMode(helix.AckOnReplayAdmission)`, which returns `nil` for that
-case; a failed enqueue is always an error.
+A fire-and-forget leg counts as admitted provisionally: it is still running
+when `Exec` returns, its failure is enqueued when it completes, and a failure
+to enqueue it then is reported only through the replay-dropped callback and
+`EventReplayDropped`, never through the returned error. Until the leg
+completes the write exists only in that background attempt, so a process
+exit loses it.
+A caller that runs a durable replayer and accepts "queued or in flight" as
+success selects `helix.WithAckMode(helix.AckOnReplayAdmission)`, which
+returns `nil` for that case; an enqueue that fails before `Exec` returns is
+always an error.
 
 ## Decision Flowchart
 

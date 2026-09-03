@@ -696,7 +696,7 @@ The reason appears in the worker log and, on collectors implementing
 The Replay System relies on client-generated timestamps for idempotency, but counter updates are additive - they don't use timestamps for conflict resolution. If a counter update succeeds on Cluster A but times out on Cluster B (while actually succeeding), the replay will increment B again, causing **double-counting**.
 
 **Alternatives for counters:**
-- Mark the statement `NonIdempotent()` (a `CounterBatch` is marked automatically): it is written synchronously to both clusters, never replayed, and a partial failure surfaces as `*types.PartialWriteError`
+- Mark the statement `NonIdempotent()` (a `CounterBatch` is marked automatically): it is written synchronously to both clusters, never replayed by this client or by a mirror destination's pair, and a partial failure surfaces as `*types.PartialWriteError`; mirror-level delivery may still retry it, see the idempotence row in [mirror.md](mirror.md#semantics)
 - Use single-cluster mode for counter tables
 - Implement application-level deduplication using unique operation IDs
 - Use a separate reconciliation strategy that compares counter values between clusters

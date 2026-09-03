@@ -295,15 +295,19 @@ The override exists specifically to prevent this race. Don't remove it early bec
 `ErrWriteAsync` never reaches the caller on its own: a write with one
 acknowledged cluster returns `nil`, and a write with none returns
 `*types.NoSynchronousAckError`. That error means the write is at best in the
-replay queue, so retrying it is safe only for idempotent statements; with a
-durable replayer, `helix.WithAckMode(helix.AckOnReplayAdmission)` makes the
-queued case `nil` again.
+replay queue or still running in the background (a fire-and-forget leg is
+enqueued only if it fails, and that later enqueue failure is reported only
+through the replay-dropped callback and event), so retrying it is safe only
+for idempotent statements; with a durable replayer,
+`helix.WithAckMode(helix.AckOnReplayAdmission)` makes the queued case `nil`
+again.
 
 ```go
 err := client.Query("INSERT ...").Exec()
 var noAck *types.NoSynchronousAckError
 if errors.As(err, &noAck) && noAck.Replay == nil {
-    // Both clusters degraded; the write is queued for replay.
+    // Both clusters degraded; the write is queued for replay, or still
+    // running in the background and queued only if that attempt fails.
 }
 ```
 
