@@ -53,8 +53,10 @@ Every behavioural change is assigned to exactly one category before implementati
 | **2 — Retry/retention default bounded by an existing cap** | Changed in the next minor. `CHANGELOG.md` "Behavior change" entry shows the old value as a one-line restore. Ships together with delayed backoff, a wall-clock window, and outcome metrics, never as a bare larger integer. | `MaxAttempts`, `MaxDeliver` (consumer `-1` plus delayed NAK), memory retry window, NATS consumer `BackOff` |
 | **3 — Infrastructure-affecting default** | Unchanged in v1. Startup `Warn` once per client when the legacy value is in effect. Flipped in v2, or selected in v1 through `WithBehaviorProfile(Safe)`. | `Replicas`, `DiscardOld` vs `DiscardNew`, route-veto enabled, `WithFailoverBelowThreshold` |
 
-`WithBehaviorProfile(Safe)` is pure option expansion over the Category 3 knobs. It is not a
-separate execution path and adds nothing to the test matrix beyond the individual options.
+`WithBehaviorProfile(Safe)` is pure option expansion over the root-owned Category 3 knobs. Knobs
+owned by a policy or replayer constructor keep their own options; root's startup `Warn` names the
+option to change for each one it can observe. Safe is not a separate execution path and adds
+nothing to the test matrix beyond the individual options.
 
 ### Write acknowledgement
 
