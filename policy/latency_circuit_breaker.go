@@ -348,11 +348,11 @@ func (l *LatencyCircuitBreaker) AbsoluteMax() time.Duration {
 	return l.absoluteMax
 }
 
-// ShouldFailover returns true if the failure threshold has been reached
-// AND the reset timeout has not yet elapsed since the last failure. See
-// [CircuitBreaker.ShouldFailover] for the full half-open transition
-// semantics. A zero-value LatencyCircuitBreaker (nil embedded
-// *CircuitBreaker) safely returns false.
+// ShouldFailover returns true while the breaker is open or half-open,
+// and otherwise the [WithFailoverBelowThreshold] setting. See
+// [CircuitBreaker.ShouldFailover] for the full semantics. A zero-value
+// LatencyCircuitBreaker (nil embedded *CircuitBreaker) safely returns
+// false.
 //
 // Parameters:
 //   - cluster: The cluster that failed

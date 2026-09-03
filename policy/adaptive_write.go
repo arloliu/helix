@@ -896,8 +896,9 @@ func (a *AdaptiveDualWrite) markDegradedLocked(state *clusterWriteState, manual 
 	if dwell >= a.maxDegradedDwell || dwell <= 0 {
 		dwell = a.maxDegradedDwell
 		// Report the cap once per run: a later re-degrade at the cap is
-		// the same flapping episode.
-		capReached = prevDwell < a.maxDegradedDwell
+		// the same flapping episode. The first re-degrade reaches it
+		// directly when the minimum dwell already equals the cap.
+		capReached = prevDwell < a.maxDegradedDwell || state.redegrades == 1
 	}
 	state.dwell = dwell
 
