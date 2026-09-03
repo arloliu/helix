@@ -11,9 +11,9 @@ affected read. See [Per-operation kinds](#per-operation-kinds).
 
 This is a push-based, best-effort notification stream for driving alerting,
 paging, or an operational dashboard. A handler that cannot keep up loses
-events; a metrics counter does not. Every kind has a metric counterpart —
-read rates and current state from the metric and use the event only as the
-push notification. See [Events and Metrics](#events-and-metrics) for the full
+events; a metrics counter does not. Every kind but `write_flapping` has a
+metric counterpart — read rates and current state from the metric and use the
+event only as the push notification. See [Events and Metrics](#events-and-metrics) for the full
 kind-to-metric table, including one kind whose event and metric count
 different things.
 

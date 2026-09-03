@@ -1177,12 +1177,28 @@ func (n *NATSReplayer) Pending(ctx context.Context) (int, error) {
 	}
 	n.mu.RUnlock()
 
-	info, err := n.stream.Info(ctx)
+	info, err := n.streamInfo(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("helix: failed to get stream info: %w", err)
+		return 0, err
 	}
 
 	return msgsToInt(info.State.Msgs)
+}
+
+// streamInfo fetches the stream's state under infoMu, because the handle
+// writes its cached info without locking.
+func (n *NATSReplayer) streamInfo(ctx context.Context, opts ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
+	if n.stream == nil {
+		return nil, errors.New("helix: NATS replayer not initialized, use NewNATSReplayer")
+	}
+	n.infoMu.Lock()
+	defer n.infoMu.Unlock()
+	info, err := n.stream.Info(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("helix: failed to get stream info: %w", err)
+	}
+
+	return info, nil
 }
 
 // msgsToInt converts a JetStream stream's uint64 message count to a
@@ -1259,27 +1275,26 @@ func (n *NATSReplayer) Config() NATSReplayerConfig {
 //
 // Returns:
 //   - int: Outstanding messages for that cluster
-//   - error: Error if stream info cannot be fetched
+//   - error: [types.ErrInvalidCluster] for a cluster other than A or B, or
+//     an error if stream info cannot be fetched
 func (n *NATSReplayer) PendingByCluster(ctx context.Context, cluster types.ClusterID) (int, error) {
+	if err := validateTargetCluster(cluster); err != nil {
+		return 0, err
+	}
 	n.mu.RLock()
 	closed := n.closed
 	n.mu.RUnlock()
 	if closed {
 		return 0, types.ErrSessionClosed
 	}
-	if n.stream == nil {
-		return 0, errors.New("helix: NATS replayer not initialized, use NewNATSReplayer")
-	}
 
 	// The stream is a work queue: a message stays under its subject until
 	// it is acknowledged, so the per-subject counts are the outstanding
 	// backlog whether or not the consumers exist yet.
 	filter := n.config.SubjectPrefix + ".*." + string(cluster)
-	n.infoMu.Lock()
-	info, err := n.stream.Info(ctx, jetstream.WithSubjectFilter(filter))
-	n.infoMu.Unlock()
+	info, err := n.streamInfo(ctx, jetstream.WithSubjectFilter(filter))
 	if err != nil {
-		return 0, fmt.Errorf("helix: failed to get stream info: %w", err)
+		return 0, err
 	}
 
 	total := uint64(0)

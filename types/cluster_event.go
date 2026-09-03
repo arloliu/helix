@@ -90,9 +90,10 @@ const (
 // Delivery is asynchronous and best-effort: a bounded buffer absorbs
 // bursts, and events are dropped (and counted) rather than ever blocking
 // a read/write operation. Treat this as an alerting/notification stream,
-// not a durable audit log. Every kind has a metric counterpart — read
-// rates and current state from the metric and use the event as the push
-// notification. See docs/cluster-events.md for the kind-to-metric table.
+// not a durable audit log. Every kind but EventWriteFlapping has a metric
+// counterpart — read rates and current state from the metric and use the
+// event as the push notification. See docs/cluster-events.md for the
+// kind-to-metric table.
 //
 // Ordering: events produced by circuit-breaker and adaptive-write state
 // transitions are delivered in per-cluster transition order, per policy
