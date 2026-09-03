@@ -306,14 +306,17 @@ Time →
 │ Error occurs → failover to B ───┤ Cooldown starts (5 min)          │
 │                                 │                                  │
 │                                 │ If B errors during cooldown:     │
-│                                 │   Preferred stays on B           │
-│                                 │   Read retries on A (per-request)│
+│                                 │   A known bad → stays on B,      │
+│                                 │     read retries on A (per-req)  │
+│                                 │   A known good → preferred → A   │
 │                                 │                                  │
 │                                 │ After cooldown: can switch to A  │
 └─────────────────────────────────┴──────────────────────────────────┘
 ```
 
-During the cooldown window, if the current preferred cluster (B) fails, `OnFailure` returns the alternative (A) as a failover target for that individual request without changing preferred. Reads succeed via the retry, but each request during this window pays the cost of trying B first — resulting in elevated latency, error counts, and failover log entries until a later failure occurs after cooldown expiry and preferred can switch.
+During the cooldown window, if the current preferred cluster (B) fails, `OnFailure` returns the alternative (A) as the failover target for that request. Whether preferred moves depends on what the strategy knows about A: a cluster is *known bad* from its last `OnFailure` until its next `OnSuccess`. If A is still known bad (both clusters are failing in turn), preferred stays on B and each request pays the cost of trying B first, so two flapping clusters cannot swap the preference back and forth. If A is known good (the per-request failover succeeded on it, or any other read did), preferred moves to A at once, so a single blip on A followed by B going hard down costs one failed read on B, not five minutes of them.
+
+`SetPreferred(cluster)` moves the preference by hand and restarts the cooldown; `Reset()` returns it to the cluster chosen at construction and clears the cooldown.
 
 Cooldown expiry by itself does **not** trigger a probe back to the original cluster. If B stays healthy after A recovers, reads continue on B indefinitely. StickyRead only changes preferred in response to a failure on the current preferred cluster.
 
@@ -664,7 +667,7 @@ This is intentional. If `OnFailure(B)` were called during override, `StickyRead`
 
 **When override is removed**, strategy state resumes from where it was frozen. For example:
 - `StickyRead`: preferred stays at its last value (likely B, from the original failover). Reads go to B, normal cooldown mechanics resume.
-- `PrimaryOnlyRead`: `failoverTime` stays at its last value. If the recovery timeout elapsed while frozen, the next `Select()` probes A — which is correct if the operator removed the override because A is now consistent.
+- `PrimaryOnlyRead`: the recovery timer keeps running. If it elapsed while frozen, the next `Select()` hands A to one caller as the probe — which is correct if the operator removed the override because A is now consistent.
 - If you need to force strategy state after removing the override, call `PrimaryOnlyRead.Reset()` or use `WithPreferredCluster`.
 
 **`FailoverPolicy` still receives health signals.** Even during override, `RecordSuccess`, `RecordFailure`, and `RecordLatency` are called so that circuit breaker state reflects real cluster health. The circuit breaker still gates failover: if it says no, the read fails even if the override list has a fallback entry.
