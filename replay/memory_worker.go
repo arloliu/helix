@@ -102,10 +102,6 @@ func (b *memoryBackend) dequeueLoop() {
 		}
 
 		payload, ok := b.replayer.tryDequeueRetained(b.config.allows)
-		if ok && !b.retained() {
-			// The bounded policy stops counting a payload once it is taken.
-			b.replayer.releaseSlot(payload.TargetCluster)
-		}
 		b.reportBacklog()
 		if !ok {
 			select {
@@ -151,6 +147,11 @@ func (b *memoryBackend) handleFirstAttempt(payload types.ReplayPayload) {
 		b.requeueGated(payload)
 
 		return
+	}
+	if !b.retained() {
+		// The bounded policy stops counting a payload once the gate has
+		// admitted it to its first attempt.
+		b.replayer.releaseSlot(payload.TargetCluster)
 	}
 
 	err := b.runAttempt(payload, 1, maxAttempts)
@@ -233,14 +234,18 @@ func (b *memoryBackend) waitUngated(cluster types.ClusterID) bool {
 	return true
 }
 
-// requeueGated returns a payload the gate closed on to its queue. Under
-// the bounded policy the slot was released at dequeue, so Enqueue reserves
-// it again; a full queue drops the payload like any other admission
-// failure, which is reported so the loss is visible.
+// requeueGated returns a payload the gate closed on to its queue. The
+// payload still holds its capacity slot under either policy, so the
+// requeue cannot fail admission and a producer cannot take its place.
+// The drop below only guards the channel-sizing invariant.
 func (b *memoryBackend) requeueGated(payload types.ReplayPayload) {
-	if err := b.replayer.Enqueue(context.Background(), payload); err != nil {
-		b.dropPayload(payload, err, b.config.MaxAttempts, types.ReplayDropRequeueFailed)
+	if b.replayer.requeue(payload) {
+		return
 	}
+	if !b.retained() {
+		b.replayer.releaseSlot(payload.TargetCluster)
+	}
+	b.dropPayload(payload, types.ErrReplayQueueFull, b.config.MaxAttempts, types.ReplayDropRequeueFailed)
 }
 
 // runAttempt performs a single execution attempt and emits all the

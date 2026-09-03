@@ -607,7 +607,7 @@ payload never blocks payloads for the other cluster.
 |--------|----------------|----------------------|
 | Waiting between attempts | One goroutine per waiting payload | A timer queue; goroutines are used only while executing |
 | Pool full | Payload dropped with reason `retry_pool_saturated` | Attempt waits for a free slot |
-| Capacity slot | Released at dequeue; `Len()` excludes in-flight payloads | Held until success or drop; `Len()` and `PendingByCluster()` count queued, executing, and waiting payloads, and new enqueues fail with `ErrReplayQueueFull` when the backlog is full |
+| Capacity slot | Released once the gate admits the payload to its first attempt; `Len()` excludes in-flight payloads | Held until success or drop; `Len()` and `PendingByCluster()` count queued, executing, and waiting payloads, and new enqueues fail with `ErrReplayQueueFull` when the backlog is full |
 
 ### Drop reasons
 
@@ -624,6 +624,8 @@ The reason appears in the worker log and, on collectors implementing
 - `shutdown`: `Worker.Stop` was called while the payload was queued or waiting.
 - `dead_letter`: the classifier dead-lettered the payload enough times.
 - `retry_window_expired`: memory only, `RetryWindow` elapsed.
+- `requeue_failed`: memory only, a payload the gate closed on after dequeue could not be
+  returned to its queue; the queues are sized so this does not happen.
 
 ### Comparing Memory and NATS
 

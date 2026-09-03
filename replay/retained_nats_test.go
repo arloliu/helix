@@ -30,6 +30,23 @@ func newRetainedNATSReplayer(t *testing.T, js jetstream.JetStream, name string) 
 	return replayer
 }
 
+// PendingByCluster reads the stream, so a replayer that has created no
+// consumer (a fresh process, or one whose worker is gated) still sees the
+// durable backlog.
+func TestNATSReplayer_PendingByClusterSeesDurableBacklog(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	producer := newRetainedNATSReplayer(t, js, "backlog")
+	enqueueN(t, producer, 3, types.ClusterA)
+
+	fresh := newRetainedNATSReplayer(t, js, "backlog")
+	pending, err := fresh.PendingByCluster(t.Context(), types.ClusterA)
+	require.NoError(t, err)
+	assert.Equal(t, 3, pending, "the backlog is visible without a consumer")
+	pending, err = fresh.PendingByCluster(t.Context(), types.ClusterB)
+	require.NoError(t, err)
+	assert.Zero(t, pending)
+}
+
 // Under RetryWhileRetained the consumer never drops a message on its own:
 // an unreachable cluster is retried past any attempt budget until it returns.
 func TestNATSWorker_RetainedPolicySurvivesOutage(t *testing.T) {

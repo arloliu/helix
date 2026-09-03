@@ -122,6 +122,8 @@ type NATSReplayer struct {
 	consumers map[string]jetstream.Consumer
 	closed    bool
 	mu        sync.RWMutex
+	// infoMu serializes stream.Info, which writes the handle's cached info.
+	infoMu sync.Mutex
 
 	// redeliveryBackoff is set by a worker running RetryWhileRetained before
 	// it starts: consumers created afterwards allow unlimited deliveries and
@@ -1245,9 +1247,11 @@ func (n *NATSReplayer) Config() NATSReplayerConfig {
 
 // PendingByCluster returns the number of messages for one cluster that have
 // not yet been replayed successfully: not yet delivered, delivered but not
-// acknowledged, and waiting for redelivery, across both priority consumers.
+// acknowledged, and waiting for redelivery, across both priority levels.
 //
-// Consumers that this replayer has not created yet contribute 0.
+// The count is read from the stream rather than from this replayer's
+// consumers, so a freshly started process sees the durable backlog before
+// any worker has fetched from it.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -1255,29 +1259,32 @@ func (n *NATSReplayer) Config() NATSReplayerConfig {
 //
 // Returns:
 //   - int: Outstanding messages for that cluster
-//   - error: Error if consumer info cannot be fetched
+//   - error: Error if stream info cannot be fetched
 func (n *NATSReplayer) PendingByCluster(ctx context.Context, cluster types.ClusterID) (int, error) {
 	n.mu.RLock()
-	if n.closed {
-		n.mu.RUnlock()
-
+	closed := n.closed
+	n.mu.RUnlock()
+	if closed {
 		return 0, types.ErrSessionClosed
 	}
-	consumers := make([]jetstream.Consumer, 0, 2)
-	for _, priority := range []string{"high", "low"} {
-		if consumer, ok := n.consumers[workerConsumerName(priority, cluster)]; ok {
-			consumers = append(consumers, consumer)
-		}
+	if n.stream == nil {
+		return 0, errors.New("helix: NATS replayer not initialized, use NewNATSReplayer")
 	}
-	n.mu.RUnlock()
+
+	// The stream is a work queue: a message stays under its subject until
+	// it is acknowledged, so the per-subject counts are the outstanding
+	// backlog whether or not the consumers exist yet.
+	filter := n.config.SubjectPrefix + ".*." + string(cluster)
+	n.infoMu.Lock()
+	info, err := n.stream.Info(ctx, jetstream.WithSubjectFilter(filter))
+	n.infoMu.Unlock()
+	if err != nil {
+		return 0, fmt.Errorf("helix: failed to get stream info: %w", err)
+	}
 
 	total := uint64(0)
-	for _, consumer := range consumers {
-		info, err := consumer.Info(ctx)
-		if err != nil {
-			return 0, fmt.Errorf("helix: failed to get consumer info: %w", err)
-		}
-		total += info.NumPending + uint64(info.NumAckPending) //nolint:gosec // NumAckPending is a non-negative count
+	for _, count := range info.State.Subjects {
+		total += count
 	}
 
 	return msgsToInt(total)

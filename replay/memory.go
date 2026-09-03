@@ -400,6 +400,25 @@ func (m *MemoryReplayer) releaseSlot(cluster types.ClusterID) {
 	}
 }
 
+// requeue puts a payload a worker took back at the tail of its queue.
+// The worker still holds the payload's capacity slot and every channel is
+// sized to the full capacity, so the send cannot block; the result is
+// false only if that invariant is broken.
+func (m *MemoryReplayer) requeue(payload types.ReplayPayload) bool {
+	q := &m.queues[clusterIndex(payload.TargetCluster)]
+	targetQueue := q.low
+	if payload.Priority == types.PriorityHigh {
+		targetQueue = q.high
+	}
+
+	select {
+	case targetQueue <- payload:
+		return true
+	default:
+		return false
+	}
+}
+
 // clusterPending returns the per-cluster slot counter.
 func (m *MemoryReplayer) clusterPending(cluster types.ClusterID) *atomic.Int64 {
 	return &m.queues[clusterIndex(cluster)].pending
