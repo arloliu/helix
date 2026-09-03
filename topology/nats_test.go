@@ -697,3 +697,79 @@ func TestDrainConfigContainsCluster(t *testing.T) {
 		})
 	}
 }
+
+// retryWatchKV is a jetstream.KeyValue test double that fails Watch a fixed
+// number of times before delegating to the real bucket, so tests can verify
+// that the watcher returns to watch mode after falling back to polling.
+type retryWatchKV struct {
+	jetstream.KeyValue
+	mu       sync.Mutex
+	failures int // Watch calls left to fail
+	calls    int
+}
+
+func (r *retryWatchKV) Watch(ctx context.Context, key string, opts ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+	r.mu.Lock()
+	r.calls++
+	fail := r.failures > 0
+	if fail {
+		r.failures--
+	}
+	r.mu.Unlock()
+	if fail {
+		return nil, errors.New("boom: watch temporarily unavailable")
+	}
+
+	return r.KeyValue.Watch(ctx, key, opts...)
+}
+
+func (r *retryWatchKV) watchCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.calls
+}
+
+// TestNATSWatchFailure_ReturnsToWatchMode verifies that a watcher which fell
+// back to polling retries Watch on each poll tick and, once Watch succeeds,
+// observes KV changes through the watch again.
+func TestNATSWatchFailure_ReturnsToWatchMode(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	kv := &retryWatchKV{KeyValue: createTestKV(t, js, "test-watch-retry"), failures: 3}
+	logger := &recordingLogger{}
+
+	watcher, err := topology.NewNATS(kv,
+		topology.WithLogger(logger),
+		topology.WithPollInterval(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	updates := watcher.Watch(ctx)
+
+	// Three failures, then the fourth call establishes the watch.
+	require.Eventually(t, func() bool {
+		return kv.watchCalls() >= 4
+	}, 2*time.Second, 5*time.Millisecond, "Watch must be retried after falling back to polling")
+	require.Equal(t, 2, logger.warnCount(), "failures one and two warn; the third is a debug line")
+
+	// A watch delivers the change immediately, well inside one poll interval
+	// on a quiet embedded server; a watcher stuck in polling would still see
+	// it, so also confirm no further Watch calls were needed.
+	drainConfig := topology.DrainConfig{Drain: []types.ClusterID{types.ClusterB}, Reason: "OS Patching"}
+	data, _ := json.Marshal(drainConfig)
+	_, err = kv.Put(ctx, "helix.topology.drain", data)
+	require.NoError(t, err)
+
+	select {
+	case update := <-updates:
+		assert.Equal(t, types.ClusterB, update.Cluster)
+		assert.True(t, update.DrainMode)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for topology update")
+	}
+	assert.Equal(t, 4, kv.watchCalls(), "the established watch must stay in place")
+}

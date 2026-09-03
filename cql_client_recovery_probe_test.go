@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -391,4 +392,73 @@ func TestRecoveryProbe_NilProbeFilled(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("probe did not fire within 500ms")
 	}
+}
+
+// TestRecoveryProbe_FailureLogging verifies that consecutive probe failures
+// are logged at Warn on the first failure and on power-of-two counts, and
+// that the first success after failures is logged at Info.
+func TestRecoveryProbe_FailureLogging(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	adaptive := policy.NewAdaptiveDualWrite()
+	adaptive.ForceDegrade(ClusterA)
+
+	const failingProbes = 5
+	var calls atomic.Int32
+	release := make(chan struct{})
+	probes := &probeCounters{}
+	customProbe := RecoveryProbe{
+		Probe: func(ctx context.Context, _ cql.Session) error {
+			if calls.Add(1) <= failingProbes {
+				return errors.New("probe: cluster unreachable")
+			}
+			// Hold every later probe until the test has inspected the
+			// failure log lines, then let it succeed.
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+		Interval: 5 * time.Millisecond,
+		Timeout:  time.Second,
+	}
+	logger := &captureLogger{}
+
+	client, err := NewCQLClient(sa, sb,
+		WithWriteStrategy(adaptive),
+		WithRecoveryProbe(customProbe),
+		WithMetrics(probes),
+		WithLogger(logger),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	require.Eventually(t, func() bool {
+		return probes.failureA.Load() == failingProbes && calls.Load() > failingProbes
+	}, time.Second, 5*time.Millisecond, "the probe must fail five times and then block")
+
+	logger.Lock()
+	warns := 0
+	for _, msg := range logger.warnMsgs {
+		if msg == "recovery probe failed" {
+			warns++
+		}
+	}
+	logger.Unlock()
+	// Failures 1, 2, and 4 warn; 3 and 5 are debug lines.
+	require.Equal(t, 3, warns)
+
+	close(release)
+	require.Eventually(t, func() bool {
+		logger.Lock()
+		defer logger.Unlock()
+		for i, msg := range logger.infoMsgs {
+			if msg == "recovery probe succeeded" {
+				return slices.Contains(logger.infoKVs[i], any(uint64(failingProbes)))
+			}
+		}
+
+		return false
+	}, time.Second, 5*time.Millisecond, "the first success after failures must be logged at Info with the failure count")
 }

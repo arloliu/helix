@@ -190,6 +190,11 @@ func (n *NATS) GetDrainReason() string {
 }
 
 // watchLoop is the main watch loop that monitors the NATS KV key.
+//
+// When establishing the watch fails, or the watch's update channel closes,
+// the loop polls the key once per PollInterval and tries Watch again on
+// every tick, so a transient JetStream problem degrades the watcher to the
+// polling cadence only until the watch can be re-established.
 func (n *NATS) watchLoop(ctx context.Context) {
 	defer func() {
 		n.senderWG.Wait()
@@ -199,36 +204,56 @@ func (n *NATS) watchLoop(ctx context.Context) {
 	// Initial fetch
 	n.fetchAndEmit(ctx)
 
-	// Start watching
-	watcher, err := n.kv.Watch(ctx, n.config.Key)
-	if err != nil {
-		// Unlike fetchAndEmit/processEntry (which have their own fail-closed
-		// rationale for staying silent), there is no equivalent tradeoff here:
-		// falling back to polling degrades this watcher from real-time updates
-		// to a PollInterval cadence for its entire remaining lifetime, with no
-		// automatic retry back to watch mode. Log it so operators can detect
-		// the degradation instead of silently discovering slow drain updates.
-		n.config.Logger.Warn("helix/topology: NATS KV watch failed, falling back to polling",
-			"key", n.config.Key,
-			"poll_interval", n.config.PollInterval,
-			"error", err,
-		)
-		n.pollLoop(ctx)
-		return
-	}
-	defer func() { _ = watcher.Stop() }()
-
+	var failures uint64
+	ticker := time.NewTicker(n.config.PollInterval)
+	defer ticker.Stop()
 	for {
+		watcher, err := n.kv.Watch(ctx, n.config.Key)
+		if err != nil {
+			failures++
+			n.logWatchFailure(err, failures)
+		} else {
+			if failures > 0 {
+				n.config.Logger.Info("helix/topology: NATS KV watch restored",
+					"key", n.config.Key,
+					"failed_attempts", failures,
+				)
+				failures = 0
+			}
+			if n.consumeWatch(ctx, watcher) {
+				return
+			}
+			// The update channel closed under us; fall through to poll once
+			// and then watch again.
+		}
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-n.done:
 			return
+		case <-ticker.C:
+			n.fetchAndEmit(ctx)
+		}
+	}
+}
+
+// consumeWatch processes entries from an established watch until the
+// watcher is stopped or the update channel closes.
+// It returns true when the loop should exit because the context ended or
+// Close was called, and false when the watch should be re-established.
+func (n *NATS) consumeWatch(ctx context.Context, watcher jetstream.KeyWatcher) bool {
+	defer func() { _ = watcher.Stop() }()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-n.done:
+			return true
 		case entry, ok := <-watcher.Updates():
 			if !ok {
-				// Watcher channel closed, fall back to polling
-				n.pollLoop(ctx)
-				return
+				return false
 			}
 			if entry == nil {
 				// Initial nil entry, skip
@@ -239,21 +264,20 @@ func (n *NATS) watchLoop(ctx context.Context) {
 	}
 }
 
-// pollLoop is a fallback polling loop when watch fails.
-func (n *NATS) pollLoop(ctx context.Context) {
-	ticker := time.NewTicker(n.config.PollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-n.done:
-			return
-		case <-ticker.C:
-			n.fetchAndEmit(ctx)
-		}
+// logWatchFailure reports a failed Watch call at Warn when the consecutive
+// count is escalated (see [logging.Escalate]) and at Debug otherwise, so a
+// long outage stays visible without a line per poll tick.
+func (n *NATS) logWatchFailure(err error, failures uint64) {
+	log := n.config.Logger.Debug
+	if logging.Escalate(failures) {
+		log = n.config.Logger.Warn
 	}
+	log("helix/topology: NATS KV watch failed, polling until it can be re-established",
+		"key", n.config.Key,
+		"poll_interval", n.config.PollInterval,
+		"consecutive_failures", failures,
+		"error", err,
+	)
 }
 
 // fetchAndEmit fetches the current KV value and emits updates if changed.

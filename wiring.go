@@ -219,8 +219,7 @@ func (c *CQLClient) autoInjectEventEmitter() {
 // misconfigured AllowedClusters provider from flooding the log at high QPS
 // while still ensuring the error is visible immediately and periodically.
 func (c *CQLClient) shouldLogOverrideErr() bool {
-	seq := c.overrideErrSeq.Add(1)
-	return seq == 1 || seq&(seq-1) == 0
+	return logging.Escalate(c.overrideErrSeq.Add(1))
 }
 
 // emitClusterEvent forwards ev to the event dispatcher. Safe when no handler

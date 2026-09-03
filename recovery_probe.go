@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/internal/logging"
 	"github.com/arloliu/helix/types"
 )
 
@@ -41,13 +42,17 @@ func (c *CQLClient) startRecoveryProbes() {
 
 // recoveryProbeLoop ticks at p.Interval and, while the cluster is degraded,
 // executes the probe against its live session. A successful probe credits one
-// recovery point; a failing probe is logged at debug and the cluster stays
-// degraded. The loop exits when recoveryProbeCtx is cancelled (i.e. on Close).
+// recovery point; a failing probe leaves the cluster degraded.
+// Consecutive failures are logged at Warn on the first failure and on every
+// power-of-two count, and at Debug otherwise, so a long outage stays visible
+// without a line per tick; the first success after failures is logged at Info.
+// The loop exits when recoveryProbeCtx is cancelled (i.e. on Close).
 func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *RecoveryProbe) {
 	// Metrics is immutable after construction, so resolve the optional
 	// interface once. rpm is nil for collectors that do not opt in.
 	rpm, _ := c.config.Metrics.(types.RecoveryProbeMetrics)
 
+	var failures uint64
 	ticker := time.NewTicker(p.Interval)
 	defer ticker.Stop()
 	for {
@@ -66,15 +71,32 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 				if rpm != nil {
 					rpm.IncRecoveryProbeSuccess(cluster)
 				}
+				if failures > 0 {
+					c.config.Logger.Info("recovery probe succeeded",
+						"cluster", c.clusterName(cluster), "failedProbes", failures)
+					failures = 0
+				}
+
 				continue
 			}
 			if rpm != nil {
 				rpm.IncRecoveryProbeFailure(cluster)
 			}
-			c.config.Logger.Debug("recovery probe failed",
-				"cluster", c.clusterName(cluster), "error", err)
+			failures++
+			c.logProbeFailure(cluster, err, failures)
 		}
 	}
+}
+
+// logProbeFailure reports one failed probe at Warn when the consecutive
+// count is escalated (see [logging.Escalate]) and at Debug otherwise.
+func (c *CQLClient) logProbeFailure(cluster ClusterID, err error, failures uint64) {
+	log := c.config.Logger.Debug
+	if logging.Escalate(failures) {
+		log = c.config.Logger.Warn
+	}
+	log("recovery probe failed",
+		"cluster", c.clusterName(cluster), "consecutiveFailures", failures, "error", err)
 }
 
 // safeProbe calls probe and recovers from panics, converting them to errors so

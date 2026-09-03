@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The recovery probe logs a failing probe at `Warn` on the first failure and
+  on every power-of-two count of consecutive failures, and at `Debug`
+  otherwise; the first success after failures is logged at `Info`.
+  Previously every failure was a `Debug` line.
+- `topology.NatsKV` retries the KV watch on every poll tick after falling
+  back to polling, so a transient watch failure no longer leaves the watcher
+  polling for the rest of its life.
 - `replay.MemoryReplayer` keeps a separate queue pair per target cluster and
   alternates between clusters on dequeue, so a backlog for one cluster no
   longer delays the other cluster's replays. Each channel is still sized to

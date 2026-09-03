@@ -250,9 +250,12 @@ still has a write-path-only problem after recovering from the probe's perspectiv
 write will fail visibly and `AdaptiveDualWrite` will mark it degraded again. Operators with
 known write-path-specific failure modes may override the probe as shown above.
 
-**Probe failure behaviour:** a broken probe (bad query, missing schema) logs at debug level and
-never advances the recovery counter. `ForceRecover` remains available as an escape valve. Probe
-failures never degrade a healthy cluster — probes are recovery-only signals.
+**Probe failure behaviour:** a failing probe (unreachable cluster, bad query, missing schema)
+never advances the recovery counter. Consecutive failures are logged at `Warn` on the first
+failure and on every power-of-two count (1, 2, 4, 8, …) and at `Debug` otherwise, so a long
+outage stays visible without a log line per tick; the first success after failures is logged at
+`Info`. `ForceRecover` remains available as an escape valve. Probe failures never degrade a
+healthy cluster — probes are recovery-only signals.
 
 ---
 
