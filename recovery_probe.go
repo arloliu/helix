@@ -67,11 +67,23 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 			if !pr.IsDegraded(cluster) || (latch != nil && latch.IsLatched(cluster)) {
 				continue
 			}
+			holder := c.holderFor(cluster)
 			ctx, cancel := context.WithTimeout(c.recoveryProbeCtx, p.Timeout)
 			started := time.Now()
-			err := safeProbe(ctx, p.Probe, c.getSession(cluster))
+			err := safeProbe(ctx, p.Probe, holder.s)
 			cancel()
+			if err != nil && c.recoveryProbeCtx.Err() != nil {
+				// The client cancelled the probe (Close): not a health
+				// observation for anyone.
+				c.health.probe(holder, probeCanceled, err)
+
+				continue
+			}
+			// The probe's own deadline expiring is a connectivity failure
+			// by provenance, like an expired write leg.
+			err = clusterTimeoutIfExpired(ctx, c.recoveryProbeCtx, err)
 			if err == nil {
+				c.health.probe(holder, probeOK, nil)
 				if byLatency != nil {
 					byLatency.RecordProbeLatency(cluster, time.Since(started))
 				} else {
@@ -88,6 +100,7 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 
 				continue
 			}
+			c.health.probe(holder, probeFailed, err)
 			if rpm != nil {
 				rpm.IncRecoveryProbeFailure(cluster)
 			}

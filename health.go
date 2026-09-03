@@ -1,6 +1,8 @@
 package helix
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	"github.com/arloliu/helix/types"
@@ -39,17 +41,34 @@ type clusterHealth struct {
 	latency  LatencyRecorder // policy as a LatencyRecorder, or nil
 	metrics  types.MetricsCollector
 	dual     bool         // false in single-cluster mode: no strategy or policy calls
-	now      func() int64 // the client's NowProvider
+	now      func() int64 // the client's NowProvider; see deferredWriteLeg for the one entry point that must not call it
+
+	// countsForRefresh decides whether a failure is a connectivity failure
+	// worth counting toward auto-refresh; see AutoRefreshConfig.FailureClassifier.
+	countsForRefresh func(error) bool
 }
+
+// probeKind classifies a recovery probe outcome for the hub.
+type probeKind uint8
+
+const (
+	probeOK       probeKind = iota
+	probeFailed             // a cluster error, or the probe's own timeout
+	probeCanceled           // the client's probe context ended (Close)
+)
 
 // newClusterHealth resolves the authorities once at construction.
 func newClusterHealth(config *ClientConfig, dual bool) clusterHealth {
 	h := clusterHealth{
-		strategy: config.ReadStrategy,
-		policy:   config.FailoverPolicy,
-		metrics:  config.Metrics,
-		dual:     dual,
-		now:      config.NowProvider,
+		strategy:         config.ReadStrategy,
+		policy:           config.FailoverPolicy,
+		metrics:          config.Metrics,
+		dual:             dual,
+		now:              config.NowProvider,
+		countsForRefresh: config.AutoRefresh.FailureClassifier,
+	}
+	if h.countsForRefresh == nil {
+		h.countsForRefresh = DefaultAutoRefreshFailureClassifier
 	}
 	if recorder, ok := config.FailoverPolicy.(LatencyRecorder); ok {
 		h.latency = recorder
@@ -91,7 +110,7 @@ func (h *clusterHealth) readSucceeded(holder *sessionHolder, cluster ClusterID, 
 func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kind readErrKind, err error) {
 	h.metrics.IncReadError(cluster)
 	if kind == readClusterErr {
-		holder.stats.failed(err, h.now())
+		h.failedNow(holder, err)
 	}
 	if h.dual && h.policy != nil {
 		h.policy.RecordFailure(cluster)
@@ -115,7 +134,7 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 	case readOK:
 		holder.stats.succeeded(h.now())
 	case readClusterErr:
-		holder.stats.failed(err, h.now())
+		h.failedNow(holder, err)
 	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
 	}
 	switch kind {
@@ -155,8 +174,59 @@ func (h *clusterHealth) writeLeg(holder *sessionHolder, kind writeLegErrKind, er
 	case legOK:
 		holder.stats.succeeded(nowNano)
 	case legFailed:
-		holder.stats.failed(err, nowNano)
+		h.failed(holder, err, nowNano)
 	case legAsync, legDropped, legDraining, legSkipped, legCanceled:
+	}
+}
+
+// deferredWriteLeg reports the late result of a background write leg (see
+// [DeferredWriteResult]) to the holder's stats. It runs before the leg's
+// deferred registration is released, which Close waits for, so it takes
+// its timestamp from the process clock and never calls the configurable
+// NowProvider or any other user code.
+func (h *clusterHealth) deferredWriteLeg(holder *sessionHolder, kind writeLegErrKind, err error) {
+	h.writeLeg(holder, kind, err, time.Now().UnixNano())
+}
+
+// probe reports a recovery probe outcome to the holder's stats: a
+// successful probe is a success, a failed probe (including one ended by
+// its own timeout) is a failure, and a probe the client cancelled records
+// nothing.
+func (h *clusterHealth) probe(holder *sessionHolder, kind probeKind, err error) {
+	switch kind {
+	case probeOK:
+		holder.stats.succeeded(h.now())
+	case probeFailed:
+		h.failedNow(holder, err)
+	case probeCanceled:
+	}
+}
+
+// clusterTimeoutIfExpired wraps err with [types.ErrClusterTimeout] when
+// ctx's own deadline ended the operation while parent is still live: a
+// Helix-owned timeout, not the caller's or the client's cancellation.
+func clusterTimeoutIfExpired(ctx, parent context.Context, err error) error {
+	if err != nil && ctx.Err() != nil && parent.Err() == nil {
+		return fmt.Errorf("%w: %w", types.ErrClusterTimeout, err)
+	}
+
+	return err
+}
+
+// failed records a cluster failure at nowNano when the classifier counts
+// it as a connectivity failure; a failure that proves the session
+// reachable (a schema or query error) leaves the stats untouched.
+func (h *clusterHealth) failed(holder *sessionHolder, err error, nowNano int64) {
+	if h.countsForRefresh(err) {
+		holder.stats.failed(err, nowNano)
+	}
+}
+
+// failedNow is failed with the client clock, sampled only once the
+// classifier has accepted the error.
+func (h *clusterHealth) failedNow(holder *sessionHolder, err error) {
+	if h.countsForRefresh(err) {
+		holder.stats.failed(err, h.now())
 	}
 }
 

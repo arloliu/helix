@@ -232,17 +232,19 @@ func (c *CQLClient) writeLeg(
 	state *writeLegState,
 	slot *atomic.Pointer[sessionHolder],
 ) func(context.Context) error {
-	return func(ctx context.Context) error {
+	return func(parent context.Context) error {
 		if draining {
 			return types.ErrClusterDraining
 		}
 		state.start.Store(time.Now().UnixNano())
 		holder := slot.Load()
 		state.holder.Store(holder)
-		ctx, cancel := c.legContext(ctx)
+		ctx, cancel := c.legContext(parent)
 		defer cancel()
 
-		return writeFunc(ctx, holder.s)
+		// A leg ended by Helix's own deadline while the caller was still
+		// waiting is a connectivity failure, not an arbitrary driver error.
+		return clusterTimeoutIfExpired(ctx, parent, writeFunc(ctx, holder.s))
 	}
 }
 
@@ -360,8 +362,8 @@ func (c *CQLClient) executeDualWrite(
 	// ErrWriteDropped:    write was never attempted; replay is required for reconciliation.
 	// ErrClusterDraining: leg was skipped; replay delivers the write once the drain lifts.
 	// Real error:         write definitively failed; replay is required.
-	replayErrA := c.replayLeg(ctx, wc, ClusterA, errA, legA)
-	replayErrB := c.replayLeg(ctx, wc, ClusterB, errB, legB)
+	replayErrA := c.replayLeg(ctx, wc, ClusterA, &legStateA, errA, legA)
+	replayErrB := c.replayLeg(ctx, wc, ClusterB, &legStateB, errB, legB)
 
 	// Partial success is success from the caller's perspective: one cluster
 	// holds the write and replay carries it to the other.
@@ -389,6 +391,7 @@ func (c *CQLClient) replayLeg(
 	ctx context.Context,
 	wc writeContext,
 	cluster ClusterID,
+	leg *writeLegState,
 	err error,
 	kind writeLegErrKind,
 ) error {
@@ -421,9 +424,18 @@ func (c *CQLClient) replayLeg(
 		done atomic.Bool
 	}
 	deferred.OnComplete(func(legErr error) {
+		// The late result is the session's real outcome: report it to the
+		// hub so a dead session behind a degraded cluster is still
+		// refreshed. The leg has finished by now, so the holder it
+		// published is final; a strategy may return before its
+		// background leg even started, which is why it is not read
+		// earlier. bg is never cancelled, so the kind is never
+		// caller-cancelled.
+		legKind := classifyWriteLeg(bg, legErr)
+		c.health.deferredWriteLeg(leg.holder.Load(), legKind, legErr)
 		var dropErr error
 		if legErr != nil {
-			dropErr = c.admitReplayPayload(bg, payload, legErr, classifyWriteLeg(bg, legErr))
+			dropErr = c.admitReplayPayload(bg, payload, legErr, legKind)
 		}
 		admission.err = dropErr
 		admission.done.Store(true)

@@ -468,6 +468,14 @@ var (
 	// is retained instead of counting the attempt against a poison budget.
 	ErrClusterUnreachable = errors.New("helix: cluster unreachable")
 
+	// ErrClusterTimeout marks an operation that a Helix-owned deadline
+	// ended: a per-cluster write leg that exceeded WithClusterWriteTimeout,
+	// or a recovery probe that exceeded its Timeout, while the caller's own
+	// context was still live. The expiry describes the cluster, not the
+	// caller, so it counts as a connectivity failure for auto-refresh; the
+	// driver's error stays reachable through errors.Is and errors.As.
+	ErrClusterTimeout = errors.New("helix: cluster timed out")
+
 	// ErrSessionReplaced reports that RefreshSession found a different
 	// session installed for the cluster than the one it set out to replace:
 	// SwapSession or another refresh landed while the refresher ran. The

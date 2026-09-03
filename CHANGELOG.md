@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WithAutoRefreshFailureClassifier(fn)` and
+  `DefaultAutoRefreshFailureClassifier` select which errors count toward
+  auto-refresh; `types.ErrClusterTimeout` marks a Helix-owned write-leg or
+  probe deadline that expired while the caller was still waiting.
 - `WithRouteVeto(true)` lets a failover policy that implements the new
   `RouteVeto` interface steer ordinary reads away from a cluster.
   `policy.LatencyCircuitBreaker` implements it: while its breaker is open,
@@ -39,6 +43,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behavior change
 
+- Auto-refresh counts only connectivity failures toward its failure
+  threshold: errors that wrap `types.ErrClusterUnreachable` or the new
+  `types.ErrClusterTimeout` (a `WithClusterWriteTimeout` leg or a recovery
+  probe that exceeded its Helix-owned deadline). A schema or query error
+  proves the session is reachable and no longer counts, so it cannot
+  replace a healthy session. Restore the previous behaviour with one line:
+  `helix.WithAutoRefresh(helix.WithAutoRefreshFailureClassifier(func(error) bool { return true }))`.
+  A custom adapter that does not normalise driver errors needs its own
+  classifier to trigger auto-refresh.
+- The auto-refresh sustained-failure window is armed when a session is
+  installed (construction, `SwapSession`, `RefreshSession`) instead of
+  being satisfied by an empty last-success timestamp, so a burst of
+  failures on a fresh client cannot trigger a refresh before the window
+  has elapsed.
+- Failures on `AdaptiveDualWrite` fire-and-forget legs and recovery-probe
+  outcomes now reach the auto-refresh counters, so a degraded cluster whose
+  session is dead is refreshed even when no synchronous traffic reaches it.
+- `RefreshSession` closes the replaced session after a grace period of
+  `AutoRefreshConfig.RefreshTimeout` instead of immediately, so in-flight
+  operations that captured it can finish; `Close` closes it at once.
+  Without `WithAutoRefresh` the grace period is zero and the previous
+  behaviour is unchanged.
 - The recovery probe now credits `AdaptiveDualWrite` recovery only when the
   probe itself was fast: under `WithAdaptiveAbsoluteMax` and within
   `WithAdaptiveDeltaThreshold` of the other cluster's last write (or under

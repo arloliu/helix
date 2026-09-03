@@ -3,6 +3,7 @@ package helix_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -104,7 +105,7 @@ func (q *failingQuery) Values() []any                               { return nil
 func (q *failingQuery) Release()                                    {}
 func (q *failingQuery) errOrNil() error {
 	if q.fail.Load() {
-		return errors.New("simulated cluster failure")
+		return fmt.Errorf("simulated cluster failure: %w", types.ErrClusterUnreachable)
 	}
 	return nil
 }
@@ -137,7 +138,7 @@ func (b *failingBatch) SerialConsistency(cql.Consistency) cql.Batch { return b }
 func (b *failingBatch) WithTimestamp(int64) cql.Batch               { return b }
 func (b *failingBatch) errOrNil() error {
 	if b.fail.Load() {
-		return errors.New("simulated cluster failure")
+		return fmt.Errorf("simulated cluster failure: %w", types.ErrClusterUnreachable)
 	}
 	return nil
 }
@@ -632,7 +633,7 @@ func TestAutoRefresh_IteratorFailureThreadsLastErrToRefresher(t *testing.T) {
 	helix.MaybeAutoRefreshForTest(client, helix.ClusterA)
 
 	got, _ := observed.Load().(string)
-	assert.Equal(t, "simulated cluster failure", got,
+	assert.Equal(t, "simulated cluster failure: helix: cluster unreachable", got,
 		"refresher's lastErr must reflect the iterator failure")
 }
 

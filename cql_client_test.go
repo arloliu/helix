@@ -27,7 +27,8 @@ type mockSession struct {
 	scanErr    error
 	scanValues []any
 	closed     atomic.Bool
-	lastQuery  *mockQuery // Track last query for inspection
+	closedAt   atomic.Int64 // Unix nanoseconds of the first Close
+	lastQuery  *mockQuery   // Track last query for inspection
 }
 
 func newMockSession() *mockSession {
@@ -51,7 +52,9 @@ func (m *mockSession) Batch(kind cql.BatchType) cql.Batch {
 }
 
 func (m *mockSession) Close() {
-	m.closed.Store(true)
+	if m.closed.CompareAndSwap(false, true) {
+		m.closedAt.Store(time.Now().UnixNano())
+	}
 }
 
 // mockQuery implements cql.Query for testing.

@@ -112,6 +112,10 @@ type CQLClient struct {
 	// through; it writes the liveness stats on the session holders.
 	health clusterHealth
 
+	// retired holds sessions RefreshSession replaced and will close once
+	// their grace period elapses; Close closes them at once.
+	retired retiredSessions
+
 	// lastRefreshA / lastRefreshB throttle the auto-refresh detector:
 	// stamped before each refresh attempt so a hung refresher cannot cause
 	// a re-entrant double-fire on the next detector tick. They outlive
@@ -221,14 +225,24 @@ func (c *CQLClient) loadSessionB() cql.Session {
 // storeSessionA installs s as the cluster A session. Used by NewCQLClient
 // during construction and by SwapSession at runtime.
 func (c *CQLClient) storeSessionA(s cql.Session) {
-	c.sessionA.Store(&sessionHolder{s: s})
+	c.sessionA.Store(c.newSessionHolder(s))
+}
+
+// newSessionHolder wraps s with fresh stats whose last success is now, so
+// the auto-refresh sustained-failure window is armed from the moment a
+// session is installed rather than satisfied by a zero timestamp.
+func (c *CQLClient) newSessionHolder(s cql.Session) *sessionHolder {
+	h := &sessionHolder{s: s}
+	h.stats.lastSuccessNanos.Store(c.config.NowProvider())
+
+	return h
 }
 
 // storeSessionB installs s as the cluster B session. In single-cluster mode
 // it stores a holder wrapping nil so loadSessionB() returns nil safely
 // without a nil-pointer-deref on the holder pointer.
 func (c *CQLClient) storeSessionB(s cql.Session) {
-	c.sessionB.Store(&sessionHolder{s: s})
+	c.sessionB.Store(c.newSessionHolder(s))
 }
 
 // holderFor returns the installed session holder for the given cluster.

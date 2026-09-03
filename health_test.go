@@ -2,7 +2,7 @@ package helix
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -226,8 +226,8 @@ func TestHub_LateReportLandsOnReplacedHolder(t *testing.T) {
 		newErr     error
 		wantNewErr bool
 	}{
-		{name: "old failure after new success", oldErr: errors.New("old session died"), newErr: nil},
-		{name: "old success after new failure", oldErr: nil, newErr: errors.New("new session failed"), wantNewErr: true},
+		{name: "old failure after new success", oldErr: fmt.Errorf("old session died: %w", types.ErrClusterUnreachable), newErr: nil},
+		{name: "old success after new failure", oldErr: nil, newErr: fmt.Errorf("new session failed: %w", types.ErrClusterUnreachable), wantNewErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -270,7 +270,7 @@ func TestHub_LateReportLandsOnReplacedHolder(t *testing.T) {
 // stats: a swap installs fresh counters.
 func TestHub_SwappedSessionStartsFresh(t *testing.T) {
 	sa := newMockSession()
-	sa.execErr = errors.New("dead")
+	sa.execErr = fmt.Errorf("dead: %w", types.ErrClusterUnreachable)
 	client, err := NewCQLClient(sa, newMockSession())
 	require.NoError(t, err)
 	t.Cleanup(client.Close)

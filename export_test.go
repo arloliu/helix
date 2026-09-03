@@ -7,10 +7,17 @@ import "context"
 // for tests in this package.
 
 // SetClientNowFuncForTest replaces the client's NowProvider with the
-// given function. Used by auto-refresh tests to drive a deterministic
-// clock instead of wall-clock.
+// given function and re-seeds the installed sessions' last-success stamps
+// from it, as if the client had been constructed under that clock. Used by
+// auto-refresh tests to drive a deterministic clock instead of wall-clock.
 func SetClientNowFuncForTest(c *CQLClient, fn NowProvider) {
 	c.config.NowProvider = fn
+	c.health.now = fn
+	now := fn()
+	c.sessionA.Load().stats.lastSuccessNanos.Store(now)
+	if !c.singleCluster {
+		c.sessionB.Load().stats.lastSuccessNanos.Store(now)
+	}
 }
 
 // MaybeAutoRefreshForTest drives a single auto-refresh evaluation for

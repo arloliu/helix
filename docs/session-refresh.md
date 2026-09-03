@@ -61,6 +61,30 @@ A cluster is considered "session permanently dead" when **all three** are true:
 
 The detector goroutine ticks every `CheckInterval` (default 30s) and evaluates each cluster independently.
 
+Only connectivity failures count toward `FailureThreshold`. The default classifier
+(`helix.DefaultAutoRefreshFailureClassifier`) counts an error when it wraps
+`types.ErrClusterUnreachable` (the bundled adapters mark driver connectivity errors with it) or
+`types.ErrClusterTimeout` (a `WithClusterWriteTimeout` leg or a recovery probe exceeded its
+Helix-owned deadline). A schema or query error proves the session is reachable and counts for
+nothing, so a burst of `Unconfigured table` errors on a fresh client no longer replaces a healthy
+session. Override it with `helix.WithAutoRefreshFailureClassifier(func(error) bool)`; the previous
+every-error behaviour is one line away:
+
+```go
+helix.WithAutoRefresh(
+    helix.WithAutoRefreshFailureClassifier(func(error) bool { return true }),
+)
+```
+
+A custom adapter that does not normalise driver errors never triggers auto-refresh under the
+default; give it a classifier that recognises its driver's connectivity errors.
+
+`lastSuccess` is seeded when a session is installed (at construction, `SwapSession`, and
+`RefreshSession`), so the sustained-failure window is armed from that moment rather than satisfied
+by an empty timestamp. Failures reported by `AdaptiveDualWrite` fire-and-forget legs and by the
+recovery probe count like any other operation, so a degraded cluster whose session is dead is
+still refreshed even when no synchronous traffic reaches it.
+
 Defaults are intentionally conservative — refresh storms (the detector firing repeatedly) are operationally far worse than slow recovery. Tune per-knob if you need faster reaction:
 
 ```go
@@ -79,7 +103,7 @@ The throttle (`MinRetryInterval`) bounds the rate at which auto-refresh can fire
 
 ## Operational States the Detector Filters
 
-`recordOpOutcome` (the helper that updates the per-cluster failure counter) filters the following non-failure states so they never trigger auto-refresh:
+The observation hub (the single writer of the per-session failure counter) filters the following non-failure states so they never trigger auto-refresh:
 
 | State | Why it's not counted |
 |---|---|
@@ -102,7 +126,7 @@ if err := client.RefreshSession(ctx, helix.ClusterA); err != nil {
 }
 ```
 
-This invokes the registered refresher synchronously, swaps the new session in atomically, and **closes the old session** because the refresh contract implies the old one is dead.
+This invokes the registered refresher synchronously, swaps the new session in atomically, and **closes the old session** after a grace period of `RefreshTimeout` (zero, so immediately, without `WithAutoRefresh`) because the refresh contract implies the old one is dead.
 
 For full caller control over old-session lifecycle, use `SwapSession`:
 
@@ -125,7 +149,7 @@ oldSession.Close()
 
 - The swap is **lock-free on the read path**. Concurrent `Query`/`Batch`/`Iter` callers see either the old or the new session, never a partially-swapped state.
 - **In-flight ops on the old session — `SwapSession` only.** Operations that have already resolved their session (in-flight `Iter` or CAS, mid-execution synchronous calls, fire-and-forget writes captured into a goroutine) continue against the session they captured. Only operations that resolve the session AFTER the swap observe the new one. This preserves "the write was dispatched to cluster X" semantics — but it relies on the caller deferring `oldSession.Close()` until in-flights have drained, which is `SwapSession`'s contract.
-- **`RefreshSession` does not preserve in-flights.** The old session is closed immediately after the atomic swap (the refresh contract implies the old one is dead). Drivers that abort outstanding work on `Close()` will fail any in-flight ops that captured the old session reference. Only call `RefreshSession` when the old session is already non-functional, or use `SwapSession` if you need to drain.
+- **`RefreshSession` gives in-flights one grace period.** The old session is closed `RefreshTimeout` after the atomic swap, and `Close()` closes it at once; without `WithAutoRefresh` the grace period is zero. Drivers that abort outstanding work on `Close()` will fail any in-flight ops that captured the old session reference and outlive the grace period. Only call `RefreshSession` when the old session is already non-functional, or use `SwapSession` if you need to control the teardown.
 - `SwapSession` and `RefreshSession` reject calls on a closed client (`types.ErrSessionClosed`).
 - `RefreshSession` only replaces the session it set out to replace. If `SwapSession` or another refresh installs a different session while the refresher is running, `RefreshSession` closes the refresher's session, leaves the newer one installed, and returns `types.ErrSessionReplaced`.
 - `SwapSession` rejects nil sessions (`types.ErrNilSession`) and `ClusterB` on a single-cluster client (`types.ErrInvalidCluster`).
