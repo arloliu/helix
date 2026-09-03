@@ -4,13 +4,15 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arloliu/helix/types"
 )
 
 // depthRefreshInterval bounds how often a NATS worker goroutine asks the
-// server for consumer info to publish the queue depth gauge.
+// server for stream state: the queue depth gauge per cluster and, under
+// WithEvictionWatch, the eviction watch.
 const depthRefreshInterval = time.Second
 
 // maxRedeliverySteps caps the length of the server-side redelivery schedule
@@ -19,6 +21,9 @@ const maxRedeliverySteps = 8
 
 // natsBackend implements workerBackend for NATSReplayer.
 type natsBackend struct {
+	// emitter is the worker's cluster event emitter slot, shared with the
+	// Worker that owns it.
+	emitter  *atomic.Pointer[types.ClusterEventEmitter]
 	replayer *NATSReplayer
 	config   *WorkerConfig
 	execute  ExecuteFunc
@@ -645,6 +650,7 @@ func newNATSWorkerWithConfig(
 		deadLetters: make(map[uint64]int),
 	}
 
+	backend.emitter = &w.emitter
 	w.backend = backend
 	if replayer != nil {
 		replayer.setCorruptObserver(backend.observeCorrupt)

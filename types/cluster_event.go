@@ -69,6 +69,14 @@ const (
 	// access, use helix.WithOnReplayDropped.
 	EventReplayDropped ClusterEventKind = "replay_dropped"
 
+	// EventReplayEvicted fires when the NATS replay worker's opt-in eviction
+	// watch (replay.WithEvictionWatch) sees the stream remove messages
+	// without this process acknowledging them. Count carries the number
+	// removed since the previous poll; Cluster is unset because the stream
+	// state does not say which cluster they targeted. Best effort; see
+	// replay.WithEvictionWatch.
+	EventReplayEvicted ClusterEventKind = "replay_evicted"
+
 	// EventMirrorReplayDropped fires when a failed mirror write cannot be
 	// enqueued for mirror replay — potential mirror-target data loss. Err
 	// carries the enqueue error. Cluster is unset: mirror payloads target
@@ -137,6 +145,7 @@ const (
 //     backoff window), Reason
 //   - EventDrainEntered / EventDrainExited: Cluster
 //   - EventReplayDropped: Cluster (replay target), Err (enqueue error)
+//   - EventReplayEvicted: Count (messages removed since the previous poll)
 //   - EventMirrorReplayDropped: Err (enqueue error), Reason; Cluster unset
 //   - EventSessionRefreshAttempt: Cluster, Count (qualifying failures)
 //   - EventSessionRefreshSuccess: Cluster

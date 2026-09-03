@@ -218,8 +218,8 @@ type LatchReporter interface {
 }
 
 // EventEmitterSetter is an optional interface for read strategies, write
-// strategies, and failover policies that emit cluster events (see
-// [WithOnClusterEvent]).
+// strategies, failover policies, and replay workers that emit cluster
+// events (see [WithOnClusterEvent]).
 //
 // When the configured strategy or policy implements it, [NewCQLClient] installs
 // the client's dispatcher before any background goroutine starts, so the
@@ -229,6 +229,13 @@ type EventEmitterSetter interface {
 	// SetEventEmitter installs the emitter the component reports events to.
 	// A nil emitter disables emission.
 	SetEventEmitter(emitter types.ClusterEventEmitter)
+}
+
+// evictionWatchReporter is implemented by a replay worker that can run the
+// eviction watch (replay.Worker), so the startup reachability warning
+// lists replay_evicted only when the watch is off.
+type evictionWatchReporter interface {
+	EvictionWatchEnabled() bool
 }
 
 // Instrumentable is an optional interface for components that can adopt the

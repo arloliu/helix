@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason (`failover`, `alternative known good`, `manual`, `recovered`).
   The client installs its collector and event dispatcher on a read strategy
   that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- `replay.WithEvictionWatch()` makes a NATS worker poll the stream state
+  once a second and report the messages the stream removed without this
+  process acknowledging them (`MaxAge` expiry, `DiscardOld`, a purge):
+  `{prefix}_replay_evicted_total`, a `replay_evicted` cluster event with
+  the count, and a `Warn` line. Best effort and off by default; the watch
+  assumes one worker process per stream. `replay.Worker` accepts the
+  client's event dispatcher (`helix.EventEmitterSetter`), which the client
+  installs before starting it.
 - `types.ReplayStreamMetrics` lets a collector count the NATS worker's
   stream-level losses: `{prefix}_replay_corrupt_total{cluster}` (a fetched
   message that did not decode was terminated, also logged at `Error`) and

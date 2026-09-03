@@ -133,6 +133,7 @@ var orderedClusterEventKinds = []types.ClusterEventKind{
 	types.EventDrainEntered,
 	types.EventDrainExited,
 	types.EventReplayDropped,
+	types.EventReplayEvicted,
 	types.EventMirrorReplayDropped,
 	types.EventSessionRefreshAttempt,
 	types.EventSessionRefreshSuccess,
@@ -165,6 +166,10 @@ func eventKindUnreachable(kind types.ClusterEventKind, config *ClientConfig, dua
 		return config.TopologyWatcher == nil
 	case types.EventReplayDropped:
 		return !dualCluster || config.Replayer == nil
+	case types.EventReplayEvicted:
+		w, ok := config.ReplayWorker.(evictionWatchReporter)
+
+		return !ok || !w.EvictionWatchEnabled()
 	case types.EventMirrorReplayDropped:
 		return !config.mirrorTargetSet || config.MirrorReplayer == nil
 	case types.EventSessionRefreshAttempt, types.EventSessionRefreshSuccess, types.EventSessionRefreshError:
@@ -455,6 +460,11 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	// following the same shutdown order as Close: topology watcher, then
 	// mirror engine, then mirror replay worker.
 	if config.ReplayWorker != nil {
+		// The worker is an event source, so it receives the dispatcher
+		// before its goroutines can emit.
+		if es, ok := config.ReplayWorker.(EventEmitterSetter); ok {
+			es.SetEventEmitter(client.runtime.events)
+		}
 		if err := config.ReplayWorker.Start(); err != nil {
 			if client.topologyClose != nil {
 				client.topologyClose()

@@ -129,6 +129,9 @@ type NATSReplayer struct {
 	// corrupt is the worker's observer of messages terminated at decode,
 	// installed when the worker is built; the last worker built wins.
 	corrupt atomic.Pointer[corruptObserver]
+	// settled counts the acknowledgements and terminations the server
+	// accepted; the worker's eviction watch swaps it to zero once a poll.
+	settled atomic.Uint64
 
 	// redeliveryBackoff is set by a worker running RetryWhileRetained before
 	// it starts: consumers created afterwards allow unlimited deliveries and
@@ -722,11 +725,11 @@ msgLoop:
 
 		result = append(result, ReplayMessage{
 			Payload:          payload,
-			ackFunc:          msg.Ack,
+			ackFunc:          n.settling(msg.Ack),
 			nakFunc:          msg.Nak,
 			nakWithDelayFunc: msg.NakWithDelay,
 			inProgressFunc:   msg.InProgress,
-			termFunc:         msg.Term,
+			termFunc:         n.settling(msg.Term),
 			DeliveryCount:    deliveryCount,
 			MaxDeliver:       maxDeliver,
 			StreamSequence:   streamSeq,
@@ -1227,7 +1230,7 @@ func msgsToInt(msgs uint64) (int, error) {
 // allow the message to be processed successfully. Calling Term() removes the
 // message from the queue without waiting for MaxDeliver exhaustion.
 func (n *NATSReplayer) handleCorrupt(cluster types.ClusterID, streamSeq uint64, msg jetstream.Msg, err error) {
-	termErr := msg.Term()
+	termErr := n.settling(msg.Term)()
 	if observe := n.corrupt.Load(); observe != nil {
 		(*observe)(cluster, streamSeq, err, termErr)
 	}
@@ -1236,6 +1239,19 @@ func (n *NATSReplayer) handleCorrupt(cluster types.ClusterID, streamSeq uint64, 
 	}
 	if n.config.OnCorruptMessage != nil {
 		n.config.OnCorruptMessage(err)
+	}
+}
+
+// settling wraps an acknowledgement or termination so an accepted one is
+// counted as a settlement for the eviction watch.
+func (n *NATSReplayer) settling(settle func() error) func() error {
+	return func() error {
+		err := settle()
+		if err == nil {
+			n.settled.Add(1)
+		}
+
+		return err
 	}
 }
 

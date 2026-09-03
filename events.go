@@ -33,9 +33,9 @@ func isPerOperationKind(kind types.ClusterEventKind) bool {
 	case types.EventReadRouteChanged,
 		types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed,
 		types.EventWriteDegraded, types.EventWriteRecovered, types.EventWriteFlapping,
-		types.EventDrainEntered, types.EventDrainExited,
+		types.EventDrainEntered, types.EventDrainExited, types.EventReplayEvicted,
 		types.EventSessionRefreshAttempt, types.EventSessionRefreshSuccess, types.EventSessionRefreshError:
-		// State transitions.
+		// State transitions and per-poll aggregates.
 	}
 
 	return false
