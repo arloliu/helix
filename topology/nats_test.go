@@ -207,6 +207,17 @@ func TestNewNATSNilKV(t *testing.T) {
 	assert.Contains(t, err.Error(), "KeyValue store is nil")
 }
 
+func TestNewNATSRejectsNonPositivePollInterval(t *testing.T) {
+	js := testutil.StartEmbeddedNATS(t)
+	kv := createTestKV(t, js, "test-poll-interval")
+
+	for _, d := range []time.Duration{0, -time.Second} {
+		_, err := topology.NewNATS(kv, topology.WithPollInterval(d))
+		require.Error(t, err, "PollInterval %v", d)
+		assert.Contains(t, err.Error(), "PollInterval must be positive")
+	}
+}
+
 func TestNewNATSDefaults(t *testing.T) {
 	js := testutil.StartEmbeddedNATS(t)
 	kv := createTestKV(t, js, "test-defaults")
