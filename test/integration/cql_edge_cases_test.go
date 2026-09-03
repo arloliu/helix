@@ -811,22 +811,29 @@ func TestCQLAdaptiveDualWriteBothDegradedIntegration(t *testing.T) {
 	require.True(t, adaptiveWrite.IsDegraded(types.ClusterA))
 	require.True(t, adaptiveWrite.IsDegraded(types.ClusterB))
 
-	// Execute a write. Before the fix this returned DualClusterError; after the fix
-	// it must return nil because both writes are dispatched asynchronously.
+	// Execute a write. Both legs are dispatched in the background, so no
+	// cluster acknowledged it before the call returned: the caller sees a
+	// NoSynchronousAckError naming both async legs, with nothing left to
+	// report about replay admission.
 	orderID := gocql.TimeUUID()
 	writeErr := client.Query(
 		"INSERT INTO "+ordersTable+" (id, user_id, total, status) VALUES (?, ?, ?, ?)",
 		orderID, gocql.TimeUUID(), 42.0, "both_degraded_test",
 	).ExecContext(ctx)
 
-	require.NoError(t, writeErr,
-		"write must succeed (return nil) when both clusters are in degraded fire-and-forget mode")
+	require.ErrorIs(t, writeErr, types.ErrNoSynchronousAck,
+		"a write no cluster acknowledged synchronously must say so")
+	require.ErrorIs(t, writeErr, types.ErrWriteAsync)
+	var noAck *types.NoSynchronousAckError
+	require.ErrorAs(t, writeErr, &noAck)
+	require.NoError(t, noAck.Replay)
 
-	// Replay must be enqueued for both clusters as a safety net.
-	assert.Equal(t, int64(1), metricsCollector.GetReplayEnqueued(types.ClusterA),
-		"replay must be enqueued for degraded cluster A")
-	assert.Equal(t, int64(1), metricsCollector.GetReplayEnqueued(types.ClusterB),
-		"replay must be enqueued for degraded cluster B")
+	// Both background writes reach their reachable clusters, so neither leg
+	// is enqueued for replay.
+	assert.Equal(t, int64(0), metricsCollector.GetReplayEnqueued(types.ClusterA),
+		"a background write that lands is not replayed")
+	assert.Equal(t, int64(0), metricsCollector.GetReplayEnqueued(types.ClusterB),
+		"a background write that lands is not replayed")
 
 	// IncWriteAsync must be incremented for both; IncWriteError must not be touched.
 	assert.Equal(t, int64(1), metricsCollector.GetWriteAsync(types.ClusterA),
