@@ -97,9 +97,13 @@ const (
 	// The write then exists only in the replay queue until the worker
 	// delivers it, so this mode is only sound with a durable replayer.
 	// A leg still running in the background (see [DeferredWriteResult])
-	// counts as enqueued: its failure is enqueued when it completes, and
-	// until then the write exists only in that background attempt.
-	// A failed replay enqueue is always an error.
+	// counts as admitted provisionally: nil is returned before that leg
+	// completes, its failure is enqueued when it does, and an enqueue
+	// failure at that point is reported only through [WithOnReplayDropped]
+	// and [types.EventReplayDropped], never through the returned error.
+	// Until the leg completes, the write exists only in that background
+	// attempt and is lost if the process exits.
+	// A replay enqueue that fails before the call returns is always an error.
 	AckOnReplayAdmission
 )
 
@@ -609,8 +613,10 @@ func WithMirrorReplayer(replayer Replayer, workerOpts ...replay.WorkerOption) Op
 // [types.NoSynchronousAckError] that names each leg's result and whether
 // the write was enqueued for replay. [AckOnReplayAdmission] restores the
 // previous behaviour of returning nil once every leg that needed replay
-// was enqueued; use it only with a durable replayer such as the NATS
-// replayer, because the write then exists nowhere but in the queue.
+// was enqueued, or is still running in the background with its failure to
+// be enqueued on completion; use it only with a durable replayer such as
+// the NATS replayer, because the write then exists nowhere but in the
+// queue or in that background attempt.
 //
 // Parameters:
 //   - mode: The acknowledgement mode
@@ -673,6 +679,10 @@ func WithReplayWorker(worker ReplayWorker) Option {
 // against this client's clusters would also re-drive mirror-destined ones.
 // [types.EventMirrorReplayDropped] (see [WithOnClusterEvent]) is the signal
 // that tells the two apart.
+//
+// The handler runs on the goroutine that failed to enqueue, which may be a
+// write in progress that [CQLClient.Close] waits for; it must therefore
+// never call Close itself. Trigger shutdown from another goroutine.
 //
 // Parameters:
 //   - handler: Function called with the dropped payload and the enqueue error

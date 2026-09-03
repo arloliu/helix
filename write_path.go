@@ -263,6 +263,14 @@ func (c *CQLClient) executeDualWrite(
 	if wc.strict {
 		return c.executeStrictDualWrite(ctx, writeFunc, drainA, drainB)
 	}
+	// Hold the client open until every leg has been enqueued or handed to
+	// a completion callback, so Close cannot stop the replay worker in
+	// between.
+	if !c.deferred.add() {
+		return types.ErrSessionClosed
+	}
+	defer c.deferred.done()
+
 	// Dual-cluster mode: concurrent writes with replay support
 	// Note: We capture start times outside the write functions to avoid data races
 	// when WriteStrategy uses fire-and-forget (background goroutines).
@@ -393,21 +401,28 @@ func (c *CQLClient) replayLeg(
 		return c.enqueueReplayPayload(bg, payload, err, kind)
 	}
 	deferred.OnComplete(func(legErr error) {
-		defer c.deferred.done()
 		if legErr == nil {
+			c.deferred.done()
+
 			return
 		}
-		// The outcome is already counted and reported inside; nothing is
-		// left to return to a caller that has long since moved on.
-		_ = c.enqueueReplayPayload(bg, payload, legErr, classifyWriteLeg(bg, legErr))
+		// Admit first, then release the client before reporting a drop, so
+		// a drop handler that shuts the client down does not wait on itself.
+		// Nothing is left to return to a caller that has long since moved on.
+		dropErr := c.admitReplayPayload(bg, payload, legErr, classifyWriteLeg(bg, legErr))
+		c.deferred.done()
+		if dropErr != nil {
+			c.emitReplayDropped(payload.TargetCluster, payload, dropErr)
+		}
 	})
 
 	return nil
 }
 
-// deferredLegs counts write legs whose result a strategy reports later
-// (see [DeferredWriteResult]) so Close can wait for their replay to be
-// enqueued before it stops the replay worker.
+// deferredLegs counts the dual writes in progress and the background legs
+// whose result a strategy reports later (see [DeferredWriteResult]), so
+// Close can wait for every replay to be enqueued before it stops the
+// replay worker.
 type deferredLegs struct {
 	mu      sync.Mutex
 	active  int
@@ -415,11 +430,13 @@ type deferredLegs struct {
 	idle    chan struct{}
 }
 
-// add registers one leg and reports false once wait has begun.
+// add registers one holder. It reports false once wait has finished:
+// while a holder is still registered, wait is blocked and a new holder
+// (a leg the holder hands to a completion callback) may still join.
 func (d *deferredLegs) add() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closing {
+	if d.closing && d.active == 0 {
 		return false
 	}
 	d.active++
@@ -427,7 +444,7 @@ func (d *deferredLegs) add() bool {
 	return true
 }
 
-// done unregisters one leg and releases wait once the last leg finished.
+// done unregisters one holder and releases wait once the last one finished.
 func (d *deferredLegs) done() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -437,7 +454,7 @@ func (d *deferredLegs) done() {
 	}
 }
 
-// wait refuses new legs and blocks until every registered leg completed.
+// wait blocks until every registered holder finished, then refuses new ones.
 func (d *deferredLegs) wait() {
 	d.mu.Lock()
 	d.closing = true
@@ -496,6 +513,23 @@ func (c *CQLClient) enqueueReplayPayload(
 	err error,
 	kind writeLegErrKind,
 ) error {
+	dropErr := c.admitReplayPayload(ctx, payload, err, kind)
+	if dropErr != nil {
+		c.emitReplayDropped(payload.TargetCluster, payload, dropErr)
+	}
+
+	return dropErr
+}
+
+// admitReplayPayload is enqueueReplayPayload without the drop callback and
+// event: it enqueues, counts, and logs, and returns the reason a payload was
+// not admitted so the caller can report it once it is safe to do so.
+func (c *CQLClient) admitReplayPayload(
+	ctx context.Context,
+	payload types.ReplayPayload,
+	err error,
+	kind writeLegErrKind,
+) error {
 	cluster := payload.TargetCluster
 	if c.config.Replayer == nil {
 		c.config.Metrics.IncReplayDropped(cluster)
@@ -503,7 +537,6 @@ func (c *CQLClient) enqueueReplayPayload(
 			"cluster", c.clusterName(cluster),
 			"writeError", err.Error(),
 		)
-		c.emitReplayDropped(cluster, payload, types.ErrNoReplayer)
 
 		return types.ErrNoReplayer
 	}
@@ -541,7 +574,6 @@ func (c *CQLClient) enqueueReplayPayload(
 		"writeError", err.Error(),
 		"enqueueError", enqueueErr.Error(),
 	)
-	c.emitReplayDropped(cluster, payload, enqueueErr)
 
 	return enqueueErr
 }

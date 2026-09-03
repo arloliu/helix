@@ -146,3 +146,92 @@ func TestClose_ConcurrentCallerWaitsForShutdown(t *testing.T) {
 		}
 	}
 }
+
+// gatedStrategy blocks inside Execute until released, then reports cluster
+// B through a deferred result.
+type gatedStrategy struct {
+	entered chan struct{}
+	release chan struct{}
+	result  *manualDeferredError
+}
+
+func (s *gatedStrategy) Execute(ctx context.Context, writeA, _ func(context.Context) error) (errA, errB error) {
+	close(s.entered)
+	<-s.release
+
+	return writeA(ctx), s.result
+}
+
+// TestClose_WaitsForWriteInProgressToHandOffItsLegs asserts that Close
+// begun while a write is still inside the strategy waits for that write to
+// register its deferred leg, so the leg's failure is still enqueued.
+func TestClose_WaitsForWriteInProgressToHandOffItsLegs(t *testing.T) {
+	deferred := &manualDeferredError{}
+	strategy := &gatedStrategy{entered: make(chan struct{}), release: make(chan struct{}), result: deferred}
+	replayer := &mockReplayer{}
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(strategy),
+		WithReplayer(replayer),
+	)
+	require.NoError(t, err)
+
+	written := make(chan error, 1)
+	go func() { written <- client.Query("INSERT INTO t (id) VALUES (1)").Exec() }()
+	<-strategy.entered
+
+	closed := make(chan struct{})
+	go func() {
+		client.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close must wait for the write in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(strategy.release)
+	require.NoError(t, <-written)
+	select {
+	case <-closed:
+		t.Fatal("Close must wait for the deferred leg the write handed off")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	deferred.complete(errors.New("background failure"))
+	select {
+	case <-closed:
+	case <-time.After(regressionWaitTimeout):
+		t.Fatal("Close must return once the deferred leg completed")
+	}
+
+	replayer.Lock()
+	defer replayer.Unlock()
+	require.Len(t, replayer.payloads, 1, "the failed leg is enqueued before Close returns")
+}
+
+// TestDeferredDropHandlerMayClose asserts that a replay-dropped handler
+// invoked for a background leg can shut the client down without waiting on
+// its own leg.
+func TestDeferredDropHandlerMayClose(t *testing.T) {
+	deferred := &manualDeferredError{}
+	var client *CQLClient
+	closed := make(chan struct{})
+	var err error
+	client, err = NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(&deferredStrategy{result: deferred}),
+		WithOnReplayDropped(func(types.ReplayPayload, error) {
+			client.Close()
+			close(closed)
+		}),
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, client.Query("INSERT INTO t (id) VALUES (1)").Exec())
+	deferred.complete(errors.New("background failure"))
+	select {
+	case <-closed:
+	case <-time.After(regressionWaitTimeout):
+		t.Fatal("the drop handler must be able to close the client")
+	}
+}

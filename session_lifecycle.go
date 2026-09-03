@@ -298,14 +298,18 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // operations including SwapSession and RefreshSession return
 // [types.ErrSessionClosed].
 //
-// Close does not wait for in-flight synchronous operations or detached
+// Close does not wait for in-flight reads, strict writes, or detached
 // fire-and-forget writes to finish.
 // Work that already captured a session may continue racing with shutdown
 // and can fail when that session is closed.
-// The exception is a background leg whose strategy reports its result
-// through [DeferredWriteResult]: Close waits for it to complete so a
-// failure is enqueued for replay before the worker stops.
-// That wait is bounded by the strategy's own background timeout.
+// Close does wait for a replaying dual write in progress to hand its legs
+// to the replay queue, and for a background leg whose strategy reports its
+// result through [DeferredWriteResult] to complete, so every replay is
+// enqueued before the worker stops.
+// That wait is bounded by the caller's context, the strategy's background
+// timeout, and the replayer's Enqueue.
+// A [WithOnReplayDropped] handler must not call Close: like a cluster
+// event handler, it would wait for the write that invoked it.
 //
 // Close DOES wait for the configured ReplayWorker to finish via its Stop()
 // method, which blocks until the worker's in-flight batch returns.
@@ -352,8 +356,9 @@ func (c *CQLClient) Close() {
 	c.topologyWG.Wait()
 	c.autoRefreshWG.Wait()
 
-	// Wait for background legs whose failure would be enqueued for
-	// replay, so nothing is enqueued after the worker stops.
+	// Wait for replaying writes in progress and for background legs whose
+	// failure would be enqueued for replay, so nothing is enqueued after
+	// the worker stops.
 	c.deferred.wait()
 
 	// Stop the mirror engine first so it stops generating new failure

@@ -51,8 +51,10 @@ import (
 //   - Replay worker is stopped (enqueued replays are lost if using MemoryReplayer)
 //   - Topology watcher and auto-refresh detector are stopped
 //   - The currently installed underlying sessions are closed
-//   - Close does not wait for in-flight operations or fire-and-forget writes;
-//     work that already captured a session may race with shutdown and fail
+//   - Close waits for replaying dual writes in progress and for background
+//     legs reported through [DeferredWriteResult], so their replay is
+//     enqueued first; it does not wait for reads, strict writes, or other
+//     fire-and-forget writes, which may race with shutdown and fail
 //   - The client cannot be reused
 type CQLClient struct {
 	// sessionA / sessionB hold the live cql.Session references behind an
@@ -81,8 +83,9 @@ type CQLClient struct {
 	// concurrent Close returns only after shutdown completed.
 	closeDone chan struct{}
 
-	// deferred counts write legs whose result a strategy reports later;
-	// Close waits for them before stopping the replay worker.
+	// deferred counts replaying dual writes in progress and the background
+	// legs whose result a strategy reports later; Close waits for them
+	// before stopping the replay worker.
 	deferred deferredLegs
 
 	// runtime holds the components NewCQLClient builds from the
