@@ -104,6 +104,7 @@ var orderedClusterEventKinds = []types.ClusterEventKind{
 	types.EventCircuitBreakerClosed,
 	types.EventWriteDegraded,
 	types.EventWriteRecovered,
+	types.EventWriteFlapping,
 	types.EventDrainEntered,
 	types.EventDrainExited,
 	types.EventReplayDropped,
@@ -128,7 +129,7 @@ func eventKindUnreachable(kind types.ClusterEventKind, config *ClientConfig, dua
 	case types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed:
 		_, ok := config.FailoverPolicy.(EventEmitterSetter)
 		return !ok || !dualCluster
-	case types.EventWriteDegraded, types.EventWriteRecovered:
+	case types.EventWriteDegraded, types.EventWriteRecovered, types.EventWriteFlapping:
 		_, ok := config.WriteStrategy.(EventEmitterSetter)
 		return !ok || !dualCluster
 	case types.EventDrainEntered, types.EventDrainExited:

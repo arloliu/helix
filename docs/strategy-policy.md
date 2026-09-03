@@ -182,6 +182,8 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveRecoveryThreshold` | 5 | Consecutive fast writes to transition DEGRADED → HEALTHY |
 | `WithAdaptiveFireForgetTimeout` | 30s | Timeout applied to each background (fire-and-forget) write |
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent background writes; excess returns `ErrWriteDropped` |
+| `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays DEGRADED before recovery credit can restore it |
+| `WithAdaptiveRedegradeBackoff` | disabled | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
 
 **Cluster events:** degrade and recover transitions emit
 `types.EventWriteDegraded` and `types.EventWriteRecovered`, and record the

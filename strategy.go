@@ -186,6 +186,22 @@ type ProbeReporter interface {
 	RecordProbeSuccess(cluster ClusterID)
 }
 
+// ProbeLatencyReporter is an optional interface for write strategies that
+// judge a recovery probe by how long it took, such as
+// [policy.AdaptiveDualWrite].
+//
+// When the configured [WriteStrategy] implements it, the recovery probe
+// reports each successful probe through RecordProbeLatency instead of
+// [ProbeReporter.RecordProbeSuccess], so a cluster that answers the probe
+// but too slowly earns no recovery credit.
+//
+// Implementations MUST be safe for concurrent use from multiple goroutines.
+type ProbeLatencyReporter interface {
+	// RecordProbeLatency reports one successful probe against cluster and
+	// how long it took.
+	RecordProbeLatency(cluster ClusterID, latency time.Duration)
+}
+
 // LatchReporter is an optional interface for write strategies whose
 // degraded state can be latched by an operator, such as
 // [policy.AdaptiveDualWrite] after ForceDegrade.

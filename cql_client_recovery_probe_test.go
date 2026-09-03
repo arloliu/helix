@@ -479,3 +479,56 @@ func TestRecoveryProbe_FailureLogging(t *testing.T) {
 		return false
 	}, time.Second, 5*time.Millisecond, "the first success after failures must be logged at Info with the failure count")
 }
+
+// latencyProbeStrategy is a write strategy that judges probes by latency.
+type latencyProbeStrategy struct {
+	*policy.ConcurrentDualWrite
+	degraded  atomic.Bool
+	latencies chan time.Duration
+	successes atomic.Int32
+}
+
+func (s *latencyProbeStrategy) IsDegraded(ClusterID) bool    { return s.degraded.Load() }
+func (s *latencyProbeStrategy) RecordProbeSuccess(ClusterID) { s.successes.Add(1) }
+func (s *latencyProbeStrategy) RecordProbeLatency(_ ClusterID, latency time.Duration) {
+	select {
+	case s.latencies <- latency:
+	default:
+	}
+}
+
+// TestRecoveryProbe_ReportsLatencyWhenSupported verifies that a strategy
+// implementing ProbeLatencyReporter receives the probe's elapsed time instead
+// of a plain success.
+func TestRecoveryProbe_ReportsLatencyWhenSupported(t *testing.T) {
+	strategy := &latencyProbeStrategy{
+		ConcurrentDualWrite: policy.NewConcurrentDualWrite(),
+		latencies:           make(chan time.Duration, 1),
+	}
+	strategy.degraded.Store(true)
+	const probeCost = 5 * time.Millisecond
+	customProbe := RecoveryProbe{
+		Probe: func(_ context.Context, _ cql.Session) error {
+			time.Sleep(probeCost) // The probe itself is slow; the loop measures it.
+
+			return nil
+		},
+		Interval: 5 * time.Millisecond,
+		Timeout:  time.Second,
+	}
+
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(strategy),
+		WithRecoveryProbe(customProbe),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	select {
+	case latency := <-strategy.latencies:
+		require.GreaterOrEqual(t, latency, probeCost)
+	case <-time.After(time.Second):
+		t.Fatal("the probe loop never reported a latency")
+	}
+	require.Zero(t, strategy.successes.Load(), "RecordProbeSuccess must not also be called")
+}

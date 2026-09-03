@@ -41,6 +41,13 @@ const (
 	// from manual recovery ("manual", "manual reset").
 	EventWriteRecovered ClusterEventKind = "write_recovered"
 
+	// EventWriteFlapping fires when AdaptiveDualWrite degrades a cluster
+	// again so soon after a recovery that its re-degrade backoff has
+	// reached the configured cap. Count carries the number of consecutive
+	// re-degrades inside the backoff window. It fires once per run of
+	// re-degrades, when the cap is first reached.
+	EventWriteFlapping ClusterEventKind = "write_flapping"
+
 	// EventDrainEntered fires when a cluster enters drain mode via the
 	// topology watcher.
 	EventDrainEntered ClusterEventKind = "drain_entered"

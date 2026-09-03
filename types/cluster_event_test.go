@@ -16,6 +16,7 @@ func TestClusterEventKinds_DistinctAndNonEmpty(t *testing.T) {
 		types.EventCircuitBreakerClosed,
 		types.EventWriteDegraded,
 		types.EventWriteRecovered,
+		types.EventWriteFlapping,
 		types.EventDrainEntered,
 		types.EventDrainExited,
 		types.EventReplayDropped,
