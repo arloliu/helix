@@ -12,6 +12,13 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+// onlyClusterA and onlyClusterB are the immutable override lists returned by
+// [ExcludeWhileReplayBacklog], shared so a read allocates nothing.
+var (
+	onlyClusterA = []ClusterID{ClusterA}
+	onlyClusterB = []ClusterID{ClusterB}
+)
+
 // RecoveryProbe configures the background recovery probe that accelerates
 // [policy.AdaptiveDualWrite] cluster recovery.
 //
@@ -995,6 +1002,52 @@ func WithClusterNames(nameA, nameB string) Option {
 func WithAllowedClusters(fn AllowedClustersFunc) Option {
 	return func(c *ClientConfig) {
 		c.AllowedClusters = fn
+	}
+}
+
+// ExcludeWhileReplayBacklog returns an [AllowedClustersFunc] that keeps
+// reads away from a cluster while its replay backlog exceeds threshold.
+//
+// A cluster that has just returned from an outage answers queries before
+// the replay worker has finished writing the backlog it missed, so a read
+// strategy that recovers on responsiveness alone can serve stale rows. This
+// helper excludes a cluster from reads while depth reports more than
+// threshold pending payloads for it, and lets normal routing resume once
+// the backlog has drained. When both clusters are over the threshold, or
+// neither is, it returns nil and the read strategy routes as usual.
+//
+// depth runs on every read, so it must be cheap and non-blocking.
+// [replay.MemoryReplayer.PendingByCluster] can be passed directly.
+// [replay.NATSReplayer.PendingByCluster] queries JetStream, so sample it
+// from a background goroutine into per-cluster atomics and pass a function
+// that reads the atomics.
+//
+// Parameters:
+//   - depth: Returns the number of replay payloads pending for a cluster
+//   - threshold: Backlog size above which the cluster is excluded from reads
+//
+// Returns:
+//   - AllowedClustersFunc: For use with [WithAllowedClusters]
+//
+// Example:
+//
+//	replayer := replay.NewMemoryReplayer()
+//	client, _ := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithReplayer(replayer),
+//	    helix.WithAllowedClusters(helix.ExcludeWhileReplayBacklog(replayer.PendingByCluster, 100)),
+//	)
+func ExcludeWhileReplayBacklog(depth func(cluster ClusterID) int, threshold int) AllowedClustersFunc {
+	return func() []ClusterID {
+		overA := depth(ClusterA) > threshold
+		overB := depth(ClusterB) > threshold
+		switch {
+		case overA && !overB:
+			return onlyClusterB
+		case overB && !overA:
+			return onlyClusterA
+		default:
+			return nil
+		}
 	}
 }
 

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ExcludeWhileReplayBacklog(depth, threshold)` builds an `AllowedClustersFunc`
+  that keeps reads away from a cluster while its replay backlog exceeds the
+  threshold, so reads return to a recovered cluster only after its backlog
+  has drained. `replay.MemoryReplayer.PendingByCluster` can be passed
+  directly; sample `replay.NATSReplayer.PendingByCluster` into atomics first.
 - `policy.WithAdaptiveMinDegradedDwell(d)` keeps a degraded cluster degraded
   for at least `d`, and `policy.WithAdaptiveRedegradeBackoff(window, maxDwell)`
   doubles that dwell on every strike-driven degrade that follows a recovery
