@@ -400,21 +400,32 @@ func (c *CQLClient) replayLeg(
 		// a failure reported after the worker stopped would otherwise be lost.
 		return c.enqueueReplayPayload(bg, payload, err, kind)
 	}
+	// A leg that has already completed runs the callback inline, on this
+	// goroutine, before OnComplete returns; its admission result is then a
+	// synchronous outcome the caller must see.
+	// The admission is published before the flag so a later completion
+	// on another goroutine never races with the read below.
+	var admission struct {
+		err  error
+		done atomic.Bool
+	}
 	deferred.OnComplete(func(legErr error) {
-		if legErr == nil {
-			c.deferred.done()
-
-			return
+		var dropErr error
+		if legErr != nil {
+			dropErr = c.admitReplayPayload(bg, payload, legErr, classifyWriteLeg(bg, legErr))
 		}
-		// Admit first, then release the client before reporting a drop, so
-		// a drop handler that shuts the client down does not wait on itself.
-		// Nothing is left to return to a caller that has long since moved on.
-		dropErr := c.admitReplayPayload(bg, payload, legErr, classifyWriteLeg(bg, legErr))
+		admission.err = dropErr
+		admission.done.Store(true)
+		// Release the leg before reporting so a late report never delays
+		// Close for longer than the admission itself.
 		c.deferred.done()
 		if dropErr != nil {
 			c.emitReplayDropped(payload.TargetCluster, payload, dropErr)
 		}
 	})
+	if admission.done.Load() {
+		return admission.err
+	}
 
 	return nil
 }

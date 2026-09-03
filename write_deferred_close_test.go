@@ -210,28 +210,44 @@ func TestClose_WaitsForWriteInProgressToHandOffItsLegs(t *testing.T) {
 	require.Len(t, replayer.payloads, 1, "the failed leg is enqueued before Close returns")
 }
 
-// TestDeferredDropHandlerMayClose asserts that a replay-dropped handler
-// invoked for a background leg can shut the client down without waiting on
-// its own leg.
-func TestDeferredDropHandlerMayClose(t *testing.T) {
-	deferred := &manualDeferredError{}
-	var client *CQLClient
-	closed := make(chan struct{})
-	var err error
-	client, err = NewCQLClient(newMockSession(), newMockSession(),
-		WithWriteStrategy(&deferredStrategy{result: deferred}),
-		WithOnReplayDropped(func(types.ReplayPayload, error) {
-			client.Close()
-			close(closed)
-		}),
+// failingReplayer rejects every enqueue.
+type failingReplayer struct{ err error }
+
+func (r *failingReplayer) Enqueue(context.Context, types.ReplayPayload) error { return r.err }
+
+// bothDeferredStrategy reports both clusters through deferred results.
+type bothDeferredStrategy struct {
+	a, b *manualDeferredError
+}
+
+func (s *bothDeferredStrategy) Execute(context.Context, func(context.Context) error, func(context.Context) error) (errA, errB error) {
+	return s.a, s.b
+}
+
+// TestWrite_DeferredLegCompletedBeforeRegistrationIsSynchronous asserts
+// that a background leg which has already failed by the time the client
+// registers for its result is treated like a synchronous failure: its
+// replay admission error reaches the caller instead of being reported
+// only through the drop callback.
+func TestWrite_DeferredLegCompletedBeforeRegistrationIsSynchronous(t *testing.T) {
+	errFull := errors.New("replay queue full")
+	a, b := &manualDeferredError{}, &manualDeferredError{}
+	a.complete(errors.New("cluster A rejected the background write"))
+	b.complete(errors.New("cluster B rejected the background write"))
+	var drops int
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(&bothDeferredStrategy{a: a, b: b}),
+		WithReplayer(&failingReplayer{err: errFull}),
+		WithAckMode(AckOnReplayAdmission),
+		WithOnReplayDropped(func(types.ReplayPayload, error) { drops++ }),
 	)
 	require.NoError(t, err)
+	t.Cleanup(client.Close)
 
-	require.NoError(t, client.Query("INSERT INTO t (id) VALUES (1)").Exec())
-	deferred.complete(errors.New("background failure"))
-	select {
-	case <-closed:
-	case <-time.After(regressionWaitTimeout):
-		t.Fatal("the drop handler must be able to close the client")
-	}
+	err = client.Query("INSERT INTO t (id) VALUES (1)").Exec()
+	require.ErrorIs(t, err, types.ErrNoSynchronousAck, "a rejected admission before the call returns is never nil")
+	var noAck *types.NoSynchronousAckError
+	require.ErrorAs(t, err, &noAck)
+	require.ErrorIs(t, noAck.Replay, errFull)
+	require.Equal(t, 2, drops, "both rejected legs are reported")
 }
