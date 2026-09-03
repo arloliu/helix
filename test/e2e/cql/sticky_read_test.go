@@ -50,6 +50,7 @@ func TestS_StickyRead_LeavesDeadPreferredDuringCooldown(t *testing.T) {
 				helix.WithReadStrategy(rs),
 				helix.WithFailoverPolicy(policy.NewActiveFailover()),
 				helix.WithMetrics(mc),
+				helix.WithLogger(testutil.NewTestLogger(t)),
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
