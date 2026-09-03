@@ -77,9 +77,11 @@ func TestMemoryWorker_RetainedGateParksRetries(t *testing.T) {
 
 		return nil
 	}
+	// The retry delay is long enough that the gate closes well before the
+	// retry is due, even on a loaded machine.
 	worker := replay.NewMemoryWorker(replayer, execute,
 		replay.WithPollInterval(2*time.Millisecond),
-		replay.WithRetryDelay(2*time.Millisecond),
+		replay.WithRetryDelay(200*time.Millisecond),
 		replay.WithClusterGate(gate.allow),
 		replay.WithOnDrop(func(types.ReplayPayload, error) { dropped.Add(1) }),
 	)
@@ -87,12 +89,12 @@ func TestMemoryWorker_RetainedGateParksRetries(t *testing.T) {
 	startWorker(t, worker)
 
 	require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
-	gate.open.Store(false) // close before the retry is due
-	settle()
+	gate.open.Store(false)             // close before the retry is due
+	time.Sleep(300 * time.Millisecond) // past the retry delay: the retry is parked behind the gate
 	require.Equal(t, int32(1), executed.Load(), "the retry waits while the gate is closed")
 
 	gate.open.Store(true)
-	require.Eventually(t, func() bool { return executed.Load() == 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return executed.Load() == 2 }, 2*time.Second, time.Millisecond)
 	require.Zero(t, dropped.Load())
 }
 
