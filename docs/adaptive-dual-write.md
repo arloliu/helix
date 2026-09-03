@@ -163,6 +163,8 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveRecoveryThreshold` | 5 | Consecutive fast writes to recover |
 | `WithAdaptiveFireForgetTimeout` | 30s | Timeout for fire-and-forget background writes |
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent fire-and-forget goroutines |
+| `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays degraded once it degrades |
+| `WithAdaptiveRedegradeBackoff` | disabled | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
 
 ### Tuning for Different Environments
 

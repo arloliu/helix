@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.WithAdaptiveMinDegradedDwell(d)` keeps a degraded cluster degraded
+  for at least `d`, and `policy.WithAdaptiveRedegradeBackoff(window, maxDwell)`
+  doubles that dwell on every strike-driven degrade that follows a recovery
+  within `window`, up to `maxDwell`. Reaching the cap emits the new
+  `write_flapping` cluster event (`types.EventWriteFlapping`). Both default
+  to off.
 - `WithClusterWriteTimeout(d)` bounds each cluster's leg of a dual write
   independently of the caller's context. A leg that exceeds `d` is replayed
   like any other failed leg and counts as that cluster's health failure,
@@ -19,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behavior change
 
+- The recovery probe now credits `AdaptiveDualWrite` recovery only when the
+  probe itself was fast: under `WithAdaptiveAbsoluteMax` and within
+  `WithAdaptiveDeltaThreshold` of the other cluster's last write (or under
+  `WithAdaptiveMinFloor` when the other cluster has no baseline). A cluster
+  whose probe query is cheap but whose writes are still slow is no longer
+  restored by the probe. The new `helix.ProbeLatencyReporter` interface
+  carries the probe's latency; strategies that only implement
+  `ProbeReporter` keep receiving `RecordProbeSuccess`.
 - `AdaptiveDualWrite.ForceDegrade` is now a sticky operator latch: fast
   background writes and successful recovery probes no longer restore
   synchronous writes on a cluster degraded by hand, and the client skips the

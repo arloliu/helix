@@ -53,6 +53,8 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 	rpm, _ := c.config.Metrics.(types.RecoveryProbeMetrics)
 	// A latched cluster is the operator's decision; probing it is pointless.
 	latch, _ := pr.(LatchReporter)
+	// A strategy that judges probes by latency receives the elapsed time.
+	byLatency, _ := pr.(ProbeLatencyReporter)
 
 	var failures uint64
 	ticker := time.NewTicker(p.Interval)
@@ -66,10 +68,15 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 				continue
 			}
 			ctx, cancel := context.WithTimeout(c.recoveryProbeCtx, p.Timeout)
+			started := time.Now()
 			err := safeProbe(ctx, p.Probe, c.getSession(cluster))
 			cancel()
 			if err == nil {
-				pr.RecordProbeSuccess(cluster)
+				if byLatency != nil {
+					byLatency.RecordProbeLatency(cluster, time.Since(started))
+				} else {
+					pr.RecordProbeSuccess(cluster)
+				}
 				if rpm != nil {
 					rpm.IncRecoveryProbeSuccess(cluster)
 				}

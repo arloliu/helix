@@ -134,7 +134,7 @@ func TestClusterEvents_UnreachableKindsLoggedAtConstruction(t *testing.T) {
 		// component-gated kinds must be listed, in the documented order.
 		require.Equal(t,
 			"circuit_breaker_open,circuit_breaker_closed,"+
-				"write_degraded,write_recovered,"+
+				"write_degraded,write_recovered,write_flapping,"+
 				"drain_entered,drain_exited,"+
 				"replay_dropped,mirror_replay_dropped,"+
 				"session_refresh_attempt,session_refresh_success,session_refresh_error",
@@ -157,7 +157,7 @@ func TestClusterEvents_UnreachableKindsLoggedAtConstruction(t *testing.T) {
 		require.Equal(t,
 			"failover,read_divergence,"+
 				"circuit_breaker_open,circuit_breaker_closed,"+
-				"write_degraded,write_recovered,"+
+				"write_degraded,write_recovered,write_flapping,"+
 				"drain_entered,drain_exited,"+
 				"replay_dropped,mirror_replay_dropped,"+
 				"session_refresh_attempt,session_refresh_success,session_refresh_error",

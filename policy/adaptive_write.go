@@ -67,6 +67,14 @@ type AdaptiveDualWrite struct {
 	fireForgetLimit   int32         // Max concurrent fire-and-forget writes
 	fireForgetSem     chan struct{} // Semaphore for limiting concurrent fire-and-forget
 
+	// Hysteresis: a degraded cluster stays degraded for at least the current
+	// dwell, and a degrade that follows a recovery within redegradeWindow
+	// doubles the dwell up to maxDegradedDwell.
+	minDegradedDwell time.Duration
+	redegradeWindow  time.Duration
+	maxDegradedDwell time.Duration
+	now              func() int64 // Unix nanoseconds; nil means time.Now
+
 	// Observability for fire-and-forget background writes. The
 	// foreground caller already records metrics for the synchronous
 	// path; without these, real errors against a degraded cluster are
@@ -108,6 +116,12 @@ type clusterWriteState struct {
 	isDegraded  atomic.Bool  // Lock-free read in Execute fast path; written under mu.
 	latched     atomic.Bool  // Operator latch set by ForceDegrade; written under mu.
 	lastLatency atomic.Int64 // Last write latency in nanoseconds; written from goroutines.
+
+	// Hysteresis bookkeeping, all guarded by mu.
+	degradedAt  int64         // When the current degraded span began (Unix nanoseconds).
+	recoveredAt int64         // When the last strike-driven span ended; 0 after a manual recovery.
+	dwell       time.Duration // Minimum length of the current degraded span.
+	redegrades  int32         // Consecutive re-degrades inside redegradeWindow.
 
 	// reportSeq counts latched transitions (incremented under mu) and
 	// reportMu serializes the post-unlock gauge writes keyed on it, so a
@@ -319,6 +333,52 @@ func WithAdaptiveFireForgetLimit(n int) AdaptiveDualWriteOption {
 	}
 }
 
+// WithAdaptiveMinDegradedDwell sets the minimum time a cluster stays degraded.
+//
+// Fast writes and successful probes still accumulate recovery credit during
+// the dwell, but the cluster is restored only once the dwell has elapsed
+// as well. This stops a cluster whose probe answers quickly while its
+// writes are still slow from bouncing between the two states.
+//
+// Default: 0 (recover as soon as the recovery threshold is met)
+//
+// Parameters:
+//   - d: Minimum degraded span; 0 disables the dwell
+//
+// Returns:
+//   - AdaptiveDualWriteOption: Configuration option
+func WithAdaptiveMinDegradedDwell(d time.Duration) AdaptiveDualWriteOption {
+	return func(a *AdaptiveDualWrite) {
+		a.minDegradedDwell = d
+	}
+}
+
+// WithAdaptiveRedegradeBackoff lengthens the dwell of a cluster that
+// keeps degrading again shortly after recovering.
+//
+// A strike-driven degrade that begins within window of the previous
+// recovery doubles the dwell, starting from [WithAdaptiveMinDegradedDwell]
+// and capped at maxDwell. When the cap is first reached the strategy emits
+// [types.EventWriteFlapping]. A recovery that holds for longer than window,
+// or a manual recovery, resets the backoff.
+//
+// Default: disabled
+//
+// Parameters:
+//   - window: How soon after a recovery a degrade counts as a re-degrade;
+//     0 disables the backoff
+//   - maxDwell: Upper bound for the doubled dwell; must be at least the
+//     minimum dwell
+//
+// Returns:
+//   - AdaptiveDualWriteOption: Configuration option
+func WithAdaptiveRedegradeBackoff(window, maxDwell time.Duration) AdaptiveDualWriteOption {
+	return func(a *AdaptiveDualWrite) {
+		a.redegradeWindow = window
+		a.maxDegradedDwell = maxDwell
+	}
+}
+
 // NewAdaptiveDualWrite creates a new AdaptiveDualWrite strategy.
 //
 // Defaults:
@@ -414,6 +474,15 @@ func validateAdaptiveDualWrite(a *AdaptiveDualWrite) error {
 	if a.fireForgetLimit <= 0 {
 		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveFireForgetLimit"))
 	}
+	if a.minDegradedDwell < 0 {
+		errList = append(errList, optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveMinDegradedDwell"))
+	}
+	if a.redegradeWindow < 0 || a.maxDegradedDwell < 0 {
+		errList = append(errList, optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff"))
+	} else if a.redegradeWindow > 0 && (a.minDegradedDwell <= 0 || a.maxDegradedDwell < a.minDegradedDwell) {
+		errList = append(errList, newOptionError(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff",
+			"requires a positive WithAdaptiveMinDegradedDwell no larger than maxDwell"))
+	}
 	if names := a.clusterNames.Load(); names == nil {
 		errList = append(errList, newOptionError(adaptiveDualWriteComponent, "WithAdaptiveClusterNames", "cluster names cannot be nil"))
 	} else if err := names.Validate(); err != nil {
@@ -444,6 +513,14 @@ func normalizeAdaptiveDualWriteForLegacy(a *AdaptiveDualWrite) {
 	}
 	if a.fireForgetLimit <= 0 {
 		a.fireForgetLimit = defaultAdaptiveFireForgetLimit
+	}
+	if a.minDegradedDwell < 0 {
+		a.minDegradedDwell = 0
+	}
+	if a.redegradeWindow <= 0 || a.minDegradedDwell <= 0 || a.maxDegradedDwell < a.minDegradedDwell {
+		// The backoff needs a dwell to double and a cap to stop at.
+		a.redegradeWindow = 0
+		a.maxDegradedDwell = 0
 	}
 	if names := a.clusterNames.Load(); names == nil || names.Validate() != nil {
 		defaultNames := types.DefaultClusterNames()
@@ -755,32 +832,7 @@ func (a *AdaptiveDualWrite) observeFireAndForget(
 		)
 		return
 	}
-	if latency >= a.absoluteMax {
-		// Write succeeded but was too slow — no recovery credit.
-		return
-	}
-
-	// Check delta against sibling for recovery
-	// If sibling is also degraded (lastLatency == 0), fall back to absoluteMax-only check
-	siblingLatencyNs := siblingState.lastLatency.Load()
-	if siblingLatencyNs > 0 {
-		// Sibling has valid latency - require delta check for recovery
-		siblingLatency := time.Duration(siblingLatencyNs)
-		delta := latency - siblingLatency
-		if delta < 0 {
-			delta = -delta
-		}
-		if delta > a.deltaThreshold {
-			// Still significantly slower than sibling - no recovery credit
-			return
-		}
-	} else if latency >= a.minFloor {
-		// Sibling has no baseline yet (also degraded or never written to).
-		// Use minFloor as a conservative substitute for the delta check:
-		// only grant recovery credit if this write was comfortably fast on
-		// its own. Without this guard, any sub-absoluteMax write would
-		// trigger recovery even when the sibling's true cost is unknown,
-		// potentially bouncing the cluster in/out of degradation.
+	if !a.creditsRecovery(latency, siblingState) {
 		return
 	}
 
@@ -789,6 +841,67 @@ func (a *AdaptiveDualWrite) observeFireAndForget(
 	// delta check see a fresh observation rather than a stale pre-degradation value.
 	state.lastLatency.Store(latency.Nanoseconds())
 	a.recordFast(state)
+}
+
+// creditsRecovery reports whether a successful operation that took latency
+// against a degraded cluster counts toward its recovery: it must be under
+// the absolute cap and within the delta threshold of the sibling's last
+// write, or under the minimum floor when the sibling has no baseline.
+func (a *AdaptiveDualWrite) creditsRecovery(latency time.Duration, siblingState *clusterWriteState) bool {
+	if latency >= a.absoluteMax {
+		return false // Succeeded but too slow.
+	}
+	siblingLatencyNs := siblingState.lastLatency.Load()
+	if siblingLatencyNs <= 0 {
+		// Sibling has no baseline yet (also degraded or never written to).
+		// Use minFloor as a conservative substitute for the delta check:
+		// only grant recovery credit if the operation was comfortably fast
+		// on its own, so the cluster cannot bounce in and out of
+		// degradation while the sibling's true cost is unknown.
+		return latency < a.minFloor
+	}
+	delta := latency - time.Duration(siblingLatencyNs)
+	if delta < 0 {
+		delta = -delta
+	}
+
+	return delta <= a.deltaThreshold
+}
+
+// nowNanos is time.Now in Unix nanoseconds, or the injected test clock.
+func (a *AdaptiveDualWrite) nowNanos() int64 {
+	if a.now != nil {
+		return a.now()
+	}
+
+	return time.Now().UnixNano()
+}
+
+// markDegradedLocked stamps the start of a degraded span and, for a
+// strike-driven degrade that follows a recent recovery, doubles the dwell.
+// It reports whether the backoff cap was reached by this call.
+// The caller holds state.mu.
+func (a *AdaptiveDualWrite) markDegradedLocked(state *clusterWriteState, manual bool) (capReached bool) {
+	now := a.nowNanos()
+	prevDwell := state.dwell // The previous span's dwell survives a strike-driven recovery.
+	state.degradedAt = now
+	state.dwell = a.minDegradedDwell
+	if manual || a.redegradeWindow <= 0 || state.recoveredAt == 0 || now-state.recoveredAt >= int64(a.redegradeWindow) {
+		state.redegrades = 0
+
+		return false
+	}
+	state.redegrades++
+	dwell := prevDwell << 1
+	if dwell >= a.maxDegradedDwell || dwell <= 0 {
+		dwell = a.maxDegradedDwell
+		// Report the cap once per run: a later re-degrade at the cap is
+		// the same flapping episode.
+		capReached = prevDwell < a.maxDegradedDwell
+	}
+	state.dwell = dwell
+
+	return capReached
 }
 
 // updateHealthState updates cluster health based on write results.
@@ -1017,9 +1130,11 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 	// written under mu, so the read is consistent with the store that
 	// follows.
 	justDegraded := false
+	flapping := false
 	if a.strikeThreshold > 0 && state.slowStrikes >= a.strikeThreshold && !state.isDegraded.Load() {
 		state.isDegraded.Store(true)
 		justDegraded = true
+		flapping = a.markDegradedLocked(state, false)
 		cluster = a.stateCluster(state)
 		seq = state.reportSeq.Add(1)
 		a.events.enqueue(types.ClusterEvent{
@@ -1028,12 +1143,24 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 			Reason:  "slow-strike threshold reached",
 			Count:   strikes,
 		})
+		if flapping {
+			a.events.enqueue(types.ClusterEvent{
+				Kind:    types.EventWriteFlapping,
+				Cluster: cluster,
+				Reason:  "re-degrade backoff cap reached",
+				Count:   int(state.redegrades),
+			})
+		}
 	}
 	state.mu.Unlock()
 
 	if justDegraded {
 		a.recordTransitionMetrics(state, cluster, true, seq)
 		a.logWriteDegraded(cluster, "slow-strike threshold reached", strikes)
+		if flapping {
+			a.logger.Warn("adaptive: cluster is flapping between degraded and healthy",
+				"cluster", a.clusterName(cluster))
+		}
 		// Deliver the queued event last, after the log line above, so a
 		// handler that inspects or changes state from inside the callback
 		// cannot observe diagnostics that contradict the final state. Only
@@ -1068,8 +1195,19 @@ func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
 	state.fastStrikes++
 	justRecovered := false
 	if state.fastStrikes >= a.recoveryThreshold {
+		now := a.nowNanos()
+		if now-state.degradedAt < int64(state.dwell) {
+			// Enough credit, but the span is too young: hold the credit at
+			// the threshold so the first fast observation after the dwell
+			// completes the recovery.
+			state.fastStrikes = a.recoveryThreshold
+			state.mu.Unlock()
+
+			return
+		}
 		state.isDegraded.Store(false)
 		state.fastStrikes = 0
+		state.recoveredAt = now
 		justRecovered = true
 		cluster = a.stateCluster(state)
 		seq = state.reportSeq.Add(1)
@@ -1130,6 +1268,10 @@ func (a *AdaptiveDualWrite) recoverState(state *clusterWriteState, cluster types
 	state.slowStrikes = 0
 	state.fastStrikes = 0
 	state.lastLatency.Store(0)
+	// A manual recovery is a fresh start: no backoff carries over.
+	state.recoveredAt = 0
+	state.redegrades = 0
+	state.dwell = 0
 	if wasDegraded {
 		seq = state.reportSeq.Add(1)
 		a.events.enqueue(types.ClusterEvent{
@@ -1214,6 +1356,9 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 	state.fastStrikes = 0
 	state.isDegraded.Store(true)
 	state.latched.Store(true)
+	if !wasDegraded {
+		a.markDegradedLocked(state, true)
+	}
 	strikes := int(state.slowStrikes)
 	var seq uint64
 	if !wasDegraded {
@@ -1371,6 +1516,32 @@ func (a *AdaptiveDualWrite) ExecuteStrict(
 // is generated.
 func (a *AdaptiveDualWrite) RecordProbeSuccess(cluster types.ClusterID) {
 	a.RecordFastWrite(cluster)
+}
+
+// RecordProbeLatency credits one successful recovery probe that took latency.
+//
+// The probe counts toward recovery only when it would count as a fast
+// write: under the absolute cap and within the delta threshold of the
+// sibling's last write (or under the minimum floor when the sibling has no
+// baseline). A probe that answers slowly earns nothing, so a cluster whose
+// probe query is cheap but whose writes are still slow is not restored.
+// The probe's latency is not recorded as a write latency sample.
+//
+// Parameters:
+//   - cluster: The cluster that was probed
+//   - latency: How long the probe took
+func (a *AdaptiveDualWrite) RecordProbeLatency(cluster types.ClusterID, latency time.Duration) {
+	state := a.stateFor(cluster)
+	if state == nil {
+		return
+	}
+	sibling := &a.stateB
+	if state == sibling {
+		sibling = &a.stateA
+	}
+	if a.creditsRecovery(latency, sibling) {
+		a.recordFast(state)
+	}
 }
 
 // RecordFastWrite manually records a fast write for a cluster.
