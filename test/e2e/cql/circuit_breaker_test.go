@@ -52,6 +52,7 @@ func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 				)),
 				helix.WithFailoverPolicy(cb),
 				helix.WithMetrics(mc),
+				helix.WithLogger(testutil.NewTestLogger(t)),
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)

@@ -54,6 +54,7 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 				)),
 				helix.WithFailoverPolicy(lcb),
 				helix.WithMetrics(mc),
+				helix.WithLogger(testutil.NewTestLogger(t)),
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
