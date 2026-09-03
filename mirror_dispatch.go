@@ -12,9 +12,10 @@ import (
 // mirrorExecuteFunc returns a [replay.ExecuteFunc] that dispatches a
 // captured mirror payload through target's full Exec path. The same
 // function is used by the mirror engine for the initial dispatch and by
-// the auto-built mirror replay worker for retries — so timestamps,
-// dual-write strategy, and per-cluster routing on the mirror destination
-// are preserved across both paths.
+// the auto-built mirror replay worker for retries — so the timestamp,
+// consistency levels, non-idempotent marker, dual-write strategy, and
+// per-cluster routing on the mirror destination are preserved across both
+// paths. A zero timestamp is rejected like any other write's.
 func mirrorExecuteFunc(target *CQLClient) replay.ExecuteFunc {
 	return func(ctx context.Context, payload types.ReplayPayload) error {
 		if payload.IsBatch {
@@ -22,13 +23,31 @@ func mirrorExecuteFunc(target *CQLClient) replay.ExecuteFunc {
 			for _, stmt := range payload.BatchStatements {
 				batch = batch.Query(stmt.Query, stmt.Args...)
 			}
+			if payload.Consistency != nil {
+				batch = batch.Consistency(*payload.Consistency)
+			}
+			if payload.SerialConsistency != nil {
+				batch = batch.SerialConsistency(*payload.SerialConsistency)
+			}
+			if payload.NonIdempotent {
+				batch = batch.NonIdempotent()
+			}
 
 			return batch.WithTimestamp(payload.Timestamp).ExecContext(ctx)
 		}
 
-		return target.Query(payload.Query, payload.Args...).
-			WithTimestamp(payload.Timestamp).
-			ExecContext(ctx)
+		query := target.Query(payload.Query, payload.Args...)
+		if payload.Consistency != nil {
+			query = query.Consistency(*payload.Consistency)
+		}
+		if payload.SerialConsistency != nil {
+			query = query.SerialConsistency(*payload.SerialConsistency)
+		}
+		if payload.NonIdempotent {
+			query = query.NonIdempotent()
+		}
+
+		return query.WithTimestamp(payload.Timestamp).ExecContext(ctx)
 	}
 }
 

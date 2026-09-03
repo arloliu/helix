@@ -286,16 +286,17 @@ func (b *memoryBackend) clusterName(cluster types.ClusterID) string {
 // # Retry model
 //
 // The first attempt for each payload runs synchronously on the dequeue
-// loop. On failure, attempts 2..MaxAttempts run in a dedicated goroutine
-// so the dequeue loop is never blocked behind a permanently-failing
-// payload — including payloads targeting a different cluster.
+// loop. Under [RetryBounded], attempts 2..MaxAttempts then run in a
+// dedicated goroutine so the dequeue loop is never blocked behind a
+// permanently-failing payload — including payloads targeting a different
+// cluster.
 //
-// Concurrent in-flight retries are capped (default 100). Under the default
-// [RetryBounded] policy, further failures drop immediately via OnDrop with
-// the reason "retry_pool_saturated" rather than queuing behind running
+// Concurrent in-flight retries are capped (default 100). Under
+// [RetryBounded], further failures drop immediately via OnDrop with the
+// reason "retry_pool_saturated" rather than queuing behind running
 // retries.
 //
-// Under [RetryWhileRetained] a failed payload keeps its queue slot and waits
+// Under the default [RetryWhileRetained] a failed payload keeps its queue slot and waits
 // for its next attempt instead of occupying a goroutine, the pool only
 // bounds attempts that are executing, and the payload is retried until it
 // succeeds, the RetryWindow elapses, or the classifier dead-letters it

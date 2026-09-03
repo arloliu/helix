@@ -32,8 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   draining leg beside any of them. The error names each leg's result and
   whether the write was admitted to the replay queue, and matches
   `errors.Is(err, types.ErrNoSynchronousAck)`. A write with one
-  acknowledgement still returns `nil`. Restore the previous result for
-  queued writes with one line: `helix.WithAckMode(helix.AckOnReplayAdmission)`.
+  acknowledgement still returns `nil`. A leg still running in the
+  background counts as admitted: its failure is enqueued when it
+  completes. Restore the previous result for queued writes with one line:
+  `helix.WithAckMode(helix.AckOnReplayAdmission)`; a value outside the two
+  declared modes is rejected by `NewCQLClient`.
 - Without a `Replayer`, a leg that needed replay is now counted in
   `IncReplayDropped` and reported through `WithOnReplayDropped` and
   `EventReplayDropped` with `types.ErrNoReplayer`; previously it was
@@ -49,14 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arguments failed at enqueue, an inet argument failed on every replay
   attempt, and an empty blob replayed as a tombstone. Both replayers now
   reject an argument no backend can carry (a struct or user-defined type,
-  or a map with non-string keys) at enqueue with
+  or a map with non-string keys, or an invalid `net.IP`) at enqueue with
   `types.ErrUnsupportedReplayArg`, so the write is reported as a dropped
-  replay on the memory backend as well.
+  replay on the memory backend as well. The extension types are carried
+  inside slices, arrays, and string-keyed maps as well as at the top
+  level, a nil slice or map replays as NULL, and the bundled adapters bind
+  `types.Duration` inside a `[]types.Duration` and inside the decoded
+  `[]any` / `map[string]any` collections.
 - A write to a cluster that `AdaptiveDualWrite` has degraded is applied
   once. The fire-and-forget leg's result now implements the new
   `helix.DeferredWriteResult` interface, and the client enqueues replay
   for that leg only if the background write reports a failure, instead of
-  eagerly as a safety net beside a write that then succeeds. A custom
+  eagerly as a safety net beside a write that then succeeds. `Close`
+  waits for such legs before stopping the replay worker, so a failure
+  reported during shutdown is still enqueued, and `AdaptiveDualWrite`
+  releases its background slot before reporting the result. A custom
   strategy that returns a plain `types.ErrWriteAsync` keeps the immediate
   enqueue.
 - `Close` waits for the auto-refresh detector and topology watcher
@@ -86,13 +96,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NewCQLClient` rejects a `TimestampProvider` that returns zero with a
   `types.OptionError`. The drivers treat zero as "use the current time", so
   a replayed write would have carried a newer timestamp than the original
-  and overwritten later data.
+  and overwritten later data. `DefaultExecuteFunc` and the built-in mirror
+  executor reject a payload with a zero timestamp (one enqueued before this
+  release) with `types.ErrInvalidTimestamp`, which
+  `replay.DefaultReplayClassifier` dead-letters.
 - `Iter.Close` now reports its outcome to the failover policy and the read
   strategy like every other read: a clean close is a `RecordSuccess`, and a
   cluster error is a `RecordFailure` plus `OnFailure` (the suggested
-  alternative is ignored because an iterator cannot be retried). Previously
-  an iterator-heavy workload never tripped a circuit breaker, never moved
-  the sticky preference, and a clean close never reset a breaker.
+  alternative is ignored because an iterator cannot be retried). Only the
+  first `Close` reports; a repeated `Close` returns the same error.
+  Previously an iterator-heavy workload never tripped a circuit breaker,
+  never moved the sticky preference, and a clean close never reset a
+  breaker.
 - `LatencyRecorder` documents that `RecordLatency` stands in for
   `RecordSuccess` on the read path and must reset the failure counter for a
   fast sample. Calling both would let `RecordSuccess` erase the slow-read
@@ -101,14 +116,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An error observed after the caller's context was cancelled or expired is
   no longer counted as a cluster failure. On every read entry point it is
   returned as-is without `IncReadError`, `RecordFailure`, `OnFailure`, the
-  auto-refresh failure counter, or a failover attempt with the dead context;
-  on writes the leg is still replayed but neither `IncWriteError`, the
-  auto-refresh counter, nor an `AdaptiveDualWrite` strike records it; a
-  failover attempt is skipped once the caller's context has ended. A
+  auto-refresh failure counter, or a failover attempt with the dead context,
+  and a `FallbackRead` probe is not started with a dead context (the
+  caller's context error is returned instead); on writes the leg is
+  replayed exactly when a failed leg would be (a pair of unacknowledged
+  hard failures still returns `DualClusterError` without replay) but
+  neither `IncWriteError`, the auto-refresh counter, nor an
+  `AdaptiveDualWrite` strike records it; a failover attempt is skipped
+  once the caller's context has ended. A
   context error the driver reports while the caller's context is still
   live is a cluster error like any other. Previously one cancelled request
   counted as a failure on both clusters and could flip the sticky read
   preference.
+- The NATS worker sends one negative acknowledgement per failed attempt
+  under `RetryWhileRetained`. Previously a plain `Nak` preceded the delayed
+  one, so JetStream redelivered immediately and logged the delayed call as
+  already acknowledged; the documented backoff never applied.
+- The built-in mirror executor applies the captured consistency and serial
+  consistency levels, as `DefaultExecuteFunc` does; previously a mirrored
+  write ran at the destination's session defaults.
+- A paging token from `Iter.PageState` carries a checksum, so a driver
+  token that happens to start with the Helix header is passed through
+  unchanged instead of being misread.
+- A concurrent `Close` returns only after the first one finished shutting
+  the client down; previously it returned immediately.
 
 ### Added
 
@@ -116,17 +147,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `types.ReplayPayload` gains `Consistency` and `SerialConsistency`
   (nil for a session-default write), the client records them on every
   replay and mirror payload, and `DefaultExecuteFunc` applies them. The
-  NATS envelope is now versioned: version 2 messages carry the levels, and
-  workers keep reading version 1 messages. Upgrade workers before
-  publishers; an older worker replays a version 2 message at its session
-  default, as it did before. `USING TTL` drift on replay is documented.
+  NATS envelope is now versioned: version 2 messages carry the levels and
+  the non-idempotent marker, and workers keep reading version 1 messages.
+  Upgrade every worker before any publisher: an older worker replays a
+  version 2 message at its session default, as it did before, but cannot
+  bind the varint, decimal, inet, and duration encodings that are new in
+  this release and drops such a message after its retries. `USING TTL`
+  drift on replay is documented.
 - `Query.NonIdempotent` and `Batch.NonIdempotent` mark a statement that
   must not be applied twice, such as a counter update or a collection
   append. The write takes the strict path (synchronous on both clusters,
   no fire-and-forget, no replay) and a partial failure surfaces as
   `*types.PartialWriteError`; unlike `Strict`, it may be combined with
-  `Mirror`. A `CounterBatch` is non-idempotent automatically, so it is
-  no longer replayed.
+  `Mirror`: `types.ReplayPayload.NonIdempotent` carries the marker, so
+  the destination executes the statement on its strict path and never
+  replays it within its own pair (mirror delivery itself may still be
+  retried, as before). A `CounterBatch` is non-idempotent automatically,
+  so it is no longer replayed.
 - `helix.DeferredWriteResult`: the optional interface on a write strategy's
   fire-and-forget leg result through which the client learns the leg's
   final outcome.
@@ -153,7 +190,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clusters, both of which have no effect.
 - `ClientConfig` no longer exposes the components `NewCQLClient` builds:
   the `MirrorEngine` and `MirrorReplayWorker` fields are gone. The mirror
-  engine is still available through `CQLClient.Mirror`.
+  engine is still available through `CQLClient.Mirror`. This is a
+  source-incompatible change for code that read those fields; it is the
+  only exported removal in this release.
 
 - A write to a dual cluster with one cluster draining now runs through the
   configured `WriteStrategy` like every other write: the draining cluster's

@@ -43,11 +43,3 @@ jobs:
 
       - name: Run simulation quick profile
         run: make test-simulation
-
-      - name: Upload simulation reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: simulation-reports
-          path: reports/
-          if-no-files-found: ignore

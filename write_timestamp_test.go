@@ -53,3 +53,21 @@ func TestWrite_ProviderReturningZeroLaterIsRejected(t *testing.T) {
 	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
 	require.ErrorIs(t, err, types.ErrInvalidTimestamp)
 }
+
+// TestDefaultExecuteFunc_RejectsZeroTimestamp asserts that a payload from
+// before zero timestamps were rejected is not replayed with the driver's
+// current time.
+func TestDefaultExecuteFunc_RejectsZeroTimestamp(t *testing.T) {
+	sessionA, sessionB := newMockSession(), newMockSession()
+	client, err := NewCQLClient(sessionA, sessionB)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	err = client.DefaultExecuteFunc()(t.Context(), types.ReplayPayload{
+		TargetCluster: ClusterA,
+		Query:         "INSERT INTO t (id) VALUES (?)",
+		Args:          []any{1},
+	})
+	require.ErrorIs(t, err, types.ErrInvalidTimestamp)
+	require.Empty(t, sessionA.queries, "the session must not see the write")
+}

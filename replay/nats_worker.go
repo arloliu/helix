@@ -439,9 +439,13 @@ func (b *natsBackend) ackMessage(msg ReplayMessage) error {
 
 // nakMessage requests redelivery, after delay when it is positive.
 func (b *natsBackend) nakMessage(msg ReplayMessage, reason string, delay time.Duration) {
-	err := msg.Nak()
+	// A message accepts one acknowledgement: a plain Nak followed by a
+	// delayed one would redeliver immediately and fail the second call.
+	var err error
 	if delay > 0 {
 		err = msg.NakWithDelay(delay)
+	} else {
+		err = msg.Nak()
 	}
 	if err != nil {
 		b.config.Logger.Error("failed to nak replay message",

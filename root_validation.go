@@ -36,7 +36,19 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootRecoveryProbe(config),
 		validateRootReplayWiring(config),
 		validateRootTimestampProvider(config),
+		validateRootAckMode(config),
 	)
+}
+
+// validateRootAckMode rejects an acknowledgement mode outside the declared
+// constants, which the write path would otherwise treat as the default.
+func validateRootAckMode(config *ClientConfig) error {
+	switch config.AckMode {
+	case RequireSynchronousAck, AckOnReplayAdmission:
+		return nil
+	default:
+		return newRootOptionError("WithAckMode", "must be RequireSynchronousAck or AckOnReplayAdmission")
+	}
 }
 
 // validateRootTimestampProvider samples the timestamp provider once and

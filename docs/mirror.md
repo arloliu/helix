@@ -145,7 +145,8 @@ the whole batch mirrors or none does.
 | Timestamps | The original client-generated timestamp is captured at `Mirror()` opt-in time and applied at mirror exec via `WithTimestamp`. Server-side `WRITETIME`, LWW, TTL, tombstone semantics on the mirror cluster match the primary. |
 | Args | `[]any` args (and batch entries' args) are deep-copied synchronously **before** `Exec` returns to the caller. Caller-side buffer reuse / pooling cannot corrupt mirror payloads. |
 | Disable / Enable | `client.Mirror().Disable()` stops accepting new captures; the in-flight queue continues to drain. `Enable()` mid-drain resumes normal operation. Workers always process queued items regardless of the enabled flag. |
-| Idempotence | Mirror writes may be retried on failure (via `WithMirrorReplayer` or by NATS redelivery in publisher mode). Counter updates and `IF`-clause LWTs are not idempotent under retry — accept divergence on those statements. |
+| Idempotence | Mirror writes may be retried on failure (via `WithMirrorReplayer` or by NATS redelivery in publisher mode). Counter updates and `IF`-clause LWTs are not idempotent under retry — accept divergence on those statements. A `NonIdempotent()` statement (a `CounterBatch` automatically) carries its marker in the payload, so the destination executes it on its strict path and never replays it within its own pair; only the mirror-level retry can repeat it. |
+| Consistency | The consistency and serial consistency the original write set are captured and applied by the built-in executor, so the destination acknowledges the write under the same rule. A session-default write runs at the destination's default. |
 
 ## Runtime control
 

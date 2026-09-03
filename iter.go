@@ -3,6 +3,9 @@ package helix
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"hash/crc32"
+	"sync"
 
 	"github.com/arloliu/helix/adapter/cql"
 )
@@ -14,6 +17,9 @@ type cqlIter struct {
 	cluster        ClusterID
 	ctx            context.Context // the caller's context, for error provenance on Close
 	overrideActive bool            // captured from readTarget at creation, not re-evaluated
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (i *cqlIter) Scan(dest ...any) bool {
@@ -26,7 +32,14 @@ func (i *cqlIter) Scan(dest ...any) bool {
 // alternative is ignored because an iterator cannot be retried), and data
 // sentinels or a caller-context error are neither. Auto-refresh accounting
 // sees every outcome except a caller-context error.
+// Only the first Close reports; later calls return the same error.
 func (i *cqlIter) Close() error {
+	i.closeOnce.Do(func() { i.closeErr = i.closeAndReport() })
+
+	return i.closeErr
+}
+
+func (i *cqlIter) closeAndReport() error {
 	err := i.iter.Close()
 	kind := classifyReadErr(i.ctx, err)
 	if kind != readCtxErr {
@@ -59,8 +72,12 @@ func (i *cqlIter) Close() error {
 }
 
 // pageStateHeader identifies a paging token issued by Helix: a magic and a
-// format version, followed by the issuing cluster's letter.
+// format version, followed by the issuing cluster's letter and a CRC-32 of
+// the driver token. The checksum keeps a driver token that happens to
+// start with the magic from being misread as a Helix token.
 const pageStateHeader = "hx1"
+
+const pageStatePrefixLen = len(pageStateHeader) + 1 + crc32.Size
 
 // encodePageState prepends the issuing cluster to a driver paging token.
 // An empty token (no more pages) is returned unchanged so callers keep the
@@ -69,28 +86,32 @@ func encodePageState(cluster ClusterID, raw []byte) []byte {
 	if len(raw) == 0 {
 		return raw
 	}
-	out := make([]byte, 0, len(pageStateHeader)+len(cluster)+len(raw))
+	out := make([]byte, 0, pageStatePrefixLen+len(raw))
 	out = append(out, pageStateHeader...)
 	out = append(out, cluster...)
+	out = binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(raw))
 
 	return append(out, raw...)
 }
 
 // decodePageState splits a token produced by encodePageState into the
-// issuing cluster and the driver token. A token without the Helix header
-// (one produced by a driver directly, or by an older Helix) is returned
-// as-is with an empty cluster.
+// issuing cluster and the driver token. A token without a valid Helix
+// header (one produced by a driver directly, or by an older Helix) is
+// returned as-is with an empty cluster.
 func decodePageState(state []byte) (cluster ClusterID, raw []byte) {
-	prefix := len(pageStateHeader) + 1
-	if len(state) <= prefix || !bytes.HasPrefix(state, []byte(pageStateHeader)) {
+	if len(state) <= pageStatePrefixLen || !bytes.HasPrefix(state, []byte(pageStateHeader)) {
 		return "", state
 	}
-	cluster = ClusterID(state[len(pageStateHeader):prefix])
+	cluster = ClusterID(state[len(pageStateHeader) : len(pageStateHeader)+1])
 	if cluster != ClusterA && cluster != ClusterB {
 		return "", state
 	}
+	raw = state[pageStatePrefixLen:]
+	if binary.BigEndian.Uint32(state[len(pageStateHeader)+1:]) != crc32.ChecksumIEEE(raw) {
+		return "", state
+	}
 
-	return cluster, state[prefix:]
+	return cluster, raw
 }
 
 // errorIter is returned when resolveReadTarget fails. It defers the error

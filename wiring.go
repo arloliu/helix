@@ -332,6 +332,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	client := &CQLClient{
 		config:        config,
 		singleCluster: sessionB == nil,
+		closeDone:     make(chan struct{}),
 	}
 	client.storeSessionA(sessionA)
 	// Store sessionB even if nil; in single-cluster mode the holder wraps a
@@ -477,6 +478,11 @@ func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 	return func(ctx context.Context, payload types.ReplayPayload) error {
 		if payload.TargetCluster != ClusterA && payload.TargetCluster != ClusterB {
 			return fmt.Errorf("%w: replay target %q", types.ErrInvalidCluster, payload.TargetCluster)
+		}
+		if payload.Timestamp == 0 {
+			// The driver would stamp the replay with the current time, so
+			// it could outrank data written after the original.
+			return types.ErrInvalidTimestamp
 		}
 		session := c.getSession(payload.TargetCluster)
 

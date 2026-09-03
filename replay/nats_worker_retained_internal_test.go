@@ -54,9 +54,10 @@ func TestNATSBackend_ProcessMessages_MarksInProgressBeforeEachExecute(t *testing
 // the backoff delay for its delivery count, never terminated.
 func TestNATSBackend_SettleRetained_NaksWithBackoff(t *testing.T) {
 	var delays []time.Duration
-	var termed bool
+	var termed, plainNak bool
 	msg := ReplayMessage{
 		Payload:          types.ReplayPayload{TargetCluster: types.ClusterA, Query: "INSERT test"},
+		nakFunc:          func() error { plainNak = true; return nil },
 		nakWithDelayFunc: func(d time.Duration) error { delays = append(delays, d); return nil },
 		termFunc:         func() error { termed = true; return nil },
 		DeliveryCount:    3,
@@ -74,6 +75,7 @@ func TestNATSBackend_SettleRetained_NaksWithBackoff(t *testing.T) {
 	b.settleRetained(msg, errors.New("unknown failure"))
 
 	require.Equal(t, []time.Duration{40 * time.Millisecond}, delays, "third delivery waits 10ms * 2^2")
+	assert.False(t, plainNak, "a message accepts one acknowledgement: no plain Nak beside the delayed one")
 	assert.False(t, termed, "an unknown error is retried, not dead-lettered")
 }
 

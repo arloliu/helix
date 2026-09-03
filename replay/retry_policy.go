@@ -100,6 +100,7 @@ type ReplayClassifier func(err error) ReplayDisposition
 // It relies on the typed sentinels the bundled adapters produce:
 //   - [types.ErrClusterUnreachable] -> [DispositionDefer]
 //   - [types.ErrInvalidCluster] -> [DispositionDeadLetter]
+//   - [types.ErrInvalidTimestamp] -> [DispositionDeadLetter]
 //   - anything else -> [DispositionRetry]
 //
 // Parameters:
@@ -111,7 +112,7 @@ func DefaultReplayClassifier(err error) ReplayDisposition {
 	switch {
 	case errors.Is(err, types.ErrClusterUnreachable):
 		return DispositionDefer
-	case errors.Is(err, types.ErrInvalidCluster):
+	case errors.Is(err, types.ErrInvalidCluster), errors.Is(err, types.ErrInvalidTimestamp):
 		return DispositionDeadLetter
 	default:
 		return DispositionRetry
@@ -120,9 +121,10 @@ func DefaultReplayClassifier(err error) ReplayDisposition {
 
 // WithRetryPolicy selects the retry policy for a worker.
 //
-// The default is [RetryBounded].
-// Choose [RetryWhileRetained] when the replay queue must survive cluster
-// outages longer than a few seconds.
+// The default is [RetryWhileRetained], which survives cluster outages
+// that fit within the retention window.
+// Choose [RetryBounded] to give up after [WorkerConfig.MaxAttempts]
+// attempts as workers did before the retained policy became the default.
 //
 // Parameters:
 //   - p: The policy to apply

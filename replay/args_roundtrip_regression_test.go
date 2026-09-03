@@ -123,6 +123,8 @@ func TestMemoryReplayerEnqueueRejectsUnsupportedArgType(t *testing.T) {
 		{name: "map with non-string keys", arg: map[int]string{1: "a"}},
 		{name: "struct value", arg: udt{Name: "x", Age: 1}},
 		{name: "struct pointer", arg: &udt{Name: "x", Age: 1}},
+		{name: "invalid inet", arg: net.IP{1, 2, 3}},
+		{name: "invalid inet inside a slice", arg: []net.IP{{1, 2, 3}}},
 	}
 
 	for _, tt := range tests {

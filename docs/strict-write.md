@@ -312,8 +312,11 @@ as `Strict()` — synchronous on both clusters, no fire-and-forget, no replay,
 intent: the statement must not be applied twice. Use it for counter updates
 and collection appends. A `CounterBatch` is marked automatically. The one
 difference from `Strict()` is that `NonIdempotent()` may be combined with
-`Mirror()`, because the mirror destination applies the statement once on
-its own pair.
+`Mirror()`: the marker travels with the mirror payload, so the destination
+executes the statement on the same strict path and never replays it within
+its own pair. Mirror delivery itself may still be retried after an
+ambiguous failure, as [docs/mirror.md](mirror.md) describes under
+idempotence.
 
 ## Custom Write Strategy Support
 

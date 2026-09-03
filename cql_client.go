@@ -77,6 +77,13 @@ type CQLClient struct {
 
 	config *ClientConfig
 	closed atomic.Bool
+	// closeDone is closed once the first Close call has finished, so a
+	// concurrent Close returns only after shutdown completed.
+	closeDone chan struct{}
+
+	// deferred counts write legs whose result a strategy reports later;
+	// Close waits for them before stopping the replay worker.
+	deferred deferredLegs
 
 	// runtime holds the components NewCQLClient builds from the
 	// configuration. They are owned by the client, not by the caller, and

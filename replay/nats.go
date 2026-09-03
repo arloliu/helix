@@ -452,6 +452,7 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 		BatchType:       uint8(payload.BatchType),
 		BatchStatements: batchStmts,
 		Version:         replayEnvelopeVersion,
+		NonIdempotent:   payload.NonIdempotent,
 	}
 	msg.HasConsistency, msg.Consistency = consistencyToWire(payload.Consistency)
 	msg.HasSerialConsistency, msg.SerialConsistency = consistencyToWire(payload.SerialConsistency)
@@ -702,6 +703,7 @@ msgLoop:
 			IsBatch:         natsMsg.IsBatch,
 			BatchType:       types.BatchType(natsMsg.BatchType),
 			BatchStatements: batchStmts,
+			NonIdempotent:   natsMsg.NonIdempotent,
 		}
 		payload.Consistency = consistencyFromWire(natsMsg.HasConsistency, natsMsg.Consistency)
 		payload.SerialConsistency = consistencyFromWire(natsMsg.HasSerialConsistency, natsMsg.SerialConsistency)
@@ -845,6 +847,9 @@ func appendArg(buf []byte, arg any) ([]byte, error) {
 		if v == nil {
 			return msgp.AppendNil(buf), nil
 		}
+		if canonicalIP(v) == nil {
+			return buf, errInvalidInet
+		}
 
 		return msgp.AppendExtension(buf, &inetExt{value: v})
 	case []byte:
@@ -861,9 +866,56 @@ func appendArg(buf []byte, arg any) ([]byte, error) {
 	if d, ok := durationFromValue(arg); ok {
 		return msgp.AppendExtension(buf, &durationExt{value: d})
 	}
+	if out, ok, err := appendCollection(buf, arg); ok {
+		return out, err
+	}
 
 	// Fall back to standard msgp encoding
 	return msgp.AppendIntf(buf, arg)
+}
+
+// appendCollection encodes a slice, array, or string-keyed map element by
+// element through appendArg, so an extension type nested in a collection
+// is carried like a top-level one. A nil slice or map stays nil, which the
+// driver binds as NULL. It reports false for any other kind of value.
+func appendCollection(buf []byte, arg any) ([]byte, bool, error) {
+	rv := reflect.ValueOf(arg)
+	kind := rv.Kind()
+	if kind == reflect.Slice || kind == reflect.Array {
+		if kind == reflect.Slice && rv.IsNil() {
+			return msgp.AppendNil(buf), true, nil
+		}
+		n := rv.Len()
+		//nolint:gosec // an argument collection never approaches the header's range
+		buf = msgp.AppendArrayHeader(buf, uint32(n))
+		for i := range n {
+			var err error
+			buf, err = appendArg(buf, rv.Index(i).Interface())
+			if err != nil {
+				return buf, true, err
+			}
+		}
+
+		return buf, true, nil
+	}
+	if kind != reflect.Map || rv.Type().Key().Kind() != reflect.String {
+		return buf, false, nil
+	}
+	if rv.IsNil() {
+		return msgp.AppendNil(buf), true, nil
+	}
+	//nolint:gosec // an argument collection never approaches the header's range
+	buf = msgp.AppendMapHeader(buf, uint32(rv.Len()))
+	for it := rv.MapRange(); it.Next(); {
+		buf = msgp.AppendString(buf, it.Key().String())
+		var err error
+		buf, err = appendArg(buf, it.Value().Interface())
+		if err != nil {
+			return buf, true, err
+		}
+	}
+
+	return buf, true, nil
 }
 
 // tryConvertToUUID attempts to convert an argument to a UUID extension.
@@ -967,10 +1019,23 @@ func decodeArgs(raw msgp.Raw) ([]any, error) {
 }
 
 // unwrapArg turns a decoded MessagePack value into the value handed to the
-// driver: extensions become their Go types and an empty binary stays an
-// empty, non-nil byte slice.
+// driver: extensions become their Go types, an empty binary stays an
+// empty, non-nil byte slice, and collections are unwrapped element by
+// element.
 func unwrapArg(val any) any {
 	switch v := val.(type) {
+	case []any:
+		for i, e := range v {
+			v[i] = unwrapArg(e)
+		}
+
+		return v
+	case map[string]any:
+		for k, e := range v {
+			v[k] = unwrapArg(e)
+		}
+
+		return v
 	case *UUID:
 		// []byte is universally accepted by CQL drivers for both UUID and
 		// blob columns.

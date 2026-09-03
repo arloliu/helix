@@ -76,3 +76,10 @@ func warnings(logger *captureLogger) []string {
 
 	return append([]string(nil), logger.warnMsgs...)
 }
+
+func TestNewCQLClient_RejectsUnknownAckMode(t *testing.T) {
+	_, err := NewCQLClient(newMockSession(), newMockSession(), WithAckMode(AckMode(99)))
+	require.Error(t, err)
+	require.True(t, types.IsOptionError(err))
+	require.ErrorContains(t, err, "WithAckMode")
+}

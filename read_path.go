@@ -818,6 +818,7 @@ type fallbackReadOptions struct {
 //     unreachable cluster)
 //   - the alt's error verbatim when opts.propagateAltErr returns true, or
 //     when the caller's context ended during the probe
+//   - the caller's context error when it had already ended before the probe
 func (c *CQLClient) executeFallbackRead(
 	ctx context.Context,
 	snap overrideSnapshot,
@@ -826,6 +827,12 @@ func (c *CQLClient) executeFallbackRead(
 	opts fallbackReadOptions,
 ) error {
 	alternativeCluster := c.alternativeCluster(selectedCluster)
+
+	// A caller whose context has ended gets that error, as it would from
+	// the probe itself; the alternative is not contacted with a dead context.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Override fence: don't probe a cluster excluded by the override.
 	if snap.active && alternativeCluster != snap.primary && alternativeCluster != snap.fallback {
