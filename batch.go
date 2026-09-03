@@ -257,7 +257,8 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 			return types.ErrSessionClosed
 		}
 
-		batch := b.client.loadSessionA().Batch(b.kind)
+		holder := b.client.holderFor(ClusterA)
+		batch := holder.s.Batch(b.kind)
 		for _, entry := range b.entries {
 			batch = batch.Query(entry.statement, entry.args...)
 		}
@@ -270,7 +271,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		batch = batch.WithTimestamp(ts)
 
 		err = batch.ExecContext(ctx)
-		b.client.recordWriteOutcome(ctx, ClusterA, err)
+		b.client.health.writeLeg(holder, classifyWriteLeg(ctx, err), err, b.client.config.NowProvider())
 
 		return err
 	}
@@ -314,7 +315,8 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 		return &errorIter{err: rt.err}
 	}
 
-	session := b.client.getSession(rt.cluster)
+	holder := b.client.holderFor(rt.cluster)
+	session := holder.s
 	batch := session.Batch(b.kind)
 	for _, entry := range b.entries {
 		batch = batch.Query(entry.statement, entry.args...)
@@ -331,6 +333,7 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 		iter:           batch.IterContext(ctx),
 		client:         b.client,
 		cluster:        rt.cluster,
+		holder:         holder,
 		ctx:            ctx,
 		overrideActive: rt.snap.active,
 	}
@@ -352,7 +355,8 @@ func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied boo
 
 	selectedCluster := b.client.selectClusterForCAS(ctx)
 
-	session := b.client.getSession(selectedCluster)
+	holder := b.client.holderFor(selectedCluster)
+	session := holder.s
 	batch := session.Batch(b.kind)
 	for _, entry := range b.entries {
 		batch = batch.Query(entry.statement, entry.args...)
@@ -374,6 +378,7 @@ func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied boo
 		iter:    cqlItr,
 		client:  b.client,
 		cluster: selectedCluster,
+		holder:  holder,
 		ctx:     ctx,
 	}, err
 }
@@ -394,7 +399,8 @@ func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (
 
 	selectedCluster := b.client.selectClusterForCAS(ctx)
 
-	session := b.client.getSession(selectedCluster)
+	holder := b.client.holderFor(selectedCluster)
+	session := holder.s
 	batch := session.Batch(b.kind)
 	for _, entry := range b.entries {
 		batch = batch.Query(entry.statement, entry.args...)
@@ -416,6 +422,7 @@ func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (
 		iter:    cqlItr,
 		client:  b.client,
 		cluster: selectedCluster,
+		holder:  holder,
 		ctx:     ctx,
 	}, err
 }

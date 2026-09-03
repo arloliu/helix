@@ -2,7 +2,6 @@ package helix
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -60,6 +59,7 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	}
 
 	s := c.statsForCluster(cluster)
+	lastRefresh := c.lastRefreshFor(cluster)
 	now := c.config.NowProvider()
 	cfg := c.config.AutoRefresh
 
@@ -77,14 +77,14 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	if now-s.lastSuccessNanos.Load() < int64(cfg.SustainedFailureWindow) {
 		return
 	}
-	if now-s.lastRefreshNanos.Load() < int64(cfg.MinRetryInterval) {
+	if now-lastRefresh.Load() < int64(cfg.MinRetryInterval) {
 		return
 	}
 
 	// Throttle stamp first — any future tick within MinRetryInterval will
 	// see this and bail at the predicate above, even if RefreshSession
 	// hangs or panics.
-	s.lastRefreshNanos.Store(now)
+	lastRefresh.Store(now)
 
 	refreshMetrics, _ := c.config.Metrics.(types.SessionRefreshMetrics)
 	if refreshMetrics != nil {
@@ -131,77 +131,9 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	c.config.Logger.Info("auto-refresh: session refreshed",
 		"cluster", c.clusterName(cluster),
 	)
-
-	// Reset failure counters: the new session deserves a fresh start.
-	// Leave lastSuccessNanos stale — we want the detector to require a
-	// genuinely successful op against the new session before considering
-	// it healthy. Without this, an immediate re-tick would see threshold
-	// failures already met against a now-replaced session and could
-	// (modulo MinRetryInterval) re-fire spuriously.
-	s.consecutiveFailures.Store(0)
-	s.lastFailureNanos.Store(0)
-}
-
-// recordOpOutcome updates the per-cluster stats based on a single op's
-// result for that cluster. Designed to be invoked PER cluster — never
-// gated on "all clusters succeeded" — so a dual-write where A succeeds
-// and B fails records success on A AND failure on B independently.
-//
-// err == nil counts as success. ErrWriteAsync, ErrWriteDropped, ErrNotFound,
-// ErrRowLimitExceeded, ErrClusterDegraded, and ErrClusterDraining are
-// operational/data states (not health signals) and MUST NOT count as
-// failure. All other errors increment consecutiveFailures.
-//
-// The ErrNotFound exclusion depends on Helix's adapter normalization
-// contract: gocql v1's gocql.ErrNotFound and gocql v2's equivalent are
-// both translated to types.ErrNotFound at the adapter boundary
-// (verified in adapter/cql/v{1,2}/adapter.go:14). If a future adapter
-// surfaces a driver-native not-found instead of the Helix sentinel,
-// recordOpOutcome will count those as failures and a workload with
-// many genuine not-founds could trigger spurious auto-refreshes.
-// Revisit this helper if the adapter contract changes.
-func (c *CQLClient) recordOpOutcome(cluster ClusterID, err error) {
-	c.recordOpOutcomeAt(cluster, err, 0)
-}
-
-// recordOpOutcomeAt is the same as recordOpOutcome but accepts a caller-
-// captured timestamp to avoid a redundant nowFunc() call when the caller
-// already has one. Pass nowNano == 0 to let the helper sample the clock
-// itself; the clock is only sampled when the outcome actually needs to
-// stamp lastSuccess/lastFailure.
-func (c *CQLClient) recordOpOutcomeAt(cluster ClusterID, err error, nowNano int64) {
-	s := c.statsForCluster(cluster)
-
-	switch {
-	case err == nil:
-		if nowNano == 0 {
-			nowNano = c.config.NowProvider()
-		}
-		s.consecutiveFailures.Store(0)
-		s.lastSuccessNanos.Store(nowNano)
-		// Steady-state lastErr is already nil; skip the redundant Store.
-		if s.lastErr.Load() != nil {
-			s.lastErr.Store(nil)
-		}
-	case errors.Is(err, types.ErrWriteAsync),
-		errors.Is(err, types.ErrWriteDropped),
-		errors.Is(err, types.ErrNotFound),
-		errors.Is(err, types.ErrRowLimitExceeded),
-		errors.Is(err, types.ErrClusterDegraded),
-		errors.Is(err, types.ErrClusterDraining):
-		// Operational/data state; not a health signal.
-		return
-	default:
-		if nowNano == 0 {
-			nowNano = c.config.NowProvider()
-		}
-		s.consecutiveFailures.Add(1)
-		s.lastFailureNanos.Store(nowNano)
-		// Stable heap pointer for atomic.Pointer; the err interface
-		// itself is two words and can't be stored directly.
-		errCopy := err
-		s.lastErr.Store(&errCopy)
-	}
+	// The new session carries fresh stats on its holder: the detector
+	// requires a genuinely successful op against it before considering it
+	// healthy, and the throttle above prevents a spurious re-fire.
 }
 
 // watchTopology monitors topology updates and updates drain state.

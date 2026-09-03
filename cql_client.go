@@ -108,13 +108,16 @@ type CQLClient struct {
 	// Prevents log storms when the AllowedClusters provider is misconfigured.
 	overrideErrSeq atomic.Uint64
 
-	// statsA / statsB track per-cluster op outcomes for the auto-refresh
-	// detector (see WithAutoRefresh). Updated by recordOpOutcome on every
-	// hot-path op. When auto-refresh is disabled the fields are still
-	// updated (the cost is negligible) so toggling the option after
-	// construction would just-work in v2.x if/when we add it.
-	statsA clusterStats
-	statsB clusterStats
+	// health is the observation hub every health observation enters
+	// through; it writes the liveness stats on the session holders.
+	health clusterHealth
+
+	// lastRefreshA / lastRefreshB throttle the auto-refresh detector:
+	// stamped before each refresh attempt so a hung refresher cannot cause
+	// a re-entrant double-fire on the next detector tick. They outlive
+	// the holder a refresh replaces, so they live on the client.
+	lastRefreshA atomic.Int64
+	lastRefreshB atomic.Int64
 
 	// autoRefreshCtx / autoRefreshClose control the auto-refresh
 	// background goroutine's lifetime. Nil if WithAutoRefresh was not
@@ -154,28 +157,31 @@ type clientRuntime struct {
 	mirrorReplayWorker ReplayWorker
 }
 
-// sessionHolder wraps a cql.Session so it can live in an atomic.Pointer.
-// The indirection is required because cql.Session is an interface.
+// sessionHolder wraps a cql.Session so it can live in an atomic.Pointer,
+// together with the liveness stats observed against that session.
+// The indirection is required because cql.Session is an interface; keeping
+// the stats on the holder means a swap installs fresh stats atomically and
+// a report from an attempt that used the old session lands on the old
+// holder.
 type sessionHolder struct {
-	s cql.Session
+	s     cql.Session
+	stats clusterStats
 }
 
-// clusterStats holds per-cluster op-outcome counters. All fields are
-// atomics — no lock needed on the read or write side.
+// clusterStats holds the op-outcome counters observed against one session.
+// All fields are atomics — no lock needed on the read or write side; the
+// observation hub ([clusterHealth]) is the only writer.
 //
-// The auto-refresh detector (see [WithAutoRefresh]) reads these fields
-// to decide when a cluster's session is permanently dead and needs a
-// RefreshSession call. lastRefreshNanos is the throttle: stamped before
-// each refresh attempt so a hung refresher cannot cause re-entrant
-// double-fire on the next detector tick. lastErr captures the most
-// recently observed failure error and is threaded through to the
-// SessionRefresher's lastErr parameter so refreshers can tailor
-// reconnection strategy to the observed failure mode.
+// The auto-refresh detector (see [WithAutoRefresh]) reads the installed
+// holder's stats to decide when a cluster's session is permanently dead
+// and needs a RefreshSession call. lastErr captures the most recently
+// observed failure error and is threaded through to the SessionRefresher's
+// lastErr parameter so refreshers can tailor reconnection strategy to the
+// observed failure mode.
 type clusterStats struct {
 	consecutiveFailures atomic.Int32
 	lastSuccessNanos    atomic.Int64
 	lastFailureNanos    atomic.Int64
-	lastRefreshNanos    atomic.Int64
 	lastErr             atomic.Pointer[error]
 }
 
@@ -225,15 +231,29 @@ func (c *CQLClient) storeSessionB(s cql.Session) {
 	c.sessionB.Store(&sessionHolder{s: s})
 }
 
-// statsForCluster returns the stats container for the given cluster.
-// In single-cluster mode, only statsA is meaningful; statsB exists but
-// is never read by the auto-refresh detector.
-func (c *CQLClient) statsForCluster(cluster ClusterID) *clusterStats {
-	if cluster == ClusterB {
-		return &c.statsB
+// holderFor returns the installed session holder for the given cluster.
+// In single-cluster mode every cluster maps to the cluster A holder.
+func (c *CQLClient) holderFor(cluster ClusterID) *sessionHolder {
+	if c.singleCluster || cluster == ClusterA {
+		return c.sessionA.Load()
 	}
 
-	return &c.statsA
+	return c.sessionB.Load()
+}
+
+// statsForCluster returns the liveness stats of the installed session for
+// the given cluster.
+func (c *CQLClient) statsForCluster(cluster ClusterID) *clusterStats {
+	return &c.holderFor(cluster).stats
+}
+
+// lastRefreshFor returns the auto-refresh throttle stamp for the cluster.
+func (c *CQLClient) lastRefreshFor(cluster ClusterID) *atomic.Int64 {
+	if cluster == ClusterB {
+		return &c.lastRefreshB
+	}
+
+	return &c.lastRefreshA
 }
 
 // Compile-time assertion that CQLClient implements CQLSession.
@@ -271,12 +291,14 @@ func (c *CQLClient) IsSingleCluster() bool {
 // getSession returns the session for the given cluster.
 // In single-cluster mode, always returns sessionA.
 func (c *CQLClient) getSession(cluster ClusterID) cql.Session {
-	if c.singleCluster || cluster == ClusterA {
-		return c.loadSessionA()
-	}
-
-	return c.loadSessionB()
+	return c.holderFor(cluster).s
 }
+
+// getSession is for call sites that never report health for the session
+// they use (immediate CAS, the recovery probe's session lookup, replay
+// execution). A call site that reports an outcome to the hub must load the
+// holder with holderFor and keep it, so the report lands on the session
+// the attempt actually used.
 
 // clusterName returns the display name for the given cluster.
 func (c *CQLClient) clusterName(cluster ClusterID) string {

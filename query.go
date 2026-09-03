@@ -225,14 +225,15 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 			return types.ErrSessionClosed
 		}
 
-		query := q.client.loadSessionA().Query(q.statement, q.values...)
+		holder := q.client.holderFor(ClusterA)
+		query := holder.s.Query(q.statement, q.values...)
 		query = q.applyConfig(query)
 		// Important for writes to generate the timestamp on the client side
 		// to ensure consistency across clusters
 		query = query.WithTimestamp(ts)
 
 		err = query.ExecContext(ctx)
-		q.client.recordWriteOutcome(ctx, ClusterA, err)
+		q.client.health.writeLeg(holder, classifyWriteLeg(ctx, err), err, q.client.config.NowProvider())
 
 		return err
 	}
@@ -297,14 +298,15 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 		return &errorIter{err: rt.err}
 	}
 
-	session := q.client.getSession(rt.cluster)
-	query := session.Query(q.statement, q.values...)
+	holder := q.client.holderFor(rt.cluster)
+	query := holder.s.Query(q.statement, q.values...)
 	query = q.applyConfig(query)
 
 	return &cqlIter{
 		iter:           query.IterContext(ctx),
 		client:         q.client,
 		cluster:        rt.cluster,
+		holder:         holder,
 		ctx:            ctx,
 		overrideActive: rt.snap.active,
 	}
