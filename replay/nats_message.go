@@ -34,6 +34,7 @@ type natsReplayMessage struct {
 	Consistency          uint16           `msg:"consistency"`
 	HasSerialConsistency bool             `msg:"has_serial_consistency"`
 	SerialConsistency    uint16           `msg:"serial_consistency"`
+	NonIdempotent        bool             `msg:"non_idempotent"`
 }
 
 // consistencyToWire splits an optional consistency level into the envelope's

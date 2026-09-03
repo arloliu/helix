@@ -306,9 +306,15 @@ func TestSliceScan_AltCtxCanceledAfterScanFn_PropagatesViaScanFnInvokedFlag(t *t
 		WithFailoverPolicy(policy),
 	)
 
+	// The caller gives up while the alt probe is streaming: the context is
+	// cancelled from inside the first callback, and the fixture then fails
+	// the drain with the context error.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	rowCount, err := client.Query("SELECT id FROM t").FallbackRead().SliceScanContext(
-		canceledContext(t), func(r RowScanner) error {
+		ctx, func(r RowScanner) error {
 			var v int
+			cancel()
 			return r.Scan(&v)
 		})
 	require.ErrorIs(t, err, context.Canceled)

@@ -96,6 +96,9 @@ const (
 	// acknowledgement as long as every leg that needed replay was enqueued.
 	// The write then exists only in the replay queue until the worker
 	// delivers it, so this mode is only sound with a durable replayer.
+	// A leg still running in the background (see [DeferredWriteResult])
+	// counts as enqueued: its failure is enqueued when it completes, and
+	// until then the write exists only in that background attempt.
 	// A failed replay enqueue is always an error.
 	AckOnReplayAdmission
 )

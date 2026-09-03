@@ -223,6 +223,12 @@ type ReplayPayload struct {
 	// SerialConsistency is the serial consistency level the original write
 	// used, or nil when it used the session default.
 	SerialConsistency *Consistency
+
+	// NonIdempotent marks a statement that must not be applied twice, such
+	// as a counter update (see the client's NonIdempotent option).
+	// The write path never enqueues such a statement for replay; the flag
+	// is carried so a mirror destination executes it on its strict path.
+	NonIdempotent bool
 }
 
 // NoSynchronousAckError reports a dual-cluster write that no cluster
@@ -232,8 +238,11 @@ type ReplayPayload struct {
 //
 // The write may still land through the replay queue: Replay is nil when
 // every leg that needed replay was enqueued, and carries the enqueue error
-// (or [ErrNoReplayer]) otherwise. Callers that accept a replay admission as
-// success select that mode on the client instead of inspecting Replay.
+// (or [ErrNoReplayer]) otherwise.
+// A leg still running in the background counts as enqueued here: its
+// failure, if any, is enqueued when it completes.
+// Callers that accept a replay admission as success select that mode on
+// the client instead of inspecting Replay.
 //
 // errors.Is(err, ErrNoSynchronousAck) matches every value of this type;
 // errors.Is also reaches the individual leg results.

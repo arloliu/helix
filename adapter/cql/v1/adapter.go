@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/arloliu/helix/adapter/cql"
@@ -122,21 +123,74 @@ func (s *Session) Query(stmt string, values ...any) cql.Query {
 
 // bindDurations converts every [types.Duration] argument, which is how a
 // replayed CQL duration reaches the adapter, into the driver's own duration
-// type. The common case, no duration argument, allocates nothing.
+// type, also inside a duration slice and inside the []any and
+// map[string]any collections a replay decodes. The common case, no
+// duration argument, allocates nothing.
 func bindDurations(values []any) []any {
-	converted := values
+	converted, _ := bindDurationSlice(values)
+
+	return converted
+}
+
+// bindDurationSlice is bindDurations reporting whether anything changed.
+func bindDurationSlice(values []any) ([]any, bool) {
+	var converted []any
 	for i, v := range values {
-		d, ok := v.(types.Duration)
+		d, ok := bindDuration(v)
 		if !ok {
 			continue
 		}
-		if &converted[0] == &values[0] {
+		if converted == nil {
 			converted = append([]any(nil), values...)
 		}
-		converted[i] = gocql.Duration{Months: d.Months, Days: d.Days, Nanoseconds: d.Nanoseconds}
+		converted[i] = d
+	}
+	if converted == nil {
+		return values, false
 	}
 
-	return converted
+	return converted, true
+}
+
+// bindDuration converts one argument, or the durations nested in it, to the
+// driver's duration type. It reports false when the argument is unchanged.
+func bindDuration(v any) (any, bool) {
+	switch x := v.(type) {
+	case types.Duration:
+		return driverDuration(x), true
+	case []types.Duration:
+		out := make([]gocql.Duration, len(x))
+		for i, d := range x {
+			out[i] = driverDuration(d)
+		}
+
+		return out, true
+	case []any:
+		return bindDurationSlice(x)
+	case map[string]any:
+		var out map[string]any
+		for k, e := range x {
+			d, ok := bindDuration(e)
+			if !ok {
+				continue
+			}
+			if out == nil {
+				out = maps.Clone(x)
+			}
+			out[k] = d
+		}
+		if out == nil {
+			return v, false
+		}
+
+		return out, true
+	default:
+		return v, false
+	}
+}
+
+func driverDuration(d types.Duration) gocql.Duration {
+	return gocql.Duration{Months: d.Months, Days: d.Days, Nanoseconds: d.Nanoseconds}
 }
 
 // Batch creates a new batch of the given type.

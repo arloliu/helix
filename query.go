@@ -206,6 +206,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		// A non-idempotent statement takes the strict path: synchronous on
 		// both clusters, no fire-and-forget, no replay.
 		strict:            q.strict || q.nonIdempotent,
+		nonIdempotent:     q.nonIdempotent,
 		consistency:       q.consistency,
 		serialConsistency: q.serialConsistency,
 	}

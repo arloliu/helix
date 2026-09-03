@@ -872,3 +872,21 @@ func TestSingleCluster_IterContext_OnSuccessReceivesClusterA(t *testing.T) {
 	assert.Equal(t, ClusterA, successCalls[0],
 		"single-cluster mode must report ClusterA to OnSuccess even when Select returns ClusterB")
 }
+
+// TestFallback_SkipsProbeWhenCallerContextEnded asserts that a not-found
+// observed after the caller's context ended yields the caller's context
+// error: the alternative cluster is not probed with a dead context.
+func TestFallback_SkipsProbeWhenCallerContextEnded(t *testing.T) {
+	sessionA, sessionB := newMockSession(), newMockSession()
+	sessionA.scanErr = types.ErrNotFound
+	client, err := NewCQLClient(sessionA, sessionB)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var v int
+	err = client.Query("SELECT v FROM t").FallbackRead().ScanContext(ctx, &v)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, sessionB.queries, "the alternative must not be probed with a dead context")
+}

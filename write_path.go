@@ -41,6 +41,9 @@ type writeContext struct {
 	batchType    BatchType
 	batchEntries []batchEntry // Internal format, converted lazily for replay
 	strict       bool         // if true: no replay, returns PartialWriteError on partial failure
+	// nonIdempotent marks a statement that must not be applied twice; it
+	// implies strict and is carried to a mirror destination.
+	nonIdempotent bool
 	// consistency and serialConsistency are the levels set on the query
 	// or batch, nil for the session default; replay applies the same ones.
 	consistency       *Consistency
@@ -328,16 +331,6 @@ func (c *CQLClient) executeDualWrite(
 		return &types.DualClusterError{ErrorA: errA, ErrorB: errB}
 	}
 
-	// A draining leg never acknowledges, so a real failure on the other
-	// cluster leaves the write unacknowledged: report that failure and
-	// leave reconciliation to the caller's retry.
-	if legA.failed() && legB == legDraining {
-		return errA
-	}
-	if legB.failed() && legA == legDraining {
-		return errB
-	}
-
 	// At least one cluster had a non-nil result (error, async, dropped, or draining).
 	// Enqueue replay for each affected cluster to ensure eventual consistency.
 	//
@@ -390,17 +383,72 @@ func (c *CQLClient) replayLeg(
 
 	// Snapshot the write now: the caller may reuse its buffers as soon as
 	// this call returns, while the leg completes later.
+	// The enqueue then runs on a context that keeps the caller's values
+	// but not its deadline, as an immediate enqueue does.
 	payload := c.replayPayload(wc, cluster)
+	bg := context.WithoutCancel(ctx)
+	if !c.deferred.add() {
+		// Close has begun and will not wait for this leg, so enqueue now:
+		// a failure reported after the worker stopped would otherwise be lost.
+		return c.enqueueReplayPayload(bg, payload, err, kind)
+	}
 	deferred.OnComplete(func(legErr error) {
+		defer c.deferred.done()
 		if legErr == nil {
 			return
 		}
 		// The outcome is already counted and reported inside; nothing is
 		// left to return to a caller that has long since moved on.
-		_ = c.enqueueReplayPayload(context.Background(), payload, legErr, classifyWriteLeg(context.Background(), legErr))
+		_ = c.enqueueReplayPayload(bg, payload, legErr, classifyWriteLeg(bg, legErr))
 	})
 
 	return nil
+}
+
+// deferredLegs counts write legs whose result a strategy reports later
+// (see [DeferredWriteResult]) so Close can wait for their replay to be
+// enqueued before it stops the replay worker.
+type deferredLegs struct {
+	mu      sync.Mutex
+	active  int
+	closing bool
+	idle    chan struct{}
+}
+
+// add registers one leg and reports false once wait has begun.
+func (d *deferredLegs) add() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closing {
+		return false
+	}
+	d.active++
+
+	return true
+}
+
+// done unregisters one leg and releases wait once the last leg finished.
+func (d *deferredLegs) done() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.active--
+	if d.closing && d.active == 0 {
+		close(d.idle)
+	}
+}
+
+// wait refuses new legs and blocks until every registered leg completed.
+func (d *deferredLegs) wait() {
+	d.mu.Lock()
+	d.closing = true
+	if d.active == 0 {
+		d.mu.Unlock()
+
+		return
+	}
+	d.idle = make(chan struct{})
+	d.mu.Unlock()
+	<-d.idle
 }
 
 // replayPayload builds the replay payload for one leg of wc. Byte-slice
@@ -418,6 +466,7 @@ func (c *CQLClient) replayPayload(wc writeContext, cluster ClusterID) types.Repl
 		Priority:          wc.priority,
 		Consistency:       cloneConsistency(wc.consistency),
 		SerialConsistency: cloneConsistency(wc.serialConsistency),
+		NonIdempotent:     wc.nonIdempotent,
 	}
 }
 

@@ -709,72 +709,85 @@ func (a *AdaptiveDualWrite) fireAndForget(
 
 	result := &deferredWriteError{}
 	go func() {
-		defer func() { <-a.fireForgetSem }() // Release semaphore
-
 		ctx, cancel := context.WithTimeout(context.Background(), a.fireForgetTimeout)
 		defer cancel()
 
 		start := time.Now()
 		err := safeWrite(ctx, write, a.clusterName(cluster))
-		latency := time.Since(start)
-		defer result.complete(err)
+		a.observeFireAndForget(cluster, err, time.Since(start), state, siblingState)
 
-		// Track latency for potential recovery
-		if isSkippedErr(err) {
-			// The leg was skipped (for example, the cluster is draining):
-			// neither a failure nor a latency sample.
-			return
-		}
-		if err != nil {
-			// Surface the background failure: IncWriteError makes it
-			// visible to dashboards, and the Warn log gives operators a
-			// breadcrumb that "the cluster you flagged degraded is
-			// actually erroring on its background writes." The deferred
-			// result hands the error to the client for replay.
-			a.metrics.IncWriteError(cluster)
-			a.logger.Warn("adaptive: fire-and-forget write failed on degraded cluster",
-				"cluster", a.clusterName(cluster),
-				"error", err.Error(),
-			)
-			return
-		}
-		if latency >= a.absoluteMax {
-			// Write succeeded but was too slow — no recovery credit.
-			return
-		}
-
-		// Check delta against sibling for recovery
-		// If sibling is also degraded (lastLatency == 0), fall back to absoluteMax-only check
-		siblingLatencyNs := siblingState.lastLatency.Load()
-		if siblingLatencyNs > 0 {
-			// Sibling has valid latency - require delta check for recovery
-			siblingLatency := time.Duration(siblingLatencyNs)
-			delta := latency - siblingLatency
-			if delta < 0 {
-				delta = -delta
-			}
-			if delta > a.deltaThreshold {
-				// Still significantly slower than sibling - no recovery credit
-				return
-			}
-		} else if latency >= a.minFloor {
-			// Sibling has no baseline yet (also degraded or never written to).
-			// Use minFloor as a conservative substitute for the delta check:
-			// only grant recovery credit if this write was comfortably fast on
-			// its own. Without this guard, any sub-absoluteMax write would
-			// trigger recovery even when the sibling's true cost is unknown,
-			// potentially bouncing the cluster in/out of degradation.
-			return
-		}
-
-		// Write succeeded, was fast, and within delta of sibling - record for recovery.
-		// Update lastLatency so subsequent fire-and-forget cycles and the sibling's
-		// delta check see a fresh observation rather than a stale pre-degradation value.
-		state.lastLatency.Store(latency.Nanoseconds())
-		a.recordFast(state)
+		// Release the slot before reporting: the client's completion
+		// callback may enqueue replay, which must not hold a slot.
+		<-a.fireForgetSem
+		result.complete(err)
 	}()
 
 	return result
+}
+
+// observeFireAndForget records the outcome of one background write for
+// health tracking: a failure is surfaced, and a fast success earns the
+// degraded cluster recovery credit.
+func (a *AdaptiveDualWrite) observeFireAndForget(
+	cluster types.ClusterID,
+	err error,
+	latency time.Duration,
+	state *clusterWriteState,
+	siblingState *clusterWriteState,
+) {
+	// Track latency for potential recovery
+	if isSkippedErr(err) {
+		// The leg was skipped (for example, the cluster is draining):
+		// neither a failure nor a latency sample.
+		return
+	}
+	if err != nil {
+		// Surface the background failure: IncWriteError makes it
+		// visible to dashboards, and the Warn log gives operators a
+		// breadcrumb that "the cluster you flagged degraded is
+		// actually erroring on its background writes." The deferred
+		// result hands the error to the client for replay.
+		a.metrics.IncWriteError(cluster)
+		a.logger.Warn("adaptive: fire-and-forget write failed on degraded cluster",
+			"cluster", a.clusterName(cluster),
+			"error", err.Error(),
+		)
+		return
+	}
+	if latency >= a.absoluteMax {
+		// Write succeeded but was too slow — no recovery credit.
+		return
+	}
+
+	// Check delta against sibling for recovery
+	// If sibling is also degraded (lastLatency == 0), fall back to absoluteMax-only check
+	siblingLatencyNs := siblingState.lastLatency.Load()
+	if siblingLatencyNs > 0 {
+		// Sibling has valid latency - require delta check for recovery
+		siblingLatency := time.Duration(siblingLatencyNs)
+		delta := latency - siblingLatency
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta > a.deltaThreshold {
+			// Still significantly slower than sibling - no recovery credit
+			return
+		}
+	} else if latency >= a.minFloor {
+		// Sibling has no baseline yet (also degraded or never written to).
+		// Use minFloor as a conservative substitute for the delta check:
+		// only grant recovery credit if this write was comfortably fast on
+		// its own. Without this guard, any sub-absoluteMax write would
+		// trigger recovery even when the sibling's true cost is unknown,
+		// potentially bouncing the cluster in/out of degradation.
+		return
+	}
+
+	// Write succeeded, was fast, and within delta of sibling - record for recovery.
+	// Update lastLatency so subsequent fire-and-forget cycles and the sibling's
+	// delta check see a fresh observation rather than a stale pre-degradation value.
+	state.lastLatency.Store(latency.Nanoseconds())
+	a.recordFast(state)
 }
 
 // updateHealthState updates cluster health based on write results.

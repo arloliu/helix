@@ -238,6 +238,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		batchType:         b.kind,
 		batchEntries:      b.entries, // Pass directly, convert lazily if needed for replay
 		strict:            b.strict || b.nonIdempotent,
+		nonIdempotent:     b.nonIdempotent,
 		consistency:       b.consistency,
 		serialConsistency: b.serialConsistency,
 	}

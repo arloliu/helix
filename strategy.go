@@ -245,6 +245,8 @@ type DeferredWriteResult interface {
 	// immediately on the caller's goroutine; otherwise it runs on the
 	// goroutine that completes the leg, so it must be quick and must not
 	// block on the strategy.
+	// The leg must complete within a bounded time: [CQLClient.Close]
+	// waits for every registered leg before stopping the replay worker.
 	OnComplete(fn func(err error))
 }
 

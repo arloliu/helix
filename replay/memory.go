@@ -446,7 +446,7 @@ func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
 
 // Len returns the number of capacity slots currently held.
 //
-// Under the worker's default [RetryBounded] policy a slot is released as
+// Under the worker's [RetryBounded] policy a slot is released as
 // soon as a worker dequeues the payload, so Len reports queue depth only:
 // payloads being attempted or sleeping between attempts are NOT counted,
 // and a worker pulling a payload, failing, and retrying with backoff

@@ -299,13 +299,20 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // [types.ErrSessionClosed].
 //
 // Close does not wait for in-flight synchronous operations or detached
-// fire-and-forget writes to finish. Work that already captured a session may
-// continue racing with shutdown and can fail when that session is closed.
+// fire-and-forget writes to finish.
+// Work that already captured a session may continue racing with shutdown
+// and can fail when that session is closed.
+// The exception is a background leg whose strategy reports its result
+// through [DeferredWriteResult]: Close waits for it to complete so a
+// failure is enqueued for replay before the worker stops.
+// That wait is bounded by the strategy's own background timeout.
 //
 // Close DOES wait for the configured ReplayWorker to finish via its Stop()
-// method, which blocks until the worker's in-flight batch returns. Bound
-// that batch's wall time via the worker's own timeouts if you need a hard
-// upper bound on Close latency.
+// method, which blocks until the worker's in-flight batch returns.
+// Bound that batch's wall time via the worker's own timeouts if you need
+// a hard upper bound on Close latency.
+//
+// A concurrent Close returns once the first one has finished.
 //
 // When a handler is registered via [WithOnClusterEvent], Close also stops
 // event intake, drains the buffered events to that handler, and waits for
@@ -325,47 +332,56 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // session does not panic; custom [cql.Session] implementations must follow
 // the same contract or callers must serialize Close with their own swap.
 func (c *CQLClient) Close() {
-	if c.closed.CompareAndSwap(false, true) {
-		// Stop the topology watcher and the auto-refresh detector, then
-		// wait for both goroutines so nothing of theirs runs after Close
-		// returns. A refresh in flight sees its context cancelled and
-		// returns; a refresher that ignores its context delays Close.
-		if c.topologyClose != nil {
-			c.topologyClose()
-		}
-		if c.autoRefreshClose != nil {
-			c.autoRefreshClose()
-		}
-		c.topologyWG.Wait()
-		c.autoRefreshWG.Wait()
+	if !c.closed.CompareAndSwap(false, true) {
+		<-c.closeDone
 
-		// Stop the mirror engine first so it stops generating new failure
-		// captures, then drain any failures that landed in the mirror
-		// replayer through its worker.
-		c.stopMirrorComponents()
+		return
+	}
+	defer close(c.closeDone)
 
-		// Stop replay worker
-		if c.config.ReplayWorker != nil {
-			c.config.ReplayWorker.Stop()
-		}
+	// Stop the topology watcher and the auto-refresh detector, then
+	// wait for both goroutines so nothing of theirs runs after Close returns.
+	// A refresh in flight sees its context cancelled and returns;
+	// a refresher that ignores its context delays Close.
+	if c.topologyClose != nil {
+		c.topologyClose()
+	}
+	if c.autoRefreshClose != nil {
+		c.autoRefreshClose()
+	}
+	c.topologyWG.Wait()
+	c.autoRefreshWG.Wait()
 
-		// Cancel recovery probe goroutines and wait for them to exit before
-		// closing sessions so a probe in flight cannot race against a closed session.
-		if c.recoveryProbeClose != nil {
-			c.recoveryProbeClose()
-			c.recoveryProbeWG.Wait()
-		}
+	// Wait for background legs whose failure would be enqueued for
+	// replay, so nothing is enqueued after the worker stops.
+	c.deferred.wait()
 
-		// Stop the event dispatcher: intake halts, buffered events drain to
-		// the handler, and the in-flight handler invocation is awaited. The
-		// topology and auto-refresh goroutines were joined above, so every
-		// event of theirs is already buffered.
-		c.runtime.events.stop()
+	// Stop the mirror engine first so it stops generating new failure
+	// captures, then drain any failures that landed in the mirror
+	// replayer through its worker.
+	c.stopMirrorComponents()
 
-		c.loadSessionA().Close()
-		if !c.singleCluster {
-			c.loadSessionB().Close()
-		}
+	// Stop replay worker
+	if c.config.ReplayWorker != nil {
+		c.config.ReplayWorker.Stop()
+	}
+
+	// Cancel recovery probe goroutines and wait for them to exit before
+	// closing sessions so a probe in flight cannot race against a closed session.
+	if c.recoveryProbeClose != nil {
+		c.recoveryProbeClose()
+		c.recoveryProbeWG.Wait()
+	}
+
+	// Stop the event dispatcher: intake halts, buffered events drain to
+	// the handler, and the in-flight handler invocation is awaited. The
+	// topology and auto-refresh goroutines were joined above, so every
+	// event of theirs is already buffered.
+	c.runtime.events.stop()
+
+	c.loadSessionA().Close()
+	if !c.singleCluster {
+		c.loadSessionB().Close()
 	}
 }
 

@@ -25,6 +25,14 @@ func TestPageState_RoundTripCarriesIssuingCluster(t *testing.T) {
 	cluster, got = decodePageState([]byte("hx1Zrest"))
 	require.Empty(t, cluster, "an unknown cluster letter is not a Helix token")
 	require.Equal(t, []byte("hx1Zrest"), got)
+
+	colliding := []byte("hx1A-a-driver-token-that-starts-with-the-magic")
+	cluster, got = decodePageState(colliding)
+	require.Empty(t, cluster, "a driver token starting with the magic fails the checksum and passes through")
+	require.Equal(t, colliding, got)
+	cluster, got = decodePageState(encodePageState(ClusterA, colliding))
+	require.Equal(t, ClusterA, cluster)
+	require.Equal(t, colliding, got)
 }
 
 // TestIter_PageStateIsStrippedBeforeTheDriver asserts that the routing

@@ -276,6 +276,12 @@ func (z *natsReplayMessage) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "SerialConsistency")
 				return
 			}
+		case "non_idempotent":
+			z.NonIdempotent, err = dc.ReadBool()
+			if err != nil {
+				err = msgp.WrapError(err, "NonIdempotent")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -289,9 +295,9 @@ func (z *natsReplayMessage) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *natsReplayMessage) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 13
+	// map header, size 14
 	// write "target_cluster"
-	err = en.Append(0x8d, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
+	err = en.Append(0x8e, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
 	if err != nil {
 		return
 	}
@@ -443,15 +449,25 @@ func (z *natsReplayMessage) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "SerialConsistency")
 		return
 	}
+	// write "non_idempotent"
+	err = en.Append(0xae, 0x6e, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x65, 0x6d, 0x70, 0x6f, 0x74, 0x65, 0x6e, 0x74)
+	if err != nil {
+		return
+	}
+	err = en.WriteBool(z.NonIdempotent)
+	if err != nil {
+		err = msgp.WrapError(err, "NonIdempotent")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *natsReplayMessage) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 13
+	// map header, size 14
 	// string "target_cluster"
-	o = append(o, 0x8d, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
+	o = append(o, 0x8e, 0xae, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72)
 	o = msgp.AppendString(o, z.TargetCluster)
 	// string "query"
 	o = append(o, 0xa5, 0x71, 0x75, 0x65, 0x72, 0x79)
@@ -506,6 +522,9 @@ func (z *natsReplayMessage) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "serial_consistency"
 	o = append(o, 0xb2, 0x73, 0x65, 0x72, 0x69, 0x61, 0x6c, 0x5f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x63, 0x79)
 	o = msgp.AppendUint16(o, z.SerialConsistency)
+	// string "non_idempotent"
+	o = append(o, 0xae, 0x6e, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x65, 0x6d, 0x70, 0x6f, 0x74, 0x65, 0x6e, 0x74)
+	o = msgp.AppendBool(o, z.NonIdempotent)
 	return
 }
 
@@ -647,6 +666,12 @@ func (z *natsReplayMessage) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "SerialConsistency")
 				return
 			}
+		case "non_idempotent":
+			z.NonIdempotent, bts, err = msgp.ReadBoolBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "NonIdempotent")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -665,6 +690,6 @@ func (z *natsReplayMessage) Msgsize() (s int) {
 	for za0001 := range z.BatchStatements {
 		s += 1 + 6 + msgp.StringPrefixSize + len(z.BatchStatements[za0001].Query) + 5 + z.BatchStatements[za0001].Args.Msgsize()
 	}
-	s += 8 + msgp.Uint8Size + 16 + msgp.BoolSize + 12 + msgp.Uint16Size + 23 + msgp.BoolSize + 19 + msgp.Uint16Size
+	s += 8 + msgp.Uint8Size + 16 + msgp.BoolSize + 12 + msgp.Uint16Size + 23 + msgp.BoolSize + 19 + msgp.Uint16Size + 15 + msgp.BoolSize
 	return
 }

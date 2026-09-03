@@ -717,7 +717,13 @@ never changes which writes are reconcilable:
 | `*inf.Dec` (decimal) | an equal `*inf.Dec` |
 | `net.IP` (inet) | an equal `net.IP` |
 | a driver `Duration` or `types.Duration` | `types.Duration`; the bundled adapters bind it as the driver's type |
-| slices, arrays, string-keyed maps of the above | `[]any` / `map[string]any` |
+| slices, arrays, string-keyed maps of the above | `[]any` / `map[string]any`, element by element; a nil slice or map stays nil (NULL) |
+
+The bundled adapters convert `types.Duration` to the driver's type at the
+top level, inside a `[]types.Duration`, and inside the `[]any` and
+`map[string]any` collections a replay decodes.
+Bind any other typed collection of durations with the driver's own type.
+An invalid `net.IP` (neither 4 nor 16 bytes) is rejected at enqueue.
 
 Structs, user-defined types (UDTs), and maps with non-string keys are not
 carried; bind them as a driver-supported representation or use `Strict()`.
@@ -741,12 +747,19 @@ Two things are not preserved:
   the stream isolation rule below.
 
 **Envelope versions and rollout.** NATS messages carry an envelope version.
-Version 2 adds the consistency levels; a version 1 message, or a version 2
-message for a session-default write, decodes with no level and replays at
-the worker's default. Workers read every version, so upgrade the workers
-before the publishers: an older worker that receives a version 2 message
-ignores the levels and replays at its session default, exactly as it did
-before.
+Version 2 adds the consistency levels and the non-idempotent marker; a
+version 1 message, or a version 2 message for a session-default write,
+decodes with no level and replays at the worker's default.
+Workers read every version, so upgrade the workers before the publishers.
+An older worker that receives a version 2 message ignores the new fields
+and replays at its session default, exactly as it did before, provided the
+arguments use encodings it knows: varint, decimal, inet, and duration
+arguments are new in version 2, and an older worker cannot bind them, so
+it retries and finally drops such a message.
+Keep publishers on the previous release until every worker is upgraded.
+A version 1 message with a zero timestamp is dead-lettered: `DefaultExecuteFunc`
+rejects it with `types.ErrInvalidTimestamp` rather than letting the driver
+stamp it with the current time.
 
 ### 4. Always Set Timestamps
 

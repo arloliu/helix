@@ -190,7 +190,10 @@ type Query interface {
 	// again. A partial failure surfaces as [*types.PartialWriteError] and a
 	// total failure as [*types.DualClusterError], exactly like [Query.Strict].
 	// Unlike Strict, NonIdempotent may be combined with [Query.Mirror]: the
-	// mirror destination receives the statement once, on its own pair.
+	// marker travels with the mirror payload, so the destination executes
+	// the statement on the same strict path, never replaying it within
+	// its own pair. Mirror delivery itself may still be retried after an
+	// ambiguous failure (see docs/mirror.md).
 	//
 	// Batches created with [types.CounterBatch] are non-idempotent
 	// automatically.

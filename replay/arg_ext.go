@@ -35,6 +35,7 @@ const durationExtensionSize = 16
 var (
 	errShortExtension = errors.New("helix: extension payload too short")
 	errBadInetLength  = errors.New("helix: inet payload must be 4 or 16 bytes")
+	errInvalidInet    = errors.New("helix: inet argument is not an IPv4 or IPv6 address")
 )
 
 func init() {

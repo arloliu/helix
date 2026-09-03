@@ -39,7 +39,7 @@ go run ./test/simulation/cmd/main.go -profile fallback -config test/simulation/c
 `make test-simulation` runs the quick profile with `configs/quick.yaml`;
 override the profile or config with `SIM_PROFILE=comprehensive` or `SIM_CONFIG=...`.
 The nightly GitHub Actions workflow (`.github/workflows/nightly.yml`) runs this target
-together with `make test-e2e` and uploads the report directory as an artifact.
+together with `make test-e2e`.
 
 Override individual flags without a config file:
 

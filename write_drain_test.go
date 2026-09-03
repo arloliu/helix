@@ -63,8 +63,9 @@ func TestWrite_DrainingLegIsSkippedInsideTheStrategy(t *testing.T) {
 }
 
 // TestWrite_HealthyLegFailsWhileOtherDrains asserts that when the only
-// cluster that can acknowledge the write fails, the caller gets that
-// cluster's error and nothing is enqueued for replay.
+// cluster that can acknowledge the write fails, no cluster acknowledged
+// it: both legs are enqueued for replay and the caller sees the failure
+// inside a NoSynchronousAckError.
 func TestWrite_HealthyLegFailsWhileOtherDrains(t *testing.T) {
 	errB := errors.New("cluster B rejected the write")
 	sessionA := newMockSession()
@@ -79,11 +80,15 @@ func TestWrite_HealthyLegFailsWhileOtherDrains(t *testing.T) {
 
 	err = client.Query("INSERT INTO t (id) VALUES (1)").Exec()
 	require.ErrorIs(t, err, errB)
+	require.ErrorIs(t, err, types.ErrNoSynchronousAck)
+	require.ErrorIs(t, err, types.ErrClusterDraining)
 	require.Empty(t, sessionA.queries)
 
 	replayer.Lock()
 	defer replayer.Unlock()
-	require.Empty(t, replayer.payloads, "an unacknowledged write is not replayed")
+	require.Len(t, replayer.payloads, 2, "both unacknowledged legs are replayed")
+	require.Equal(t, ClusterA, replayer.payloads[0].TargetCluster)
+	require.Equal(t, ClusterB, replayer.payloads[1].TargetCluster)
 }
 
 // TestCAS_AvoidsDrainingCluster asserts that a lightweight transaction is
