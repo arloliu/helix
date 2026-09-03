@@ -593,10 +593,10 @@ The client calls `RecordLatency()` automatically after each successful read if t
  t=4s   Read A → circuit still OPEN → failover to B → B in 600ms → RecordSuccess(B)
  t=5s   Read A → hard error → RecordFailure(A) directly → A.failures=4 (stays OPEN)
  t=10s  Read A → circuit OPEN → failover to B → B succeeds → RecordSuccess(B)
-           Meanwhile: A closes on its next recorded call — a RecordSuccess
-           (Reason "operation succeeded"), or a RecordFailure arriving more
-           than resetTimeout after A's last failure (Reason "reset timeout
-           elapsed"). Until one of those arrives, A stays OPEN.
+           Meanwhile: A closes on a RecordSuccess (Reason "operation
+           succeeded") or when the client's recovery probe, reserved once
+           resetTimeout has elapsed, succeeds (Reason "probe succeeded").
+           Until one of those arrives, A stays OPEN.
 ```
 
 > **Note:** Because every fast successful read calls `RecordSuccess()`, the `resetTimeout` is less significant in `LatencyCircuitBreaker` than in `CircuitBreaker` — successful reads continuously reset the counter, so stale failure accumulation is rare. The dominant closure mechanism is fast responses, not idle timeouts.

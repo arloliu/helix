@@ -166,10 +166,9 @@ featureFlag.Set("exclude_cluster_A", false)
 // Step 2: Recover writes — resume synchronous dual-write
 writeStrategy.ForceRecover(helix.ClusterA)
 
-// Step 3 (optional, PrimaryOnlyRead only): force preferred back to A
-// StickyRead has no Reset — to force preferred back, rebuild the client
-// with WithPreferredCluster, or wait for the current preferred to fail.
+// Step 3 (optional): force reads back to A
 // primaryOnly.Reset()
+// stickyRead.SetPreferred(helix.ClusterA) // or stickyRead.Reset()
 ```
 
 **Why this order?** If you call `ForceRecover` first (writes resume to both clusters) but reads are still overridden to B, new writes land on A but no reads go there — this is safe, just redundant. If you remove the read override first, reads may go to A which now has consistent data — also safe. The dangerous order would be recovering writes while reads are already going to A with stale data, which can't happen if you kept the override active during the outage.
@@ -245,7 +244,8 @@ No manual intervention needed. Both transitions emit cluster events; see the
 
 ### Replay System
 
-The replay worker continuously processes the queue regardless of cluster state:
+The replay worker continuously processes the queue; only a cluster whose replay gate is closed
+(`replay.WithClusterGate`, or the client's drain state and `WithReplayGate`) is held back:
 
 - **MemoryReplayer**: Volatile, in-process. Fast but lost on crash.
 - **NATSReplayer**: Durable, supports dedicated replay service. Production recommended.

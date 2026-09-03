@@ -17,7 +17,7 @@ When reviewing specific packages, specify them by name. The reviewable packages 
 - `adapter/cql/v2`: Apache driver adapter — `NewSession`
 - `policy/`: Strategies and policies — `NewStickyRead`, `NewPrimaryOnlyRead`, `NewRoundRobinRead`, `NewConcurrentDualWrite`, `NewSyncDualWrite`, `NewAdaptiveDualWrite`, `NewActiveFailover`, `NewCircuitBreaker`, `NewLatencyCircuitBreaker`
 - `replay/`: Reconciliation — `NewMemoryReplayer`, `NewNATSReplayer`, `NewMemoryWorker`, `NewNATSWorker`
-- `topology/`: Topology awareness — `Local`, `NatsKV`
+- `topology/`: Topology awareness — `Local`, `NATS`
 - `types/`: Shared contracts — `CQLSession`, `DualClusterError`, `ClusterError`, sentinel errors
 
 ## 1. API and Interface Quality (The "Clean" Test)
