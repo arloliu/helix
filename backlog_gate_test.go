@@ -26,6 +26,8 @@ func TestExcludeWhileReplayBacklog(t *testing.T) {
 	require.Nil(t, allowed(), "at the threshold is not over it")
 	depthB.Store(50)
 	require.Equal(t, []ClusterID{ClusterA}, allowed())
+	allowed()[0] = ClusterB // a caller mutating its result
+	require.Equal(t, []ClusterID{ClusterA}, allowed(), "each call owns its slice")
 	depthA.Store(50)
 	require.Nil(t, allowed(), "both over the threshold: nothing better than normal routing")
 }

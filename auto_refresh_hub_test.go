@@ -112,6 +112,45 @@ func TestRecoveryProbe_TimeoutIsAConnectivityFailure(t *testing.T) {
 	require.ErrorIs(t, *stats.lastErr.Load(), types.ErrClusterTimeout, "the probe's own deadline is Helix's, so it counts")
 }
 
+// A probe that fails at once with an error that proves the session
+// reachable (a schema or query error) must not be relabelled as a timeout
+// and must not count toward auto-refresh.
+func TestRecoveryProbe_ImmediateNonConnectivityErrorStaysUnwrapped(t *testing.T) {
+	adaptive := policy.NewAdaptiveDualWrite()
+	schemaErr := errors.New("unconfigured table")
+	probed := make(chan struct{}, 64)
+	probe := RecoveryProbe{
+		Probe: func(context.Context, cql.Session) error {
+			select {
+			case probed <- struct{}{}:
+			default:
+			}
+
+			return schemaErr
+		},
+		Interval: 5 * time.Millisecond,
+		Timeout:  time.Second,
+	}
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(adaptive),
+		WithRecoveryProbe(probe),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	degradeClusterA(t, adaptive)
+
+	for range 3 {
+		select {
+		case <-probed:
+		case <-time.After(time.Second):
+			t.Fatal("the probe did not run")
+		}
+	}
+	stats := client.statsForCluster(ClusterA)
+	require.Zero(t, stats.consecutiveFailures.Load(), "a reachable session's error is not a connectivity failure")
+	require.Nil(t, stats.lastErr.Load(), "nothing was recorded, so nothing was relabelled as a timeout")
+}
+
 func TestRecoveryProbe_CancelledByCloseRecordsNothing(t *testing.T) {
 	adaptive := policy.NewAdaptiveDualWrite()
 	entered := make(chan struct{}, 1)
@@ -160,6 +199,52 @@ func TestRefreshSession_ClosesOldSessionAfterGrace(t *testing.T) {
 	require.False(t, old.closed.Load(), "the replaced session stays open for the grace period")
 	require.Eventually(t, func() bool { return old.closed.Load() }, time.Second, time.Millisecond)
 	require.GreaterOrEqual(t, time.Duration(old.closedAt.Load()-before.UnixNano()), grace)
+}
+
+// The auto-refresh detector qualifies one holder; a session installed
+// after that (an operator's SwapSession) must not be replaced on the
+// strength of its predecessor's failures.
+func TestAutoRefresh_DoesNotReplaceASessionInstalledMeanwhile(t *testing.T) {
+	old := newMockSession()
+	built := newMockSession()
+	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return built, nil }
+	client, err := NewCQLClient(old, newMockSession(), WithSessionRefresher(refresher))
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	qualified := client.holderFor(ClusterA)
+	swappedIn := newMockSession()
+	_, err = client.SwapSession(ClusterA, swappedIn)
+	require.NoError(t, err)
+
+	err = client.replaceHolder(t.Context(), ClusterA, &client.sessionA, qualified)
+	require.ErrorIs(t, err, types.ErrSessionReplaced)
+	require.Same(t, swappedIn, client.holderFor(ClusterA).s, "the newer session stays installed")
+	require.False(t, swappedIn.closed.Load())
+	require.True(t, built.closed.Load(), "the refresher's session is not leaked")
+}
+
+// A retired session is forgotten once its grace timer has closed it, so a
+// long-lived client does not accumulate every session it ever replaced.
+func TestRefreshSession_ForgetsClosedRetiredSessions(t *testing.T) {
+	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return newMockSession(), nil }
+	client, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithSessionRefresher(refresher),
+		WithAutoRefresh(WithAutoRefreshRefreshTimeout(time.Millisecond)),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	for range 3 {
+		require.NoError(t, client.RefreshSession(t.Context(), ClusterA))
+	}
+	tracked := func() int {
+		client.retired.mu.Lock()
+		defer client.retired.mu.Unlock()
+
+		return len(client.retired.entries)
+	}
+	require.Eventually(t, func() bool { return tracked() == 0 }, time.Second, time.Millisecond)
 }
 
 func TestRefreshSession_CloseClosesRetiredSessionsAtOnce(t *testing.T) {

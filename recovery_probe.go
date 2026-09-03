@@ -103,8 +103,13 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp Fa
 		ctx, cancel := context.WithTimeout(c.recoveryProbeCtx, p.Timeout)
 		started := time.Now()
 		err := safeProbe(ctx, p.Probe, holder.s)
+		// Classify before cancel, which would make every error look like
+		// an expired context. The probe's own deadline expiring is a
+		// connectivity failure by provenance, like an expired write leg.
+		canceled := err != nil && c.recoveryProbeCtx.Err() != nil
+		err = clusterTimeoutIfExpired(ctx, c.recoveryProbeCtx, err)
 		cancel()
-		if err != nil && c.recoveryProbeCtx.Err() != nil {
+		if canceled {
 			// The client cancelled the probe (Close): not a health
 			// observation for anyone, and the breaker gets its
 			// reservation back.
@@ -115,9 +120,6 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp Fa
 
 			continue
 		}
-		// The probe's own deadline expiring is a connectivity failure
-		// by provenance, like an expired write leg.
-		err = clusterTimeoutIfExpired(ctx, c.recoveryProbeCtx, err)
 		if err == nil {
 			if demand.write {
 				if byLatency != nil {

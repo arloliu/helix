@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,7 +60,11 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 		return // can't refresh; the loop is moot for this cluster
 	}
 
-	s := c.statsForCluster(cluster)
+	// Qualify one holder and refresh exactly that one, so a session
+	// installed meanwhile (SwapSession, another refresh) is never
+	// replaced on the strength of its predecessor's failures.
+	holder := c.holderFor(cluster)
+	s := &holder.stats
 	lastRefresh := c.lastRefreshFor(cluster)
 	now := c.config.NowProvider()
 	cfg := c.config.AutoRefresh
@@ -105,7 +110,11 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 	ctx, cancel := context.WithTimeout(c.autoRefreshCtx, cfg.RefreshTimeout)
 	defer cancel()
 
-	if err := c.RefreshSession(ctx, cluster); err != nil {
+	slot, err := c.sessionSlot(cluster)
+	if err != nil {
+		return
+	}
+	if err := c.replaceHolder(ctx, cluster, slot, holder); err != nil {
 		if refreshMetrics != nil {
 			refreshMetrics.IncSessionRefreshError(cluster)
 		}
@@ -446,20 +455,28 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 		return err
 	}
 
+	return c.replaceHolder(ctx, cluster, slot, slot.Load())
+}
+
+// replaceHolder runs the refresher and installs its session in place of
+// exactly holder. If anyone installs a different session while the
+// refresher runs, that session is newer than what the refresher saw and
+// must not be closed underneath them.
+func (c *CQLClient) replaceHolder(
+	ctx context.Context,
+	cluster ClusterID,
+	slot *atomic.Pointer[sessionHolder],
+	holder *sessionHolder,
+) error {
 	// Thread the most recently observed failure for this cluster through
 	// to the refresher so it can tailor reconnection strategy to the
 	// observed failure mode (e.g. "no hosts available" suggests a hard
 	// reachability issue while "timeout" suggests a slow but reachable
 	// cluster). Nil if the cluster has had no recorded failures.
 	var lastErr error
-	if e := c.statsForCluster(cluster).lastErr.Load(); e != nil {
+	if e := holder.stats.lastErr.Load(); e != nil {
 		lastErr = *e
 	}
-
-	// Capture the holder the refresher is replacing. If anyone installs a
-	// different session while the refresher runs, that session is newer
-	// than what the refresher saw and must not be closed underneath them.
-	holder := slot.Load()
 
 	newSession, err := c.config.SessionRefresher(ctx, cluster, lastErr)
 	if err != nil {
@@ -533,9 +550,20 @@ func (r *retiredSessions) add(s cql.Session, grace time.Duration) {
 	entry.timer = time.AfterFunc(grace, func() {
 		defer r.wg.Done()
 		entry.closeOnce()
+		r.forget(entry)
 	})
 	r.entries = append(r.entries, entry)
 	r.mu.Unlock()
+}
+
+// forget drops a closed entry so a long-lived client does not keep every
+// session it ever retired.
+func (r *retiredSessions) forget(entry *retiredSession) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i := slices.Index(r.entries, entry); i >= 0 {
+		r.entries = slices.Delete(r.entries, i, i+1)
+	}
 }
 
 // closeAll closes every pending session now and waits for any grace timer

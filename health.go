@@ -2,6 +2,7 @@ package helix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -206,7 +207,7 @@ func (h *clusterHealth) probe(holder *sessionHolder, kind probeKind, err error) 
 // ctx's own deadline ended the operation while parent is still live: a
 // Helix-owned timeout, not the caller's or the client's cancellation.
 func clusterTimeoutIfExpired(ctx, parent context.Context, err error) error {
-	if err != nil && ctx.Err() != nil && parent.Err() == nil {
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
 		return fmt.Errorf("%w: %w", types.ErrClusterTimeout, err)
 	}
 
