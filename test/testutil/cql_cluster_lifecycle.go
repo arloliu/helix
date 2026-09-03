@@ -238,7 +238,7 @@ func (c *CQLCluster) rebuildSessionsWithRetry(
 	for {
 		session, err := createCQLSession(host, c.keyspace, c.sessionTimeout, c.connectTimeout, c.reconnectInterval)
 		if err == nil {
-			sessionV2, v2Err := createCQLSessionV2(host, c.keyspace, c.sessionTimeout, c.connectTimeout)
+			sessionV2, v2Err := createCQLSessionV2(host, c.keyspace, c.sessionTimeout, c.connectTimeout, c.reconnectInterval)
 			if v2Err == nil {
 				return session, sessionV2, nil
 			}

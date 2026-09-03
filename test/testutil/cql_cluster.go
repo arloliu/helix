@@ -118,8 +118,8 @@ type CQLClusterOptions struct {
 	// ConnectTimeout overrides gocql's ConnectTimeout for both drivers.
 	// Defaults to SessionTimeout when SessionTimeout is non-zero.
 	ConnectTimeout time.Duration
-	// ReconnectInterval sets gocql's ReconnectInterval (v1 only — v2 may
-	// expose a similar knob or rely on its retry policy). Zero means default.
+	// ReconnectInterval sets the drivers' ReconnectInterval (v1 and v2), how
+	// often a host marked DOWN is retried. Zero keeps the drivers' 60 s default.
 	ReconnectInterval time.Duration
 }
 
@@ -250,7 +250,7 @@ func startScyllaDBCluster(ctx context.Context, opts CQLClusterOptions) (*CQLClus
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
-	sessionV2, err := createCQLSessionV2(host, opts.Keyspace, sessionTimeout, connectTimeout)
+	sessionV2, err := createCQLSessionV2(host, opts.Keyspace, sessionTimeout, connectTimeout, opts.ReconnectInterval)
 	if err != nil {
 		session.Close()
 		_ = container.Terminate(ctx)
@@ -303,7 +303,7 @@ func startCassandraCluster(ctx context.Context, opts CQLClusterOptions) (*CQLClu
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
-	sessionV2, err := createCQLSessionV2(host, opts.Keyspace, sessionTimeout, connectTimeout)
+	sessionV2, err := createCQLSessionV2(host, opts.Keyspace, sessionTimeout, connectTimeout, opts.ReconnectInterval)
 	if err != nil {
 		session.Close()
 		_ = container.Terminate(ctx)
@@ -357,11 +357,16 @@ func createCQLSession(host, keyspace string, timeout, connectTimeout, reconnectI
 	return cluster.CreateSession()
 }
 
-func createCQLSessionV2(host, keyspace string, timeout, connectTimeout time.Duration) (*gocqlv2.Session, error) {
+func createCQLSessionV2(host, keyspace string, timeout, connectTimeout, reconnectInterval time.Duration) (*gocqlv2.Session, error) {
 	cluster := gocqlv2.NewCluster(host)
 	cluster.Consistency = gocqlv2.Quorum
 	cluster.Timeout = timeout
 	cluster.ConnectTimeout = connectTimeout
+	if reconnectInterval > 0 {
+		// The driver's default is 60 s: a host marked DOWN during a pause
+		// would stay down far longer than the scenarios wait for recovery.
+		cluster.ReconnectInterval = reconnectInterval
+	}
 	cluster.Keyspace = keyspace
 
 	return cluster.CreateSession()
