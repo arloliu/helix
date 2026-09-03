@@ -688,7 +688,7 @@ func TestStrict_RecoveryProbe_DefaultProbeRestoresCluster(t *testing.T) {
 			)
 			mc := newRecoveryProbeCounter()
 
-			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
+			opts := []helix.Option{
 				helix.WithWriteStrategy(adw),
 				helix.WithFailoverPolicy(policy.NewActiveFailover()),
 				helix.WithMetrics(mc),
@@ -698,7 +698,10 @@ func TestStrict_RecoveryProbe_DefaultProbeRestoresCluster(t *testing.T) {
 					Interval: 200 * time.Millisecond,
 					Timeout:  100 * time.Millisecond,
 				}),
-			)
+				helix.WithLogger(testutil.NewTestLogger(t)),
+			}
+			opts = append(opts, withSessionRebuild(b, d)...)
+			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b), opts...)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
 
