@@ -640,7 +640,7 @@ func (c *CircuitBreaker) TryBeginFailoverProbe(cluster types.ClusterID) (uint64,
 // the reset timeout, emitting no event and counting no trip.
 // [types.ProbeAbandoned] returns it to open without touching the counters
 // or the timeout, so another client sharing the breaker may reserve it
-// at once.
+// at once; an outcome this package does not know is treated the same way.
 //
 // Parameters:
 //   - cluster: The cluster that was probed
@@ -660,14 +660,16 @@ func (c *CircuitBreaker) CompleteFailoverProbe(cluster types.ClusterID, token ui
 	}
 	var transition breakerTransition
 	var seq uint64
-	switch outcome {
+	switch outcome { //nolint:exhaustive // an unknown outcome is released like ProbeAbandoned
 	case types.ProbeSucceeded:
 		transition, seq = c.closeLocked(state, cluster, "probe succeeded")
 	case types.ProbeFailed:
 		state.halfOpen = false
 		state.lastFailure.Store(time.Now().UnixNano())
 		transition, seq = transitionReopened, state.seq.Add(1)
-	case types.ProbeAbandoned:
+	default:
+		// ProbeAbandoned, and any value this package does not know,
+		// releases the reservation so the breaker cannot stay half-open.
 		state.halfOpen = false
 		transition, seq = transitionReopened, state.seq.Add(1)
 	}

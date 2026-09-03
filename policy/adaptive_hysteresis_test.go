@@ -70,6 +70,34 @@ func TestAdaptiveDualWrite_MinDegradedDwellHoldsRecovery(t *testing.T) {
 	require.False(t, a.IsDegraded(types.ClusterA), "the first fast observation after the dwell recovers")
 }
 
+// A minimum dwell equal to the cap reaches the cap on the first re-degrade,
+// which must still be reported.
+func TestAdaptiveDualWrite_RedegradeBackoffReportsFlappingWhenDwellEqualsCap(t *testing.T) {
+	clock := &manualClock{}
+	em := &recordingEmitter{}
+	a := newHysteresisStrategy(clock,
+		WithAdaptiveMinDegradedDwell(10*time.Second),
+		WithAdaptiveRedegradeBackoff(time.Hour, 10*time.Second),
+	)
+	a.SetEventEmitter(em)
+
+	degradeByStrikes(a, types.ClusterA)
+	clock.advance(10 * time.Second)
+	a.recordFast(&a.stateA)
+	require.False(t, a.IsDegraded(types.ClusterA))
+
+	clock.advance(time.Second)
+	degradeByStrikes(a, types.ClusterA) // first re-degrade lands on the cap
+	require.Equal(t, 10*time.Second, a.stateA.dwell)
+	require.Equal(t, 1, countKind(em, types.EventWriteFlapping), "the cap is reported")
+
+	clock.advance(10 * time.Second)
+	a.recordFast(&a.stateA)
+	clock.advance(time.Second)
+	degradeByStrikes(a, types.ClusterA) // second: still at the cap, same episode
+	require.Equal(t, 1, countKind(em, types.EventWriteFlapping))
+}
+
 func TestAdaptiveDualWrite_RedegradeBackoffDoublesDwellAndReportsFlapping(t *testing.T) {
 	clock := &manualClock{}
 	em := &recordingEmitter{}

@@ -647,6 +647,20 @@ func TestCircuitBreaker_ProbeAbandonedReleasesReservation(t *testing.T) {
 	require.True(t, ok, "the timeout had already elapsed, so the breaker can be reserved again at once")
 }
 
+func TestCircuitBreaker_UnknownProbeOutcomeReleasesReservation(t *testing.T) {
+	mc := testutil.NewTestMetricsCollector()
+	cb := NewCircuitBreaker(WithThreshold(1), WithResetTimeout(1*time.Hour), WithCircuitBreakerMetrics(mc))
+
+	cb.RecordFailure(types.ClusterA) // trips
+	token := reserveProbe(t, cb, types.ClusterA)
+
+	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeOutcome(255))
+
+	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge returns to open")
+	_, ok := cb.TryBeginFailoverProbe(types.ClusterA)
+	require.True(t, ok, "an outcome the breaker does not know cannot leave it half-open")
+}
+
 // TestCircuitBreaker_OrdinaryObservationsDuringReservation pins what
 // RecordFailure and RecordSuccess do while a probe is in flight: a failure
 // keeps counting and leaves the reservation valid; a success closes the
