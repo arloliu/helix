@@ -286,11 +286,11 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage, retained bool) {
 			isLastAttempt := msg.MaxDeliver > 0 && msg.DeliveryCount >= uint64(msg.MaxDeliver)
 
 			if isLastAttempt {
-				// This is the last attempt - message will be dropped
-				// Use Term() to explicitly terminate, preventing any redelivery
-				if b.termMessage(msg, "max retries exceeded") {
-					b.recordDrop(msg, err, types.ReplayDropMaxAttempts)
-				}
+				// This is the last attempt: the server will not deliver
+				// the message again whether or not it accepts the Term, so
+				// the drop is recorded either way.
+				b.termMessage(msg, "max retries exceeded")
+				b.recordDrop(msg, err, types.ReplayDropMaxAttempts)
 			} else {
 				// Nak for redelivery
 				b.nakMessage(msg, "retry", 0)
@@ -524,8 +524,30 @@ func (b *natsBackend) nakMessage(msg ReplayMessage, reason string, delay time.Du
 	}
 }
 
+// observeCorrupt records a message the replayer terminated at decode; the
+// worker owns the metrics and the logger, so it reports on the replayer's
+// behalf.
+func (b *natsBackend) observeCorrupt(cluster types.ClusterID, streamSeq uint64, decodeErr, termErr error) {
+	stream := b.config.streamMetrics()
+	stream.IncReplayCorrupt(cluster)
+	attrs := []any{
+		"cluster", b.clusterName(cluster),
+		"streamSequence", streamSeq,
+		"error", decodeErr.Error(),
+	}
+	if termErr != nil {
+		stream.IncReplayTermFailed(cluster)
+		attrs = append(attrs, "termError", termErr.Error())
+	}
+	b.config.Logger.Error("corrupt replay message terminated", attrs...)
+}
+
+// termMessage terminates a message the worker gave up on and reports
+// whether the server accepted it. A refused Term is counted, because the
+// message may be delivered again.
 func (b *natsBackend) termMessage(msg ReplayMessage, reason string) bool {
 	if err := msg.Term(); err != nil {
+		b.config.streamMetrics().IncReplayTermFailed(msg.Payload.TargetCluster)
 		b.config.Logger.Error("failed to terminate replay message",
 			"cluster", b.clusterName(msg.Payload.TargetCluster),
 			"reason", reason,
@@ -614,7 +636,7 @@ func newNATSWorkerWithConfig(
 	}
 
 	// Create and inject the NATS backend
-	w.backend = &natsBackend{
+	backend := &natsBackend{
 		replayer:    replayer,
 		config:      &w.config,
 		execute:     execute,
@@ -623,10 +645,14 @@ func newNATSWorkerWithConfig(
 		deadLetters: make(map[uint64]int),
 	}
 
-	if config.RetryPolicy == RetryWhileRetained && replayer != nil {
-		replayer.enableRetainedDelivery(
-			redeliverySchedule(replayer.config.AckWait, config.MaxRetryDelay),
-		)
+	w.backend = backend
+	if replayer != nil {
+		replayer.setCorruptObserver(backend.observeCorrupt)
+		if config.RetryPolicy == RetryWhileRetained {
+			replayer.enableRetainedDelivery(
+				redeliverySchedule(replayer.config.AckWait, config.MaxRetryDelay),
+			)
+		}
 	}
 
 	return w

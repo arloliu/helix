@@ -101,6 +101,7 @@ type WorkerConfig struct {
 	// backlog is Metrics narrowed to the optional backlog interface, or a
 	// no-op collector when Metrics does not implement it.
 	backlog types.ReplayBacklogMetrics
+	stream  types.ReplayStreamMetrics
 
 	// metricsExplicit is true when WithWorkerMetrics was called by the
 	// caller. Used by [Worker.MetricsConfigured] so a parent (e.g. the
@@ -484,7 +485,7 @@ func (w *Worker) SetMetrics(m types.MetricsCollector) {
 	}
 	w.config.Metrics = m
 	w.config.metricsExplicit = true
-	w.config.resolveBacklog()
+	w.config.resolveOptionalMetrics()
 }
 
 // Metrics returns the worker's metrics collector. Useful for tests and
@@ -499,10 +500,25 @@ func (w *Worker) BackendType() string {
 	return w.backend.backendType()
 }
 
-// resolveBacklog narrows Metrics to the optional backlog interface once so
-// the workers can report without a type assertion per payload.
-func (c *WorkerConfig) resolveBacklog() {
+// resolveOptionalMetrics narrows Metrics to the optional backlog and
+// stream interfaces once so the workers can report without a type
+// assertion per payload.
+func (c *WorkerConfig) resolveOptionalMetrics() {
 	c.backlog = c.backlogMetrics()
+	c.stream = c.streamMetrics()
+}
+
+// streamMetrics returns the resolved stream collector, deriving it from
+// Metrics for configurations built without finalizeWorkerConfig.
+func (c *WorkerConfig) streamMetrics() types.ReplayStreamMetrics {
+	if c.stream != nil {
+		return c.stream
+	}
+	if sm, ok := c.Metrics.(types.ReplayStreamMetrics); ok {
+		return sm
+	}
+
+	return metrics.NewNopMetrics()
 }
 
 // backlogMetrics returns the resolved backlog collector, deriving it from

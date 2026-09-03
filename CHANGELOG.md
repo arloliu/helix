@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason (`failover`, `alternative known good`, `manual`, `recovered`).
   The client installs its collector and event dispatcher on a read strategy
   that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- `types.ReplayStreamMetrics` lets a collector count the NATS worker's
+  stream-level losses: `{prefix}_replay_corrupt_total{cluster}` (a fetched
+  message that did not decode was terminated, also logged at `Error`) and
+  `{prefix}_replay_term_failed_total{cluster}` (a `Term` the server
+  refused). Under `RetryBounded` a refused `Term` on the last permitted
+  delivery now records the `max_attempts` drop as well; previously neither
+  was counted. See `docs/replay-system.md`.
 - The cluster event buffer grows from 128 to 160 slots and the four
   per-operation kinds (`failover`, `read_divergence`, `replay_dropped`,
   `mirror_replay_dropped`) may hold at most 128 of them, so a storm of

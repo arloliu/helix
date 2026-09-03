@@ -91,6 +91,14 @@
 //     retry_pool_saturated, shutdown, dead_letter, retry_window_expired);
 //     unlike replay_dropped_total it never counts enqueue failures
 //
+// Replay stream (optional types.ReplayStreamMetrics, NATS worker only):
+//   - {prefix}_replay_corrupt_total{cluster} - Counter of messages
+//     terminated because they did not decode
+//   - {prefix}_replay_term_failed_total{cluster} - Counter of terminations
+//     the server refused
+//   - {prefix}_replay_evicted_total - Counter of messages the stream removed
+//     without this process's acknowledgement (the worker's eviction watch)
+//
 // Cluster health:
 //   - {prefix}_cluster_draining{cluster} - Gauge (1=draining, 0=healthy)
 //   - {prefix}_drain_mode_entered_total{cluster} - Counter of drain entries

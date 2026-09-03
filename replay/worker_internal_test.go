@@ -304,10 +304,24 @@ func TestNATSBackend_ProcessMessages_AckFailureIsReportedAsError(t *testing.T) {
 	assert.Equal(t, int32(1), logger.errorCount.Load())
 }
 
-func TestNATSBackend_ProcessMessages_TermFailureDoesNotReportDrop(t *testing.T) {
+// streamCounter records the optional stream metrics.
+type streamCounter struct {
+	metrics.NopMetrics
+	corrupt, termFailed, evicted atomic.Int32
+}
+
+func (s *streamCounter) IncReplayCorrupt(types.ClusterID)    { s.corrupt.Add(1) }
+func (s *streamCounter) IncReplayTermFailed(types.ClusterID) { s.termFailed.Add(1) }
+func (s *streamCounter) AddReplayEvicted(n int)              { s.evicted.Add(int32(n)) }
+
+// Under the bounded policy the last permitted delivery is a loss whether
+// or not the server accepts the Term, so the drop is recorded and the
+// refused Term is counted.
+func TestNATSBackend_ProcessMessages_TermFailureOnLastDeliveryStillReportsDrop(t *testing.T) {
 	logger := &recordingWorkerLogger{}
-	cfg := DefaultWorkerConfig()
-	cfg.Metrics = metrics.NewNopMetrics()
+	sc := &streamCounter{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Metrics = sc
 	cfg.Logger = logger
 
 	var dropped atomic.Int32
@@ -329,8 +343,74 @@ func TestNATSBackend_ProcessMessages_TermFailureDoesNotReportDrop(t *testing.T) 
 	}
 	b.processMessages([]ReplayMessage{msg}, false)
 
-	assert.Equal(t, int32(0), dropped.Load(), "failed Term means the broker did not confirm the message was dropped")
-	assert.Equal(t, int32(1), logger.errorCount.Load())
+	assert.Equal(t, int32(1), dropped.Load(), "the server will not deliver the message again, so it is lost")
+	assert.Equal(t, int32(1), sc.termFailed.Load())
+	assert.Equal(t, int32(2), logger.errorCount.Load(), "the refused Term and the drop are both logged")
+}
+
+// Under the retained policy a refused Term brings the message back, so
+// only the refusal is counted and no drop is recorded.
+func TestNATSBackend_SettleRetained_TermFailureRecordsNoDrop(t *testing.T) {
+	sc := &streamCounter{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Metrics = sc
+	cfg.MaxAttempts = 1
+	cfg.Classifier = func(error) ReplayDisposition { return DispositionDeadLetter }
+	var dropped atomic.Int32
+	cfg.OnDrop = func(_ types.ReplayPayload, _ error) { dropped.Add(1) }
+
+	b := &natsBackend{
+		config:      &cfg,
+		stopCh:      make(chan struct{}),
+		deadLetters: map[uint64]int{},
+	}
+	msg := ReplayMessage{
+		Payload:        types.ReplayPayload{TargetCluster: types.ClusterA},
+		termFunc:       func() error { return errors.New("term failed") },
+		DeliveryCount:  1,
+		StreamSequence: 7,
+	}
+	b.settleRetained(msg, errors.New("poison"))
+
+	assert.Zero(t, dropped.Load(), "the message is redelivered, so it is not a drop yet")
+	assert.Equal(t, int32(1), sc.termFailed.Load())
+}
+
+func TestNATSReplayer_HandleCorrupt_ReportsToTheObserverAndTheCallback(t *testing.T) {
+	var gotCluster types.ClusterID
+	var gotSeq uint64
+	var gotDecodeErr, gotTermErr, callbackErr error
+	n := &NATSReplayer{config: NATSReplayerConfig{OnCorruptMessage: func(err error) { callbackErr = err }}}
+	n.setCorruptObserver(func(cluster types.ClusterID, seq uint64, decodeErr, termErr error) {
+		gotCluster, gotSeq, gotDecodeErr, gotTermErr = cluster, seq, decodeErr, termErr
+	})
+
+	decodeErr := errors.New("bad bytes")
+	n.handleCorrupt(types.ClusterB, 42, &fakeMsg{}, decodeErr)
+	assert.Equal(t, types.ClusterB, gotCluster)
+	assert.Equal(t, uint64(42), gotSeq)
+	assert.Equal(t, decodeErr, gotDecodeErr)
+	assert.NoError(t, gotTermErr)
+	assert.Equal(t, decodeErr, callbackErr, "an accepted Term leaves the decode error alone")
+
+	n.handleCorrupt(types.ClusterA, 43, &fakeMsg{termErr: errors.New("term refused")}, decodeErr)
+	assert.Error(t, gotTermErr, "the refused Term reaches the observer")
+	assert.ErrorIs(t, callbackErr, decodeErr)
+	assert.Contains(t, callbackErr.Error(), "term refused", "and the callback sees both errors")
+}
+
+// Building a worker installs it as the replayer's decode observer, so a
+// message terminated at decode is counted on the worker's collector.
+func TestNATSWorker_ConstructionInstallsTheCorruptObserver(t *testing.T) {
+	n := &NATSReplayer{}
+	sc := &streamCounter{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Metrics = sc
+	_ = newNATSWorkerWithConfig(cfg, n, func(context.Context, types.ReplayPayload) error { return nil }, nil)
+
+	n.handleCorrupt(types.ClusterA, 1, &fakeMsg{termErr: errors.New("term refused")}, errors.New("bad bytes"))
+	assert.Equal(t, int32(1), sc.corrupt.Load())
+	assert.Equal(t, int32(1), sc.termFailed.Load())
 }
 
 var errAckFailed = errors.New("ack failed")

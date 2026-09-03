@@ -698,6 +698,27 @@ func (c *Collector) IncReplayWorkerDropped(cluster types.ClusterID, reason strin
 	c.set.GetOrCreateCounter(name).Inc()
 }
 
+// IncReplayCorrupt counts a message terminated at decode. Part of the
+// optional types.ReplayStreamMetrics interface.
+func (c *Collector) IncReplayCorrupt(cluster types.ClusterID) {
+	c.set.GetOrCreateCounter(fmt.Sprintf(`%s_replay_corrupt_total{cluster="%s"}`,
+		c.prefix, c.clusterNames.Name(cluster))).Inc()
+}
+
+// IncReplayTermFailed counts a Term the server refused. Part of the
+// optional types.ReplayStreamMetrics interface.
+func (c *Collector) IncReplayTermFailed(cluster types.ClusterID) {
+	c.set.GetOrCreateCounter(fmt.Sprintf(`%s_replay_term_failed_total{cluster="%s"}`,
+		c.prefix, c.clusterNames.Name(cluster))).Inc()
+}
+
+// AddReplayEvicted counts messages the stream removed without this
+// process's acknowledgement. Part of the optional
+// types.ReplayStreamMetrics interface.
+func (c *Collector) AddReplayEvicted(n int) {
+	c.set.GetOrCreateCounter(c.prefix + "_replay_evicted_total").Add(n)
+}
+
 // ----------------------
 // Cluster Health
 // ----------------------

@@ -263,7 +263,8 @@ func (b *fakeMessageBatch) Error() error { return b.err }
 // called by the exercised code paths.
 type fakeMsg struct {
 	jetstream.Msg
-	data []byte
+	data    []byte
+	termErr error // returned by Term, so a test can refuse a termination
 }
 
 func (m *fakeMsg) Metadata() (*jetstream.MsgMetadata, error) {
@@ -280,7 +281,7 @@ func (m *fakeMsg) NakWithDelay(time.Duration) error { return nil }
 
 func (m *fakeMsg) InProgress() error { return nil }
 
-func (m *fakeMsg) Term() error { return nil }
+func (m *fakeMsg) Term() error { return m.termErr }
 
 // fakeTrackedMsg is a fakeMsg variant that reports every Ack/Nak/Term call
 // on events, tagged with id, so a test can match a specific message's

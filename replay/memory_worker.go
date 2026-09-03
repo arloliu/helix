@@ -450,7 +450,7 @@ func finalizeWorkerConfig(config *WorkerConfig) {
 	if config.Classifier == nil {
 		config.Classifier = DefaultReplayClassifier
 	}
-	config.resolveBacklog()
+	config.resolveOptionalMetrics()
 }
 
 func validateWorkerInputs(hasReplayer bool, execute ExecuteFunc) error {

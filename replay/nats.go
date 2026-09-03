@@ -11,6 +11,7 @@ import (
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -124,6 +125,10 @@ type NATSReplayer struct {
 	mu        sync.RWMutex
 	// infoMu serializes stream.Info, which writes the handle's cached info.
 	infoMu sync.Mutex
+
+	// corrupt is the worker's observer of messages terminated at decode,
+	// installed when the worker is built; the last worker built wins.
+	corrupt atomic.Pointer[corruptObserver]
 
 	// redeliveryBackoff is set by a worker running RetryWhileRetained before
 	// it starts: consumers created afterwards allow unlimited deliveries and
@@ -519,7 +524,7 @@ func (n *NATSReplayer) Dequeue(ctx context.Context, cluster types.ClusterID, bat
 		return nil, err
 	}
 
-	return n.fetchReplayMessages(ctx, consumerName, consumer, batchSize)
+	return n.fetchReplayMessages(ctx, cluster, consumerName, consumer, batchSize)
 }
 
 // DequeueByPriority retrieves a batch of replay messages for a specific priority.
@@ -563,7 +568,7 @@ func (n *NATSReplayer) DequeueByPriority(ctx context.Context, cluster types.Clus
 		return nil, err
 	}
 
-	return n.fetchReplayMessages(ctx, consumerName, consumer, batchSize)
+	return n.fetchReplayMessages(ctx, cluster, consumerName, consumer, batchSize)
 }
 
 func (n *NATSReplayer) getOrCreateConsumer(
@@ -620,6 +625,7 @@ func (n *NATSReplayer) getOrCreateConsumer(
 
 func (n *NATSReplayer) fetchReplayMessages(
 	ctx context.Context,
+	cluster types.ClusterID,
 	consumerName string,
 	consumer jetstream.Consumer,
 	batchSize int,
@@ -662,14 +668,14 @@ msgLoop:
 		var natsMsg natsReplayMessage
 		if _, err := natsMsg.UnmarshalMsg(msg.Data()); err != nil {
 			// Permanently corrupt — Term immediately; no retry will fix bad bytes.
-			n.handleCorrupt(msg, err)
+			n.handleCorrupt(cluster, streamSeq, msg, err)
 
 			continue
 		}
 
 		// A target no client can resolve is as unprocessable as bad bytes.
 		if err := validateTargetCluster(types.ClusterID(natsMsg.TargetCluster)); err != nil {
-			n.handleCorrupt(msg, err)
+			n.handleCorrupt(cluster, streamSeq, msg, err)
 
 			continue
 		}
@@ -677,7 +683,7 @@ msgLoop:
 		// Decode Args from msgp.Raw
 		args, err := decodeArgs(natsMsg.Args)
 		if err != nil {
-			n.handleCorrupt(msg, err)
+			n.handleCorrupt(cluster, streamSeq, msg, err)
 
 			continue
 		}
@@ -689,7 +695,7 @@ msgLoop:
 			for i, stmt := range natsMsg.BatchStatements {
 				stmtArgs, err := decodeArgs(stmt.Args)
 				if err != nil {
-					n.handleCorrupt(msg, err)
+					n.handleCorrupt(cluster, streamSeq, msg, err)
 
 					continue msgLoop
 				}
@@ -1220,13 +1226,28 @@ func msgsToInt(msgs uint64) (int, error) {
 // payload bytes are irrecoverably malformed, no number of redeliveries would
 // allow the message to be processed successfully. Calling Term() removes the
 // message from the queue without waiting for MaxDeliver exhaustion.
-func (n *NATSReplayer) handleCorrupt(msg jetstream.Msg, err error) {
-	if termErr := msg.Term(); termErr != nil {
+func (n *NATSReplayer) handleCorrupt(cluster types.ClusterID, streamSeq uint64, msg jetstream.Msg, err error) {
+	termErr := msg.Term()
+	if observe := n.corrupt.Load(); observe != nil {
+		(*observe)(cluster, streamSeq, err, termErr)
+	}
+	if termErr != nil {
 		err = errors.Join(err, fmt.Errorf("helix: failed to terminate corrupt replay message: %w", termErr))
 	}
 	if n.config.OnCorruptMessage != nil {
 		n.config.OnCorruptMessage(err)
 	}
+}
+
+// corruptObserver receives a message terminated at decode: the consumer's
+// cluster, the stream sequence, the decode error, and the Term error if
+// the server refused the termination.
+type corruptObserver func(cluster types.ClusterID, streamSeq uint64, decodeErr, termErr error)
+
+// setCorruptObserver installs the worker's observer; a later worker
+// replaces an earlier one.
+func (n *NATSReplayer) setCorruptObserver(fn corruptObserver) {
+	n.corrupt.Store(&fn)
 }
 
 // Close closes the replayer.
