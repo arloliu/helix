@@ -34,9 +34,9 @@ func (l *TestLogger) WithDebug() *TestLogger {
 
 func (l *TestLogger) log(level, msg string, kv []any) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s helix/%s %s", time.Now().Format("15:04:05.000"), level, msg)
+	_, _ = fmt.Fprintf(&b, "%s helix/%s %s", time.Now().Format("15:04:05.000"), level, msg)
 	for i := 0; i+1 < len(kv); i += 2 {
-		fmt.Fprintf(&b, " %v=%v", kv[i], kv[i+1])
+		_, _ = fmt.Fprintf(&b, " %v=%v", kv[i], kv[i+1]) // strings.Builder never fails
 	}
 	l.tb.Log(b.String())
 }
