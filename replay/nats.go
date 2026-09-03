@@ -10,6 +10,8 @@ import (
 	"math/big"
 	"net"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +51,10 @@ type NATSReplayerConfig struct {
 	// is reached. Default: DiscardOld, preserving write availability by
 	// retaining the newest replay window and evicting older messages.
 	DiscardPolicy jetstream.DiscardPolicy
+
+	// DuplicateWindow is the stream's duplicate window; zero keeps the
+	// server default. Set via [WithDuplicateWindow].
+	DuplicateWindow time.Duration
 
 	// Replicas is the number of stream replicas (for fault tolerance).
 	// Default: 1 (use 3 for production clusters)
@@ -204,6 +210,26 @@ func WithMaxMsgs(n int64) NATSReplayerOption {
 func WithMaxBytes(n int64) NATSReplayerOption {
 	return func(c *NATSReplayerConfig) {
 		c.MaxBytes = n
+	}
+}
+
+// WithDuplicateWindow sets how long the stream remembers a message id.
+//
+// Every idempotent payload is published with a Nats-Msg-Id derived from
+// its identity, so a publish retried after an ambiguous timeout is stored
+// once as long as the retry starts within this window of the first
+// attempt; the window bounds the delay between attempts, not the publish
+// timeout. A non-idempotent payload carries no id and is not safe to
+// retry.
+//
+// Parameters:
+//   - d: The duplicate window; zero keeps the server default of two minutes
+//
+// Returns:
+//   - NATSReplayerOption: Configuration option
+func WithDuplicateWindow(d time.Duration) NATSReplayerOption {
+	return func(c *NATSReplayerConfig) {
+		c.DuplicateWindow = d
 	}
 }
 
@@ -394,6 +420,7 @@ func NewNATSReplayer(js jetstream.JetStream, opts ...NATSReplayerOption) (*NATSR
 		Replicas:    config.Replicas,
 		Storage:     jetstream.FileStorage,
 		Discard:     config.DiscardPolicy,
+		Duplicates:  config.DuplicateWindow,
 	}
 
 	stream, err := js.CreateOrUpdateStream(ctx, streamConfig)
@@ -407,6 +434,51 @@ func NewNATSReplayer(js jetstream.JetStream, opts ...NATSReplayerOption) (*NATSR
 		config:    config,
 		consumers: make(map[string]jetstream.Consumer),
 	}, nil
+}
+
+// newNATSReplayMessage builds the wire envelope of a payload, encoding
+// every argument list once; the message id is derived from the same
+// encoded fields.
+func newNATSReplayMessage(payload types.ReplayPayload) (natsReplayMessage, error) {
+	// Serialize Args to msgp.Raw
+	argsRaw, err := encodeArgs(payload.Args)
+	if err != nil {
+		return natsReplayMessage{}, err
+	}
+
+	// Build batch statements if this is a batch
+	var batchStmts []batchStatement
+	if payload.IsBatch {
+		batchStmts = make([]batchStatement, len(payload.BatchStatements))
+		for i, stmt := range payload.BatchStatements {
+			stmtArgsRaw, err := encodeArgs(stmt.Args)
+			if err != nil {
+				return natsReplayMessage{}, err
+			}
+			batchStmts[i] = batchStatement{
+				Query: stmt.Query,
+				Args:  stmtArgsRaw,
+			}
+		}
+	}
+
+	// Build the message
+	msg := natsReplayMessage{
+		TargetCluster:   string(payload.TargetCluster),
+		Query:           payload.Query,
+		Args:            argsRaw,
+		Timestamp:       payload.Timestamp,
+		Priority:        int(payload.Priority),
+		IsBatch:         payload.IsBatch,
+		BatchType:       uint8(payload.BatchType),
+		BatchStatements: batchStmts,
+		Version:         replayEnvelopeVersion,
+		NonIdempotent:   payload.NonIdempotent,
+	}
+	msg.HasConsistency, msg.Consistency = consistencyToWire(payload.Consistency)
+	msg.HasSerialConsistency, msg.SerialConsistency = consistencyToWire(payload.SerialConsistency)
+
+	return msg, nil
 }
 
 // Enqueue adds a failed write to the NATS JetStream replay queue.
@@ -433,43 +505,10 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 		return err
 	}
 
-	// Serialize Args to msgp.Raw
-	argsRaw, err := encodeArgs(payload.Args)
+	msg, err := newNATSReplayMessage(payload)
 	if err != nil {
 		return err
 	}
-
-	// Build batch statements if this is a batch
-	var batchStmts []batchStatement
-	if payload.IsBatch {
-		batchStmts = make([]batchStatement, len(payload.BatchStatements))
-		for i, stmt := range payload.BatchStatements {
-			stmtArgsRaw, err := encodeArgs(stmt.Args)
-			if err != nil {
-				return err
-			}
-			batchStmts[i] = batchStatement{
-				Query: stmt.Query,
-				Args:  stmtArgsRaw,
-			}
-		}
-	}
-
-	// Build the message
-	msg := natsReplayMessage{
-		TargetCluster:   string(payload.TargetCluster),
-		Query:           payload.Query,
-		Args:            argsRaw,
-		Timestamp:       payload.Timestamp,
-		Priority:        int(payload.Priority),
-		IsBatch:         payload.IsBatch,
-		BatchType:       uint8(payload.BatchType),
-		BatchStatements: batchStmts,
-		Version:         replayEnvelopeVersion,
-		NonIdempotent:   payload.NonIdempotent,
-	}
-	msg.HasConsistency, msg.Consistency = consistencyToWire(payload.Consistency)
-	msg.HasSerialConsistency, msg.SerialConsistency = consistencyToWire(payload.SerialConsistency)
 
 	// Use msgp for efficient serialization
 	data, err := msg.MarshalMsg(nil)
@@ -484,11 +523,18 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 	}
 	subject := n.config.SubjectPrefix + "." + priorityStr + "." + string(payload.TargetCluster)
 
+	// An idempotent payload carries an id, so a retried publish is stored
+	// once; the server's duplicate acknowledgement is a success.
+	var opts []jetstream.PublishOpt
+	if id := msg.messageID(); id != "" {
+		opts = append(opts, jetstream.WithMsgID(id))
+	}
+
 	// Publish with timeout
 	pubCtx, cancel := context.WithTimeout(ctx, n.config.PublishTimeout)
 	defer cancel()
 
-	_, err = n.js.Publish(pubCtx, subject, data)
+	_, err = n.js.Publish(pubCtx, subject, data, opts...)
 	if err != nil {
 		return fmt.Errorf("helix: failed to publish replay message: %w", err)
 	}
@@ -921,10 +967,15 @@ func appendCollection(buf []byte, arg any) ([]byte, bool, error) {
 	}
 	//nolint:gosec // an argument collection never approaches the header's range
 	buf = msgp.AppendMapHeader(buf, uint32(rv.Len()))
-	for it := rv.MapRange(); it.Next(); {
-		buf = msgp.AppendString(buf, it.Key().String())
+	// Keys are written in sorted order so the same map always encodes to
+	// the same bytes, which the message id relies on; decoding does not
+	// depend on key order.
+	keys := rv.MapKeys()
+	slices.SortFunc(keys, func(a, b reflect.Value) int { return strings.Compare(a.String(), b.String()) })
+	for _, key := range keys {
+		buf = msgp.AppendString(buf, key.String())
 		var err error
-		buf, err = appendArg(buf, it.Value().Interface())
+		buf, err = appendArg(buf, rv.MapIndex(key).Interface())
 		if err != nil {
 			return buf, true, err
 		}

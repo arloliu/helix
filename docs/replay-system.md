@@ -114,6 +114,11 @@ type ReplayWorker interface {
 }
 ```
 
+`Stop()` blocks until the worker's in-flight batch returns (bound it with
+`WithExecuteTimeout`), and `client.Close()` waits for it in turn.
+A `WithOnDrop` or `WithOnError` callback must not call `Stop()` or the
+client's `Close()`: both wait for the goroutine that invoked the callback.
+
 `Stop()` is terminal for a worker instance. After a worker has been stopped,
 construct a new worker rather than calling `Start()` again.
 
@@ -673,6 +678,27 @@ collectors implementing `types.ReplayStreamMetrics` instead:
 | `WithMemoryHighPriorityRatio(n)` | 10 | Process N high-priority items before 1 low-priority |
 | `WithMemoryStrictPriority(bool)` | false | Drain all high-priority before any low-priority |
 
+### Message ids
+
+Every idempotent payload is published with a `Nats-Msg-Id` derived from its
+identity: the target cluster, the timestamp, the priority, the consistency
+levels, and the statement with its arguments (or the batch type and every
+statement in order), with map arguments encoded in sorted key order so the
+same arguments always give the same id.
+A publish that times out on the client after the server stored the message
+can therefore be retried: JetStream stores the payload once as long as the
+retry starts within the duplicate window (`WithDuplicateWindow`, server
+default two minutes) of the first attempt, and reports the second as a
+duplicate, which `Enqueue` treats as success.
+The window bounds the delay between the first attempt and its retry, not
+the publish timeout.
+A non-idempotent payload (`Query.NonIdempotent()`, a counter batch) carries
+no id, because two distinct such writes can share every identity field
+within one microsecond; its publish is not safe to retry after an ambiguous
+timeout.
+Two idempotent writes with the same identity are the same write under the
+client-side timestamp, so storing one of them is correct.
+
 ### NATSReplayer Options
 
 | Option | Default | Description |
@@ -686,6 +712,7 @@ collectors implementing `types.ReplayStreamMetrics` instead:
 | `WithRejectNewOnLimit()` | off | Use `DiscardNew` so full streams reject new replay messages instead of evicting old ones |
 | `WithReplicas(n)` | 1 | Replication factor (use 3 for production) |
 | `WithPublishTimeout(d)` | 5s | Publish timeout |
+| `WithDuplicateWindow(d)` | server default (2m) | How long the stream remembers a message id, see [Message ids](#message-ids) |
 | `WithMaxAckPending(n)` | 1000 | Max unacked messages per consumer (backpressure) |
 | `WithMaxRequestBatch(n)` | 100 | Max batch size per pull request |
 | `WithAckWait(d)` | 30s | Time before unacked message is redelivered |

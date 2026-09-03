@@ -1,6 +1,9 @@
 package replay
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+
 	"github.com/arloliu/helix/types"
 	"github.com/tinylib/msgp/msgp"
 )
@@ -35,6 +38,51 @@ type natsReplayMessage struct {
 	HasSerialConsistency bool             `msg:"has_serial_consistency"`
 	SerialConsistency    uint16           `msg:"serial_consistency"`
 	NonIdempotent        bool             `msg:"non_idempotent"`
+}
+
+// identitySchema tags the layout of the bytes hashed into a message id,
+// separately from the wire version: a field added to the identity bumps
+// it, so ids from before and after the change never collide by accident.
+const identitySchema uint8 = 1
+
+// messageID returns the Nats-Msg-Id of an idempotent envelope: the hex
+// SHA-256 of its identity fields (target cluster, timestamp, priority,
+// consistency levels, and the statement with its encoded arguments, or the
+// batch type and every statement in order), each written with the msgp
+// encoder so fields are length-prefixed and map arguments are already in
+// sorted key order. The wire version is not part of it.
+//
+// A non-idempotent envelope returns "": two distinct counter updates can
+// share every identity field within one microsecond, and JetStream would
+// keep only one.
+func (m *natsReplayMessage) messageID() string {
+	if m.NonIdempotent {
+		return ""
+	}
+	buf := make([]byte, 0, 64+len(m.Query)+len(m.Args))
+	buf = msgp.AppendUint8(buf, identitySchema)
+	buf = msgp.AppendString(buf, m.TargetCluster)
+	buf = msgp.AppendInt64(buf, m.Timestamp)
+	buf = msgp.AppendInt(buf, m.Priority)
+	buf = msgp.AppendBool(buf, m.HasConsistency)
+	buf = msgp.AppendUint16(buf, m.Consistency)
+	buf = msgp.AppendBool(buf, m.HasSerialConsistency)
+	buf = msgp.AppendUint16(buf, m.SerialConsistency)
+	buf = msgp.AppendBool(buf, m.IsBatch)
+	if m.IsBatch {
+		buf = msgp.AppendUint8(buf, m.BatchType)
+		buf = msgp.AppendArrayHeader(buf, uint32(len(m.BatchStatements))) //nolint:gosec // a batch never approaches the header's range
+		for _, stmt := range m.BatchStatements {
+			buf = msgp.AppendString(buf, stmt.Query)
+			buf = msgp.AppendBytes(buf, stmt.Args)
+		}
+	} else {
+		buf = msgp.AppendString(buf, m.Query)
+		buf = msgp.AppendBytes(buf, m.Args)
+	}
+	sum := sha256.Sum256(buf)
+
+	return hex.EncodeToString(sum[:])
 }
 
 // consistencyToWire splits an optional consistency level into the envelope's

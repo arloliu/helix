@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason (`failover`, `alternative known good`, `manual`, `recovered`).
   The client installs its collector and event dispatcher on a read strategy
   that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- `replay.NATSReplayer.Enqueue` publishes every idempotent payload with a
+  `Nats-Msg-Id` derived from its identity (cluster, timestamp, priority,
+  consistency levels, statement and arguments), so a publish retried after
+  an ambiguous timeout is stored once within the stream's duplicate window
+  (`replay.WithDuplicateWindow`, server default two minutes). A
+  non-idempotent payload carries no id. Map arguments are now encoded in
+  sorted key order.
 - `replay.WithEvictionWatch()` makes a NATS worker poll the stream state
   once a second and report the messages the stream removed without this
   process acknowledging them (`MaxAge` expiry, `DiscardOld`, a purge):
