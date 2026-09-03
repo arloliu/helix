@@ -34,6 +34,7 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootMirrorMode(config),
 		validateRootDefaultMaxRows(config),
 		validateRootClusterWriteTimeout(config),
+		validateRootBehaviorProfile(config),
 		validateRootRecoveryProbe(config),
 		validateRootReplayWiring(config),
 		validateRootTimestampProvider(config),
@@ -132,6 +133,16 @@ func validateRootClusterWriteTimeout(config *ClientConfig) error {
 	}
 
 	return nil
+}
+
+// validateRootBehaviorProfile rejects a profile outside the declared constants.
+func validateRootBehaviorProfile(config *ClientConfig) error {
+	switch config.profile {
+	case Legacy, Safe:
+		return nil
+	default:
+		return newRootOptionError("WithBehaviorProfile", "unknown profile")
+	}
 }
 
 // validateRootRecoveryProbe rejects a negative Interval or Timeout on

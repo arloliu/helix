@@ -92,6 +92,23 @@ func DefaultTimestampProvider() int64 {
 	return time.Now().UnixMicro()
 }
 
+// BehaviorProfile selects a set of defaults for the options whose v1 default
+// is kept for compatibility. See [WithBehaviorProfile].
+type BehaviorProfile int
+
+const (
+	// Legacy keeps every v1 default. It is the default profile.
+	Legacy BehaviorProfile = iota
+
+	// Safe selects the defaults a future major version will adopt for the
+	// options the client itself owns: [WithRouteVeto] on. Options owned by
+	// a policy or replayer constructor keep their own settings; the client
+	// logs a startup warning naming the option to change for each one it
+	// can observe (WithFailoverBelowThreshold, WithLatencyFailoverBelowThreshold,
+	// and the replay stream settings).
+	Safe
+)
+
 // AckMode selects when a dual-cluster write that no cluster acknowledged
 // synchronously is reported as success.
 //
@@ -301,6 +318,10 @@ type ClientConfig struct {
 	// recoveryProbeOff disables the recovery probe even when AdaptiveDualWrite
 	// is detected. Set via [WithRecoveryProbeDisabled].
 	recoveryProbeOff bool
+
+	// profile is the [BehaviorProfile] selected via [WithBehaviorProfile];
+	// kept so validation can reject an unknown value.
+	profile BehaviorProfile
 }
 
 // SessionRefresher builds a fresh [cql.Session] for the given cluster.
@@ -391,6 +412,37 @@ func WithWriteStrategy(strategy WriteStrategy) Option {
 func WithFailoverPolicy(policy FailoverPolicy) Option {
 	return func(c *ClientConfig) {
 		c.FailoverPolicy = policy
+	}
+}
+
+// WithBehaviorProfile applies a [BehaviorProfile]: a named set of values
+// for the client-owned options whose v1 default is kept only for
+// compatibility.
+//
+// It is pure option expansion: [Safe] is exactly WithRouteVeto(true), and
+// a later option in the same NewCQLClient call overrides it. It adds no
+// behaviour of its own.
+//
+// Parameters:
+//   - profile: [Legacy] (the default) or [Safe]
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	client, err := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithBehaviorProfile(helix.Safe),
+//	    helix.WithFailoverPolicy(policy.NewLatencyCircuitBreaker(
+//	        policy.WithLatencyFailoverBelowThreshold(true),
+//	    )),
+//	)
+func WithBehaviorProfile(profile BehaviorProfile) Option {
+	return func(c *ClientConfig) {
+		c.profile = profile
+		if profile == Safe {
+			c.RouteVeto = true
+		}
 	}
 }
 

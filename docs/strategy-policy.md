@@ -554,7 +554,8 @@ default in v1; the client logs a startup warning while it is off). The veto is a
 paging cursors, `AllowedClusters` overrides, and CAS are never rerouted, a read moves only when
 the other cluster is neither draining nor vetoed, and a FallbackRead probe skips a vetoed
 alternative. The veto never calls `OnFailure`; the strategy's ordinary `OnSuccess` for the
-cluster that served the read is unchanged.
+cluster that served the read is unchanged. `helix.WithBehaviorProfile(helix.Safe)` turns the
+veto on together with any future client-owned default that changes in the next major version.
 
 **Configuration validation:**
 

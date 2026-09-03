@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WithBehaviorProfile(Safe)` selects the defaults a future major version
+  will adopt for the client-owned options kept at their v1 value for
+  compatibility; today that is `WithRouteVeto(true)`. It is pure option
+  expansion, so a later option in the same call overrides it. Options owned
+  by a policy or replayer constructor (`WithFailoverBelowThreshold`,
+  `WithLatencyFailoverBelowThreshold`, the replay stream settings) keep
+  their own defaults and their startup warnings.
 - `policy.WithFailoverBelowThreshold(bool)` and
   `policy.WithLatencyFailoverBelowThreshold(bool)` let a failed read retry on
   the other cluster while the breaker is still closed. Default `false` keeps
