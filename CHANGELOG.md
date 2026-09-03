@@ -33,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether the write was admitted to the replay queue, and matches
   `errors.Is(err, types.ErrNoSynchronousAck)`. A write with one
   acknowledgement still returns `nil`. A leg still running in the
-  background counts as admitted: its failure is enqueued when it
-  completes. Restore the previous result for queued writes with one line:
+  background counts as admitted provisionally: its failure is enqueued
+  when it completes, and a failure to enqueue it then is reported only
+  through `WithOnReplayDropped` and `EventReplayDropped`. Restore the
+  previous result for queued writes with one line:
   `helix.WithAckMode(helix.AckOnReplayAdmission)`; a value outside the two
   declared modes is rejected by `NewCQLClient`.
 - Without a `Replayer`, a leg that needed replay is now counted in
@@ -64,9 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `helix.DeferredWriteResult` interface, and the client enqueues replay
   for that leg only if the background write reports a failure, instead of
   eagerly as a safety net beside a write that then succeeds. `Close`
-  waits for such legs before stopping the replay worker, so a failure
-  reported during shutdown is still enqueued, and `AdaptiveDualWrite`
-  releases its background slot before reporting the result. A custom
+  waits for replaying dual writes in progress and for such legs before
+  stopping the replay worker, so a failure reported during shutdown is
+  still enqueued, and `AdaptiveDualWrite` releases its background slot
+  before reporting the result. A `WithOnReplayDropped` handler must not
+  call `Close`. A custom
   strategy that returns a plain `types.ErrWriteAsync` keeps the immediate
   enqueue.
 - `Close` waits for the auto-refresh detector and topology watcher

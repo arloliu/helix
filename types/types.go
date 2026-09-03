@@ -239,8 +239,10 @@ type ReplayPayload struct {
 // The write may still land through the replay queue: Replay is nil when
 // every leg that needed replay was enqueued, and carries the enqueue error
 // (or [ErrNoReplayer]) otherwise.
-// A leg still running in the background counts as enqueued here: its
-// failure, if any, is enqueued when it completes.
+// A leg still running in the background counts as enqueued here
+// provisionally: its failure, if any, is enqueued when it completes, and a
+// failure to enqueue it then is reported only through the client's
+// replay-dropped callback and event.
 // Callers that accept a replay admission as success select that mode on
 // the client instead of inspecting Replay.
 //
