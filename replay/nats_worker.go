@@ -72,11 +72,6 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		ratio = 1 // 1:1 equal priority
 	}
 
-	wait := b.backoffWait
-	if wait == nil {
-		wait = time.After
-	}
-
 	var nextDepthAt time.Time
 	retained := b.config.RetryPolicy == RetryWhileRetained
 
@@ -85,6 +80,17 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		case <-b.stopCh:
 			return
 		default:
+		}
+
+		if !b.config.allows(cluster) {
+			// Leave the cluster's messages server-side while it is gated.
+			b.config.observeIdle(cluster)
+			select {
+			case <-b.stopCh:
+				return
+			case <-b.after(b.config.PollInterval):
+				continue
+			}
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -116,7 +122,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 			select {
 			case <-b.stopCh:
 				return
-			case <-wait(b.config.PollInterval):
+			case <-b.after(b.config.PollInterval):
 				continue
 			}
 		}
@@ -127,7 +133,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 			select {
 			case <-b.stopCh:
 				return
-			case <-wait(b.config.PollInterval):
+			case <-b.after(b.config.PollInterval):
 				continue
 			}
 		}
@@ -240,15 +246,15 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage, retained bool) {
 	for i, msg := range msgs {
 		select {
 		case <-b.stopCh:
-			// Nak the current message AND every unprocessed message left
-			// in the batch. Each Nak is independent; an error on one does
-			// not block the others.
-			for j := i; j < len(msgs); j++ {
-				b.nakMessage(msgs[j], "shutdown", 0)
-			}
+			b.nakTail(msgs[i:])
 
 			return
 		default:
+		}
+		if !b.holdWhileGated(msgs[i:]) {
+			b.nakTail(msgs[i:])
+
+			return
 		}
 
 		if retained {
@@ -318,6 +324,64 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage, retained bool) {
 			if b.config.OnSuccess != nil {
 				b.config.OnSuccess(msg.Payload)
 			}
+		}
+	}
+}
+
+// after is time.After, or the test seam installed in backoffWait.
+func (b *natsBackend) after(d time.Duration) <-chan time.Time {
+	if b.backoffWait != nil {
+		return b.backoffWait(d)
+	}
+
+	return time.After(d)
+}
+
+// nakTail NAKs every message in tail; see processMessages for why a
+// shutdown NAKs the unprocessed rest of a batch.
+func (b *natsBackend) nakTail(tail []ReplayMessage) {
+	for _, msg := range tail {
+		b.nakMessage(msg, "shutdown", 0)
+	}
+}
+
+// holdWhileGated keeps a fetched batch alive while the gate refuses its
+// cluster: every unprocessed message is marked in progress at a fraction
+// of the consumer's AckWait so nothing is redelivered or charged a delivery
+// while parked. It returns true once the gate permits execution and false
+// when the worker stops first.
+func (b *natsBackend) holdWhileGated(tail []ReplayMessage) bool {
+	cluster := tail[0].Payload.TargetCluster
+	if b.config.allows(cluster) {
+		return true
+	}
+	// The gate is polled every PollInterval, but the acknowledgement
+	// timers are only refreshed once a third of AckWait has passed, so a
+	// long quarantine does not turn into a stream of InProgress calls.
+	refreshEvery := b.config.PollInterval
+	if ackWait := b.replayer.config.AckWait; ackWait > 0 {
+		refreshEvery = max(refreshEvery, ackWait/3)
+	}
+	var lastRefresh time.Time
+	for {
+		if time.Since(lastRefresh) >= refreshEvery {
+			lastRefresh = time.Now()
+			for _, msg := range tail {
+				if err := msg.InProgress(); err != nil {
+					b.config.Logger.Debug("failed to mark gated replay message in progress",
+						"cluster", b.clusterName(cluster),
+						"error", err.Error(),
+					)
+				}
+			}
+		}
+		select {
+		case <-b.stopCh:
+			return false
+		case <-b.after(b.config.PollInterval):
+		}
+		if b.config.allows(cluster) {
+			return true
 		}
 	}
 }

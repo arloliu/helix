@@ -218,6 +218,11 @@ type ClientConfig struct {
 	// Default: false.
 	RouteVeto bool
 
+	// ReplayGate is the operator's replay control: replay to a cluster
+	// runs only while it returns true (and the cluster is not draining).
+	// nil permits every cluster. See [WithReplayGate].
+	ReplayGate func(cluster ClusterID) bool
+
 	// ClusterWriteTimeout bounds each cluster's leg of a dual write
 	// independently of the caller's context. See [WithClusterWriteTimeout].
 	//
@@ -443,6 +448,47 @@ func WithBehaviorProfile(profile BehaviorProfile) Option {
 		if profile == Safe {
 			c.RouteVeto = true
 		}
+	}
+}
+
+// WithReplayGate installs the operator's replay control: replay to a
+// cluster executes only while the predicate returns true for it.
+//
+// The client composes the predicate with drain (a draining cluster never
+// receives replay) and installs the result as the cluster gate of the
+// replay worker it builds for [WithAutoMemoryWorker]: queued payloads for a
+// gated cluster stay queued without consuming attempts or their retry
+// window, and execution resumes within the worker's poll interval once the
+// gate opens. Use it to quarantine a cluster during a repair or a schema
+// change, or to hold replay back until a returning cluster is ready for
+// writes. Mirror workers are never gated by the source client, and a
+// worker supplied through [WithReplayWorker] must carry its own
+// [replay.WithClusterGate]; the client logs a startup warning in that case.
+//
+// The predicate runs before every replay attempt, so it must be cheap,
+// non-blocking, and safe for concurrent use. A predicate that panics
+// counts as closed. As with any other option, a later WithReplayGate in
+// the same call replaces an earlier one.
+//
+// Parameters:
+//   - allow: Returns true when replay to the cluster may execute; nil
+//     permits every cluster
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	var quarantined atomic.Bool
+//	client, err := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithAutoMemoryWorker(10000),
+//	    helix.WithReplayGate(func(c helix.ClusterID) bool {
+//	        return c != helix.ClusterA || !quarantined.Load()
+//	    }),
+//	)
+func WithReplayGate(allow func(cluster ClusterID) bool) Option {
+	return func(c *ClientConfig) {
+		c.ReplayGate = allow
 	}
 }
 

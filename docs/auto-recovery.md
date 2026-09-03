@@ -80,6 +80,11 @@ A is down           A comes back      reads auto-recover to A
 - The recovering cluster missed a meaningful volume of writes
 - You need to guarantee read consistency before switching back
 
+**Replay holds back for a draining or quarantined cluster.** The replay worker a client builds with
+`WithAutoMemoryWorker` never executes against a draining cluster, and `helix.WithReplayGate` lets
+the operator hold replay back for any reason; queued writes wait, without consuming retries, until
+the gate opens. See [Hold Replay Back per Cluster](replay-system.md#9-hold-replay-back-per-cluster).
+
 **Automatic backlog gating.** `helix.ExcludeWhileReplayBacklog` builds an `AllowedClusters`
 function that keeps reads away from a cluster while its replay backlog is above a threshold,
 so reads return to a recovered cluster only after its backlog has drained:

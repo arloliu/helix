@@ -23,6 +23,11 @@ const (
 	// ReplayDropRetryWindowExpired: the memory worker's retention window
 	// elapsed before the payload could be replayed.
 	ReplayDropRetryWindowExpired = "retry_window_expired"
+
+	// ReplayDropRequeueFailed: the memory worker could not put a payload
+	// back in its queue after the cluster gate closed between dequeue and
+	// execution, because the queue had filled meanwhile.
+	ReplayDropRequeueFailed = "requeue_failed"
 )
 
 // ReplayBacklogMetrics is an OPTIONAL interface that [MetricsCollector]

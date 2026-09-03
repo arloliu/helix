@@ -924,7 +924,32 @@ for the same messages to be non-overlapping. The built-in `NATSWorker` uses
 
 ---
 
-### 9. Isolate Streams per Deployment
+### 9. Hold Replay Back per Cluster
+
+The replay worker consults a cluster gate before every execution attempt:
+`replay.WithClusterGate(func(types.ClusterID) bool)` on either backend, and repeated gates compose by
+AND. A gated cluster's payloads stay queued (memory) or server-side (NATS) without consuming an
+attempt or the retry window; a NATS batch already fetched is kept in progress rather than NAK'd, so a
+bounded consumer's delivery budget is never spent while gated. Execution resumes within
+`PollInterval` once the gate opens.
+
+A `helix.NewCQLClient` with `WithAutoMemoryWorker` installs its own gate on the worker it builds:
+replay never runs against a draining cluster, and `helix.WithReplayGate(func(helix.ClusterID) bool)`
+adds the operator's control, for example to quarantine a cluster during a repair. Mirror workers
+are not gated by the source client, and a worker supplied through `WithReplayWorker` must carry its
+own gate (the client logs a startup warning otherwise).
+
+```go
+var quarantined atomic.Bool
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithAutoMemoryWorker(10000),
+    helix.WithReplayGate(func(c helix.ClusterID) bool {
+        return c != helix.ClusterA || !quarantined.Load()
+    }),
+)
+```
+
+### 10. Isolate Streams per Deployment
 
 Every message is routed by subject prefix, priority, and target cluster
 (`{prefix}.{priority}.{A|B}`).
