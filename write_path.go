@@ -142,21 +142,6 @@ func (c *CQLClient) recordWriteLegMetrics(cluster ClusterID, leg writeLegErrKind
 	}
 }
 
-// recordWriteOutcome feeds one leg's outcome to the auto-refresh detector.
-// A failure observed after the caller's context ended is the caller's
-// doing, not the cluster's, and is not recorded.
-func (c *CQLClient) recordWriteOutcome(ctx context.Context, cluster ClusterID, err error) {
-	c.recordWriteOutcomeAt(ctx, cluster, err, 0)
-}
-
-// recordWriteOutcomeAt is recordWriteOutcome with a caller-captured clock.
-func (c *CQLClient) recordWriteOutcomeAt(ctx context.Context, cluster ClusterID, err error, nowNano int64) {
-	if err != nil && ctx.Err() != nil {
-		return
-	}
-	c.recordOpOutcomeAt(cluster, err, nowNano)
-}
-
 // executeWriteWithReplay performs a write operation with optional dual-write and replay support.
 //
 // In single-cluster mode, the write is executed directly on sessionA.
@@ -178,11 +163,12 @@ func (c *CQLClient) executeWriteWithReplay(
 	}
 
 	// Single-cluster mode: direct execution, no dual-write logic.
-	// recordOpOutcome must run here so the auto-refresh detector sees
+	// The hub must hear the outcome here so the auto-refresh detector sees
 	// cluster-A outcomes — no other code path observes err for stats.
 	if c.IsSingleCluster() {
-		err := writeFunc(ctx, c.loadSessionA())
-		c.recordWriteOutcome(ctx, ClusterA, err)
+		holder := c.holderFor(ClusterA)
+		err := writeFunc(ctx, holder.s)
+		c.health.writeLeg(holder, classifyWriteLeg(ctx, err), err, c.config.NowProvider())
 
 		return err
 	}
@@ -223,29 +209,40 @@ func (c *CQLClient) executeWriteWithReplay(
 func (c *CQLClient) writeLegs(
 	writeFunc func(context.Context, cql.Session) error,
 	drainA, drainB bool,
-	startA, startB *atomic.Int64,
+	legA, legB *writeLegState,
 ) (writeA, writeB func(context.Context) error) {
-	return c.writeLeg(writeFunc, drainA, startA, c.loadSessionA),
-		c.writeLeg(writeFunc, drainB, startB, c.loadSessionB)
+	return c.writeLeg(writeFunc, drainA, legA, &c.sessionA),
+		c.writeLeg(writeFunc, drainB, legB, &c.sessionB)
+}
+
+// writeLegState is what one leg publishes for the aggregation that follows
+// the strategy: when it started and which session holder it used. Both are
+// atomics because a fire-and-forget leg writes them from its own goroutine.
+type writeLegState struct {
+	start  atomic.Int64
+	holder atomic.Pointer[sessionHolder]
 }
 
 // writeLeg builds one cluster's leg: a draining cluster is skipped, the
-// start time is stamped, and the write runs under legContext.
+// start time and the session holder are published, and the write runs
+// under legContext.
 func (c *CQLClient) writeLeg(
 	writeFunc func(context.Context, cql.Session) error,
 	draining bool,
-	start *atomic.Int64,
-	loadSession func() cql.Session,
+	state *writeLegState,
+	slot *atomic.Pointer[sessionHolder],
 ) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if draining {
 			return types.ErrClusterDraining
 		}
-		start.Store(time.Now().UnixNano())
+		state.start.Store(time.Now().UnixNano())
+		holder := slot.Load()
+		state.holder.Store(holder)
 		ctx, cancel := c.legContext(ctx)
 		defer cancel()
 
-		return writeFunc(ctx, loadSession())
+		return writeFunc(ctx, holder.s)
 	}
 }
 
@@ -289,11 +286,11 @@ func (c *CQLClient) executeDualWrite(
 	}
 	defer c.deferred.done()
 
-	// Dual-cluster mode: concurrent writes with replay support
-	// Note: We capture start times outside the write functions to avoid data races
-	// when WriteStrategy uses fire-and-forget (background goroutines).
-	var startA, startB atomic.Int64
-	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &startA, &startB)
+	// Dual-cluster mode: concurrent writes with replay support.
+	// Each leg publishes its start time and session holder through atomics
+	// because a fire-and-forget strategy runs it on a background goroutine.
+	var legStateA, legStateB writeLegState
+	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &legStateA, &legStateB)
 
 	var errA, errB error
 
@@ -334,18 +331,14 @@ func (c *CQLClient) executeDualWrite(
 	now := time.Now()
 	nowNano := now.UnixNano()
 
-	c.recordWriteLegMetrics(ClusterA, legA, startA.Load(), nowNano)
-	c.recordWriteLegMetrics(ClusterB, legB, startB.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
 
-	// Auto-refresh stat tracking — invoked PER cluster so partial-success
-	// (A=ok, B=err) correctly advances A's lastSuccess while accumulating
-	// failures on B. recordOpOutcomeAt internally skips ErrWriteAsync /
-	// ErrWriteDropped / ErrNotFound so operational states don't poison
-	// the failure counters, and a caller-cancelled leg is skipped here.
-	// Reuse the already-captured nowNano so the helper does not re-sample
-	// the clock.
-	c.recordWriteOutcomeAt(ctx, ClusterA, errA, nowNano)
-	c.recordWriteOutcomeAt(ctx, ClusterB, errB, nowNano)
+	// Session liveness — reported PER leg so a partial success (A=ok,
+	// B=err) advances A's lastSuccess while accumulating failures on B.
+	// The hub ignores async, dropped, skipped, and caller-cancelled legs.
+	c.health.writeLeg(legStateA.holder.Load(), legA, errA, nowNano)
+	c.health.writeLeg(legStateB.holder.Load(), legB, errB, nowNano)
 
 	// Both succeeded definitively.
 	if errA == nil && errB == nil {
@@ -621,8 +614,8 @@ func (c *CQLClient) executeStrictDualWrite(
 	writeFunc func(context.Context, cql.Session) error,
 	drainA, drainB bool,
 ) error {
-	var startA, startB atomic.Int64
-	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &startA, &startB)
+	var legStateA, legStateB writeLegState
+	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &legStateA, &legStateB)
 
 	var errA, errB error
 
@@ -647,11 +640,13 @@ func (c *CQLClient) executeStrictDualWrite(
 	now := time.Now()
 	nowNano := now.UnixNano()
 
-	c.recordWriteLegMetrics(ClusterA, classifyWriteLeg(ctx, errA), startA.Load(), nowNano)
-	c.recordWriteLegMetrics(ClusterB, classifyWriteLeg(ctx, errB), startB.Load(), nowNano)
+	legA := classifyWriteLeg(ctx, errA)
+	legB := classifyWriteLeg(ctx, errB)
+	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
 
-	c.recordWriteOutcomeAt(ctx, ClusterA, errA, nowNano)
-	c.recordWriteOutcomeAt(ctx, ClusterB, errB, nowNano)
+	c.health.writeLeg(legStateA.holder.Load(), legA, errA, nowNano)
+	c.health.writeLeg(legStateB.holder.Load(), legB, errB, nowNano)
 
 	if errA == nil && errB == nil {
 		return nil

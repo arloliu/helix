@@ -430,36 +430,6 @@ func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOpt
 	}
 }
 
-// recordReadFailure records a cluster fault on a read leg: the error
-// metric, the auto-refresh counter, and the failover policy.
-func (c *CQLClient) recordReadFailure(cluster ClusterID, err error) {
-	c.config.Metrics.IncReadError(cluster)
-	c.recordOpOutcome(cluster, err)
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(cluster)
-	}
-}
-
-// recordReadSuccess records a successful read, using latency-aware recording if supported.
-// When overrideActive is true, the ReadStrategy is frozen (no OnSuccess call).
-// FailoverPolicy always receives health signals regardless of override state.
-//
-// A policy that implements [LatencyRecorder] receives RecordLatency instead
-// of RecordSuccess: the sample is its success signal, and calling both would
-// let RecordSuccess erase the slow-read count a latency breaker keeps.
-func (c *CQLClient) recordReadSuccess(cluster ClusterID, elapsed float64, overrideActive bool) {
-	if !overrideActive && c.config.ReadStrategy != nil {
-		c.config.ReadStrategy.OnSuccess(cluster)
-	}
-	if c.config.FailoverPolicy != nil {
-		if recorder, ok := c.config.FailoverPolicy.(LatencyRecorder); ok {
-			recorder.RecordLatency(cluster, time.Duration(elapsed*float64(time.Second)))
-		} else {
-			c.config.FailoverPolicy.RecordSuccess(cluster)
-		}
-	}
-}
-
 // primaryAttemptResult captures the outcome of one primary-cluster read
 // attempt. It carries enough state for either the failover-enabled or the
 // no-failover wrapper to record terminal signals correctly without each
@@ -475,6 +445,7 @@ type primaryAttemptResult struct {
 	attempted bool
 	target    readTarget
 	selected  ClusterID
+	holder    *sessionHolder // the session the attempt used
 	elapsed   float64
 	err       error
 }
@@ -483,11 +454,9 @@ type primaryAttemptResult struct {
 // attempt fail-closed checks, cluster selection through resolveReadTarget,
 // and the once-per-attempt IncReadTotal / ObserveReadDuration metrics.
 //
-// runPrimaryRead intentionally does NOT call IncReadError, recordOpOutcome,
-// recordReadSuccess, or FailoverPolicy.RecordFailure. Those terminal
-// signals are caller-owned so RecordFailure fires exactly once per primary
-// failure: executeRead delegates it to its failover branch;
-// executeReadNoFailover records it itself.
+// runPrimaryRead intentionally reports nothing to the observation hub.
+// Those terminal signals are caller-owned so each fires exactly once per
+// attempt.
 func (c *CQLClient) runPrimaryRead(
 	ctx context.Context,
 	opts readOptions,
@@ -502,36 +471,44 @@ func (c *CQLClient) runPrimaryRead(
 		return primaryAttemptResult{err: rt.err, target: rt}
 	}
 
-	var selected ClusterID
-	var session cql.Session
-
+	// Single-cluster mode applies whether AllowedClusters is nil, returns
+	// nil/empty, or returns [ClusterA]: resolveReadTarget returns ClusterA
+	// and holderFor maps every cluster to the only session. Otherwise
+	// resolveReadTarget already moved the selection away from an
+	// ineligible cluster where the options allow it.
+	selected := rt.cluster
 	if c.IsSingleCluster() {
-		// Single-cluster mode applies whether AllowedClusters is nil,
-		// returns nil/empty, or returns [ClusterA]. In all cases
-		// resolveReadTarget returns ClusterA; there is no second session.
 		selected = ClusterA
-		session = c.loadSessionA()
-	} else {
-		// resolveReadTarget already moved the selection away from a
-		// draining cluster where the options allow it.
-		selected = rt.cluster
-		session = c.getSession(selected)
 	}
-
-	start := time.Now()
-	err := readFunc(ctx, session)
-	elapsed := time.Since(start).Seconds()
-
-	c.config.Metrics.IncReadTotal(selected)
-	c.config.Metrics.ObserveReadDuration(selected, elapsed)
+	holder, elapsed, err := c.attemptRead(ctx, selected, readFunc)
 
 	return primaryAttemptResult{
 		attempted: true,
 		target:    rt,
 		selected:  selected,
+		holder:    holder,
 		elapsed:   elapsed,
 		err:       err,
 	}
+}
+
+// attemptRead runs readFunc once against the installed session for
+// cluster and records the per-attempt metrics. It returns the holder the
+// attempt used so the outcome can be reported against it.
+func (c *CQLClient) attemptRead(
+	ctx context.Context,
+	cluster ClusterID,
+	readFunc func(context.Context, cql.Session) error,
+) (holder *sessionHolder, elapsed float64, err error) {
+	holder = c.holderFor(cluster)
+	start := time.Now()
+	err = readFunc(ctx, holder.s)
+	elapsed = time.Since(start).Seconds()
+
+	c.config.Metrics.IncReadTotal(cluster)
+	c.config.Metrics.ObserveReadDuration(cluster, elapsed)
+
+	return holder, elapsed, err
 }
 
 // executeRead performs a read operation with optional sticky routing and failover.
@@ -562,14 +539,7 @@ func (c *CQLClient) executeRead(
 	}
 
 	if res.err == nil {
-		// Single-cluster mode never invoked ReadStrategy.OnSuccess /
-		// FailoverPolicy.RecordSuccess pre-v1.5.0 — neither is meaningful
-		// without a second cluster, and configured policies must keep
-		// their pre-refactor activity.
-		if !c.IsSingleCluster() {
-			c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
-		}
-		c.recordOpOutcome(res.selected, nil)
+		c.health.readSucceeded(res.holder, res.selected, res.target.snap.active, res.elapsed)
 		return nil
 	}
 
@@ -585,14 +555,11 @@ func (c *CQLClient) executeRead(
 		return res.err
 	}
 
-	// Real error path: record IncReadError + recordOpOutcome here, but
-	// leave RecordFailure to the failover branch so it is called exactly
-	// once across the two layers.
-	c.config.Metrics.IncReadError(res.selected)
-	c.recordOpOutcome(res.selected, res.err)
+	// Real error path: the hub records the metric, the stats, and the
+	// policy failure once; the failover branch below only decides routing.
+	c.health.readFailed(res.holder, res.selected, kind, res.err)
 
-	// Single-cluster real-error has no failover target; preserve today's
-	// fast-path behavior (return the error without calling RecordFailure).
+	// Single-cluster real-error has no failover target.
 	if c.IsSingleCluster() {
 		return res.err
 	}
@@ -610,10 +577,10 @@ func (c *CQLClient) executeRead(
 // PageState cursor or (for SliceScan) re-invoke the caller's scanFn after
 // partial accumulator mutation.
 //
-// On a real primary error, executeReadNoFailover records IncReadError,
-// recordOpOutcome, AND FailoverPolicy.RecordFailure (in dual-cluster mode)
-// so per-cluster health stays consistent with executeRead's failover path.
-// The returned error is the primary's error verbatim.
+// On a real primary error, executeReadNoFailover reports the failure to
+// the observation hub exactly as executeRead does, so per-cluster health
+// stays consistent with the failover path. The returned error is the
+// primary's error verbatim.
 //
 // opts.fallbackRead is honored; single-cluster mode skips the fallback
 // invocation and returns the primary error directly.
@@ -628,13 +595,7 @@ func (c *CQLClient) executeReadNoFailover(
 	}
 
 	if res.err == nil {
-		// Symmetric with executeRead's single-cluster gate: skip
-		// ReadStrategy.OnSuccess / FailoverPolicy.RecordSuccess in
-		// single-cluster mode where neither is meaningful.
-		if !c.IsSingleCluster() {
-			c.recordReadSuccess(res.selected, res.elapsed, res.target.snap.active)
-		}
-		c.recordOpOutcome(res.selected, nil)
+		c.health.readSucceeded(res.holder, res.selected, res.target.snap.active, res.elapsed)
 		return nil
 	}
 
@@ -651,17 +612,9 @@ func (c *CQLClient) executeReadNoFailover(
 		return res.err
 	}
 
-	// Real error path: record ALL terminal signals here because there is
-	// no failover branch to claim ownership of RecordFailure. RecordFailure
-	// is gated on dual-cluster + a configured FailoverPolicy to preserve
-	// today's single-cluster behavior (no RecordFailure when there is no
-	// alternative cluster to fail over to).
-	if c.IsSingleCluster() {
-		c.config.Metrics.IncReadError(res.selected)
-		c.recordOpOutcome(res.selected, res.err)
-	} else {
-		c.recordReadFailure(res.selected, res.err)
-	}
+	// Real error path: there is no failover branch, so the hub is the one
+	// place every terminal signal is recorded.
+	c.health.readFailed(res.holder, res.selected, kind, res.err)
 
 	return res.err
 }
@@ -675,10 +628,6 @@ func (c *CQLClient) executeOverrideFailover(
 	readFunc func(context.Context, cql.Session) error,
 ) error {
 	selected := rt.cluster
-
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(selected)
-	}
 
 	// No failover target in the override list
 	if rt.snap.fallback == "" || rt.snap.fallback == selected {
@@ -706,12 +655,10 @@ func (c *CQLClient) executeNormalFailover(
 	primaryErr error,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	if c.config.FailoverPolicy != nil {
-		c.config.FailoverPolicy.RecordFailure(selectedCluster)
-
-		if !c.config.FailoverPolicy.ShouldFailover(selectedCluster, primaryErr) {
-			return primaryErr
-		}
+	// The hub has already recorded the failure; the policy now only decides
+	// whether this request may retry on the other cluster.
+	if c.config.FailoverPolicy != nil && !c.config.FailoverPolicy.ShouldFailover(selectedCluster, primaryErr) {
+		return primaryErr
 	}
 
 	// Ask strategy for alternative.
@@ -770,17 +717,9 @@ func (c *CQLClient) tryFallbackCluster(
 		Err:         primaryErr,
 	})
 
-	session := c.getSession(fallback)
-	start := time.Now()
-	err := readFunc(ctx, session)
-	elapsed := time.Since(start).Seconds()
-
-	c.config.Metrics.IncReadTotal(fallback)
-	c.config.Metrics.ObserveReadDuration(fallback, elapsed)
-
+	holder, elapsed, err := c.attemptRead(ctx, fallback, readFunc)
 	if err == nil {
-		c.recordReadSuccess(fallback, elapsed, overrideActive)
-		c.recordOpOutcome(fallback, nil)
+		c.health.readSucceeded(holder, fallback, overrideActive, elapsed)
 		return nil
 	}
 
@@ -790,11 +729,12 @@ func (c *CQLClient) tryFallbackCluster(
 	// ErrRowLimitExceeded reaching this site means the failover cluster
 	// also exceeded the application cap; the caller wants to see that, not
 	// a wrapped two-cluster error.
-	if !classifyReadErr(ctx, err).isHealthSignal() {
+	kind := classifyReadErr(ctx, err)
+	if !kind.isHealthSignal() {
 		return err
 	}
 
-	c.recordReadFailure(fallback, err)
+	c.health.readFailed(holder, fallback, kind, err)
 
 	if selected == ClusterA {
 		return &types.DualClusterError{ErrorA: primaryErr, ErrorB: err}
@@ -884,18 +824,10 @@ func (c *CQLClient) executeFallbackRead(
 		"toCluster", c.clusterName(alternativeCluster),
 	)
 
-	alternativeSession := c.getSession(alternativeCluster)
-	start := time.Now()
-	err := readFunc(ctx, alternativeSession)
-	elapsed := time.Since(start).Seconds()
-
-	c.config.Metrics.IncReadTotal(alternativeCluster)
-	c.config.Metrics.ObserveReadDuration(alternativeCluster, elapsed)
-
+	alternative, elapsed, err := c.attemptRead(ctx, alternativeCluster, readFunc)
 	if err == nil {
 		// Found the data on the alternative cluster — divergence (replay lag).
-		c.recordReadSuccess(alternativeCluster, elapsed, snap.active)
-		c.recordOpOutcome(alternativeCluster, nil)
+		c.health.readSucceeded(alternative, alternativeCluster, snap.active, elapsed)
 		c.config.Metrics.IncReadDivergence(selectedCluster)
 		c.config.Logger.Debug("fallback read: found data on alternative cluster",
 			"staleCluster", c.clusterName(selectedCluster),
@@ -909,7 +841,8 @@ func (c *CQLClient) executeFallbackRead(
 		return nil
 	}
 
-	switch classifyReadErr(ctx, err) {
+	kind := classifyReadErr(ctx, err)
+	switch kind {
 	case readNotFound:
 		// Both clusters confirmed the row is absent — definitively not found.
 		c.config.Logger.Debug("fallback read: alternative cluster also returned not-found",
@@ -937,7 +870,7 @@ func (c *CQLClient) executeFallbackRead(
 	}
 
 	// Alternative returned a real error: record health on the alt.
-	c.recordReadFailure(alternativeCluster, err)
+	c.health.readFailed(alternative, alternativeCluster, kind, err)
 
 	// Propagation is governed independently: opts.propagateAltErr lets the
 	// SliceScan caller surface "scanFn was invoked on alt" to the caller.

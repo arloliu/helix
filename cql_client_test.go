@@ -1813,8 +1813,9 @@ func TestExecuteDualWrite_AsyncLogIsInfoNotWarn(t *testing.T) {
 // cql_client.go:1602/:1623 (running writeA inline instead of in its own
 // goroutine).
 type blockingSession struct {
-	entered chan struct{}
-	release chan struct{}
+	entered    chan struct{}
+	release    chan struct{}
+	releaseErr error // returned by the write once release is closed
 }
 
 func newBlockingSession() *blockingSession {
@@ -1848,7 +1849,7 @@ func (q *blockingQuery) ExecContext(ctx context.Context) error {
 	}
 	select {
 	case <-q.session.release:
-		return nil
+		return q.session.releaseErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}

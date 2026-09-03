@@ -15,6 +15,7 @@ type cqlIter struct {
 	iter           cql.Iter
 	client         *CQLClient
 	cluster        ClusterID
+	holder         *sessionHolder  // the session the iterator was opened on
 	ctx            context.Context // the caller's context, for error provenance on Close
 	overrideActive bool            // captured from readTarget at creation, not re-evaluated
 
@@ -41,32 +42,7 @@ func (i *cqlIter) Close() error {
 
 func (i *cqlIter) closeAndReport() error {
 	err := i.iter.Close()
-	kind := classifyReadErr(i.ctx, err)
-	if kind != readCtxErr {
-		i.client.recordOpOutcome(i.cluster, err)
-	}
-
-	c := i.client
-	switch kind {
-	case readOK:
-		if !i.overrideActive && c.config.ReadStrategy != nil {
-			c.config.ReadStrategy.OnSuccess(i.cluster)
-		}
-		if !c.IsSingleCluster() && c.config.FailoverPolicy != nil {
-			c.config.FailoverPolicy.RecordSuccess(i.cluster)
-		}
-	case readClusterErr:
-		if c.IsSingleCluster() {
-			break
-		}
-		if c.config.FailoverPolicy != nil {
-			c.config.FailoverPolicy.RecordFailure(i.cluster)
-		}
-		if !i.overrideActive && c.config.ReadStrategy != nil {
-			c.config.ReadStrategy.OnFailure(i.cluster, err)
-		}
-	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
-	}
+	i.client.health.iterClosed(i.holder, i.cluster, classifyReadErr(i.ctx, err), err, i.overrideActive)
 
 	return err
 }

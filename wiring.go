@@ -347,6 +347,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	if config.RouteVeto {
 		client.routeVeto, _ = config.FailoverPolicy.(RouteVeto)
 	}
+	client.health = newClusterHealth(config, sessionB != nil)
 	client.storeSessionA(sessionA)
 	// Store sessionB even if nil; in single-cluster mode the holder wraps a
 	// nil cql.Session so loadSessionB() returns nil safely without a

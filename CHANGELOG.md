@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Session-liveness stats (the auto-refresh detector's consecutive failure
+  count, last success, and last error) now live on the installed session
+  rather than on the client: `SwapSession` and `RefreshSession` install a
+  session with fresh stats, and an operation that started on the replaced
+  session reports to that session, never to the new one. All health
+  observations now enter through one internal observation hub with a fixed
+  authority order; the read strategy, failover policy, and latency recorder
+  receive exactly the calls they received before.
 - The recovery probe logs a failing probe at `Warn` on the first failure and
   on every power-of-two count of consecutive failures, and at `Debug`
   otherwise; the first success after failures is logged at `Info`.
