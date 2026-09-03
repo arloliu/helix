@@ -181,6 +181,14 @@ type ClientConfig struct {
 	// Default: 0.
 	DefaultMaxRows int
 
+	// ClusterWriteTimeout bounds each cluster's leg of a dual write
+	// independently of the caller's context. See [WithClusterWriteTimeout].
+	//
+	// 0 disables the per-leg timeout. Must be >= 0.
+	//
+	// Default: 0.
+	ClusterWriteTimeout time.Duration
+
 	// AckMode selects whether a write with no synchronous acknowledgement
 	// may return nil. Default: RequireSynchronousAck. Set via [WithAckMode].
 	AckMode AckMode
@@ -1066,6 +1074,41 @@ func WithDefaultFallbackRead(enabled bool) Option {
 func WithDefaultMaxRows(n int) Option {
 	return func(c *ClientConfig) {
 		c.DefaultMaxRows = n
+	}
+}
+
+// WithClusterWriteTimeout bounds each cluster's leg of a dual write.
+//
+// Without it a write waits for its slowest leg: a cluster that accepts
+// connections but answers slowly holds every caller for as long as the
+// caller's own deadline allows, and a strategy that writes the clusters in
+// sequence may never reach the second one. With it, each leg runs under its
+// own deadline of d. A leg that expires counts as that cluster's failure:
+// it is replayed like any other failed leg, the other leg's acknowledgement
+// stands, and the expiry is a health signal for the slow cluster because the
+// deadline is Helix's own, not the caller's. A failure observed after the
+// caller's context ended is still attributed to the caller.
+//
+// The timeout applies to the normal and strict dual-write legs, including
+// the background legs a degraded [policy.AdaptiveDualWrite] dispatches.
+// It does not apply to single-cluster writes, reads, or mirror writes.
+//
+// Parameters:
+//   - d: Per-leg deadline. 0 disables the timeout. Negative values are
+//     rejected by NewCQLClient.
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	client, err := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithClusterWriteTimeout(2*time.Second),
+//	    helix.WithReplayer(replayer),
+//	)
+func WithClusterWriteTimeout(d time.Duration) Option {
+	return func(c *ClientConfig) {
+		c.ClusterWriteTimeout = d
 	}
 }
 

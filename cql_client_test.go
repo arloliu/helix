@@ -1806,7 +1806,8 @@ func TestExecuteDualWrite_AsyncLogIsInfoNotWarn(t *testing.T) {
 }
 
 // blockingSession is a cql.Session whose Query().ExecContext blocks until
-// release is closed, recording entry via entered before blocking. Used to
+// release is closed or the context ends, recording entry via entered before
+// blocking. Used to
 // prove that the default (no WriteStrategy) dual-write path still executes
 // both cluster writes concurrently after the alloc-perf fix at
 // cql_client.go:1602/:1623 (running writeA inline instead of in its own
@@ -1840,14 +1841,17 @@ func (q *blockingQuery) Statement() string                             { return 
 func (q *blockingQuery) Values() []any                                 { return nil }
 func (q *blockingQuery) Release()                                      {}
 func (q *blockingQuery) Exec() error                                   { return q.ExecContext(context.Background()) }
-func (q *blockingQuery) ExecContext(_ context.Context) error {
+func (q *blockingQuery) ExecContext(ctx context.Context) error {
 	select {
 	case q.session.entered <- struct{}{}:
 	default:
 	}
-	<-q.session.release
-
-	return nil
+	select {
+	case <-q.session.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 func (q *blockingQuery) Scan(_ ...any) error                           { return nil }
 func (q *blockingQuery) ScanContext(_ context.Context, _ ...any) error { return nil }

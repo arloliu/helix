@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WithClusterWriteTimeout(d)` bounds each cluster's leg of a dual write
+  independently of the caller's context. A leg that exceeds `d` is replayed
+  like any other failed leg and counts as that cluster's health failure,
+  while the other leg's acknowledgement stands. It applies to normal and
+  strict dual writes, including the background legs a degraded
+  `AdaptiveDualWrite` dispatches; it does not apply to single-cluster
+  writes, reads, or mirror writes. Default 0 (disabled).
+
 ### Changed
 
 - The recovery probe logs a failing probe at `Warn` on the first failure and
