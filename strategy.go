@@ -186,6 +186,21 @@ type ProbeReporter interface {
 	RecordProbeSuccess(cluster ClusterID)
 }
 
+// LatchReporter is an optional interface for write strategies whose
+// degraded state can be latched by an operator, such as
+// [policy.AdaptiveDualWrite] after ForceDegrade.
+//
+// A dual-cluster client skips the recovery probe for a latched cluster:
+// a probe could not restore it, and reporting probe successes against it
+// would misrepresent the operator's decision as pending recovery.
+//
+// Implementations MUST be safe for concurrent use from multiple goroutines.
+type LatchReporter interface {
+	// IsLatched reports whether cluster is held degraded by the operator
+	// until an explicit manual recovery.
+	IsLatched(cluster ClusterID) bool
+}
+
 // EventEmitterSetter is an optional interface for write strategies and
 // failover policies that emit cluster events (see [WithOnClusterEvent]).
 //

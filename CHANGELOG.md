@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AdaptiveDualWrite` dispatches; it does not apply to single-cluster
   writes, reads, or mirror writes. Default 0 (disabled).
 
+### Behavior change
+
+- `AdaptiveDualWrite.ForceDegrade` is now a sticky operator latch: fast
+  background writes and successful recovery probes no longer restore
+  synchronous writes on a cluster degraded by hand, and the client skips the
+  recovery probe for a latched cluster. Only `ForceRecover` or `Reset`
+  clears the latch. Previously a healthy cluster was restored by the probe
+  within a few ticks of `ForceDegrade`, silently undoing the operator's
+  isolation. The new `helix.LatchReporter` interface and
+  `AdaptiveDualWrite.IsLatched` expose the latch.
+
 ### Changed
 
 - The recovery probe logs a failing probe at `Warn` on the first failure and

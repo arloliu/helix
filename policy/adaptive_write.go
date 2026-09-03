@@ -106,6 +106,7 @@ type clusterWriteState struct {
 	slowStrikes int32        // Consecutive slow writes; guarded by mu.
 	fastStrikes int32        // Consecutive fast writes for recovery; guarded by mu.
 	isDegraded  atomic.Bool  // Lock-free read in Execute fast path; written under mu.
+	latched     atomic.Bool  // Operator latch set by ForceDegrade; written under mu.
 	lastLatency atomic.Int64 // Last write latency in nanoseconds; written from goroutines.
 
 	// reportSeq counts latched transitions (incremented under mu) and
@@ -1060,9 +1061,9 @@ func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
 
 	state.mu.Lock()
 	state.slowStrikes = 0 // Always clear, regardless of degraded state.
-	if !state.isDegraded.Load() {
+	if !state.isDegraded.Load() || state.latched.Load() {
 		state.mu.Unlock()
-		return // Healthy — no recovery credit needed.
+		return // Healthy, or held degraded by the operator: no recovery credit.
 	}
 	state.fastStrikes++
 	justRecovered := false
@@ -1097,13 +1098,48 @@ func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
 // Returns:
 //   - bool: true if the cluster is degraded
 func (a *AdaptiveDualWrite) IsDegraded(cluster types.ClusterID) bool {
-	if cluster == types.ClusterA {
-		return a.stateA.isDegraded.Load()
-	}
-	if cluster != types.ClusterB {
+	state := a.stateFor(cluster)
+	if state == nil {
 		return false
 	}
-	return a.stateB.isDegraded.Load()
+
+	return state.isDegraded.Load()
+}
+
+// stateFor returns the per-cluster state, or nil for an unknown cluster.
+func (a *AdaptiveDualWrite) stateFor(cluster types.ClusterID) *clusterWriteState {
+	switch cluster {
+	case types.ClusterA:
+		return &a.stateA
+	case types.ClusterB:
+		return &a.stateB
+	default:
+		return nil
+	}
+}
+
+// recoverState clears a cluster's degraded state and latch under its mutex
+// and queues the recovery event when this call performs the transition.
+// The caller reports the transition with the returned sequence.
+func (a *AdaptiveDualWrite) recoverState(state *clusterWriteState, cluster types.ClusterID, reason string) (wasDegraded bool, seq uint64) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	wasDegraded = state.isDegraded.Load()
+	state.isDegraded.Store(false)
+	state.latched.Store(false)
+	state.slowStrikes = 0
+	state.fastStrikes = 0
+	state.lastLatency.Store(0)
+	if wasDegraded {
+		seq = state.reportSeq.Add(1)
+		a.events.enqueue(types.ClusterEvent{
+			Kind:    types.EventWriteRecovered,
+			Cluster: cluster,
+			Reason:  reason,
+		})
+	}
+
+	return wasDegraded, seq
 }
 
 // Reset clears all health state, returning both clusters to healthy.
@@ -1132,24 +1168,7 @@ func (a *AdaptiveDualWrite) Reset() {
 
 	for _, state := range []*clusterWriteState{&a.stateA, &a.stateB} {
 		cluster := a.stateCluster(state)
-
-		state.mu.Lock()
-		wasDegraded := state.isDegraded.Load()
-		state.slowStrikes = 0
-		state.fastStrikes = 0
-		state.isDegraded.Store(false)
-		state.lastLatency.Store(0)
-		var seq uint64
-		if wasDegraded {
-			seq = state.reportSeq.Add(1)
-			a.events.enqueue(types.ClusterEvent{
-				Kind:    types.EventWriteRecovered,
-				Cluster: cluster,
-				Reason:  "manual reset",
-			})
-		}
-		state.mu.Unlock()
-
+		wasDegraded, seq := a.recoverState(state, cluster, "manual reset")
 		if wasDegraded {
 			anyRecovered = true
 			a.recordTransitionMetrics(state, cluster, false, seq)
@@ -1165,12 +1184,16 @@ func (a *AdaptiveDualWrite) Reset() {
 	}
 }
 
-// ForceDegrade manually marks a cluster as degraded.
+// ForceDegrade manually marks a cluster as degraded and latches it there.
 //
-// This is useful for testing or manual intervention. The call acquires the
-// cluster's mutex so that fastStrikes is reset atomically with the degraded
-// transition — preventing a stale fast-strike accumulation from immediately
-// recovering the cluster on the very next recordFast call.
+// The latch is an operator decision: fast background writes and successful
+// recovery probes update nothing while it is set, so the cluster stays in
+// fire-and-forget mode until [AdaptiveDualWrite.ForceRecover] or
+// [AdaptiveDualWrite.Reset] clears it. A client skips the recovery probe for
+// a latched cluster (see [helix.LatchReporter]).
+//
+// The call acquires the cluster's mutex so that fastStrikes is reset
+// atomically with the degraded transition.
 //
 // Emits [types.EventWriteDegraded] with Reason "manual" and Count set to the
 // cluster's current slow-strike count when this call performs the transition.
@@ -1181,13 +1204,8 @@ func (a *AdaptiveDualWrite) Reset() {
 // Parameters:
 //   - cluster: The cluster to degrade
 func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
-	var state *clusterWriteState
-	switch cluster {
-	case types.ClusterA:
-		state = &a.stateA
-	case types.ClusterB:
-		state = &a.stateB
-	default:
+	state := a.stateFor(cluster)
+	if state == nil {
 		return
 	}
 
@@ -1195,6 +1213,7 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 	wasDegraded := state.isDegraded.Load()
 	state.fastStrikes = 0
 	state.isDegraded.Store(true)
+	state.latched.Store(true)
 	strikes := int(state.slowStrikes)
 	var seq uint64
 	if !wasDegraded {
@@ -1218,7 +1237,8 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 	}
 }
 
-// ForceRecover manually marks a cluster as healthy.
+// ForceRecover manually marks a cluster as healthy and clears the
+// [AdaptiveDualWrite.ForceDegrade] latch.
 //
 // This is useful for testing or manual intervention when you know
 // a cluster has recovered (e.g., from external health checks).
@@ -1230,38 +1250,35 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 // Parameters:
 //   - cluster: The cluster to recover
 func (a *AdaptiveDualWrite) ForceRecover(cluster types.ClusterID) {
-	var state *clusterWriteState
-	switch cluster {
-	case types.ClusterA:
-		state = &a.stateA
-	case types.ClusterB:
-		state = &a.stateB
-	default:
+	state := a.stateFor(cluster)
+	if state == nil {
 		return
 	}
 
-	state.mu.Lock()
-	wasDegraded := state.isDegraded.Load()
-	state.isDegraded.Store(false)
-	state.slowStrikes = 0
-	state.fastStrikes = 0
-	state.lastLatency.Store(0)
-	var seq uint64
-	if wasDegraded {
-		seq = state.reportSeq.Add(1)
-		a.events.enqueue(types.ClusterEvent{
-			Kind:    types.EventWriteRecovered,
-			Cluster: cluster,
-			Reason:  "manual",
-		})
-	}
-	state.mu.Unlock()
-
+	wasDegraded, seq := a.recoverState(state, cluster, "manual")
 	if wasDegraded {
 		a.recordTransitionMetrics(state, cluster, false, seq)
 		a.logWriteRecovered(cluster, "manual")
 		a.events.drain()
 	}
+}
+
+// IsLatched reports whether cluster is held degraded by
+// [AdaptiveDualWrite.ForceDegrade] and can only be restored by
+// [AdaptiveDualWrite.ForceRecover] or [AdaptiveDualWrite.Reset].
+//
+// Parameters:
+//   - cluster: The cluster to check
+//
+// Returns:
+//   - bool: true while the operator latch is set
+func (a *AdaptiveDualWrite) IsLatched(cluster types.ClusterID) bool {
+	state := a.stateFor(cluster)
+	if state == nil {
+		return false
+	}
+
+	return state.latched.Load()
 }
 
 // ExecuteStrict performs adaptive concurrent writes without fire-and-forget dispatch.
@@ -1365,10 +1382,7 @@ func (a *AdaptiveDualWrite) RecordProbeSuccess(cluster types.ClusterID) {
 // Parameters:
 //   - cluster: The cluster to record the fast write for
 func (a *AdaptiveDualWrite) RecordFastWrite(cluster types.ClusterID) {
-	switch cluster {
-	case types.ClusterA:
-		a.recordFast(&a.stateA)
-	case types.ClusterB:
-		a.recordFast(&a.stateB)
+	if state := a.stateFor(cluster); state != nil {
+		a.recordFast(state)
 	}
 }

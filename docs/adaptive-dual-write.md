@@ -267,10 +267,11 @@ if strategy.IsDegraded(helix.ClusterB) {
 ### Manual Intervention
 
 ```go
-// Force a cluster into degraded mode (e.g., during maintenance)
+// Force a cluster into degraded mode (e.g., during maintenance).
+// This is a latch: fast writes and recovery probes cannot undo it.
 strategy.ForceDegrade(helix.ClusterB)
 
-// Force a cluster back to healthy (e.g., after maintenance)
+// Force a cluster back to healthy (e.g., after maintenance); clears the latch
 strategy.ForceRecover(helix.ClusterB)
 
 // Reset all state (e.g., after deployment)
@@ -375,7 +376,7 @@ strategy.ForceDegrade(helix.ClusterB)
 
 // Perform maintenance on Cluster B...
 
-// After maintenance: allow automatic recovery
+// After maintenance: clear the latch and allow automatic recovery
 strategy.ForceRecover(helix.ClusterB)
 ```
 
