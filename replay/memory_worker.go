@@ -101,7 +101,7 @@ func (b *memoryBackend) dequeueLoop() {
 		default:
 		}
 
-		payload, ok := b.replayer.tryDequeueRetained()
+		payload, ok := b.replayer.tryDequeueRetained(b.config.allows)
 		if ok && !b.retained() {
 			// The bounded policy stops counting a payload once it is taken.
 			b.replayer.releaseSlot(payload.TargetCluster)
@@ -142,6 +142,15 @@ func (b *memoryBackend) handleFirstAttempt(payload types.ReplayPayload) {
 	maxAttempts := b.config.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 1
+	}
+
+	if !b.config.allows(payload.TargetCluster) {
+		// The gate closed between dequeue and execution: put the payload
+		// back rather than spend its only attempt on a cluster that must
+		// not be written to. It re-enters at the tail of its queue.
+		b.requeueGated(payload)
+
+		return
 	}
 
 	err := b.runAttempt(payload, 1, maxAttempts)
@@ -194,6 +203,10 @@ func (b *memoryBackend) retryAsync(payload types.ReplayPayload, prevErr error, m
 			return
 		case <-timer.C:
 		}
+		if !b.waitUngated(payload.TargetCluster) {
+			b.dropPayload(payload, prevErr, maxAttempts, types.ReplayDropShutdown)
+			return
+		}
 
 		err := b.runAttempt(payload, attempt, maxAttempts)
 		if err == nil {
@@ -203,6 +216,31 @@ func (b *memoryBackend) retryAsync(payload types.ReplayPayload, prevErr error, m
 	}
 
 	b.dropPayload(payload, prevErr, maxAttempts, types.ReplayDropMaxAttempts)
+}
+
+// waitUngated blocks until the gate permits cluster, polling once per
+// PollInterval, and reports false when the worker stops first. It never
+// consumes an attempt: a gated cluster is not a failing cluster.
+func (b *memoryBackend) waitUngated(cluster types.ClusterID) bool {
+	for !b.config.allows(cluster) {
+		select {
+		case <-b.stopCh:
+			return false
+		case <-time.After(b.config.PollInterval):
+		}
+	}
+
+	return true
+}
+
+// requeueGated returns a payload the gate closed on to its queue. Under
+// the bounded policy the slot was released at dequeue, so Enqueue reserves
+// it again; a full queue drops the payload like any other admission
+// failure, which is reported so the loss is visible.
+func (b *memoryBackend) requeueGated(payload types.ReplayPayload) {
+	if err := b.replayer.Enqueue(context.Background(), payload); err != nil {
+		b.dropPayload(payload, err, b.config.MaxAttempts, types.ReplayDropRequeueFailed)
+	}
 }
 
 // runAttempt performs a single execution attempt and emits all the

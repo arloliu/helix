@@ -221,10 +221,14 @@ func initializeMemoryReplayerQueues(m *MemoryReplayer) {
 	}
 }
 
+// clusterOrder maps queue indexes to clusters; clusterIndex and clusterAt
+// are its two directions.
+var clusterOrder = [2]types.ClusterID{types.ClusterA, types.ClusterB}
+
 // clusterIndex maps a target cluster to its slot in MemoryReplayer.queues.
 // Enqueue has already rejected any target other than A or B.
 func clusterIndex(cluster types.ClusterID) int {
-	if cluster == types.ClusterA {
+	if cluster == clusterOrder[0] {
 		return 0
 	}
 
@@ -312,7 +316,7 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 	}
 
 	// Determine which queue to try based on priority mode
-	payload, ok := m.tryDequeueWithPriority()
+	payload, ok := m.tryDequeueWithPriority(nil)
 	if ok {
 		m.releaseSlot(payload.TargetCluster)
 		return payload, true
@@ -406,7 +410,7 @@ func (m *MemoryReplayer) clusterPending(cluster types.ClusterID) *atomic.Int64 {
 // The worker that took it must call releaseSlot once the payload has been
 // replayed or dropped, so capacity keeps counting executing and waiting
 // payloads.
-func (m *MemoryReplayer) tryDequeueRetained() (types.ReplayPayload, bool) {
+func (m *MemoryReplayer) tryDequeueRetained(allow func(types.ClusterID) bool) (types.ReplayPayload, bool) {
 	if !m.initialized() {
 		return types.ReplayPayload{}, false
 	}
@@ -414,18 +418,36 @@ func (m *MemoryReplayer) tryDequeueRetained() (types.ReplayPayload, bool) {
 		return types.ReplayPayload{}, false
 	}
 
-	return m.tryDequeueWithPriority()
+	return m.tryDequeueWithPriority(allow)
+}
+
+// clusterAt maps a queue index back to its cluster.
+func clusterAt(idx int) types.ClusterID {
+	return clusterOrder[idx]
 }
 
 // tryDequeueWithPriority attempts to dequeue from the next cluster in the
-// rotation, falling back to the other cluster when that one is empty.
+// rotation, falling back to the other cluster when that one is empty or
+// not allowed. A nil allow permits every cluster.
 // Returns immediately without blocking.
-func (m *MemoryReplayer) tryDequeueWithPriority() (types.ReplayPayload, bool) {
+func (m *MemoryReplayer) tryDequeueWithPriority(allow func(types.ClusterID) bool) (types.ReplayPayload, bool) {
+	// Ask the gate before taking the lock, so a slow gate never stalls the
+	// other cluster's dequeues.
+	allowed := [2]bool{true, true}
+	if allow != nil {
+		for idx := range allowed {
+			allowed[idx] = allow(clusterAt(idx))
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for i := range m.queues {
 		idx := (m.nextQueue + i) % len(m.queues)
+		if !allowed[idx] {
+			continue
+		}
 		payload, high, ok := m.tryDequeueCluster(&m.queues[idx])
 		if ok {
 			m.noteDequeuedLocked(idx, high)
@@ -478,7 +500,7 @@ func (m *MemoryReplayer) tryDequeueCluster(q *clusterQueues) (payload types.Repl
 //   - types.ReplayPayload: The payload if available
 //   - bool: true if a payload was retrieved, false if queue is empty or closed
 func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
-	payload, ok := m.tryDequeueRetained()
+	payload, ok := m.tryDequeueRetained(nil)
 	if ok {
 		m.releaseSlot(payload.TargetCluster)
 	}

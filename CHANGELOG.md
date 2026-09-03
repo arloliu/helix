@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `replay.WithClusterGate(func(types.ClusterID) bool)` lets a replay worker
+  hold execution back per cluster on both backends: a gated payload is
+  parked without consuming an attempt or its retry window, a fetched NATS
+  batch is kept in progress rather than NAK'd, and repeated gates compose by
+  AND. `WithReplayGate(func(ClusterID) bool)` is the client's operator
+  control; the client composes it with drain and installs the result on the
+  worker it builds for `WithAutoMemoryWorker`, so replay never runs against
+  a draining cluster. A worker supplied through `WithReplayWorker` must
+  carry its own gate; the client warns at startup when drain or a replay
+  gate is configured with one. Mirror workers are never gated by the source
+  client. The new drop reason `requeue_failed` reports the rare case where
+  the memory queue filled while a payload the gate refused was put back.
 - `WithBehaviorProfile(Safe)` selects the defaults a future major version
   will adopt for the client-owned options kept at their v1 value for
   compatibility; today that is `WithRouteVeto(true)`. It is pure option

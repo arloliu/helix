@@ -13,6 +13,7 @@ import (
 // It owns one capacity slot in the replayer from the moment it is dequeued
 // until it succeeds or is dropped.
 type retainedItem struct {
+	gatedSince  time.Time // when the gate parked the item; zero while it is not parked
 	payload     types.ReplayPayload
 	attempts    int       // attempts made so far
 	deadLetters int       // attempts the classifier marked dead-letter
@@ -109,6 +110,13 @@ func (b *memoryBackend) retained() bool {
 // handleFirstAttemptRetained runs the first attempt inline on the dequeue
 // loop; the item is only materialised when that attempt fails.
 func (b *memoryBackend) handleFirstAttemptRetained(payload types.ReplayPayload) {
+	if !b.config.allows(payload.TargetCluster) {
+		// Park the payload without an attempt: it keeps its slot and its
+		// retry window starts only when the first attempt runs.
+		b.park(&retainedItem{payload: payload, firstAt: time.Now()})
+
+		return
+	}
 	if err := b.runAttempt(payload, 1, b.config.MaxAttempts); err != nil {
 		b.settleRetained(&retainedItem{payload: payload, attempts: 1, firstAt: time.Now()}, err)
 
@@ -122,6 +130,17 @@ func (b *memoryBackend) attemptRetained(it *retainedItem) {
 	defer b.retryWG.Done()
 	defer func() { <-b.retrySem }()
 
+	if !b.config.allows(it.payload.TargetCluster) {
+		b.park(it)
+
+		return
+	}
+	if !it.gatedSince.IsZero() {
+		// The time spent parked is not the cluster's failure time: move the
+		// window start forward by it so gating never expires the item.
+		it.firstAt = it.firstAt.Add(time.Since(it.gatedSince))
+		it.gatedSince = time.Time{}
+	}
 	it.attempts++
 	b.config.observeAge(it.payload)
 	if err := b.runAttempt(it.payload, it.attempts, b.config.MaxAttempts); err != nil {
@@ -130,6 +149,17 @@ func (b *memoryBackend) attemptRetained(it *retainedItem) {
 		return
 	}
 	b.replayer.releaseSlot(it.payload.TargetCluster)
+}
+
+// park schedules an item the gate refused for another look after one
+// PollInterval, counting no attempt against it.
+func (b *memoryBackend) park(it *retainedItem) {
+	now := time.Now()
+	if it.gatedSince.IsZero() {
+		it.gatedSince = now
+	}
+	it.dueAt = now.Add(b.config.PollInterval)
+	b.sched.push(it)
 }
 
 // settleRetained decides what happens to an item after a failed attempt:

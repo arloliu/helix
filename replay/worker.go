@@ -131,6 +131,10 @@ type WorkerConfig struct {
 	// stream limit with DiscardOld) never reaches the worker and is not
 	// reported here; watch JetStream's stream and consumer metrics for it.
 	OnDrop func(payload types.ReplayPayload, err error)
+
+	// ClusterGate answers whether replay to a cluster may execute now; nil
+	// permits every cluster. Set via [WithClusterGate].
+	ClusterGate func(cluster types.ClusterID) bool
 }
 
 // DefaultWorkerConfig returns the default worker configuration.
@@ -250,6 +254,49 @@ func WithOnSuccess(fn func(types.ReplayPayload)) WorkerOption {
 func WithOnError(fn func(types.ReplayPayload, error, int)) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.OnError = fn
+	}
+}
+
+// WithClusterGate installs a predicate that decides whether replay to a
+// cluster may execute right now.
+//
+// The gate is consulted before every execution attempt, on both backends:
+// the memory worker's first attempt and every retry, and every message of
+// a fetched NATS batch. A gated payload is parked, not counted: the memory
+// worker holds it without consuming an attempt or its retry window, and
+// the NATS worker keeps the fetched batch in progress without NAKing, so a
+// bounded consumer's delivery budget is never spent while gated. The
+// memory dequeue and the NATS fetch also skip a gated cluster, so queued
+// work stays queued or server-side. Reopening is observed within
+// PollInterval.
+//
+// Repeated WithClusterGate options compose by logical AND: every gate must
+// permit a cluster before replay runs, whichever order the options came in.
+// A helix client that builds its own worker appends a gate driven by drain
+// and its operator predicate (see helix.WithReplayGate).
+//
+// The predicate must be cheap, non-blocking, and safe for concurrent use.
+// A gate that panics counts as closed.
+//
+// Parameters:
+//   - gate: Returns true when replay to the cluster may execute; nil is
+//     ignored
+//
+// Returns:
+//   - WorkerOption: Configuration option
+func WithClusterGate(gate func(cluster types.ClusterID) bool) WorkerOption {
+	return func(c *WorkerConfig) {
+		if gate == nil {
+			return
+		}
+		if prev := c.ClusterGate; prev != nil {
+			c.ClusterGate = func(cluster types.ClusterID) bool {
+				return prev(cluster) && gate(cluster)
+			}
+
+			return
+		}
+		c.ClusterGate = gate
 	}
 }
 
@@ -484,6 +531,23 @@ func (c *WorkerConfig) observeAge(payload types.ReplayPayload) {
 // observeIdle resets the age gauge for a cluster with nothing pending.
 func (c *WorkerConfig) observeIdle(cluster types.ClusterID) {
 	c.backlogMetrics().SetReplayOldestAge(cluster, 0)
+}
+
+// allows reports whether replay to cluster may execute now. A nil gate
+// permits everything; a gate that panics counts as closed.
+func (c *WorkerConfig) allows(cluster types.ClusterID) (allowed bool) {
+	if c.ClusterGate == nil {
+		return true
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.Logger.Error("replay cluster gate panicked; treating the cluster as gated",
+				"cluster", c.ClusterNames.Name(cluster), "panic", r)
+			allowed = false
+		}
+	}()
+
+	return c.ClusterGate(cluster)
 }
 
 // observeDrop records one permanently dropped payload exactly once: the

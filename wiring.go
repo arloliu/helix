@@ -75,6 +75,10 @@ func warnNoEffectOptions(config *ClientConfig) {
 		config.Logger.Warn("the failover policy returns the first threshold-1 read failures to the caller (the v1 default); " +
 			"enable failover below the threshold with the policy's WithFailoverBelowThreshold(true) or WithLatencyFailoverBelowThreshold(true)")
 	}
+	if !config.AutoMemoryWorker && config.ReplayWorker != nil && (config.TopologyWatcher != nil || config.ReplayGate != nil) {
+		config.Logger.Warn("replay gating could not be applied or verified for the supplied replay worker: " +
+			"pass replay.WithClusterGate when building it so drain and WithReplayGate hold replay back")
+	}
 	_, canVeto := config.FailoverPolicy.(RouteVeto)
 	switch {
 	case config.RouteVeto && !canVeto:
@@ -371,10 +375,14 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 			replay.WithQueueCapacity(config.AutoMemoryCapacity),
 		)
 		config.Replayer = memReplayer
+		// The client's gate goes last: gates compose by AND, so a
+		// caller-supplied gate in AutoMemoryWorkerOpts and this one must
+		// both permit a cluster.
 		workerOpts := append(
 			[]replay.WorkerOption{replay.WithWorkerMetrics(config.Metrics)},
 			config.AutoMemoryWorkerOpts...,
 		)
+		workerOpts = append(workerOpts, replay.WithClusterGate(client.replayAllowed))
 		worker, workerErr := replay.NewMemoryWorkerChecked(
 			memReplayer,
 			client.DefaultExecuteFunc(),
@@ -466,6 +474,18 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	client.startRecoveryProbes()
 
 	return client, nil
+}
+
+// replayAllowed is the cluster gate the client installs on the replay
+// worker it builds: replay to a cluster runs only while the cluster is not
+// draining and the operator's [WithReplayGate] predicate, if any, permits it.
+func (c *CQLClient) replayAllowed(cluster ClusterID) bool {
+	drainA, drainB := c.getDrainStates()
+	if c.clusterIsDraining(cluster, drainA, drainB) {
+		return false
+	}
+
+	return c.config.ReplayGate == nil || c.config.ReplayGate(cluster)
 }
 
 // DefaultExecuteFunc returns an ExecuteFunc for use with replay workers.
