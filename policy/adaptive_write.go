@@ -1159,6 +1159,9 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 		a.recordTransitionMetrics(state, cluster, true, seq)
 		a.logWriteDegraded(cluster, "slow-strike threshold reached", strikes)
 		if flapping {
+			if fm, ok := a.metrics.(types.WriteFlappingMetrics); ok {
+				fm.IncWriteFlapping(cluster)
+			}
 			a.logger.Warn("adaptive: cluster is flapping between degraded and healthy",
 				"cluster", a.clusterName(cluster))
 		}

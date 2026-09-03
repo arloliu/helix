@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/require"
 )
@@ -106,6 +107,8 @@ func TestAdaptiveDualWrite_RedegradeBackoffDoublesDwellAndReportsFlapping(t *tes
 		WithAdaptiveRedegradeBackoff(time.Hour, 40*time.Second),
 	)
 	a.SetEventEmitter(em)
+	mc := testutil.NewTestMetricsCollector()
+	a.SetMetrics(mc)
 
 	recoverAfter := func(d time.Duration) {
 		clock.advance(d)
@@ -134,12 +137,14 @@ func TestAdaptiveDualWrite_RedegradeBackoffDoublesDwellAndReportsFlapping(t *tes
 		}
 	}
 	require.Equal(t, 1, flapping, "the cap is reported once")
+	require.Equal(t, int64(1), mc.WriteFlapping[types.ClusterA], "and counted once")
 	recoverAfter(40 * time.Second)
 
 	clock.advance(time.Second)
 	degradeByStrikes(a, types.ClusterA) // third: still at the cap, no second event
 	require.Equal(t, 40*time.Second, a.stateA.dwell)
 	require.Equal(t, 1, countKind(em, types.EventWriteFlapping))
+	require.Equal(t, int64(1), mc.WriteFlapping[types.ClusterA])
 	recoverAfter(40 * time.Second)
 
 	// A recovery that holds past the window resets the backoff.

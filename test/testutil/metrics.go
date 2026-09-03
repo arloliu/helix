@@ -37,8 +37,12 @@ type TestMetricsCollector struct {
 	ReadPreferred map[types.ClusterID]bool
 
 	// Circuit breaker
-	CircuitBreakerState map[types.ClusterID]int
-	CircuitBreakerTrips map[types.ClusterID]int64
+	CircuitBreakerState  map[types.ClusterID]int
+	CircuitBreakerTrips  map[types.ClusterID]int64
+	CircuitBreakerProbes map[types.ClusterID]map[string]int64 // optional types.BreakerProbeMetrics
+
+	// Write flapping (optional types.WriteFlappingMetrics)
+	WriteFlapping map[types.ClusterID]int64
 
 	// Replay
 	ReplayEnqueued   map[types.ClusterID]int64
@@ -112,6 +116,8 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		ReplayOldestAge:         make(map[types.ClusterID]float64),
 		ReplayWorkerDropped:     make(map[types.ClusterID]map[string]int64),
 		ReplayCorrupt:           make(map[types.ClusterID]int64),
+		CircuitBreakerProbes:    make(map[types.ClusterID]map[string]int64),
+		WriteFlapping:           make(map[types.ClusterID]int64),
 		ReplayTermFailed:        make(map[types.ClusterID]int64),
 		ReplayDuration:          make(map[types.ClusterID][]float64),
 		ClusterDraining:         make(map[types.ClusterID]bool),
@@ -242,6 +248,13 @@ func (m *TestMetricsCollector) IncWriteRecovered(cluster types.ClusterID) {
 	m.WriteRecovered[cluster]++
 }
 
+// IncWriteFlapping implements the optional types.WriteFlappingMetrics.
+func (m *TestMetricsCollector) IncWriteFlapping(cluster types.ClusterID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.WriteFlapping[cluster]++
+}
+
 // GetWriteDegradedState returns the last recorded degraded-state gauge
 // value for the given cluster.
 // GetReplayCorrupt returns the corrupt-message count for a cluster.
@@ -297,6 +310,11 @@ func (m *TestMetricsCollector) GetWriteRecoveredTransitions(cluster types.Cluste
 // optional types.AdaptiveWriteMetrics interface.
 var _ types.AdaptiveWriteMetrics = (*TestMetricsCollector)(nil)
 
+var (
+	_ types.WriteFlappingMetrics = (*TestMetricsCollector)(nil)
+	_ types.BreakerProbeMetrics  = (*TestMetricsCollector)(nil)
+)
+
 // ----------------------
 // Failover
 // ----------------------
@@ -323,6 +341,16 @@ func (m *TestMetricsCollector) IncCircuitBreakerTrip(cluster types.ClusterID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.CircuitBreakerTrips[cluster]++
+}
+
+// IncCircuitBreakerProbe implements the optional types.BreakerProbeMetrics.
+func (m *TestMetricsCollector) IncCircuitBreakerProbe(cluster types.ClusterID, outcome string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.CircuitBreakerProbes[cluster] == nil {
+		m.CircuitBreakerProbes[cluster] = make(map[string]int64)
+	}
+	m.CircuitBreakerProbes[cluster][outcome]++
 }
 
 // ----------------------

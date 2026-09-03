@@ -11,9 +11,9 @@ affected read. See [Per-operation kinds](#per-operation-kinds).
 
 This is a push-based, best-effort notification stream for driving alerting,
 paging, or an operational dashboard. A handler that cannot keep up loses
-events; a metrics counter does not. Every kind but `write_flapping` has a
-metric counterpart — read rates and current state from the metric and use the
-event only as the push notification. See [Events and Metrics](#events-and-metrics) for the full
+events; a metrics counter does not. Every kind has a metric counterpart —
+read rates and current state from the metric and use the event only as the
+push notification. See [Events and Metrics](#events-and-metrics) for the full
 kind-to-metric table, including one kind whose event and metric count
 different things.
 
@@ -295,27 +295,27 @@ fits what you need:
 | `helix.WithOnReplayDropped` | Access to the full dropped `types.ReplayPayload` (query, args, target cluster) — not just the fact that a drop happened. It covers **both** replay paths: it fires alongside `EventReplayDropped` for a primary-path drop and alongside `EventMirrorReplayDropped` for a mirror-path drop. Nothing in the callback signature tells the two apart — mirror payloads carry a fixed conventional `TargetCluster`, so a handler that re-drives dropped payloads against the primary clusters would also re-drive mirror-destined ones. |
 | `mirror.WithOnError` | Full control over mirror write failures. Supplying this option **replaces** Helix's internal mirror error handler entirely — and with it, `EventMirrorReplayDropped` stops firing, because that event is emitted by the internal handler you just replaced. This is existing "caller options win" behavior, not a special case for events. |
 | `replay.WithOnDrop` | Worker-side permanent drops (a replay exhausted its retry budget), a different failure mode from enqueue-time drops. |
-| A `types.MetricsCollector` (e.g. `contrib/metrics/vm`) | Rates, current state, and dashboards — every kind but `write_flapping` has a metric counterpart. See [Events and Metrics](#events-and-metrics). |
+| A `types.MetricsCollector` (e.g. `contrib/metrics/vm`) | Rates, current state, and dashboards — every kind has a metric counterpart. See [Events and Metrics](#events-and-metrics). |
 
 ---
 
 ## Events and Metrics
 
 Metrics do not lose anything, and events do, so a metric is the better source
-wherever one exists. Every kind but `write_flapping` has one, and one pair does not line up.
+wherever one exists. Every kind has one, and one pair does not line up.
 
 | Event kind | Metric counterpart |
 |---|---|
 | `failover` | `{prefix}_failover_total{from,to}` — same call site, same meaning. |
 | `read_divergence` | `{prefix}_read_divergence_total{cluster}` — same call site, same meaning. |
 | `read_route_changed` | The `{prefix}_read_preferred{cluster}` gauge (1 for the strategy's preferred cluster, 0 for the other), written at the same transition. |
-| `circuit_breaker_open` / `_closed` | `{prefix}_circuit_breaker_trips_total{cluster}` and the `{prefix}_circuit_breaker_state{cluster}` gauge. |
+| `circuit_breaker_open` / `_closed` | `{prefix}_circuit_breaker_trips_total{cluster}` and the `{prefix}_circuit_breaker_state{cluster}` gauge; `{prefix}_circuit_breaker_probe_total{cluster,outcome}` (optional `types.BreakerProbeMetrics`) counts how each reserved recovery probe ended. |
 | `drain_entered` / `drain_exited` | `{prefix}_drain_mode_entered_total{cluster}` / `{prefix}_drain_mode_exited_total{cluster}`. |
 | `session_refresh_attempt` / `_success` / `_error` | `{prefix}_session_refresh_attempt_total{cluster}` and siblings. |
 | `replay_dropped` | `{prefix}_replay_dropped_total{cluster}` — **counts more than the event does**, see below. |
 | `replay_evicted` | `{prefix}_replay_evicted_total` — same poll, same count. |
 | `write_degraded` / `write_recovered` | The `{prefix}_write_degraded{cluster}` gauge (1=degraded, 0=healthy) plus the `{prefix}_write_degraded_total{cluster}` / `{prefix}_write_recovered_total{cluster}` transition counters, written at the same transitions that emit the events. `{prefix}_write_async_total` remains the per-write view: it counts individual fire-and-forget writes, not transitions. |
-| `write_flapping` | None. `{prefix}_write_degraded_total{cluster}` counts every re-degrade, but only the event reports that the backoff reached its cap; log it from the handler if you need a durable record. |
+| `write_flapping` | `{prefix}_write_flapping_total{cluster}` (optional `types.WriteFlappingMetrics`), written at the same transition. |
 | `mirror_replay_dropped` | `{prefix}_mirror_replay_dropped_total` (no cluster label — mirror targets a logical sink) — same call site, same meaning. Distinct from `{prefix}_mirror_enqueue_dropped_total`, which is the mirror engine's own ring buffer rejecting a capture, not the replay enqueue failing. |
 
 The transition counters and the degraded-state gauge require a

@@ -660,13 +660,16 @@ func (c *CircuitBreaker) CompleteFailoverProbe(cluster types.ClusterID, token ui
 	}
 	var transition breakerTransition
 	var seq uint64
+	label := types.BreakerProbeAbandoned
 	switch outcome { //nolint:exhaustive // an unknown outcome is released like ProbeAbandoned
 	case types.ProbeSucceeded:
 		transition, seq = c.closeLocked(state, cluster, "probe succeeded")
+		label = types.BreakerProbeSucceeded
 	case types.ProbeFailed:
 		state.halfOpen = false
 		state.lastFailure.Store(time.Now().UnixNano())
 		transition, seq = transitionReopened, state.seq.Add(1)
+		label = types.BreakerProbeFailed
 	default:
 		// ProbeAbandoned, and any value this package does not know,
 		// releases the reservation so the breaker cannot stay half-open.
@@ -675,6 +678,9 @@ func (c *CircuitBreaker) CompleteFailoverProbe(cluster types.ClusterID, token ui
 	}
 	state.mu.Unlock()
 
+	if pm, ok := c.metrics.(types.BreakerProbeMetrics); ok {
+		pm.IncCircuitBreakerProbe(cluster, label)
+	}
 	c.report(state, cluster, transition, seq)
 }
 

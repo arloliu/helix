@@ -72,6 +72,9 @@ func (m *NopMetrics) SetCircuitBreakerState(_ types.ClusterID, _ int) {}
 // IncCircuitBreakerTrip discards the metric.
 func (m *NopMetrics) IncCircuitBreakerTrip(_ types.ClusterID) {}
 
+// IncCircuitBreakerProbe discards the metric.
+func (m *NopMetrics) IncCircuitBreakerProbe(_ types.ClusterID, _ string) {}
+
 // ----------------------
 // Replay Queue
 // ----------------------
@@ -191,9 +194,19 @@ func (m *NopMetrics) IncWriteDegraded(_ types.ClusterID) {}
 // IncWriteRecovered discards the metric.
 func (m *NopMetrics) IncWriteRecovered(_ types.ClusterID) {}
 
+// IncWriteFlapping discards the metric.
+func (m *NopMetrics) IncWriteFlapping(_ types.ClusterID) {}
+
 // Compile-time assertion that NopMetrics implements the optional
 // types.AdaptiveWriteMetrics interface so embedders pick up no-op coverage.
 var _ types.AdaptiveWriteMetrics = (*NopMetrics)(nil)
+
+// Compile-time assertions for the optional counters added alongside the
+// flapping event and the breaker probe.
+var (
+	_ types.WriteFlappingMetrics = (*NopMetrics)(nil)
+	_ types.BreakerProbeMetrics  = (*NopMetrics)(nil)
+)
 
 // ----------------------
 // Cluster event dispatcher (optional types.ClusterEventMetrics)

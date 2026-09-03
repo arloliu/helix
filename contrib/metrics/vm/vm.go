@@ -587,6 +587,13 @@ func (c *Collector) IncWriteRecovered(cluster types.ClusterID) {
 	}
 }
 
+// IncWriteFlapping counts a re-degrade that reached the backoff cap. Part
+// of the optional types.WriteFlappingMetrics interface.
+func (c *Collector) IncWriteFlapping(cluster types.ClusterID) {
+	c.set.GetOrCreateCounter(fmt.Sprintf(`%s_write_flapping_total{cluster="%s"}`,
+		c.prefix, c.clusterNames.Name(cluster))).Inc()
+}
+
 // ----------------------
 // Failover
 // ----------------------
@@ -620,6 +627,13 @@ func (c *Collector) IncCircuitBreakerTrip(cluster types.ClusterID) {
 	} else {
 		c.circuitTripsB.Inc()
 	}
+}
+
+// IncCircuitBreakerProbe counts a completed breaker probe reservation by
+// outcome. Part of the optional types.BreakerProbeMetrics interface.
+func (c *Collector) IncCircuitBreakerProbe(cluster types.ClusterID, outcome string) {
+	c.set.GetOrCreateCounter(fmt.Sprintf(`%s_circuit_breaker_probe_total{cluster="%s",outcome="%s"}`,
+		c.prefix, c.clusterNames.Name(cluster), outcome)).Inc()
 }
 
 // ----------------------

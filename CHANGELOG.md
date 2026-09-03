@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason (`failover`, `alternative known good`, `manual`, `recovered`).
   The client installs its collector and event dispatcher on a read strategy
   that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- `types.WriteFlappingMetrics` (`{prefix}_write_flapping_total{cluster}`)
+  counts the `write_flapping` transitions, and `types.BreakerProbeMetrics`
+  (`{prefix}_circuit_breaker_probe_total{cluster,outcome}`) counts how each
+  recovery probe a breaker reserved ended (`succeeded`, `failed`,
+  `abandoned`), so every cluster event kind now has a metric counterpart.
 - `mirror.WithDrainTimeout(d)` cuts the mirror engine's shutdown drain
   short: the captures still queued after `d` are dropped once through
   `mirror.WithOnDrop`, `Stats().Dropped`, and the new optional
