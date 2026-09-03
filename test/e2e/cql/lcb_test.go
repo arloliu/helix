@@ -49,14 +49,16 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 			)
 			mc := testutil.NewTestMetricsCollector()
 
-			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
+			opts := []helix.Option{
 				helix.WithReadStrategy(policy.NewStickyRead(
 					policy.WithPreferredCluster(htypes.ClusterA),
 				)),
 				helix.WithFailoverPolicy(lcb),
 				helix.WithMetrics(mc),
 				helix.WithLogger(testutil.NewTestLogger(t)),
-			)
+			}
+			opts = append(opts, withSessionRebuild(a, d)...)
+			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b), opts...)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
 

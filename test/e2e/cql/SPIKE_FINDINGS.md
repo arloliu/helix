@@ -72,6 +72,10 @@ when the driver cannot answer a `system.local` read.
 For Helix users this is the case `WithAutoRefresh` with a `SessionRefresher`
 exists for: the client observes the connectivity failures and rebuilds the
 session instead of waiting on the driver.
+The breaker scenarios, whose own pause outlasts the budget on the CI runner,
+configure exactly that through `withSessionRebuild` (see `setup_test.go`), so
+the recovery probe's failures rebuild the session and the probe then closes
+the breaker.
 
 ## 3. v1/v2 errors.Is sentinel mismatch — INVALIDATED, spike test artifact
 
