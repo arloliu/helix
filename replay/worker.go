@@ -136,6 +136,10 @@ type WorkerConfig struct {
 	// ClusterGate answers whether replay to a cluster may execute now; nil
 	// permits every cluster. Set via [WithClusterGate].
 	ClusterGate func(cluster types.ClusterID) bool
+
+	// EvictionWatch starts the NATS worker's eviction watch. Set via
+	// [WithEvictionWatch]; ignored by the memory worker.
+	EvictionWatch bool
 }
 
 // DefaultWorkerConfig returns the default worker configuration.
@@ -258,6 +262,28 @@ func WithOnError(fn func(types.ReplayPayload, error, int)) WorkerOption {
 	}
 }
 
+// WithEvictionWatch makes a NATS worker poll the stream state once a second
+// and report the messages the stream removed without this process
+// acknowledging them (MaxAge expiry, DiscardOld under a limit, a purge):
+// [types.ReplayStreamMetrics.AddReplayEvicted], one
+// [types.EventReplayEvicted] event per poll that saw removals, and a Warn
+// line.
+//
+// The count is best effort and a signal to investigate, not a loss total:
+// the watch assumes this process runs the only workers on the stream
+// (another process's acknowledgements count as removals it did not make),
+// and an acknowledgement the server applies just before a poll and the
+// worker counts just after it is reported once and offset in the next
+// interval. The memory worker ignores the option.
+//
+// Returns:
+//   - WorkerOption: Configuration option
+func WithEvictionWatch() WorkerOption {
+	return func(c *WorkerConfig) {
+		c.EvictionWatch = true
+	}
+}
+
 // WithClusterGate installs a predicate that decides whether replay to a
 // cluster may execute right now.
 //
@@ -363,6 +389,44 @@ type Worker struct {
 	startupErr error
 	running    atomic.Bool
 	stopped    atomic.Bool
+	emitter    atomic.Pointer[types.ClusterEventEmitter] // installed by SetEventEmitter
+}
+
+// SetEventEmitter installs the emitter the worker's cluster events are
+// delivered to (today [types.EventReplayEvicted] from the eviction watch);
+// nil disables emission. helix.NewCQLClient calls it with the client's
+// dispatcher before Start.
+//
+// Parameters:
+//   - em: The event emitter
+func (w *Worker) SetEventEmitter(em types.ClusterEventEmitter) {
+	w.emitter.Store(&em)
+}
+
+// EvictionWatchEnabled reports whether this worker runs the eviction watch:
+// a NATS worker built with [WithEvictionWatch]. helix.NewCQLClient uses it
+// to classify [types.EventReplayEvicted] as reachable.
+//
+// Returns:
+//   - bool: true when the watch runs while the worker runs
+func (w *Worker) EvictionWatchEnabled() bool {
+	_, ok := w.evictionWatcher()
+
+	return ok
+}
+
+// evictionWatcher is implemented by a backend that can run the eviction
+// watch.
+type evictionWatcher interface {
+	watchEvictions()
+}
+
+// evictionWatcher returns the backend that runs the eviction watch, if
+// this worker has one and the option is set.
+func (w *Worker) evictionWatcher() (evictionWatcher, bool) {
+	ew, ok := w.backend.(evictionWatcher)
+
+	return ew, ok && w.config.EvictionWatch
 }
 
 // workerBackend abstracts queue-specific processing logic.
@@ -414,6 +478,10 @@ func (w *Worker) Start() error {
 		// One worker per cluster (NATS backend)
 		go w.backend.start(types.ClusterA)
 		go w.backend.start(types.ClusterB)
+	}
+	if ew, ok := w.evictionWatcher(); ok {
+		w.wg.Add(1)
+		go ew.watchEvictions()
 	}
 
 	return nil

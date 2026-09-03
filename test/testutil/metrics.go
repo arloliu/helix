@@ -242,6 +242,14 @@ func (m *TestMetricsCollector) GetReplayCorrupt(cluster types.ClusterID) int64 {
 	return m.ReplayCorrupt[cluster]
 }
 
+// GetReplayEvicted returns the evicted-message total.
+func (m *TestMetricsCollector) GetReplayEvicted() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.ReplayEvicted
+}
+
 // GetReplayTermFailed returns the refused-Term count for a cluster.
 func (m *TestMetricsCollector) GetReplayTermFailed(cluster types.ClusterID) int64 {
 	m.mu.RLock()
