@@ -10,15 +10,36 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
-// eventBufferSize bounds the dispatcher's pending-event buffer. Most
-// kinds are state transitions, so their bursts are small and 128 absorbs
-// them without measurable memory cost. EventFailover and
-// EventReadDivergence are the exception: they fire once per affected read,
-// so a sustained outage overruns this buffer and the excess is dropped.
-// That is the accepted trade — the buffer exists to keep emission
-// non-blocking, and rates for those two kinds are meant to be read from
-// metrics, not reconstructed from events.
-const eventBufferSize = 128
+// eventBufferSize bounds the dispatcher's pending-event buffer and
+// perOperationShare bounds how much of it the per-operation kinds (see
+// isPerOperationKind) may hold, so a storm of them cannot evict the rare
+// transition it coincides with. The buffer exists to keep emission
+// non-blocking; the excess is dropped and counted, and rates for the
+// per-operation kinds are read from metrics. The numbers are documented
+// on [ClusterEventHandler] and in docs/cluster-events.md.
+const (
+	eventBufferSize   = 160
+	perOperationShare = 128
+)
+
+// isPerOperationKind reports whether kind fires once per affected
+// operation rather than once per state change. The switch is exhaustive
+// so a new kind must be classified here.
+func isPerOperationKind(kind types.ClusterEventKind) bool {
+	switch kind {
+	case types.EventFailover, types.EventReadDivergence,
+		types.EventReplayDropped, types.EventMirrorReplayDropped:
+		return true
+	case types.EventReadRouteChanged,
+		types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed,
+		types.EventWriteDegraded, types.EventWriteRecovered, types.EventWriteFlapping,
+		types.EventDrainEntered, types.EventDrainExited,
+		types.EventSessionRefreshAttempt, types.EventSessionRefreshSuccess, types.EventSessionRefreshError:
+		// State transitions.
+	}
+
+	return false
+}
 
 // ClusterEventHandler is called asynchronously for cluster-health events.
 // Registered via [WithOnClusterEvent].
@@ -29,7 +50,10 @@ const eventBufferSize = 128
 // independent producers arrive in enqueue order with no cross-kind causal
 // guarantee. Delivery is best-effort: a slow handler never blocks
 // read/write operations — when the internal buffer fills, newest events
-// are dropped and counted. The drop total is logged from the dispatcher
+// are dropped and counted. The per-operation kinds (failover,
+// read_divergence, replay_dropped, mirror_replay_dropped) may hold at most
+// 128 of the 160 slots, so a storm of them cannot evict a state
+// transition. The drop total is logged from the dispatcher
 // goroutine on the first drop, then only once it has at least doubled
 // since the last line, plus once at shutdown. When the configured
 // [types.MetricsCollector] also implements [types.ClusterEventMetrics],
@@ -86,6 +110,10 @@ type eventDispatcher struct {
 
 	emitting atomic.Int64  // in-flight EmitClusterEvent calls
 	dropped  atomic.Uint64 // events not delivered to the handler
+	// perOperationPending counts the per-operation events in ch, so their
+	// admission can stop at perOperationShare while transitions still
+	// find a slot.
+	perOperationPending atomic.Int32
 
 	// droppedReported tracks the last logged drop total. Touched only by
 	// the dispatcher goroutine and by stop() after joining it.
@@ -151,10 +179,39 @@ func (d *eventDispatcher) EmitClusterEvent(event types.ClusterEvent) {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
+	perOperation := isPerOperationKind(event.Kind)
+	if perOperation && d.perOperationPending.Add(1) > perOperationShare {
+		d.perOperationPending.Add(-1)
+		d.dropped.Add(1)
+
+		return
+	}
 	select {
 	case d.ch <- event:
 	default:
+		if perOperation {
+			d.perOperationPending.Add(-1)
+		}
 		d.dropped.Add(1)
+	}
+}
+
+// NoteClusterEventsDropped adds events a producer dropped before delivery
+// to the dropped total, so the policies' outbox losses reach the same
+// metric and log line as the dispatcher's own. Implements
+// [types.ClusterEventDropReporter]; an atomic add, safe from any goroutine.
+func (d *eventDispatcher) NoteClusterEventsDropped(n int) {
+	if d == nil || n <= 0 {
+		return
+	}
+	d.dropped.Add(uint64(n))
+}
+
+// releaseSlot returns the per-operation slot of an event taken from the
+// buffer. Runs on the dispatcher goroutine.
+func (d *eventDispatcher) releaseSlot(kind types.ClusterEventKind) {
+	if isPerOperationKind(kind) {
+		d.perOperationPending.Add(-1)
 	}
 }
 
@@ -179,12 +236,14 @@ func (d *eventDispatcher) run() {
 	for {
 		select {
 		case ev := <-d.ch:
+			d.releaseSlot(ev.Kind)
 			d.invoke(ev)
 			d.reconcileDrops(false)
 		case <-d.quit:
 			for {
 				select {
 				case ev := <-d.ch:
+					d.releaseSlot(ev.Kind)
 					d.invoke(ev)
 				default:
 					return
@@ -288,6 +347,7 @@ func (d *eventDispatcher) stop() {
 	for {
 		select {
 		case <-d.ch:
+			// No slot bookkeeping: admission is closed for good.
 			d.dropped.Add(1)
 		default:
 			d.reconcileDrops(true)

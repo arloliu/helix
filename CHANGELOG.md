@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason (`failover`, `alternative known good`, `manual`, `recovered`).
   The client installs its collector and event dispatcher on a read strategy
   that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- The cluster event buffer grows from 128 to 160 slots and the four
+  per-operation kinds (`failover`, `read_divergence`, `replay_dropped`,
+  `mirror_replay_dropped`) may hold at most 128 of them, so a storm of
+  per-operation events can no longer evict a state transition; delivery
+  stays in enqueue order. The policies' outbox drops (overflow, an emitter
+  removed or panicking mid-delivery) now reach the dispatcher through the
+  optional `types.ClusterEventDropReporter` interface and count in
+  `{prefix}_cluster_events_dropped_total`; previously they were counted
+  internally and never reported.
 - `policy.StickyRead.SetPreferred(cluster)` and `policy.StickyRead.Reset()`
   let an operator move the read preference by hand.
 - `replay.WithClusterGate(func(types.ClusterID) bool)` lets a replay worker

@@ -785,3 +785,75 @@ func TestEventDispatcher_CloseWaitsForInflightHandler(t *testing.T) {
 	close(release)
 	waitSignal(t, stopDone, "stop completion")
 }
+
+// TestEventDispatcher_ReservesSlotsForTransitions fills a not yet
+// started dispatcher (events buffer until start) past the per-operation
+// share and proves transitions still find their reserved slots and are
+// delivered in enqueue order behind the admitted per-operation events.
+func TestEventDispatcher_ReservesSlotsForTransitions(t *testing.T) {
+	const transitions = eventBufferSize - perOperationShare
+	h := newCollectingHandler(eventBufferSize)
+	d := newEventDispatcher(h.handle, logging.NewNopLogger())
+
+	const flood = 200
+	for range flood {
+		d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventFailover})
+	}
+	require.Equal(t, uint64(flood-perOperationShare), d.dropped.Load(),
+		"per-operation events beyond their share are dropped while slots remain")
+	for range transitions {
+		d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventCircuitBreakerOpen})
+	}
+	require.Equal(t, uint64(flood-perOperationShare), d.dropped.Load(), "the reserved slots admit every transition")
+	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventWriteDegraded})
+	require.Equal(t, uint64(flood-perOperationShare+1), d.dropped.Load(), "a full buffer drops a transition too")
+
+	d.start()
+	t.Cleanup(d.stop)
+	got := h.wait(t)
+	require.Len(t, got, eventBufferSize)
+	for i, ev := range got[:perOperationShare] {
+		require.Equal(t, types.EventFailover, ev.Kind, "event %d", i)
+	}
+	for i, ev := range got[perOperationShare:] {
+		require.Equal(t, types.EventCircuitBreakerOpen, ev.Kind, "transition %d follows the admitted per-operation events", i)
+	}
+}
+
+// TestEventDispatcher_TransitionsMayFillTheWholeBuffer proves the share
+// caps only the per-operation kinds.
+func TestEventDispatcher_TransitionsMayFillTheWholeBuffer(t *testing.T) {
+	d := newEventDispatcher(func(types.ClusterEvent) {}, logging.NewNopLogger())
+	for range eventBufferSize {
+		d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventDrainExited})
+	}
+	require.Zero(t, d.dropped.Load(), "transitions fill the whole buffer")
+	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventDrainExited})
+	require.Equal(t, uint64(1), d.dropped.Load())
+}
+
+// TestEventDispatcher_DeliveredPerOperationEventReleasesItsSlot proves the
+// share counts waiting events only.
+func TestEventDispatcher_DeliveredPerOperationEventReleasesItsSlot(t *testing.T) {
+	d := newEventDispatcher(func(types.ClusterEvent) {}, logging.NewNopLogger())
+	for range perOperationShare {
+		d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventReplayDropped})
+	}
+	require.Equal(t, int32(perOperationShare), d.perOperationPending.Load())
+	d.releaseSlot((<-d.ch).Kind)
+	require.Equal(t, int32(perOperationShare-1), d.perOperationPending.Load())
+	d.EmitClusterEvent(types.ClusterEvent{Kind: types.EventReplayDropped})
+	require.Zero(t, d.dropped.Load(), "the released slot admits the next per-operation event")
+}
+
+func TestEventDispatcher_NotedDropsReachTheMetric(t *testing.T) {
+	m := &fakeClusterEventMetrics{}
+	d := newEventDispatcher(func(types.ClusterEvent) {}, logging.NewNopLogger())
+	d.metrics = m
+	d.start()
+
+	d.NoteClusterEventsDropped(3)
+	d.NoteClusterEventsDropped(0)
+	d.stop()
+	require.Equal(t, int64(3), m.total.Load(), "a producer's drops are reconciled like the dispatcher's own")
+}

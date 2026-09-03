@@ -114,9 +114,11 @@ const (
 // guarantee. Metric updates and log lines may become visible before or
 // after the corresponding handler invocation.
 //
-// EventFailover and EventReadDivergence fire once per affected read rather
-// than once per state change, so they arrive at read rate during an outage
-// and are the kinds most likely to be dropped.
+// EventFailover, EventReadDivergence, EventReplayDropped, and
+// EventMirrorReplayDropped fire once per affected operation rather than
+// once per state change, so they arrive at operation rate during an
+// outage and are the kinds most likely to be dropped; they share a capped
+// part of the dispatcher's buffer so they cannot evict a state change.
 //
 // Kind and Timestamp are always set. Of the remaining fields, only the ones
 // relevant to a given Kind are populated; the rest hold zero values.

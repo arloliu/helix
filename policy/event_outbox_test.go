@@ -233,3 +233,94 @@ func TestEventOutbox_OverflowIsBoundedAndCounted(t *testing.T) {
 	require.Equal(t, outboxCap, pending, "pending must be capped at outboxCap")
 	require.Equal(t, uint64(5), o.dropped.Load(), "overflow must be counted")
 }
+
+// reportingEmitter records events and the drop counts forwarded to it.
+type reportingEmitter struct {
+	recordingEmitter
+	dropped atomic.Int64
+	onDrop  func(n int)
+}
+
+func (r *reportingEmitter) NoteClusterEventsDropped(n int) {
+	r.dropped.Add(int64(n))
+	if r.onDrop != nil {
+		r.onDrop(n)
+	}
+}
+
+func TestEventOutbox_ForwardsOverflowToTheReporter(t *testing.T) {
+	var o eventOutbox
+	em := &reportingEmitter{}
+	o.setEmitter(em)
+	for range outboxCap + 5 {
+		o.enqueue(types.ClusterEvent{Kind: types.EventCircuitBreakerOpen})
+	}
+	require.Zero(t, em.dropped.Load(), "nothing is forwarded from enqueue, which runs under the policy lock")
+
+	o.drain()
+	require.Equal(t, int64(5), em.dropped.Load(), "the overflow reaches the reporter once")
+	require.Zero(t, o.dropped.Load())
+	o.drain()
+	require.Equal(t, int64(5), em.dropped.Load(), "and is not forwarded again")
+}
+
+func TestEventOutbox_RetainsDropsUntilAnEmitterIsInstalled(t *testing.T) {
+	var o eventOutbox
+	o.setEmitter(&recordingEmitter{})
+	o.enqueue(types.ClusterEvent{Kind: types.EventCircuitBreakerOpen})
+	o.setEmitter(nil) // removed mid-flight: the pending event has nowhere to go
+	o.drain()
+	require.Equal(t, uint64(1), o.dropped.Load(), "the loss is retained")
+
+	em := &reportingEmitter{}
+	o.setEmitter(em)
+	o.enqueue(types.ClusterEvent{Kind: types.EventCircuitBreakerClosed})
+	o.drain()
+	require.Equal(t, int64(1), em.dropped.Load(), "the retained loss reaches the reporter installed later")
+	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerClosed}, em.kinds())
+}
+
+func TestEventOutbox_SurvivesAReporterPanic(t *testing.T) {
+	var o eventOutbox
+	em := &reportingEmitter{}
+	calls := 0
+	em.onDrop = func(int) {
+		calls++
+		if calls == 1 {
+			panic("reporter bug")
+		}
+	}
+	o.setEmitter(em)
+
+	o.dropped.Add(1)
+	require.NotPanics(t, o.drain, "a panicking reporter is recovered")
+	require.Zero(t, o.dropped.Load(), "the count handed to the panicking reporter is not retried")
+
+	o.dropped.Add(1)
+	o.drain()
+	require.Equal(t, 2, calls, "the reporter keeps receiving later drops")
+}
+
+func TestEventOutbox_ReentrantReporterDoesNotDeadlock(t *testing.T) {
+	cb := NewCircuitBreaker(WithThreshold(1))
+	em := &reportingEmitter{}
+	em.onDrop = func(int) { cb.RecordSuccess(types.ClusterA) } // calls back into the policy
+	// Overflow the breaker's outbox behind a plain emitter, then install
+	// the reporting emitter so the next transition forwards the loss.
+	cb.SetEventEmitter(&recordingEmitter{})
+	for range outboxCap + 1 {
+		cb.events.enqueue(types.ClusterEvent{Kind: types.EventCircuitBreakerOpen})
+	}
+	cb.SetEventEmitter(em)
+	done := make(chan struct{})
+	go func() {
+		cb.RecordFailure(types.ClusterA) // trips: transition, drain, forward
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwarding under a policy lock would deadlock the reentrant reporter")
+	}
+	require.Positive(t, em.dropped.Load())
+}
