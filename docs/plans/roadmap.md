@@ -322,6 +322,7 @@ Four items deviate from the table:
 | 5.4 | D-8 | Count corrupt-message terminations and failed `Term()` calls in new series. |
 | 5.5 | D-7 | `Nats-Msg-Id` from timestamp, cluster, and statement hash. |
 | 5.6 | D-9, A-1 (F-20) | Document synchronous mirror drain in `Close()` with an optional drain timeout; document the no-`Close`-from-callback rule on the replay and mirror callbacks. |
+| 5.7 | Phase 4 review | `write_flapping` counter and breaker probe outcome counter, so every event kind has a metric counterpart. |
 
 ---
 
