@@ -160,6 +160,11 @@ func bindDuration(v any) (any, bool) {
 	case types.Duration:
 		return driverDuration(x), true
 	case []types.Duration:
+		if x == nil {
+			// A nil slice binds as NULL; an empty one would bind as an
+			// empty collection.
+			return []gocql.Duration(nil), true
+		}
 		out := make([]gocql.Duration, len(x))
 		for i, d := range x {
 			out[i] = driverDuration(d)
