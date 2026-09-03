@@ -113,10 +113,11 @@ and mirror events work in either mode.
 
 ### Per-operation kinds
 
-`failover` and `read_divergence` are the two kinds that are not state
-transitions: they fire once per affected read. Under a sustained cluster
-outage the handler is invoked at read rate, so at 10,000 reads per second the
-128-event buffer holds about 13 ms of events and the rest are dropped.
+`failover`, `read_divergence`, `replay_dropped`, and `mirror_replay_dropped`
+are the kinds that are not state transitions: they fire once per affected
+operation. Under a sustained cluster outage the handler is invoked at read
+rate, so at 10,000 reads per second their 128 slots hold about 13 ms of
+events and the rest are dropped.
 
 The consequence is that a rate built from these events falls apart exactly
 during the incident it is supposed to measure. Use `{prefix}_failover_total`
@@ -126,12 +127,14 @@ notifications that an outage has started.
 Every other kind fires on a state change, so its volume is bounded by how
 often the cluster's state actually flips.
 
-The 128-slot buffer is shared across **all** kinds, not partitioned per kind.
-A `failover` / `read_divergence` storm during an outage can therefore evict a
-rare state-transition event — exactly the window in which a `write_degraded`
-is most likely to fire. If you miss one, its metric counterpart still records
-it: the `{prefix}_write_degraded` gauge and the transition counters survive
-any event loss.
+The buffer is one queue delivered in enqueue order, but the per-operation
+kinds may occupy at most 128 of its 160 slots. A `failover` storm during an
+outage therefore cannot evict a rare state-transition event such as the
+`write_degraded` that fires in the same window: 32 slots stay free for
+transitions, and only a burst of more than 32 undelivered transitions drops
+one. If you miss one, its metric counterpart still records it: the
+`{prefix}_write_degraded` gauge and the transition counters survive any
+event loss.
 
 ### Circuit Breaker Close Timing
 
@@ -162,8 +165,10 @@ reporting open, until a successful read on that cluster.
   invocations never overlap, so the handler itself does not need to be safe
   for concurrent calls.
 - **Never blocks a read or write.** Emission is a non-blocking buffered send.
-  If the handler falls behind and the buffer (128 events) fills, the newest
-  events are dropped.
+  If the handler falls behind and the buffer (160 events) fills, the newest
+  events are dropped. The four per-operation kinds may hold at most 128 of
+  those slots, so the last 32 are only ever filled by state transitions;
+  see [Per-operation kinds](#per-operation-kinds).
 - **Handler panics are recovered.** A panicking handler cannot crash the
   process or stop further delivery; the panic is logged and delivery
   continues with the next event.
@@ -194,9 +199,14 @@ Drops are counted exactly, and dispatcher drops are observable in two ways:
   since the last line, plus once more at shutdown. After a million drops the
   last line may read 524288.
 
-**Policy-side drops** produce nothing at all. The per-policy queue described
-in [Standalone Policy Usage](#standalone-policy-usage) counts its drops
-internally and never logs them or exposes them as a metric.
+**Policy-side drops** are counted too. The per-policy queue described in
+[Standalone Policy Usage](#standalone-policy-usage) forwards the events it
+had to drop (queue overflow, an emitter removed or panicking mid-delivery)
+to the client's dispatcher through the optional
+`types.ClusterEventDropReporter` interface, from the goroutine that drains
+the queue and never under a policy lock, so they join the same total, the
+same metric, and the same log line. A policy used standalone with an
+emitter that does not implement the interface keeps the count internally.
 
 ### Ordering scope
 

@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,7 +38,7 @@ type eventOutbox struct {
 	pending  []types.ClusterEvent
 	draining atomic.Bool
 	emitter  atomic.Pointer[emitterRef]
-	dropped  atomic.Uint64 // overflow + panic-lost events
+	dropped  atomic.Uint64 // overflow + panic-lost events, forwarded by forwardDrops
 }
 
 // setEmitter installs (or replaces) the emitter. nil disables emission.
@@ -96,6 +97,7 @@ func (o *eventOutbox) drain() {
 			return // another goroutine is already delivering; it will pick up our events
 		}
 		o.drainOwned()
+		o.forwardDrops()
 		// Re-check: an enqueue that arrived between our last empty batch
 		// and clearing the flag would otherwise be stranded until the
 		// next transition calls drain again.
@@ -133,6 +135,30 @@ func (o *eventOutbox) drainOwned() {
 			o.safeEmit(ref.em, ev)
 		}
 	}
+}
+
+// forwardDrops hands the drop count to the installed emitter's
+// [types.ClusterEventDropReporter], outside every policy lock.
+// The count is retained while no such emitter is installed and is not
+// retried when the reporter panics.
+func (o *eventOutbox) forwardDrops() {
+	if o.dropped.Load() == 0 {
+		return
+	}
+	ref := o.emitter.Load()
+	if ref == nil {
+		return
+	}
+	reporter, ok := ref.em.(types.ClusterEventDropReporter)
+	if !ok {
+		return
+	}
+	n := o.dropped.Swap(0)
+	if n == 0 {
+		return
+	}
+	defer func() { _ = recover() }()
+	reporter.NoteClusterEventsDropped(int(min(n, math.MaxInt))) //nolint:gosec // capped at math.MaxInt above
 }
 
 // safeEmit invokes the emitter, converting a panic into a counted drop
