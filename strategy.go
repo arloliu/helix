@@ -217,8 +217,9 @@ type LatchReporter interface {
 	IsLatched(cluster ClusterID) bool
 }
 
-// EventEmitterSetter is an optional interface for write strategies and
-// failover policies that emit cluster events (see [WithOnClusterEvent]).
+// EventEmitterSetter is an optional interface for read strategies, write
+// strategies, and failover policies that emit cluster events (see
+// [WithOnClusterEvent]).
 //
 // When the configured strategy or policy implements it, [NewCQLClient] installs
 // the client's dispatcher before any background goroutine starts, so the
@@ -231,8 +232,8 @@ type EventEmitterSetter interface {
 }
 
 // Instrumentable is an optional interface for components that can adopt the
-// client's [MetricsCollector]: write strategies, failover policies, and
-// replay workers.
+// client's [MetricsCollector]: read strategies, write strategies, failover
+// policies, and replay workers.
 //
 // [NewCQLClient] calls SetMetrics with the client's collector when
 // MetricsConfigured reports false, so a component built without its own

@@ -131,9 +131,11 @@ func TestClusterEvents_UnreachableKindsLoggedAtConstruction(t *testing.T) {
 
 		// failover and read_divergence are reachable in dual-cluster mode
 		// (read_divergence is a per-read runtime opt-in), so exactly the
-		// component-gated kinds must be listed, in the documented order.
+		// component-gated kinds must be listed, in the documented order;
+		// read_route_changed needs a read strategy that reports its route.
 		require.Equal(t,
-			"circuit_breaker_open,circuit_breaker_closed,"+
+			"read_route_changed,"+
+				"circuit_breaker_open,circuit_breaker_closed,"+
 				"write_degraded,write_recovered,write_flapping,"+
 				"drain_entered,drain_exited,"+
 				"replay_dropped,mirror_replay_dropped,"+
@@ -155,7 +157,7 @@ func TestClusterEvents_UnreachableKindsLoggedAtConstruction(t *testing.T) {
 		// including the two leading kinds that are reachable in
 		// dual-cluster mode.
 		require.Equal(t,
-			"failover,read_divergence,"+
+			"failover,read_divergence,read_route_changed,"+
 				"circuit_breaker_open,circuit_breaker_closed,"+
 				"write_degraded,write_recovered,write_flapping,"+
 				"drain_entered,drain_exited,"+

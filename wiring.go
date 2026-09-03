@@ -30,6 +30,11 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 				mw.SetMetrics(config.Metrics)
 			}
 		}
+		if config.ReadStrategy != nil {
+			if rs, ok := config.ReadStrategy.(Instrumentable); ok && !rs.MetricsConfigured() {
+				rs.SetMetrics(config.Metrics)
+			}
+		}
 		if config.WriteStrategy != nil {
 			if ws, ok := config.WriteStrategy.(Instrumentable); ok && !ws.MetricsConfigured() {
 				ws.SetMetrics(config.Metrics)
@@ -119,6 +124,7 @@ func (c *CQLClient) createEventDispatcher() {
 var orderedClusterEventKinds = []types.ClusterEventKind{
 	types.EventFailover,
 	types.EventReadDivergence,
+	types.EventReadRouteChanged,
 	types.EventCircuitBreakerOpen,
 	types.EventCircuitBreakerClosed,
 	types.EventWriteDegraded,
@@ -145,6 +151,10 @@ func eventKindUnreachable(kind types.ClusterEventKind, config *ClientConfig, dua
 	switch kind {
 	case types.EventFailover, types.EventReadDivergence:
 		return !dualCluster
+	case types.EventReadRouteChanged:
+		_, ok := config.ReadStrategy.(EventEmitterSetter)
+
+		return !ok || !dualCluster
 	case types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed:
 		_, ok := config.FailoverPolicy.(EventEmitterSetter)
 		return !ok || !dualCluster
@@ -222,6 +232,11 @@ func (c *CQLClient) startEventDelivery() {
 // starts, so a component never observes a half-installed emitter.
 func (c *CQLClient) autoInjectEventEmitter() {
 	config := c.config
+	if config.ReadStrategy != nil {
+		if rs, ok := config.ReadStrategy.(EventEmitterSetter); ok {
+			rs.SetEventEmitter(c.runtime.events)
+		}
+	}
 	if config.WriteStrategy != nil {
 		if ws, ok := config.WriteStrategy.(EventEmitterSetter); ok {
 			ws.SetEventEmitter(c.runtime.events)

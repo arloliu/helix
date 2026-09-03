@@ -183,6 +183,8 @@ type Collector struct {
 
 	// Adaptive write transitions (optional types.AdaptiveWriteMetrics)
 	writeDegradedStateA  atomic.Int64
+	readPreferredA       atomic.Int64
+	readPreferredB       atomic.Int64
 	writeDegradedStateB  atomic.Int64
 	writeDegradedTotalA  *metrics.Counter
 	writeDegradedTotalB  *metrics.Counter
@@ -320,6 +322,15 @@ func (c *Collector) initMetrics() {
 	c.writeDroppedB = c.set.NewCounter(fmt.Sprintf(`%s_write_dropped_total{cluster="%s"}`, p, nB))
 	c.writeDurationA = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nA), c.durationBuckets)
 	c.writeDurationB = c.set.NewPrometheusHistogramExt(fmt.Sprintf(`%s_write_duration_seconds{cluster="%s"}`, p, nB), c.durationBuckets)
+
+	// Read routing (optional types.ReadRouteMetrics) - the strategy's
+	// preferred cluster as a pair of 0/1 gauges
+	c.set.NewGauge(fmt.Sprintf(`%s_read_preferred{cluster="%s"}`, p, nA), func() float64 {
+		return float64(c.readPreferredA.Load())
+	})
+	c.set.NewGauge(fmt.Sprintf(`%s_read_preferred{cluster="%s"}`, p, nB), func() float64 {
+		return float64(c.readPreferredB.Load())
+	})
 
 	// Adaptive write transitions (optional types.AdaptiveWriteMetrics) -
 	// gauge with callbacks, plus per-direction transition counters
@@ -525,18 +536,34 @@ func (c *Collector) ObserveWriteDuration(cluster types.ClusterID, seconds float6
 	}
 }
 
+// SetReadPreferred sets the read-preference gauge for a cluster (1 when
+// the read strategy prefers it, 0 otherwise). Part of the optional
+// types.ReadRouteMetrics interface.
+func (c *Collector) SetReadPreferred(cluster types.ClusterID, preferred bool) {
+	if cluster == types.ClusterA {
+		c.readPreferredA.Store(boolGauge(preferred))
+	} else {
+		c.readPreferredB.Store(boolGauge(preferred))
+	}
+}
+
+// boolGauge maps a boolean state to its 0/1 gauge value.
+func boolGauge(on bool) int64 {
+	if on {
+		return 1
+	}
+
+	return 0
+}
+
 // SetWriteDegraded sets the degraded-state gauge for a cluster
 // (1=degraded fire-and-forget, 0=healthy synchronous). Part of the
 // optional types.AdaptiveWriteMetrics interface.
 func (c *Collector) SetWriteDegraded(cluster types.ClusterID, degraded bool) {
-	val := int64(0)
-	if degraded {
-		val = 1
-	}
 	if cluster == types.ClusterA {
-		c.writeDegradedStateA.Store(val)
+		c.writeDegradedStateA.Store(boolGauge(degraded))
 	} else {
-		c.writeDegradedStateB.Store(val)
+		c.writeDegradedStateB.Store(boolGauge(degraded))
 	}
 }
 

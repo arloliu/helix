@@ -33,6 +33,9 @@ type TestMetricsCollector struct {
 	// Failover
 	FailoverTotal map[string]int64 // key: "from->to"
 
+	// Read routing (optional types.ReadRouteMetrics)
+	ReadPreferred map[types.ClusterID]bool
+
 	// Circuit breaker
 	CircuitBreakerState map[types.ClusterID]int
 	CircuitBreakerTrips map[types.ClusterID]int64
@@ -87,6 +90,7 @@ func NewTestMetricsCollector() *TestMetricsCollector {
 		WriteDropped:            make(map[types.ClusterID]int64),
 		WriteDuration:           make(map[types.ClusterID][]float64),
 		WriteDegradedState:      make(map[types.ClusterID]bool),
+		ReadPreferred:           make(map[types.ClusterID]bool),
 		WriteDegraded:           make(map[types.ClusterID]int64),
 		WriteRecovered:          make(map[types.ClusterID]int64),
 		FailoverTotal:           make(map[string]int64),
@@ -174,6 +178,13 @@ func (m *TestMetricsCollector) ObserveWriteDuration(cluster types.ClusterID, sec
 // ----------------------
 // Adaptive Write Transitions (optional types.AdaptiveWriteMetrics)
 // ----------------------
+
+// SetReadPreferred implements the optional types.ReadRouteMetrics.
+func (m *TestMetricsCollector) SetReadPreferred(cluster types.ClusterID, preferred bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReadPreferred[cluster] = preferred
+}
 
 func (m *TestMetricsCollector) SetWriteDegraded(cluster types.ClusterID, degraded bool) {
 	m.mu.Lock()

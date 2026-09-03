@@ -31,12 +31,92 @@ import (
 type StickyRead struct {
 	preferred        atomic.Value // types.ClusterID
 	initial          types.ClusterID
-	mu               sync.RWMutex
+	mu               sync.RWMutex // guards lastFailoverTime and every preference transition
 	lastFailoverTime time.Time
 	failoverCooldown time.Duration
 	// knownBad marks a cluster that failed and has not succeeded since;
 	// index 0 is cluster A and index 1 is cluster B.
 	knownBad [2]atomic.Bool
+
+	route routeReporter
+}
+
+// Read-route reasons carried by [types.EventReadRouteChanged].
+const (
+	routeReasonFailover  = "failover"
+	routeReasonKnownGood = "alternative known good"
+	routeReasonManual    = "manual"
+	routeReasonRecovered = "recovered"
+)
+
+// routeReporter carries a read strategy's preference to the gauge and the
+// event stream.
+// A transition enqueues its event while the strategy's transition mutex is
+// held, so event order equals state order; the gauge is written after the
+// mutex is released.
+type routeReporter struct {
+	preferred  func() types.ClusterID // the strategy's current preference, lock-free
+	gauge      atomic.Pointer[types.ReadRouteMetrics]
+	configured atomic.Bool
+	events     eventOutbox
+	reporting  atomic.Bool // one goroutine at a time writes the gauge
+	dirty      atomic.Bool // a transition happened since the last write
+}
+
+// recordLocked enqueues the event for a transition.
+// The caller holds the strategy's transition mutex and calls report after
+// releasing it.
+func (r *routeReporter) recordLocked(from, to types.ClusterID, reason string) {
+	r.events.enqueue(types.ClusterEvent{
+		Kind:        types.EventReadRouteChanged,
+		Cluster:     to,
+		FromCluster: from,
+		ToCluster:   to,
+		Reason:      reason,
+	})
+}
+
+// report writes the current preference to the gauge and drains the outbox.
+// The caller has released the transition mutex.
+// The goroutine holding the reporting flag rereads the preference after
+// each write and writes again while transitions keep arriving; every other
+// caller marks the state dirty and returns, trusting the holder.
+// A collector that blocks therefore holds only the holder, and a collector
+// that calls back into the strategy enqueues and returns.
+func (r *routeReporter) report() {
+	if gauge := r.gauge.Load(); gauge != nil {
+		r.dirty.Store(true)
+		for r.dirty.Load() && r.reporting.CompareAndSwap(false, true) {
+			r.dirty.Store(false)
+			preferred := r.preferred()
+			(*gauge).SetReadPreferred(types.ClusterA, preferred == types.ClusterA)
+			(*gauge).SetReadPreferred(types.ClusterB, preferred == types.ClusterB)
+			r.reporting.Store(false)
+		}
+	}
+	r.events.drain()
+}
+
+// setMetrics installs the collector and publishes the current preference
+// through it.
+func (r *routeReporter) setMetrics(m types.MetricsCollector) {
+	if m == nil {
+		return
+	}
+	r.configured.Store(true)
+	if gauge, ok := m.(types.ReadRouteMetrics); ok {
+		r.gauge.Store(&gauge)
+		r.report()
+	}
+}
+
+// otherCluster returns the sibling of a known cluster.
+func otherCluster(cluster types.ClusterID) types.ClusterID {
+	if cluster == types.ClusterA {
+		return types.ClusterB
+	}
+
+	return types.ClusterA
 }
 
 // StickyReadOption configures a StickyRead strategy.
@@ -88,6 +168,7 @@ func NewStickyRead(opts ...StickyReadOption) *StickyRead {
 	s := &StickyRead{
 		failoverCooldown: 5 * time.Minute,
 	}
+	s.route.preferred = s.Preferred
 
 	// Random initial selection for load distribution
 	// Use crypto/rand for secure randomness
@@ -165,26 +246,16 @@ func (s *StickyRead) OnSuccess(cluster types.ClusterID) {
 //   - types.ClusterID: Alternative cluster to try
 //   - bool: true if failover should be attempted
 func (s *StickyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterID, bool) {
-	preferred, ok := s.preferred.Load().(types.ClusterID)
-	if !ok {
+	if !isKnownCluster(cluster) {
 		return "", false
 	}
-	if bad := s.knownBadSlot(cluster); bad != nil {
-		bad.Store(true)
-	}
+	s.knownBadSlot(cluster).Store(true)
 
 	// Only failover if the preferred cluster failed
-	if cluster != preferred {
+	if cluster != s.Preferred() {
 		return "", false
 	}
-
-	// Determine alternative
-	var alternative types.ClusterID
-	if preferred == types.ClusterA {
-		alternative = types.ClusterB
-	} else {
-		alternative = types.ClusterA
-	}
+	alternative := otherCluster(cluster)
 
 	// Within the cooldown the preference moves only when the alternative is
 	// known good; otherwise the alternative serves this request alone, so
@@ -193,14 +264,36 @@ func (s *StickyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterI
 	alternativeBad := s.knownBadSlot(alternative).Load()
 	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if now.Sub(s.lastFailoverTime) < s.failoverCooldown && alternativeBad {
-		return alternative, true
+	inCooldown := now.Sub(s.lastFailoverTime) < s.failoverCooldown
+	reason := routeReasonFailover
+	if inCooldown {
+		reason = routeReasonKnownGood
 	}
-	s.preferred.Store(alternative)
-	s.lastFailoverTime = now
+	moved := (!inCooldown || !alternativeBad) && s.settleLocked(alternative, reason)
+	if moved {
+		s.lastFailoverTime = now
+	}
+	s.mu.Unlock()
+	if moved {
+		s.route.report()
+	}
 
 	return alternative, true
+}
+
+// settleLocked moves the preference to cluster and records the transition,
+// or reports false when cluster is already preferred (a concurrent caller
+// moved it first, or the operator asked for the current one).
+// The caller holds s.mu and reports after releasing it.
+func (s *StickyRead) settleLocked(cluster types.ClusterID, reason string) bool {
+	from := s.Preferred()
+	if from == cluster {
+		return false
+	}
+	s.preferred.Store(cluster)
+	s.route.recordLocked(from, cluster, reason)
+
+	return true
 }
 
 // SetPreferred moves the preferred cluster by hand and restarts the
@@ -214,9 +307,12 @@ func (s *StickyRead) SetPreferred(cluster types.ClusterID) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.preferred.Store(cluster)
 	s.lastFailoverTime = time.Now()
+	moved := s.settleLocked(cluster, routeReasonManual)
+	s.mu.Unlock()
+	if moved {
+		s.route.report()
+	}
 }
 
 // Reset returns the preference to the cluster chosen at construction (by
@@ -224,13 +320,29 @@ func (s *StickyRead) SetPreferred(cluster types.ClusterID) {
 // which clusters are known bad.
 func (s *StickyRead) Reset() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.preferred.Store(s.initial)
 	s.lastFailoverTime = time.Time{}
 	for i := range s.knownBad {
 		s.knownBad[i].Store(false)
 	}
+	moved := s.settleLocked(s.initial, routeReasonManual)
+	s.mu.Unlock()
+	if moved {
+		s.route.report()
+	}
 }
+
+// MetricsConfigured reports whether SetMetrics installed a collector.
+func (s *StickyRead) MetricsConfigured() bool { return s.route.configured.Load() }
+
+// SetMetrics installs the collector the preference gauge is written to and
+// publishes the current preference; [helix.NewCQLClient] calls it with the
+// client's collector. A nil collector is ignored.
+func (s *StickyRead) SetMetrics(m types.MetricsCollector) { s.route.setMetrics(m) }
+
+// SetEventEmitter installs the emitter [types.EventReadRouteChanged] events
+// are delivered to; nil disables emission. [helix.NewCQLClient] calls it
+// with the client's dispatcher.
+func (s *StickyRead) SetEventEmitter(em types.ClusterEventEmitter) { s.route.events.setEmitter(em) }
 
 // Preferred returns the current preferred cluster.
 //
@@ -266,6 +378,11 @@ type PrimaryOnlyRead struct {
 	// expires after another recovery timeout.
 	nextProbeAt     atomic.Int64
 	recoveryTimeout time.Duration
+
+	// mu serializes the transitions so their events are enqueued in state
+	// order; failedOver is written under it and read lock-free by Select.
+	mu    sync.Mutex
+	route routeReporter
 }
 
 // PrimaryOnlyReadOption configures a PrimaryOnlyRead strategy.
@@ -302,9 +419,11 @@ func WithPrimaryOnlyRecoveryTimeout(d time.Duration) PrimaryOnlyReadOption {
 //   - *PrimaryOnlyRead: A new primary-only read strategy
 func NewPrimaryOnlyRead(opts ...PrimaryOnlyReadOption) *PrimaryOnlyRead {
 	p := &PrimaryOnlyRead{}
+	p.route.preferred = p.preferred
 	for _, opt := range opts {
 		opt(p)
 	}
+
 	return p
 }
 
@@ -347,7 +466,7 @@ func (p *PrimaryOnlyRead) Select(_ context.Context) types.ClusterID {
 //   - cluster: The cluster that succeeded
 func (p *PrimaryOnlyRead) OnSuccess(cluster types.ClusterID) {
 	if cluster == types.ClusterA && p.failedOver.Load() {
-		p.Reset()
+		p.restore(routeReasonRecovered)
 	}
 }
 
@@ -370,8 +489,8 @@ func (p *PrimaryOnlyRead) OnSuccess(cluster types.ClusterID) {
 //   - bool: true if failover should be attempted
 func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.ClusterID, bool) {
 	if cluster == types.ClusterA {
-		p.failedOver.Store(true)
-		p.nextProbeAt.Store(time.Now().Add(p.recoveryTimeout).UnixNano())
+		p.transition(true, time.Now().Add(p.recoveryTimeout).UnixNano(), routeReasonFailover)
+
 		return types.ClusterB, true
 	}
 
@@ -397,8 +516,59 @@ func (p *PrimaryOnlyRead) OnFailure(cluster types.ClusterID, _ error) (types.Clu
 
 // Reset resets the failover state back to primary immediately.
 func (p *PrimaryOnlyRead) Reset() {
-	p.failedOver.Store(false)
-	p.nextProbeAt.Store(0)
+	p.restore(routeReasonManual)
+}
+
+// restore returns reads to cluster A and reports the move with reason when
+// the strategy was failed over.
+func (p *PrimaryOnlyRead) restore(reason string) {
+	p.transition(false, 0, reason)
+}
+
+// transition sets the failed-over state and the probe timer, and records
+// the move with reason when the state changed.
+func (p *PrimaryOnlyRead) transition(failedOver bool, nextProbeAt int64, reason string) {
+	p.mu.Lock()
+	moved := p.failedOver.Load() != failedOver
+	if moved {
+		p.failedOver.Store(failedOver)
+	}
+	p.nextProbeAt.Store(nextProbeAt)
+	if moved {
+		from, to := types.ClusterA, types.ClusterB
+		if !failedOver {
+			from, to = to, from
+		}
+		p.route.recordLocked(from, to, reason)
+	}
+	p.mu.Unlock()
+	if moved {
+		p.route.report()
+	}
+}
+
+// preferred returns the cluster reads currently go to.
+func (p *PrimaryOnlyRead) preferred() types.ClusterID {
+	if p.failedOver.Load() {
+		return types.ClusterB
+	}
+
+	return types.ClusterA
+}
+
+// MetricsConfigured reports whether SetMetrics installed a collector.
+func (p *PrimaryOnlyRead) MetricsConfigured() bool { return p.route.configured.Load() }
+
+// SetMetrics installs the collector the preference gauge is written to and
+// publishes the current preference; [helix.NewCQLClient] calls it with the
+// client's collector. A nil collector is ignored.
+func (p *PrimaryOnlyRead) SetMetrics(m types.MetricsCollector) { p.route.setMetrics(m) }
+
+// SetEventEmitter installs the emitter [types.EventReadRouteChanged] events
+// are delivered to; nil disables emission. [helix.NewCQLClient] calls it
+// with the client's dispatcher.
+func (p *PrimaryOnlyRead) SetEventEmitter(em types.ClusterEventEmitter) {
+	p.route.events.setEmitter(em)
 }
 
 // RoundRobinRead implements a read strategy that alternates between clusters.
