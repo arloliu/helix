@@ -403,3 +403,117 @@ func TestEngineConcurrentEnqueue(t *testing.T) {
 
 	waitForCount(t, func() int { return int(e.Stats().Success) }, 800)
 }
+
+// gatedExecutor blocks every execution until released and counts them.
+type gatedExecutor struct {
+	entered chan struct{}
+	release chan struct{}
+	count   atomic.Int32
+}
+
+func newGatedExecutor() *gatedExecutor {
+	return &gatedExecutor{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (g *gatedExecutor) fn() ExecuteFunc {
+	return func(context.Context, types.ReplayPayload) error {
+		g.count.Add(1)
+		g.entered <- struct{}{}
+		<-g.release
+
+		return nil
+	}
+}
+
+// drainMetrics records the shutdown drop counter.
+type drainMetrics struct {
+	nopMirrorMetrics
+	drainDropped atomic.Int32
+}
+
+func (d *drainMetrics) AddMirrorDrainDropped(n int) { d.drainDropped.Add(int32(n)) }
+
+func TestEngineDrainTimeoutDropsTheQueueOnceAndWaitsForInFlightWork(t *testing.T) {
+	exec := newGatedExecutor()
+	var dropped atomic.Int32
+	m := &drainMetrics{}
+	e := NewEngine(exec.fn(), WithWorkers(1), WithQueueSize(8),
+		WithDrainTimeout(30*time.Millisecond),
+		WithOnDrop(func(types.ReplayPayload) { dropped.Add(1) }),
+		WithMetrics(m),
+	)
+	e.Start()
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "running"}))
+	<-exec.entered
+	for range 4 {
+		require.True(t, e.TryEnqueue(types.ReplayPayload{}))
+	}
+
+	stopped := make(chan struct{})
+	go func() { e.Stop(); close(stopped) }()
+	<-e.drainCutoff
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while an execution was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(exec.release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return once the in-flight execution finished")
+	}
+
+	require.Equal(t, int32(1), exec.count.Load(), "no execution starts after the cutoff")
+	require.Equal(t, int32(4), dropped.Load(), "every queued capture is handed to the drop handler once")
+	require.Equal(t, uint64(4), e.Stats().Dropped)
+	require.Equal(t, int32(4), m.drainDropped.Load())
+	require.False(t, e.TryEnqueue(types.ReplayPayload{Query: "late"}), "the engine stays stopped")
+}
+
+func TestEngineDrainTimeoutWaitsForABlockingDropHandler(t *testing.T) {
+	exec := newGatedExecutor()
+	handlerEntered := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	e := NewEngine(exec.fn(), WithWorkers(1), WithQueueSize(8),
+		WithDrainTimeout(time.Millisecond),
+		WithOnDrop(func(types.ReplayPayload) {
+			close(handlerEntered) // only the queued capture is dropped
+			<-handlerRelease
+		}),
+	)
+	e.Start()
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "running"}))
+	<-exec.entered
+	require.True(t, e.TryEnqueue(types.ReplayPayload{Query: "queued"}))
+
+	stopped := make(chan struct{})
+	go func() { e.Stop(); close(stopped) }()
+	<-e.drainCutoff     // elapses while the first capture is still executing
+	close(exec.release) // the worker then reaches the queued capture and drops it
+	<-handlerEntered
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while the drop handler was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(handlerRelease)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after the drop handler")
+	}
+}
+
+func TestEngineWithoutDrainTimeoutDrainsEverything(t *testing.T) {
+	rec := &recordingExecutor{delay: 5 * time.Millisecond}
+	e := NewEngine(rec.fn(), WithWorkers(1), WithQueueSize(16))
+	e.Start()
+	for range 10 {
+		require.True(t, e.TryEnqueue(types.ReplayPayload{}))
+	}
+	e.Stop()
+	e.Stop() // repeated Stop is a no-op
+	require.Len(t, rec.seen(), 10)
+	require.Zero(t, e.Stats().Dropped)
+}

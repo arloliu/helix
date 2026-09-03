@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,9 +24,13 @@ import (
 type ExecuteFunc = replay.ExecuteFunc
 
 // DropHandler is invoked when a captured write cannot be enqueued because
-// the queue is full or the engine has stopped.
+// the queue is full or the engine has stopped, and for every capture still
+// queued when [WithDrainTimeout] cuts the shutdown drain short.
 //
-// The handler runs on the caller's goroutine; keep it fast and non-blocking.
+// The handler runs on the caller's goroutine (or on a worker goroutine
+// during shutdown); keep it fast and non-blocking. It must not call the
+// owning client's Close or the engine's Stop: Stop waits for the workers
+// that run the shutdown drops, so a handler that calls it deadlocks.
 type DropHandler func(payload types.ReplayPayload)
 
 // ErrorHandler is invoked synchronously by a worker after [ExecuteFunc]
@@ -37,7 +42,9 @@ type DropHandler func(payload types.ReplayPayload)
 // or alternative durability stores.
 //
 // The handler runs on a worker goroutine and blocks the worker until it
-// returns. Keep it fast — slow handlers throttle mirror throughput.
+// returns. Keep it fast — slow handlers throttle mirror throughput. It must
+// not call the owning client's Close or the engine's Stop: both wait for
+// the worker that invoked it and would deadlock.
 type ErrorHandler func(payload types.ReplayPayload, err error)
 
 // Stats reports a snapshot of engine counters and queue state.
@@ -72,13 +79,14 @@ const (
 )
 
 type config struct {
-	queueSize int
-	workers   int
-	enabled   bool
-	onDrop    DropHandler
-	onError   ErrorHandler
-	logger    types.Logger
-	metrics   types.MirrorMetrics
+	queueSize    int
+	workers      int
+	enabled      bool
+	onDrop       DropHandler
+	onError      ErrorHandler
+	logger       types.Logger
+	metrics      types.MirrorMetrics
+	drainTimeout time.Duration
 }
 
 // Option configures an [Engine].
@@ -109,15 +117,42 @@ func WithEnabled(enabled bool) Option {
 	return func(c *config) { c.enabled = enabled }
 }
 
-// WithOnDrop installs a callback invoked for every dropped capture.
+// WithOnDrop installs a callback invoked for every dropped capture. See
+// [DropHandler] for what it must not do.
 func WithOnDrop(fn DropHandler) Option {
 	return func(c *config) { c.onDrop = fn }
 }
 
 // WithOnError installs a callback invoked synchronously by a worker after
-// [ExecuteFunc] returns a non-nil error. See [ErrorHandler] for semantics.
+// [ExecuteFunc] returns a non-nil error. See [ErrorHandler] for semantics
+// and what it must not do.
 func WithOnError(fn ErrorHandler) Option {
 	return func(c *config) { c.onError = fn }
+}
+
+// WithDrainTimeout bounds how long [Engine.Stop] keeps starting new
+// executions for queued captures. Once d elapses the workers stop taking
+// captures, every capture still queued is dropped exactly once (the
+// [DropHandler], the dropped statistic, and
+// [types.MirrorShutdownMetrics.AddMirrorDrainDropped] when the collector
+// implements it), one Warn line reports the count, and Stop then waits for
+// the captures already executing and their callbacks.
+//
+// d is the cutoff for starting new executions, not a bound on Stop: Stop,
+// and the owning client's Close, still wait for every in-flight execution
+// and every synchronous drop and error callback, whose delays add up.
+// Zero (the default) keeps the unbounded drain, which in publisher mode
+// can hold Close for minutes on a full queue. The dropped captures go to
+// the [DropHandler] only, never to a mirror replayer; a handler that
+// wants them durable must enqueue them itself.
+//
+// Parameters:
+//   - d: The cutoff; zero or negative disables it
+//
+// Returns:
+//   - Option: Configuration option
+func WithDrainTimeout(d time.Duration) Option {
+	return func(c *config) { c.drainTimeout = d }
 }
 
 // WithLogger sets the logger used for engine events. Defaults to a no-op
@@ -168,6 +203,11 @@ type Engine struct {
 	// lastDropLogNanos rate-limits the drop warning log to dropLogInterval.
 	lastDropLogNanos atomic.Int64
 
+	// drainCutoff is closed when the drain timeout elapses during Stop;
+	// workers then drop instead of execute. drainDropped counts those.
+	drainCutoff  chan struct{}
+	drainDropped atomic.Uint64
+
 	wg sync.WaitGroup
 
 	enqueued atomic.Uint64
@@ -207,9 +247,10 @@ func NewEngine(execute ExecuteFunc, opts ...Option) *Engine {
 	}
 
 	e := &Engine{
-		cfg:     cfg,
-		execute: execute,
-		queue:   make(chan types.ReplayPayload, cfg.queueSize),
+		cfg:         cfg,
+		execute:     execute,
+		queue:       make(chan types.ReplayPayload, cfg.queueSize),
+		drainCutoff: make(chan struct{}),
 	}
 	e.enabled.Store(cfg.enabled)
 
@@ -241,15 +282,46 @@ func (e *Engine) Start() {
 
 // Stop signals workers to drain remaining queued captures and exit, then
 // waits for them. After Stop returns, TryEnqueue always drops.
+// The drain is synchronous and unbounded unless [WithDrainTimeout] cuts
+// it short.
 func (e *Engine) Stop() {
 	e.stopOnce.Do(func() {
 		e.enqueueMu.Lock()
 		e.stopped.Store(true)
 		close(e.queue)
 		e.enqueueMu.Unlock()
+		if e.cfg.drainTimeout > 0 {
+			timer := time.AfterFunc(e.cfg.drainTimeout, func() { close(e.drainCutoff) })
+			defer timer.Stop()
+		}
 		e.wg.Wait()
+		if n := e.drainDropped.Load(); n > 0 {
+			e.reportDrainDropped(n)
+		}
+		// Workers write the gauge from len(queue) after their own dequeue;
+		// with several workers the last write to land can be stale, so
+		// the empty queue is reconciled here.
+		e.cfg.metrics.SetMirrorQueueDepth(0)
 		e.cfg.metrics.SetMirrorEnabled(false)
 	})
+}
+
+// reportDrainDropped publishes the captures the drain timeout dropped.
+func (e *Engine) reportDrainDropped(n uint64) {
+	count := int(min(n, math.MaxInt)) //nolint:gosec // capped above
+	if sm, ok := e.cfg.metrics.(types.MirrorShutdownMetrics); ok {
+		sm.AddMirrorDrainDropped(count)
+	}
+	e.cfg.logger.Warn("mirror drain timeout elapsed: queued captures dropped", "count", count)
+}
+
+// dropAtShutdown drops a capture the drain timeout left queued.
+func (e *Engine) dropAtShutdown(payload types.ReplayPayload) {
+	e.dropped.Add(1)
+	e.drainDropped.Add(1)
+	if e.cfg.onDrop != nil {
+		e.cfg.onDrop(payload)
+	}
 }
 
 // Enable resumes accepting new captures. Items already in the queue are
@@ -338,6 +410,13 @@ func (e *Engine) worker() {
 
 	for payload := range e.queue {
 		e.cfg.metrics.SetMirrorQueueDepth(len(e.queue))
+		select {
+		case <-e.drainCutoff:
+			e.dropAtShutdown(payload)
+
+			continue
+		default:
+		}
 
 		start := time.Now()
 		err := e.execute(ctx, payload)

@@ -210,6 +210,9 @@ var _ types.ClusterEventMetrics = (*NopMetrics)(nil)
 // Mirror replay (optional types.MirrorReplayMetrics)
 // ----------------------
 
+// AddMirrorDrainDropped discards the metric.
+func (m *NopMetrics) AddMirrorDrainDropped(_ int) {}
+
 // IncMirrorReplayDropped discards the metric.
 func (m *NopMetrics) IncMirrorReplayDropped() {}
 
