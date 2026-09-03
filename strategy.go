@@ -233,7 +233,10 @@ type LoggerSetter interface {
 // [types.ErrWriteAsync] for it. When that error also implements this
 // interface, the client defers the leg's replay: it snapshots the write
 // and enqueues it for replay only if the background leg later reports a
-// failure, so a statement that lands in the background is applied once.
+// failure, so a statement whose background attempt succeeds is not
+// applied a second time by an eager replay. An ambiguous failure such as
+// a timeout can still lead to a replay of a statement the cluster
+// applied; mark such statements [Query.NonIdempotent].
 // A plain [types.ErrWriteAsync] without this interface is enqueued for
 // replay immediately, as a safety net. [policy.AdaptiveDualWrite]
 // implements it for its fire-and-forget legs.

@@ -132,19 +132,26 @@ type Query interface {
 	SerialConsistency(c Consistency) Query
 
 	// Mirror marks this write to be asynchronously mirrored to the helix
-	// mirror destination configured via [WithMirror].
+	// mirror destination configured via [WithMirror], or published through
+	// [WithMirrorPublisher].
 	//
 	// Mirroring is fire-and-forget: the mirror write is dispatched on a
-	// background worker pool after the primary write completes successfully
-	// (at least one current-pair cluster acked). Errors on the mirror leg
-	// are never surfaced to the caller. Captures are dropped silently (with
-	// metrics and a log entry) when the mirror queue is full or the engine
-	// is disabled.
+	// background worker pool exactly when the primary Exec returns nil.
+	// Normally that means at least one current-pair cluster acknowledged
+	// the write; with [AckOnReplayAdmission] it also covers a write no
+	// cluster acknowledged that was admitted to replay or is still running
+	// in the background. A [Query.NonIdempotent] write acknowledged by one
+	// cluster returns a [*types.PartialWriteError] and is not mirrored.
+	// Errors on the mirror leg are never surfaced to the caller. Captures
+	// are dropped silently (with metrics and a log entry) when the mirror
+	// queue is full or the engine is disabled.
 	//
 	// Mirror has no effect on read or CAS operations and no effect when
-	// [WithMirror] was not configured. The original write timestamp is
-	// preserved on the mirror exec so server-side WRITETIME, LWW, TTL, and
-	// tombstone semantics match the primary cluster.
+	// neither mirror mode was configured. The write timestamp resolved when
+	// Exec began is preserved on the mirror exec, so server-side WRITETIME,
+	// LWW, and tombstone semantics match the primary cluster; USING TTL
+	// does not, because the server counts expiry from the time it applies
+	// the mirrored write (see docs/mirror.md).
 	//
 	// Returns:
 	//   - Query: The same query for chaining

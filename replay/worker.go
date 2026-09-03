@@ -124,9 +124,12 @@ type WorkerConfig struct {
 	// The error and attempt number are provided.
 	OnError func(payload types.ReplayPayload, err error, attempt int)
 
-	// OnDrop is called once when a payload is permanently dropped (optional).
-	// Both backends invoke it; the reason is reported through the optional
-	// types.ReplayBacklogMetrics interface and the worker log.
+	// OnDrop is called once when the worker permanently drops a payload
+	// (optional). Both backends invoke it; the reason is reported through
+	// the optional types.ReplayBacklogMetrics interface and the worker log.
+	// A NATS message the stream evicts on its own (MaxAge expiry, or a
+	// stream limit with DiscardOld) never reaches the worker and is not
+	// reported here; watch JetStream's stream and consumer metrics for it.
 	OnDrop func(payload types.ReplayPayload, err error)
 }
 

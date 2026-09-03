@@ -634,7 +634,7 @@ The reason appears in the worker log and, on collectors implementing
 | Backoff | `RetryDelay` doubling up to `MaxRetryDelay` | Same schedule, carried by delayed `Nak`; under `RetryBounded` the `Nak` has no delay |
 | Where retries run | In-process goroutine pool | NATS server redelivery |
 | Survives process crash | No (in-memory) | Yes (JetStream durable) |
-| Drop visibility | `OnDrop` callback | `OnDrop` callback |
+| Drop visibility | `OnDrop` callback | `OnDrop` callback for worker-directed drops; `MaxAge` expiry and `DiscardOld` eviction happen inside JetStream and need its stream and consumer metrics |
 
 ---
 
