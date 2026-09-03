@@ -13,13 +13,6 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
-// onlyClusterA and onlyClusterB are the immutable override lists returned by
-// [ExcludeWhileReplayBacklog], shared so a read allocates nothing.
-var (
-	onlyClusterA = []ClusterID{ClusterA}
-	onlyClusterB = []ClusterID{ClusterB}
-)
-
 // RecoveryProbe configures the background recovery probe that accelerates
 // [policy.AdaptiveDualWrite] cluster recovery and closes an open
 // [policy.CircuitBreaker] or [policy.LatencyCircuitBreaker].
@@ -545,21 +538,26 @@ func WithSessionRefresher(fn SessionRefresher) Option {
 	}
 }
 
-// WithRecoveryProbe configures a custom recovery probe for [policy.AdaptiveDualWrite].
+// WithRecoveryProbe configures the background recovery probe.
 //
-// The probe is called on each Interval against a degraded cluster's live session.
-// A nil return credits one recovery point; a non-nil return leaves the cluster
-// degraded. Zero Interval or Timeout values are replaced with the defaults from
-// [DefaultRecoveryProbe]; negative values are invalid and cause [NewCQLClient]
-// to return a [types.OptionError].
+// One probe per cluster serves two authorities: a write strategy that
+// reports degraded clusters (see [ProbeReporter], [policy.AdaptiveDualWrite])
+// and a failover policy that reserves its open breaker for a probe (see
+// [FailoverProbeReporter], [policy.CircuitBreaker] and
+// [policy.LatencyCircuitBreaker]). On each Interval the probe runs against
+// the live session of a cluster either authority asks about. A nil return
+// credits one recovery point and closes a reserved breaker; a non-nil
+// return leaves the cluster degraded and the breaker open. Zero Interval
+// or Timeout values are replaced with the defaults from
+// [DefaultRecoveryProbe]; negative values are invalid and cause
+// [NewCQLClient] to return a [types.OptionError].
 //
-// When not set, a default probe (system.local read, 2s interval, 1s timeout) runs
-// automatically for any client whose WriteStrategy is [policy.AdaptiveDualWrite].
-// Use [WithRecoveryProbeDisabled] to suppress all probing.
+// When not set, a default probe (system.local read, 2s interval, 1s timeout)
+// runs automatically whenever either authority is configured. Use
+// [WithRecoveryProbeDisabled] to suppress all probing.
 //
-// The probe only runs for a write strategy that reports degraded clusters
-// (see [ProbeReporter]); with any other strategy this option has no effect
-// and [NewCQLClient] logs a warning.
+// With neither a probe-reporting write strategy nor a probe-reporting
+// failover policy, this option has no effect.
 //
 // Returns:
 //   - Option: Configuration option
@@ -584,9 +582,12 @@ func WithRecoveryProbe(p RecoveryProbe) Option {
 	}
 }
 
-// WithRecoveryProbeDisabled disables the background recovery probe even when
-// [policy.AdaptiveDualWrite] is the configured write strategy. Use this when
-// you prefer fully manual recovery via [policy.AdaptiveDualWrite.ForceRecover].
+// WithRecoveryProbeDisabled disables the background recovery probe for both
+// authorities it serves. A degraded [policy.AdaptiveDualWrite] then recovers
+// only through fast background writes or [policy.AdaptiveDualWrite.ForceRecover],
+// and an open [policy.CircuitBreaker] closes only when an ordinary operation
+// against the cluster succeeds; with route veto on, reads avoid that cluster
+// until then.
 //
 // Returns:
 //   - Option: Configuration option
@@ -1183,9 +1184,9 @@ func ExcludeWhileReplayBacklog(depth func(cluster ClusterID) int, threshold int)
 		overB := depth(ClusterB) > threshold
 		switch {
 		case overA && !overB:
-			return onlyClusterB
+			return []ClusterID{ClusterB}
 		case overB && !overA:
-			return onlyClusterA
+			return []ClusterID{ClusterA}
 		default:
 			return nil
 		}
