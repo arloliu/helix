@@ -601,6 +601,8 @@ func TestStrict_DegradedSkipMetric_AdaptiveDualWrite(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			ensureReachable(t, a, d)
+			ensureReachable(t, b, d)
 			t.Cleanup(func() { _ = b.Unpause(context.Background()) })
 
 			adw := policy.NewAdaptiveDualWrite(
@@ -675,6 +677,8 @@ func TestStrict_RecoveryProbe_DefaultProbeRestoresCluster(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			ensureReachable(t, a, d)
+			ensureReachable(t, b, d)
 			t.Cleanup(func() { _ = b.Unpause(context.Background()) })
 
 			adw := policy.NewAdaptiveDualWrite(
