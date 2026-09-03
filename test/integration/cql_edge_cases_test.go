@@ -751,16 +751,16 @@ func TestCQLAdaptiveDualWriteRecoveryIntegration(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Force degrade cluster A
+	// Force degrade cluster A: an operator latch that fast writes cannot undo.
 	adaptiveWrite.ForceDegrade(types.ClusterA)
 	require.True(t, adaptiveWrite.IsDegraded(types.ClusterA))
-
-	// Simulate recovery by recording fast writes
 	for range 3 {
 		adaptiveWrite.RecordFastWrite(types.ClusterA)
 	}
+	require.True(t, adaptiveWrite.IsDegraded(types.ClusterA), "fast writes never clear the operator latch")
 
-	// Cluster A should have recovered
+	// Only the operator restores the cluster.
+	adaptiveWrite.ForceRecover(types.ClusterA)
 	assert.False(t, adaptiveWrite.IsDegraded(types.ClusterA))
 
 	// Normal writes should work
