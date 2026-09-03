@@ -40,7 +40,8 @@ type WatcherConfig struct {
 	// Default: "helix.topology.drain"
 	Key string
 
-	// PollInterval is the fallback polling interval if watch fails.
+	// PollInterval is the fallback polling interval while the watch is
+	// unavailable; the watcher also retries Watch on every poll tick.
 	// Default: 5 seconds
 	PollInterval time.Duration
 
@@ -85,8 +86,8 @@ func WithKey(key string) WatcherOption {
 
 // WithPollInterval sets the fallback polling interval.
 //
-// If the NATS watch fails or disconnects, the watcher falls back to
-// polling at this interval.
+// If the NATS watch fails or disconnects, the watcher polls the key at
+// this interval and retries Watch on every tick until it is re-established.
 //
 // Parameters:
 //   - d: Polling interval duration
