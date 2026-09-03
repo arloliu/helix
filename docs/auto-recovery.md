@@ -219,15 +219,15 @@ See [AdaptiveDualWrite Guide](adaptive-dual-write.md) for thresholds, tuning, an
 
 ### CircuitBreaker
 
-Trips after consecutive read failures, preventing failover until the cluster stabilizes:
+Trips after consecutive read failures and recovers through the client's recovery probe:
 
 - **Trips** after `threshold` (default: 3) consecutive failures
-- **Routes a probe** once `resetTimeout` (default: 30s) has elapsed since the last failure: `ShouldFailover` returns false, so the next read goes back to the failed cluster
-- **Closes** on the next recorded outcome for that cluster — a successful read, or a failure arriving after that elapsed interval. The timeout expiring does not close the breaker on its own; with no further read on that cluster it stays open
-- `LatencyCircuitBreaker` also treats slow reads (above `absoluteMax`) as soft failures
+- **Is probed** once `resetTimeout` (default: 30s) has elapsed since the last failure: the next tick of the client's recovery probe (`WithRecoveryProbe`, default on for dual-cluster clients) reserves the breaker (half-open) and runs one probe against the cluster. A successful probe closes the breaker; a failed one returns it to open and restarts the timeout. No caller's read is sacrificed to test the cluster
+- **Also closes** on any successful read against that cluster
+- Stays open until such a read when `resetTimeout` is 0 or the probe is disabled
+- `LatencyCircuitBreaker` also treats slow reads (above `absoluteMax`) as soft failures, and with `helix.WithRouteVeto(true)` keeps ordinary reads away from the cluster while open or half-open
 
-No manual intervention needed — recovery is fully automatic as long as reads
-keep reaching the cluster. Both transitions emit cluster events; see the
+No manual intervention needed. Both transitions emit cluster events; see the
 [Cluster Events Guide](cluster-events.md).
 
 ### Read Strategies

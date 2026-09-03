@@ -98,7 +98,7 @@ and mirror events work in either mode.
 | `failover` (`EventFailover`) | Nothing — on by default. A configured `FailoverPolicy` can gate it. | A read fails on the selected cluster and is retried on the alternative cluster. Fires **once per failing read**, not once per outage. | `Cluster` (= `ToCluster`), `FromCluster`, `ToCluster`, `Err` | Investigate the `FromCluster` if it recurs. Read the rate from `{prefix}_failover_total`, not from event counts. |
 | `read_divergence` (`EventReadDivergence`) | A read that opted into FallbackRead: `Query.FallbackRead()`, `helix.WithFallbackRead(ctx)`, or `helix.WithDefaultFallbackRead(true)`. | A fallback read finds the row on the alternative cluster after the selected cluster returned not-found. Fires **once per divergent read**. | `Cluster` (the cluster missing the row), `Reason` (always `"row found on alternative cluster after not-found"`) | Watch for a rising rate — it signals replay lag on `Cluster`. Read the rate from `{prefix}_read_divergence_total`. |
 | `circuit_breaker_open` (`EventCircuitBreakerOpen`) | `helix.WithFailoverPolicy` holding a `policy.CircuitBreaker` or `policy.LatencyCircuitBreaker`. `policy.ActiveFailover` produces no events. | A circuit breaker trips open for a cluster. | `Cluster`, `Count` (consecutive failures at trip) | Page. With `helix.WithRouteVeto(true)` and a `LatencyCircuitBreaker`, ordinary reads are routed away from `Cluster` while the breaker is open; otherwise the breaker only decides whether a failed read retries on the other cluster, and new reads still reach `Cluster`. |
-| `circuit_breaker_closed` (`EventCircuitBreakerClosed`) | Same as `circuit_breaker_open`. | A previously open circuit breaker closes. `Reason` `"operation succeeded"` means a read on that cluster succeeded — this is always the reason on a success-driven close. `Reason` `"reset timeout elapsed"` means a subsequent failure observed that the gap since the last recorded failure had exceeded `resetTimeout`; this reason only ever appears on a failure-driven close, on the *next* `RecordFailure` that observes the expired interval, not when the timeout itself elapses. See [Circuit Breaker Close Timing](#circuit-breaker-close-timing). | `Cluster`, `Reason` (`"operation succeeded"`, or `"reset timeout elapsed"`) | Split by `Reason`. `"operation succeeded"`: the cluster served a read; clear the alert. `"reset timeout elapsed"`: the open span ended on a timer with no successful read, so the cluster is not known to be healthy; keep the alert. |
+| `circuit_breaker_closed` (`EventCircuitBreakerClosed`) | Same as `circuit_breaker_open`. | A previously open circuit breaker closes. `Reason` `"operation succeeded"` means a read on that cluster succeeded. `Reason` `"probe succeeded"` means the client's recovery probe, reserved once `resetTimeout` had elapsed since the last failure, reached the cluster. See [Circuit Breaker Close Timing](#circuit-breaker-close-timing). | `Cluster`, `Reason` (`"operation succeeded"`, or `"probe succeeded"`) | Clear the alert: on either reason the cluster answered. |
 | `write_degraded` (`EventWriteDegraded`) | `helix.WithWriteStrategy(policy.NewAdaptiveDualWrite(...))`. | `AdaptiveDualWrite` moves a cluster into degraded (fire-and-forget) mode. | `Cluster`, `Count` (slow-strike count), `Reason` (`"slow-strike threshold reached"`, or `"manual"` for `ForceDegrade`) | Page — writes to `Cluster` are no longer synchronous and rely on replay. Read current state from the `{prefix}_write_degraded` gauge and transitions from `{prefix}_write_degraded_total`. |
 | `write_recovered` (`EventWriteRecovered`) | Same as `write_degraded`. | `AdaptiveDualWrite` moves a cluster back to healthy (synchronous) mode. | `Cluster`, `Reason` (`"fast-strike recovery"`, or `"manual"` / `"manual reset"` for `ForceRecover` / `Reset`) | Clear any related alert. `"fast-strike recovery"` covers both a fast write from ordinary traffic and a successful recovery probe; the two are not distinguishable from the event. The `{prefix}_write_degraded` gauge returns to 0 and `{prefix}_write_recovered_total` increments. |
 | `write_flapping` (`EventWriteFlapping`) | Same as `write_degraded`, plus `policy.WithAdaptiveRedegradeBackoff`. | A strike-driven degrade follows a recovery so soon that the re-degrade backoff has reached its cap. Fires once per run of re-degrades, when the cap is first reached. | `Cluster`, `Count` (consecutive re-degrades inside the backoff window), `Reason` (`"re-degrade backoff cap reached"`) | Investigate the cluster: its writes are slow on and off rather than down. The cluster now stays degraded for the capped dwell after each re-degrade. |
@@ -134,29 +134,24 @@ any event loss.
 
 ### Circuit Breaker Close Timing
 
-`resetTimeout` expiry has two separate effects, and they do not happen at the
-same moment:
+An open breaker closes in one of two ways, and both are observations, never
+a timer on its own:
 
-- **Routing changes immediately.** Once `resetTimeout` has elapsed since the
-  last recorded failure, `ShouldFailover` returns false, so the next read is
-  routed to the previously failing cluster as a probe.
-- **The close transition happens later.** The `circuit_breaker_closed` event,
-  the "circuit breaker closed" log line, and the `{prefix}_circuit_breaker_state`
-  gauge write all happen on the *next* `RecordFailure` or `RecordSuccess` that
-  observes the expired interval. A failure closes with `Reason`
-  `"reset timeout elapsed"`; a success closes with `Reason`
-  `"operation succeeded"`.
+- **A successful read on that cluster** closes it at once with `Reason`
+  `"operation succeeded"`. Reads reach an open cluster when the read strategy
+  still selects it (route veto off) or through an `AllowedClusters` override.
+- **The client's recovery probe** closes it with `Reason` `"probe succeeded"`.
+  Once `resetTimeout` has elapsed since the last recorded failure, the next
+  probe tick reserves the breaker: the `{prefix}_circuit_breaker_state` gauge
+  reports 1 (half-open) and a log line records the reservation, but no event
+  fires. The probe's outcome then closes the breaker (gauge 0, the event
+  above) or returns it to open (gauge 2, no event, no new trip; the timeout
+  restarts). `ShouldFailover` stays true throughout, so no caller's read is
+  used as the probe.
 
-If no further call is ever recorded for that cluster — the application stops
-reading, or routes every read to the other cluster — the open span never ends.
-The gauge keeps reporting open and no `circuit_breaker_closed` arrives. This is
-an accepted limitation: closing requires an observation, and the breaker has
-nothing to observe.
-
-With `threshold` set to 1, the same call that closes on the elapsed timeout
-also brings the fresh count straight back to the threshold, so it emits
-`circuit_breaker_closed` and then `circuit_breaker_open`, in that order, and
-the breaker ends up open.
+With `resetTimeout` 0, `WithRecoveryProbeDisabled()`, or a single-cluster
+client, no probe ever runs: the breaker stays open, and the gauge keeps
+reporting open, until a successful read on that cluster.
 
 ---
 

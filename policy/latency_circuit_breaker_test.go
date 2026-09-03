@@ -297,21 +297,30 @@ func TestLatencyCircuitBreaker_ZeroValueDoesNotPanic(t *testing.T) {
 func TestLatencyCircuitBreaker_ResetTimeout(t *testing.T) {
 	lcb := NewLatencyCircuitBreaker(
 		WithLatencyAbsoluteMax(100*time.Millisecond),
-		WithLatencyThreshold(3),
-		WithLatencyResetTimeout(50*time.Millisecond),
+		WithLatencyThreshold(2),
+		WithLatencyResetTimeout(20*time.Millisecond),
 	)
 
-	// Accumulate some failures
+	// Slow successes count as failures until the breaker trips.
 	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond)
 	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond)
 	require.Equal(t, 2, lcb.Failures(types.ClusterA))
+	require.True(t, lcb.ShouldFailover(types.ClusterA, nil))
+	require.True(t, lcb.VetoRoute(types.ClusterA))
 
-	// Wait for reset timeout
-	time.Sleep(60 * time.Millisecond)
+	// After the reset timeout the breaker reserves a probe and stays
+	// vetoing until the probe closes it.
+	var token uint64
+	require.Eventually(t, func() bool {
+		var ok bool
+		token, ok = lcb.TryBeginFailoverProbe(types.ClusterA)
 
-	// Next failure should reset counter to 1
-	lcb.RecordLatency(types.ClusterA, 200*time.Millisecond)
-	assert.Equal(t, 1, lcb.Failures(types.ClusterA))
+		return ok
+	}, time.Second, time.Millisecond)
+	require.True(t, lcb.VetoRoute(types.ClusterA), "half-open still vetoes")
+	lcb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded)
+	assert.Equal(t, 0, lcb.Failures(types.ClusterA))
+	assert.False(t, lcb.VetoRoute(types.ClusterA))
 }
 
 func TestLatencyCircuitBreaker_SetEventEmitterDelegates(t *testing.T) {

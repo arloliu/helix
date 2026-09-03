@@ -92,12 +92,31 @@ func WithLatencyThreshold(n int) LatencyCircuitBreakerOption {
 	}
 }
 
-// WithLatencyResetTimeout sets the duration after which failure count resets.
+// WithLatencyFailoverBelowThreshold lets a failed read retry on the other
+// cluster while the breaker is still closed. See
+// [WithFailoverBelowThreshold] for the semantics.
+//
+// Default: false (the legacy v1 behaviour; a client logs a startup warning
+// while it is in effect).
+//
+// Parameters:
+//   - enabled: true to fail over below the threshold
+//
+// Returns:
+//   - LatencyCircuitBreakerOption: Configuration option
+func WithLatencyFailoverBelowThreshold(enabled bool) LatencyCircuitBreakerOption {
+	return func(l *LatencyCircuitBreaker) {
+		l.failoverBelowThreshold = enabled
+	}
+}
+
+// WithLatencyResetTimeout sets how long an open breaker waits after its last
+// failure before the client's recovery probe may test the cluster.
 //
 // Default: 30s
 //
 // Parameters:
-//   - d: Reset timeout duration
+//   - d: Reset timeout duration; 0 disables probing
 //
 // Returns:
 //   - LatencyCircuitBreakerOption: Configuration option
@@ -265,14 +284,60 @@ func (l *LatencyCircuitBreaker) VetoRoute(cluster types.ClusterID) bool {
 	if l.CircuitBreaker == nil {
 		return false
 	}
-	switch cluster {
-	case types.ClusterA:
-		return l.openA.Load()
-	case types.ClusterB:
-		return l.openB.Load()
-	default:
+	state := l.stateFor(cluster)
+	if state == nil {
 		return false
 	}
+
+	return state.open.Load()
+}
+
+// FailoverBelowThreshold reports the [WithLatencyFailoverBelowThreshold]
+// setting. A zero-value LatencyCircuitBreaker (nil embedded
+// *CircuitBreaker) reports false.
+//
+// Returns:
+//   - bool: true when a failed read below the threshold may fail over
+func (l *LatencyCircuitBreaker) FailoverBelowThreshold() bool {
+	if l.CircuitBreaker == nil {
+		return false
+	}
+
+	return l.CircuitBreaker.FailoverBelowThreshold()
+}
+
+// TryBeginFailoverProbe reserves an open breaker for one recovery probe.
+// See [CircuitBreaker.TryBeginFailoverProbe]. A zero-value
+// LatencyCircuitBreaker (nil embedded *CircuitBreaker) never reserves.
+//
+// Parameters:
+//   - cluster: The cluster to probe
+//
+// Returns:
+//   - uint64: The reservation token
+//   - bool: true when a probe should run now
+func (l *LatencyCircuitBreaker) TryBeginFailoverProbe(cluster types.ClusterID) (uint64, bool) {
+	if l.CircuitBreaker == nil {
+		return 0, false
+	}
+
+	return l.CircuitBreaker.TryBeginFailoverProbe(cluster)
+}
+
+// CompleteFailoverProbe settles a probe reservation. See
+// [CircuitBreaker.CompleteFailoverProbe]. A zero-value
+// LatencyCircuitBreaker (nil embedded *CircuitBreaker) safely no-ops.
+//
+// Parameters:
+//   - cluster: The cluster that was probed
+//   - token: The reservation token
+//   - outcome: What the probe found
+func (l *LatencyCircuitBreaker) CompleteFailoverProbe(cluster types.ClusterID, token uint64, outcome types.ProbeOutcome) {
+	if l.CircuitBreaker == nil {
+		return
+	}
+
+	l.CircuitBreaker.CompleteFailoverProbe(cluster, token, outcome)
 }
 
 // AbsoluteMax returns the configured latency threshold.

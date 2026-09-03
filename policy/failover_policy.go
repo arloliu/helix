@@ -69,31 +69,39 @@ func (a *ActiveFailover) RecordSuccess(_ types.ClusterID) {}
 // Tracks consecutive failures and only triggers failover after a threshold
 // is reached. This prevents flapping on transient errors.
 //
+// States, per cluster:
+//   - closed: failures are counted; at threshold the breaker trips open.
+//   - open: ShouldFailover is true. The breaker closes on a successful
+//     operation against the cluster. Once resetTimeout has elapsed since
+//     the last failure a client's recovery probe may reserve the breaker
+//     (see TryBeginFailoverProbe).
+//   - half-open: a probe reservation is in flight; ShouldFailover stays
+//     true and ordinary observations keep counting. CompleteFailoverProbe
+//     closes the breaker, returns it to open, or releases the reservation.
+//
+// A breaker whose client never probes it (resetTimeout 0, probe disabled,
+// single-cluster mode) stays open until a successful operation closes it.
+//
 // Concurrency model:
-//   - muA / muB serialize all compound operations on cluster A / B state
-//     (load lastFailure → decide reset-or-add → store failures → store timestamp).
-//     Without this serialization the three atomic ops form a TOCTOU sequence
-//     that can lose counts or emit duplicate metrics under concurrent callers.
-//   - failuresA / failuresB remain atomic.Int32 so ShouldFailover can read
+//   - Each cluster's breakerState.mu serializes every compound operation
+//     on that cluster (load, decide, store). Without it the atomic ops form
+//     a TOCTOU sequence that can lose counts or emit duplicate metrics.
+//   - failures and open are atomics so ShouldFailover and VetoRoute read
 //     them lock-free on the hot path; a one-call lag on a transition is fine.
-//   - trippedA / trippedB track whether the circuit has already tripped to
-//     open; they are plain bools guarded by muA / muB respectively, ensuring
-//     the "circuit opened" metric fires exactly once per trip.
-//   - seqA / seqB count latched transitions per cluster and are incremented
-//     under muA / muB. A call captures the value its own transitions produced
-//     and, once the state mutex is released, writes the state gauge and the
-//     transition log line only while that value is still current. Without it
-//     a goroutine descheduled between latching a transition and reporting it
-//     could overwrite a fresher state with a stale one.
-//   - reportMuA / reportMuB make that check and those writes a single step.
-//     They are separate from muA / muB on purpose: a caller-supplied metrics
-//     collector or logger never runs while a state mutex is held, so a slow
-//     one cannot stall state mutation or routing decisions. They are always
-//     released before events are delivered. They are plain sync.Mutex values,
-//     not reentrant: a metrics collector or logger that synchronously calls
-//     back into RecordFailure or RecordSuccess for the same cluster, from
-//     inside the very call the report mutex is serializing, deadlocks trying
-//     to reacquire it.
+//   - seq counts latched transitions per cluster and is incremented under
+//     mu. A call captures the value its own transition produced and, once
+//     the state mutex is released, writes the state gauge and the log line
+//     only while that value is still current, so a goroutine descheduled
+//     between latching and reporting cannot overwrite a fresher state.
+//     A probe reservation is the same value: a completion settles the
+//     breaker only while its reservation is the latest transition.
+//   - reportMu makes that check and those writes a single step. It is
+//     separate from mu on purpose: a caller-supplied metrics collector or
+//     logger never runs while a state mutex is held, so a slow one cannot
+//     stall state mutation or routing decisions. It is always released
+//     before events are delivered. It is a plain sync.Mutex, not reentrant:
+//     a collector or logger that synchronously calls back into the breaker
+//     for the same cluster from inside the report deadlocks.
 //   - clusterNames is stored in an atomic.Pointer so SetClusterNames is safe
 //     to call concurrently with RecordFailure / RecordSuccess.
 //
@@ -103,11 +111,12 @@ func (a *ActiveFailover) RecordSuccess(_ types.ClusterID) {}
 // only happens inside NewCircuitBreaker / NewCircuitBreakerChecked. Use one
 // of those constructors to get a fully configured, functional CircuitBreaker.
 type CircuitBreaker struct {
-	threshold    int
-	resetTimeout time.Duration
-	metrics      types.MetricsCollector
-	logger       types.Logger
-	clusterNames atomic.Pointer[types.ClusterNames]
+	threshold              int
+	resetTimeout           time.Duration
+	failoverBelowThreshold bool
+	metrics                types.MetricsCollector
+	logger                 types.Logger
+	clusterNames           atomic.Pointer[types.ClusterNames]
 
 	// metricsExplicit / loggerExplicit track whether the caller passed
 	// WithCircuitBreakerMetrics / WithCircuitBreakerLogger (or the
@@ -117,33 +126,43 @@ type CircuitBreaker struct {
 	metricsExplicit bool
 	loggerExplicit  bool
 
-	muA          sync.Mutex    // serializes compound ops for cluster A
-	trippedA     bool          // circuit open for A; guarded by muA
-	openA        atomic.Bool   // lock-free snapshot of trippedA, read by LatencyCircuitBreaker.VetoRoute
-	failuresA    atomic.Int32  // lock-free for ShouldFailover; written under muA
-	lastFailureA atomic.Int64  // Unix nano; written under muA
-	seqA         atomic.Uint64 // latched transitions for A; incremented under muA
-	reportMuA    sync.Mutex    // orders A's state-derived metric and log writes
-
-	muB          sync.Mutex    // serializes compound ops for cluster B
-	trippedB     bool          // circuit open for B; guarded by muB
-	openB        atomic.Bool   // lock-free snapshot of trippedB, read by LatencyCircuitBreaker.VetoRoute
-	failuresB    atomic.Int32  // lock-free for ShouldFailover; written under muB
-	lastFailureB atomic.Int64  // Unix nano; written under muB
-	seqB         atomic.Uint64 // latched transitions for B; incremented under muB
-	reportMuB    sync.Mutex    // orders B's state-derived metric and log writes
+	stateA breakerState
+	stateB breakerState
 
 	// events queues open/close transitions for delivery to an optional
 	// cluster event emitter. Its zero value is disabled. enqueue is
-	// called only from inside the trip and close branches of
-	// RecordFailure / RecordSuccess, so a call that does not actually
-	// trip or close the breaker never reaches it. On a real transition
-	// with no emitter installed, the cost is enqueue's single atomic
-	// load plus drain()'s CompareAndSwap and pending-queue check, since
-	// drain runs unconditionally after every transition regardless of
-	// whether enqueue appended anything.
+	// called only from inside a real transition, so a call that does not
+	// change state never reaches it. On a real transition with no emitter
+	// installed, the cost is enqueue's single atomic load plus drain()'s
+	// CompareAndSwap and pending-queue check, since drain runs
+	// unconditionally after every transition regardless of whether
+	// enqueue appended anything.
 	events eventOutbox
 }
+
+// breakerState is one cluster's breaker state. See the concurrency model
+// on CircuitBreaker.
+type breakerState struct {
+	mu          sync.Mutex    // serializes compound ops
+	tripped     bool          // open or half-open; guarded by mu
+	halfOpen    bool          // a probe reservation is in flight; guarded by mu
+	open        atomic.Bool   // lock-free snapshot of tripped for ShouldFailover and VetoRoute
+	failures    atomic.Int32  // lock-free for Failures; written under mu
+	lastFailure atomic.Int64  // Unix nano; written under mu
+	seq         atomic.Uint64 // latched transitions; incremented under mu
+	reportMu    sync.Mutex    // orders state-derived metric and log writes
+}
+
+// breakerTransition names what one call latched, for the report step.
+type breakerTransition uint8
+
+const (
+	transitionNone     breakerTransition = iota
+	transitionTripped                    // closed → open
+	transitionClosed                     // open or half-open → closed
+	transitionHalfOpen                   // open → half-open
+	transitionReopened                   // half-open → open
+)
 
 // CircuitBreakerOption configures a CircuitBreaker policy.
 type CircuitBreakerOption func(*CircuitBreaker)
@@ -165,16 +184,47 @@ func WithThreshold(n int) CircuitBreakerOption {
 	}
 }
 
-// WithResetTimeout sets the duration after which failure count resets.
+// WithResetTimeout sets how long an open breaker waits after its last
+// failure before the client's recovery probe may test the cluster (see
+// [CircuitBreaker.TryBeginFailoverProbe]).
+//
+// Default: 30s
 //
 // Parameters:
-//   - d: Reset timeout duration
+//   - d: Reset timeout duration; 0 disables probing, so the breaker stays
+//     open until a successful operation
 //
 // Returns:
 //   - CircuitBreakerOption: Configuration option
 func WithResetTimeout(d time.Duration) CircuitBreakerOption {
 	return func(c *CircuitBreaker) {
 		c.resetTimeout = d
+	}
+}
+
+// WithFailoverBelowThreshold lets a failed read retry on the other cluster
+// while the breaker is still closed.
+//
+// By default the first threshold-1 failures on a cluster reach the caller
+// without a retry: the breaker only permits failover once it has tripped.
+// With this option [CircuitBreaker.ShouldFailover] returns true for every
+// failed read, so the caller sees a result from the healthy cluster
+// instead of the failing cluster's error, while the threshold still
+// governs when the breaker opens. A true result follows the ordinary
+// failover path, including the read strategy's OnFailure, so a sticky
+// read preference may move on the first failure.
+//
+// Default: false (the legacy v1 behaviour; a client logs a startup warning
+// while it is in effect).
+//
+// Parameters:
+//   - enabled: true to fail over below the threshold
+//
+// Returns:
+//   - CircuitBreakerOption: Configuration option
+func WithFailoverBelowThreshold(enabled bool) CircuitBreakerOption {
+	return func(c *CircuitBreaker) {
+		c.failoverBelowThreshold = enabled
 	}
 }
 
@@ -407,85 +457,59 @@ func finalizeCircuitBreaker(c *CircuitBreaker) {
 	}
 }
 
-// ShouldFailover returns true if the failure threshold has been reached
-// AND the reset timeout has not yet elapsed since the last failure.
+// ShouldFailover reports whether a read that just failed on cluster may
+// retry on the other cluster.
 //
-// Once the reset timeout passes, ShouldFailover returns false to allow a
-// half-open probe attempt: the next operation will be routed to the failed
-// cluster, and its outcome (RecordSuccess closes the breaker; RecordFailure
-// resets the counter to 1 and accumulates again) determines what happens
-// next. Without this transition, a tripped breaker stays open indefinitely
-// for any caller that stops sending traffic to the failed cluster (e.g.
-// StickyRead routing all reads to the survivor) — there is no path to
-// closure because no probe ever fires.
-//
-// Note: this is "leaky" half-open — concurrent callers may all see false
-// during the probe window and all be routed to the failed cluster. This is
-// intentional: the per-cluster mutex in RecordFailure / RecordSuccess
-// serializes the outcome, and at most (threshold) operations can fail
-// against a still-broken cluster before the breaker re-trips.
+// It is side-effect free: unknown cluster → false; open or half-open →
+// true; closed and below the threshold → the value of
+// [WithFailoverBelowThreshold] (false by default, so the first
+// threshold-1 errors reach the caller). A zero-value CircuitBreaker
+// (threshold 0) never trips and reports false unless the option is set.
 //
 // Parameters:
 //   - cluster: The cluster that failed
 //   - err: The error (unused)
 //
 // Returns:
-//   - bool: true if failover should occur
+//   - bool: true if this request may fail over
 func (c *CircuitBreaker) ShouldFailover(cluster types.ClusterID, _ error) bool {
-	if !isKnownCluster(cluster) {
+	state := c.stateFor(cluster)
+	if state == nil {
 		return false
 	}
 
-	var failures int32
-	var lastFailure int64
-	if cluster == types.ClusterA {
-		failures = c.failuresA.Load()
-		lastFailure = c.lastFailureA.Load()
-	} else {
-		failures = c.failuresB.Load()
-		lastFailure = c.lastFailureB.Load()
-	}
-	// threshold <= 0 means "never configured" (zero-value CircuitBreaker) or
-	// an explicitly disabled breaker; either way it must never report a
-	// failover, matching RecordFailure's `c.threshold > 0` guard on the trip
-	// latch below — otherwise a zero-value breaker would report true here
-	// despite never having (or being able to) record a trip.
-	if c.threshold <= 0 || int(failures) < c.threshold {
-		return false
-	}
-	// Half-open: allow a probe after resetTimeout elapses. resetTimeout=0
-	// disables the timed transition (breaker stays open until explicit
-	// RecordSuccess).
-	if c.resetTimeout > 0 && lastFailure > 0 &&
-		time.Duration(time.Now().UnixNano()-lastFailure) > c.resetTimeout {
-		return false
-	}
-
-	return true
+	return state.open.Load() || c.failoverBelowThreshold
 }
 
-// setTripped changes a cluster's open latch and its lock-free snapshot
-// together, so VetoRoute always mirrors the latched state.
-// The caller holds the cluster's mutex.
-func setTripped(tripped *bool, open *atomic.Bool, v bool) {
-	*tripped = v
-	open.Store(v)
+// FailoverBelowThreshold reports the [WithFailoverBelowThreshold] setting,
+// so a client can warn while the legacy default is in effect.
+//
+// Returns:
+//   - bool: true when a failed read below the threshold may fail over
+func (c *CircuitBreaker) FailoverBelowThreshold() bool {
+	return c.failoverBelowThreshold
+}
+
+// stateFor returns the per-cluster state, or nil for an unknown cluster.
+func (c *CircuitBreaker) stateFor(cluster types.ClusterID) *breakerState {
+	switch cluster {
+	case types.ClusterA:
+		return &c.stateA
+	case types.ClusterB:
+		return &c.stateB
+	default:
+		return nil
+	}
 }
 
 // RecordFailure increments the failure counter for a cluster.
 //
-// If the reset timeout has passed since the last failure, the counter
-// is reset to 1 instead of incrementing. The compound load-check-store
-// sequence is serialized by a per-cluster mutex to prevent TOCTOU races
-// under concurrent callers. The "circuit opened" metric is emitted at most
-// once per trip (guarded by the tripped flag inside the mutex).
-//
-// A breaker that was open when the reset timeout elapsed closes on that
-// same call: it emits [types.EventCircuitBreakerClosed] with Reason
-// "reset timeout elapsed" and returns the state gauge to closed. With
-// threshold 1 the reset also brings the counter straight back to the
-// threshold, so the call closes and re-opens, emitting Closed then Open
-// and leaving the gauge open.
+// At the threshold the breaker trips open, emitting
+// [types.EventCircuitBreakerOpen] once per trip. An open or half-open
+// breaker keeps counting and stamps the last failure, which restarts the
+// reset timeout a probe reservation waits for; no other transition happens
+// here. The compound load-check-store sequence is serialized by the
+// cluster's mutex to prevent TOCTOU races under concurrent callers.
 //
 // Under concurrent callers the state gauge and the log line always describe
 // the newest transition on that cluster: a call whose transition is
@@ -495,273 +519,242 @@ func setTripped(tripped *bool, open *atomic.Bool, v bool) {
 // Parameters:
 //   - cluster: The cluster that failed
 func (c *CircuitBreaker) RecordFailure(cluster types.ClusterID) {
-	if !isKnownCluster(cluster) {
+	state := c.stateFor(cluster)
+	if state == nil {
 		return
 	}
 
-	nowNs := time.Now().UnixNano()
-	var newFailures int32
-	var justTripped bool
-	var justClosed bool
+	state.mu.Lock()
+	failures := state.failures.Add(1)
+	state.lastFailure.Store(time.Now().UnixNano())
+	transition := transitionNone
 	var seq uint64
-
-	if cluster == types.ClusterA {
-		c.muA.Lock()
-		lastFailure := c.lastFailureA.Load()
-		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(nowNs-lastFailure) > c.resetTimeout {
-			// Half-open window expired without a recovery — counter resets
-			// to 1 AND the trip latch clears so a re-trip on this cycle
-			// fires IncCircuitBreakerTrip again. Without clearing trippedA,
-			// observability undercounts trips across multi-cycle outages.
-			//
-			// Clearing the latch also ends an open span. A breaker that was
-			// genuinely tripped closes here, so its Open event gets a matching
-			// Closed and the state gauge stops reporting open; a breaker whose
-			// stale failure count merely aged out was never open and closes
-			// nothing, which is why the latch is read before it is cleared.
-			//
-			// resetTimeout=0 disables the timed transition (matches the
-			// guard in ShouldFailover) — the breaker stays open until an
-			// explicit RecordSuccess, so failures must keep accumulating.
-			c.failuresA.Store(1)
-			newFailures = 1
-			justClosed = c.trippedA
-			setTripped(&c.trippedA, &c.openA, false)
-			seq = c.enqueueTimeoutClose(cluster, justClosed, seq)
-		} else {
-			newFailures = c.failuresA.Add(1)
-		}
-		c.lastFailureA.Store(nowNs)
-		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedA {
-			setTripped(&c.trippedA, &c.openA, true)
-			justTripped = true
-			c.events.enqueue(types.ClusterEvent{
-				Kind:    types.EventCircuitBreakerOpen,
-				Cluster: cluster,
-				Count:   int(newFailures),
-			})
-			seq = c.bumpTransitionSeq(cluster)
-		}
-		c.muA.Unlock()
-	} else {
-		c.muB.Lock()
-		lastFailure := c.lastFailureB.Load()
-		if c.resetTimeout > 0 && lastFailure > 0 && time.Duration(nowNs-lastFailure) > c.resetTimeout {
-			c.failuresB.Store(1)
-			newFailures = 1
-			justClosed = c.trippedB
-			setTripped(&c.trippedB, &c.openB, false)
-			seq = c.enqueueTimeoutClose(cluster, justClosed, seq)
-		} else {
-			newFailures = c.failuresB.Add(1)
-		}
-		c.lastFailureB.Store(nowNs)
-		if c.threshold > 0 && int(newFailures) >= c.threshold && !c.trippedB {
-			setTripped(&c.trippedB, &c.openB, true)
-			justTripped = true
-			c.events.enqueue(types.ClusterEvent{
-				Kind:    types.EventCircuitBreakerOpen,
-				Cluster: cluster,
-				Count:   int(newFailures),
-			})
-			seq = c.bumpTransitionSeq(cluster)
-		}
-		c.muB.Unlock()
+	if c.threshold > 0 && int(failures) >= c.threshold && !state.tripped {
+		state.tripped = true
+		state.open.Store(true)
+		transition = transitionTripped
+		c.events.enqueue(types.ClusterEvent{
+			Kind:    types.EventCircuitBreakerOpen,
+			Cluster: cluster,
+			Count:   int(failures),
+		})
+		seq = state.seq.Add(1)
 	}
+	state.mu.Unlock()
 
-	// Write the metrics and log side effects, then deliver the queued
-	// events last. This runs only when a close, a trip, or both actually
-	// happened, so a handler that reenters and changes the breaker
-	// mid-delivery cannot observe (or leave behind) a metrics gauge that
-	// disagrees with the state both calls settle on. One drain covers both
-	// transitions when a single call closes the breaker and re-trips it.
-	if justClosed || justTripped {
-		c.applyTransitionReports(cluster, seq, justClosed, justTripped)
-		c.events.drain()
-	}
+	c.report(state, cluster, transition, seq)
 }
 
-// RecordSuccess resets the failure counter for a cluster.
+// RecordSuccess resets the failure counter for a cluster and closes an
+// open or half-open breaker, emitting [types.EventCircuitBreakerClosed]
+// with Reason "operation succeeded". A probe reservation that was in
+// flight becomes stale and its completion is ignored.
 //
 // Parameters:
 //   - cluster: The cluster that succeeded
 func (c *CircuitBreaker) RecordSuccess(cluster types.ClusterID) {
-	if !isKnownCluster(cluster) {
+	state := c.stateFor(cluster)
+	if state == nil {
+		return
+	}
+	if state.failures.Load() == 0 && !state.open.Load() {
+		// Steady healthy state: nothing to reset and nothing to close. A
+		// concurrent failure racing this check is at most one lost
+		// success, the same one-call lag every lock-free read accepts.
 		return
 	}
 
-	var wasOpen bool
-	var seq uint64
+	state.mu.Lock()
+	transition, seq := c.closeLocked(state, cluster, "operation succeeded")
+	state.mu.Unlock()
 
-	if cluster == types.ClusterA {
-		c.muA.Lock()
-		wasOpen = c.trippedA
-		c.failuresA.Store(0)
-		c.lastFailureA.Store(0)
-		setTripped(&c.trippedA, &c.openA, false)
-		if wasOpen {
-			c.events.enqueue(types.ClusterEvent{
-				Kind:    types.EventCircuitBreakerClosed,
-				Cluster: cluster,
-				Reason:  "operation succeeded",
-			})
-			seq = c.bumpTransitionSeq(cluster)
-		}
-		c.muA.Unlock()
-	} else {
-		c.muB.Lock()
-		wasOpen = c.trippedB
-		c.failuresB.Store(0)
-		c.lastFailureB.Store(0)
-		setTripped(&c.trippedB, &c.openB, false)
-		if wasOpen {
-			c.events.enqueue(types.ClusterEvent{
-				Kind:    types.EventCircuitBreakerClosed,
-				Cluster: cluster,
-				Reason:  "operation succeeded",
-			})
-			seq = c.bumpTransitionSeq(cluster)
-		}
-		c.muB.Unlock()
-	}
-
-	if wasOpen {
-		c.applyTransitionReports(cluster, seq, true, false)
-		// Deliver the queued Closed event last, after the metrics and log
-		// updates above, for the same reason as RecordFailure's trip
-		// block: this only runs on a real close, and delivering last
-		// keeps the metrics gauge consistent with the breaker's state
-		// even if a reentrant handler changes it again mid-delivery.
-		c.events.drain()
-	}
+	c.report(state, cluster, transition, seq)
 }
 
-// enqueueTimeoutClose appends the Closed event for a breaker whose open span
-// ended because its reset timeout elapsed, and returns the cluster's
-// transition sequence after latching it. wasOpen is the trip latch as it
-// stood before the reset branch cleared it: a breaker whose stale failure
-// count merely aged out was never open, closes nothing, and gets seq back
-// unchanged.
-//
-// MUST be called with the cluster's state mutex held, so that append order
-// equals transition order.
-func (c *CircuitBreaker) enqueueTimeoutClose(cluster types.ClusterID, wasOpen bool, seq uint64) uint64 {
+// closeLocked resets the counters and closes the breaker when it was open
+// or half-open. The caller holds state.mu.
+func (c *CircuitBreaker) closeLocked(state *breakerState, cluster types.ClusterID, reason string) (breakerTransition, uint64) {
+	wasOpen := state.tripped
+	state.failures.Store(0)
+	state.lastFailure.Store(0)
+	state.tripped = false
+	state.halfOpen = false
+	state.open.Store(false)
 	if !wasOpen {
-		return seq
+		return transitionNone, 0
 	}
 	c.events.enqueue(types.ClusterEvent{
 		Kind:    types.EventCircuitBreakerClosed,
 		Cluster: cluster,
-		Reason:  "reset timeout elapsed",
+		Reason:  reason,
 	})
 
-	return c.bumpTransitionSeq(cluster)
+	return transitionClosed, state.seq.Add(1)
 }
 
-// bumpTransitionSeq increments the cluster's transition sequence and returns
-// the new value, which identifies the transition just latched.
+// TryBeginFailoverProbe reserves an open breaker for one recovery probe.
 //
-// MUST be called with the cluster's state mutex held: that is what makes the
-// sequence agree with the order in which transitions were latched, and what
-// lets a later reporter tell that it has been superseded.
-func (c *CircuitBreaker) bumpTransitionSeq(cluster types.ClusterID) uint64 {
-	if cluster == types.ClusterB {
-		return c.seqB.Add(1)
+// The reservation succeeds when the breaker is open, no probe is already
+// in flight, the reset timeout is positive, and it has elapsed since the
+// last recorded failure. The breaker then reports half-open (gauge 1, a
+// log line, no event) and returns a token the probe must pass to
+// [CircuitBreaker.CompleteFailoverProbe]. A reset timeout of 0 never
+// reserves: the breaker stays open until a successful operation.
+//
+// Parameters:
+//   - cluster: The cluster to probe
+//
+// Returns:
+//   - uint64: The reservation token
+//   - bool: true when a probe should run now
+func (c *CircuitBreaker) TryBeginFailoverProbe(cluster types.ClusterID) (uint64, bool) {
+	state := c.stateFor(cluster)
+	if state == nil || c.resetTimeout <= 0 || !state.open.Load() {
+		// A closed breaker never reserves; the atomic check keeps the
+		// steady-state tick lock-free.
+		return 0, false
 	}
 
-	return c.seqA.Add(1)
+	state.mu.Lock()
+	elapsed := time.Duration(time.Now().UnixNano() - state.lastFailure.Load())
+	if !state.tripped || state.halfOpen || elapsed <= c.resetTimeout {
+		state.mu.Unlock()
+
+		return 0, false
+	}
+	state.halfOpen = true
+	seq := state.seq.Add(1)
+	state.mu.Unlock()
+
+	c.report(state, cluster, transitionHalfOpen, seq)
+
+	return seq, true
 }
 
-// transitionReportState returns the cluster's report mutex and transition
-// sequence. Cluster A is the fallback for anything that is not cluster B;
-// every caller has already passed isKnownCluster.
-func (c *CircuitBreaker) transitionReportState(cluster types.ClusterID) (*sync.Mutex, *atomic.Uint64) {
-	if cluster == types.ClusterB {
-		return &c.reportMuB, &c.seqB
-	}
-
-	return &c.reportMuA, &c.seqA
-}
-
-// applyTransitionReports writes the metrics and log side effects for the
-// transitions a single call latched: a close, a trip, or a close followed by
-// a trip. seq is the cluster's transition sequence as it stood when the call
-// released the state mutex.
+// CompleteFailoverProbe settles the reservation token from
+// [CircuitBreaker.TryBeginFailoverProbe].
 //
-// The state gauge and the transition log lines are skipped when the sequence
-// has moved on, because another goroutine has latched a newer transition for
-// this cluster and its own report is the one that describes where the breaker
-// ended up. Writing them anyway would leave the gauge, and the log, reporting
-// a state the breaker has already left. The transition itself is not lost:
-// its event is queued in order and still delivered.
+// A stale token (the breaker moved on, for example an operation closed it)
+// is ignored. [types.ProbeSucceeded] closes the breaker with Reason
+// "probe succeeded". [types.ProbeFailed] returns it to open and restarts
+// the reset timeout, emitting no event and counting no trip.
+// [types.ProbeAbandoned] returns it to open without touching the counters
+// or the timeout, so another client sharing the breaker may reserve it
+// at once.
 //
-// The report mutex makes the check and the writes one step, so two calls
-// cannot interleave their gauge writes; the newest transition always writes
-// last. It is not the state mutex, so a caller-supplied collector or logger
-// never blocks state mutation, and it is released before events are
-// delivered so a reentrant emitter cannot deadlock on it.
-//
-// The trip counter is cumulative rather than state-derived, so it is
-// incremented even by a superseded call: the trip did happen, and skipping it
-// would undercount trips across a burst.
-//
-// Callers must have released the cluster's state mutex, and must deliver
-// queued events only after this returns.
-//
-// The nil checks are a defensive backstop for a zero-value CircuitBreaker
-// (metrics/logger nil until finalizeCircuitBreaker runs). No exported path
-// reaches here on one — a trip requires threshold > 0, and a close requires
-// an earlier trip — but any future path that sets threshold without going
-// through the constructors stays safe.
-func (c *CircuitBreaker) applyTransitionReports(cluster types.ClusterID, seq uint64, closed bool, tripped bool) {
-	if tripped && c.metrics != nil {
-		c.metrics.IncCircuitBreakerTrip(cluster)
-	}
-
-	mu, current := c.transitionReportState(cluster)
-	mu.Lock()
-	defer mu.Unlock()
-
-	if current.Load() != seq {
+// Parameters:
+//   - cluster: The cluster that was probed
+//   - token: The reservation token
+//   - outcome: What the probe found
+func (c *CircuitBreaker) CompleteFailoverProbe(cluster types.ClusterID, token uint64, outcome types.ProbeOutcome) {
+	state := c.stateFor(cluster)
+	if state == nil {
 		return
 	}
 
-	if closed {
-		c.reportClose(cluster)
+	state.mu.Lock()
+	if !state.halfOpen || state.seq.Load() != token {
+		state.mu.Unlock()
+
+		return
 	}
-	if tripped {
-		c.reportTrip(cluster)
+	var transition breakerTransition
+	var seq uint64
+	switch outcome {
+	case types.ProbeSucceeded:
+		transition, seq = c.closeLocked(state, cluster, "probe succeeded")
+	case types.ProbeFailed:
+		state.halfOpen = false
+		state.lastFailure.Store(time.Now().UnixNano())
+		transition, seq = transitionReopened, state.seq.Add(1)
+	case types.ProbeAbandoned:
+		state.halfOpen = false
+		transition, seq = transitionReopened, state.seq.Add(1)
 	}
+	state.mu.Unlock()
+
+	c.report(state, cluster, transition, seq)
 }
 
-// reportClose writes the state gauge and log line for a breaker whose open
-// span just ended, on either close path: a successful operation, or the reset
-// timeout elapsing. MUST be called from applyTransitionReports, which holds
-// the cluster's report mutex and has confirmed the transition is still the
-// newest one.
-func (c *CircuitBreaker) reportClose(cluster types.ClusterID) {
-	if c.metrics != nil {
-		c.metrics.SetCircuitBreakerState(cluster, 0) // 0 = closed
+// report writes the metrics and log side effects of the transition a call
+// latched, then delivers the queued events last, so a handler that
+// reenters and changes the breaker mid-delivery cannot observe a metrics
+// gauge that disagrees with the state both calls settle on.
+//
+// The trip counter is cumulative rather than state-derived, so it is
+// incremented even by a superseded call: the trip did happen, and skipping
+// it would undercount trips across a burst.
+//
+// The state gauge and the log line are skipped when the sequence has moved
+// on, because another goroutine has latched a newer transition for this
+// cluster and its own report describes where the breaker ended up. The
+// report mutex makes the check and the writes one step; it is not the
+// state mutex, so a caller-supplied collector or logger never blocks state
+// mutation, and it is released before events are delivered so a reentrant
+// emitter cannot deadlock on it.
+//
+// The nil checks are a defensive backstop for a zero-value CircuitBreaker
+// (metrics/logger nil until finalizeCircuitBreaker runs).
+func (c *CircuitBreaker) report(state *breakerState, cluster types.ClusterID, transition breakerTransition, seq uint64) {
+	if transition == transitionNone {
+		return
 	}
-	if c.logger != nil {
-		c.logger.Info("circuit breaker closed",
-			"cluster", c.clusterName(cluster),
-		)
+	if transition == transitionTripped && c.metrics != nil {
+		c.metrics.IncCircuitBreakerTrip(cluster)
 	}
+
+	state.reportMu.Lock()
+	if state.seq.Load() == seq {
+		c.reportTransition(cluster, transition)
+	}
+	state.reportMu.Unlock()
+
+	c.events.drain()
 }
 
-// reportTrip writes the state gauge and log line for a breaker that just
-// tripped open. The trip counter is not written here — see
-// applyTransitionReports, which is also the only permitted caller.
-func (c *CircuitBreaker) reportTrip(cluster types.ClusterID) {
-	if c.metrics != nil {
-		c.metrics.SetCircuitBreakerState(cluster, 2) // 2 = open
-	}
-	if c.logger != nil {
-		c.logger.Warn("circuit breaker tripped",
-			"cluster", c.clusterName(cluster),
-			"threshold", c.threshold,
-		)
+// reportTransition writes the state gauge and log line for one transition.
+// MUST be called from report, which holds the cluster's report mutex and
+// has confirmed the transition is still the newest one.
+func (c *CircuitBreaker) reportTransition(cluster types.ClusterID, transition breakerTransition) {
+	switch transition {
+	case transitionTripped:
+		if c.metrics != nil {
+			c.metrics.SetCircuitBreakerState(cluster, 2) // 2 = open
+		}
+		if c.logger != nil {
+			c.logger.Warn("circuit breaker tripped",
+				"cluster", c.clusterName(cluster),
+				"threshold", c.threshold,
+			)
+		}
+	case transitionClosed:
+		if c.metrics != nil {
+			c.metrics.SetCircuitBreakerState(cluster, 0) // 0 = closed
+		}
+		if c.logger != nil {
+			c.logger.Info("circuit breaker closed",
+				"cluster", c.clusterName(cluster),
+			)
+		}
+	case transitionHalfOpen:
+		if c.metrics != nil {
+			c.metrics.SetCircuitBreakerState(cluster, 1) // 1 = half-open
+		}
+		if c.logger != nil {
+			c.logger.Info("circuit breaker half-open: recovery probe reserved",
+				"cluster", c.clusterName(cluster),
+			)
+		}
+	case transitionReopened:
+		if c.metrics != nil {
+			c.metrics.SetCircuitBreakerState(cluster, 2) // 2 = open
+		}
+		if c.logger != nil {
+			c.logger.Info("circuit breaker stays open: recovery probe did not succeed",
+				"cluster", c.clusterName(cluster),
+			)
+		}
+	case transitionNone:
 	}
 }
 
@@ -773,13 +766,12 @@ func (c *CircuitBreaker) reportTrip(cluster types.ClusterID) {
 // Returns:
 //   - int: Number of consecutive failures
 func (c *CircuitBreaker) Failures(cluster types.ClusterID) int {
-	if cluster == types.ClusterA {
-		return int(c.failuresA.Load())
-	}
-	if cluster != types.ClusterB {
+	state := c.stateFor(cluster)
+	if state == nil {
 		return 0
 	}
-	return int(c.failuresB.Load())
+
+	return int(state.failures.Load())
 }
 
 // SetClusterNames sets custom display names for clusters in log messages.

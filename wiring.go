@@ -66,9 +66,14 @@ func warnNoEffectOptions(config *ClientConfig) {
 		config.Logger.Warn("WithMirrorReplayer has no effect without WithMirror; failed mirror writes are only retried in target mode")
 	}
 	if config.RecoveryProbe != nil && !config.recoveryProbeOff {
-		if _, ok := config.WriteStrategy.(ProbeReporter); !ok {
-			config.Logger.Warn("WithRecoveryProbe has no effect: the write strategy does not report degraded clusters, so no probe will run")
+		pr, fp := probeReporters(config)
+		if pr == nil && fp == nil {
+			config.Logger.Warn("WithRecoveryProbe has no effect: neither the write strategy nor the failover policy asks for probes, so no probe will run")
 		}
+	}
+	if reporter, ok := config.FailoverPolicy.(FailoverBelowThresholdReporter); ok && !reporter.FailoverBelowThreshold() {
+		config.Logger.Warn("the failover policy returns the first threshold-1 read failures to the caller (the v1 default); " +
+			"enable failover below the threshold with the policy's WithFailoverBelowThreshold(true) or WithLatencyFailoverBelowThreshold(true)")
 	}
 	_, canVeto := config.FailoverPolicy.(RouteVeto)
 	switch {

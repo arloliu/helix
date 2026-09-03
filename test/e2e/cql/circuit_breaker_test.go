@@ -27,8 +27,9 @@ import (
 //  1. Pause cluster A.
 //  2. Drive reads against A; each timeout is a failure.
 //  3. After threshold consecutive failures, ShouldFailover(A) → true (open).
-//  4. Unpause A; after resetTimeout the breaker enters half-open and
-//     ShouldFailover(A) returns false to allow a probe.
+//  4. Unpause A; after resetTimeout the client's recovery probe reserves
+//     the breaker and its success closes it, so ShouldFailover(A) returns
+//     false again without any caller read being used as the probe.
 //  5. A successful probe closes the breaker.
 func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 	a, b := sharedClusters(t)
@@ -73,24 +74,14 @@ func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 			assert.GreaterOrEqual(t, mc.CircuitBreakerTrips[htypes.ClusterA], int64(1),
 				"[%s] CircuitBreaker trip metric should fire on open", d.name)
 
-			// Unpause + wait for reset timeout. ShouldFailover should
-			// return false (half-open) allowing a probe.
+			// Unpause + wait for the reset timeout. The client's recovery
+			// probe (default interval) reserves the breaker and closes it.
 			require.NoError(t, a.Unpause(ctx))
 
 			require.Eventually(t, func() bool {
-				if !cb.ShouldFailover(htypes.ClusterA, nil) {
-					return true
-				}
-				// Drive a read to give the policy a probe attempt.
-				qCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-				var got string
-				_ = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
-					ScanContext(qCtx, &got)
-				cancel()
-
 				return !cb.ShouldFailover(htypes.ClusterA, nil)
-			}, 15*time.Second, 200*time.Millisecond,
-				"[%s] CircuitBreaker did not return to closed/half-open after Unpause + reset timeout",
+			}, 30*time.Second, 200*time.Millisecond,
+				"[%s] CircuitBreaker did not close after Unpause + reset timeout via the recovery probe",
 				d.name)
 		})
 	}

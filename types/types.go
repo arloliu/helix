@@ -175,6 +175,21 @@ const (
 	PriorityLow
 )
 
+// ProbeOutcome is the result a client reports for a failover-policy probe
+// it reserved (see the FailoverProbeReporter interface in the root package).
+type ProbeOutcome uint8
+
+const (
+	// ProbeSucceeded means the probe reached the cluster and completed.
+	ProbeSucceeded ProbeOutcome = iota
+	// ProbeFailed means the cluster returned an error or the probe's own
+	// deadline expired.
+	ProbeFailed
+	// ProbeAbandoned means the client cancelled the probe, for example on
+	// Close; it says nothing about the cluster.
+	ProbeAbandoned
+)
+
 // BatchStatement represents a single statement in a batch for replay.
 type BatchStatement struct {
 	// Query is the CQL statement.

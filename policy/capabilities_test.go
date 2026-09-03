@@ -24,6 +24,12 @@ var (
 	_ helix.FailoverPolicy  = (*policy.CircuitBreaker)(nil)
 	_ helix.FailoverPolicy  = (*policy.LatencyCircuitBreaker)(nil)
 	_ helix.LatencyRecorder = (*policy.LatencyCircuitBreaker)(nil)
+	_ helix.RouteVeto       = (*policy.LatencyCircuitBreaker)(nil)
+
+	_ helix.FailoverProbeReporter          = (*policy.CircuitBreaker)(nil)
+	_ helix.FailoverProbeReporter          = (*policy.LatencyCircuitBreaker)(nil)
+	_ helix.FailoverBelowThresholdReporter = (*policy.CircuitBreaker)(nil)
+	_ helix.FailoverBelowThresholdReporter = (*policy.LatencyCircuitBreaker)(nil)
 
 	_ helix.ProbeReporter        = (*policy.AdaptiveDualWrite)(nil)
 	_ helix.LatchReporter        = (*policy.AdaptiveDualWrite)(nil)

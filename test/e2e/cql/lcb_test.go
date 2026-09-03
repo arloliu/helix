@@ -85,18 +85,16 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 				"[%s] breaker took too many ops to open — strike accumulation may be misclassified",
 				d.name)
 
-			// Unpause A; reset timeout is 5s. The half-open transition
-			// (CircuitBreaker.ShouldFailover returns false after resetTimeout)
-			// allows the next read to probe A. If A's latency is healthy,
-			// RecordLatency → RecordSuccess closes the breaker.
+			// Unpause A; reset timeout is 5s. Once it has elapsed the
+			// client's recovery probe reserves the breaker; a healthy probe
+			// closes it. Reads driven meanwhile still go to A (route veto is
+			// off), so a fast successful read may close it first.
 			require.NoError(t, a.Unpause(ctx))
 
 			require.Eventually(t, func() bool {
 				if !lcb.ShouldFailover(htypes.ClusterA, nil) {
 					return true
 				}
-				// Drive a read; whichever cluster the policy selects, the
-				// successful latency record will eventually close the breaker.
 				qCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 				var got string
 				_ = client.Query("SELECT value FROM "+table+" WHERE key = ?", "k").
@@ -104,9 +102,8 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 				cancel()
 
 				return !lcb.ShouldFailover(htypes.ClusterA, nil)
-			}, 15*time.Second, 200*time.Millisecond,
-				"[%s] LatencyCircuitBreaker did not close after Unpause + reset timeout "+
-					"(half-open probe should re-route to A and observe healthy latency)",
+			}, 30*time.Second, 200*time.Millisecond,
+				"[%s] LatencyCircuitBreaker did not close after Unpause + reset timeout",
 				d.name)
 		})
 	}

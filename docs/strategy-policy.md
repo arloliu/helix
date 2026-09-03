@@ -433,7 +433,8 @@ breaker := policy.NewCircuitBreaker(
 | Option | Default | Description |
 |--------|---------|-------------|
 | `WithThreshold` | 3 | Consecutive failures before circuit opens |
-| `WithResetTimeout` | 30s | If the gap between two consecutive failures exceeds this, the counter resets to 1 on the next failure rather than incrementing — stale failures are discarded, not the live counter |
+| `WithResetTimeout` | 30s | How long an open breaker waits after its last failure before the client's recovery probe may test the cluster; 0 disables probing so the breaker stays open until a successful read |
+| `WithFailoverBelowThreshold` | false | Let a failed read retry on the other cluster while the breaker is still closed; off, the first `threshold-1` errors reach the caller (the v1 default; the client logs a startup warning) |
 | `WithCircuitBreakerLogger` | no-op | Structured logger for open/close events |
 | `WithCircuitBreakerMetrics` | no-op | Metrics collector for trip events and state changes |
 | `WithCircuitBreakerClusterNames` | "A"/"B" | Display names used in log and metric labels |
@@ -460,7 +461,7 @@ if err != nil {
 }
 ```
 
-> **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence." The counter does not reset automatically over time — it resets to 1 only when the *next* failure arrives after a `resetTimeout`-long gap. If a cluster stays broken, the counter keeps incrementing; `resetTimeout` only protects against counting a failure from *last week* against today's blip. An open circuit closes two ways: a successful read (`RecordSuccess`) closes it immediately, or that delayed failure closes it first — ending the stale open span — before it starts the fresh count at 1. With `threshold` set to 1, the fresh count reaches threshold immediately, so the same call closes and reopens the circuit.
+> **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence," and it no longer discards a stale failure count. Once the breaker is open and `resetTimeout` has elapsed since the last failure, the client's recovery probe (see `WithRecoveryProbe`) reserves the breaker, which reports half-open, and runs one probe against the cluster; a successful probe closes the breaker (`Reason: "probe succeeded"`), a failed one returns it to open and restarts the timeout. No caller's read is used as the probe. An open circuit also closes immediately on any successful read against that cluster (`Reason: "operation succeeded"`). With `resetTimeout` 0, or on a client with the probe disabled, the breaker stays open until such a read.
 
 **What triggers `RecordFailure` vs `RecordSuccess`:**
 - `RecordFailure`: every hard error returned by the driver (network failure, timeout, unavailable) — all errors except Helix-internal sentinels (`ErrWriteAsync`, `ErrWriteDropped`) which never appear on the read path
@@ -470,19 +471,24 @@ if err != nil {
 
 ```
 CLOSED (failures < threshold)
-  └─ ShouldFailover() → false   ← absorbs transient errors; error returned to caller
-  └─ On RecordFailure():
-       ├─ Gap since last failure > resetTimeout → reset counter to 1 (stale)
-       └─ Otherwise → increment; if counter >= threshold: transition to OPEN, emit metric
+  └─ ShouldFailover() → WithFailoverBelowThreshold (false by default: error returned to caller)
+  └─ On RecordFailure(): increment; at threshold → OPEN (event circuit_breaker_open, gauge 2)
+  └─ On RecordSuccess(): counter back to 0
 
-OPEN (failures >= threshold)
+OPEN
   └─ ShouldFailover() → true    ← permits failover to alternative cluster
-  └─ On RecordSuccess():
-       └─ Reset counter to 0, transition to CLOSED, emit metric (Reason: "operation succeeded")
-  └─ On RecordFailure():
-       ├─ Gap since last failure > resetTimeout → close (reset counter to 1, transition to CLOSED,
-       │    emit metric, Reason: "reset timeout elapsed"); threshold=1 re-opens in the same call
-       └─ Otherwise → increment (stay OPEN)
+  └─ On RecordSuccess(): → CLOSED (event circuit_breaker_closed, Reason "operation succeeded", gauge 0)
+  └─ On RecordFailure(): increment, restart resetTimeout (stay OPEN)
+  └─ resetTimeout elapsed since the last failure → the client's recovery probe reserves the
+       breaker → HALF-OPEN (gauge 1, no event)
+
+HALF-OPEN (one probe in flight)
+  └─ ShouldFailover() → true    ← still not the caller's job to test the cluster
+  └─ Probe succeeded → CLOSED (event circuit_breaker_closed, Reason "probe succeeded", gauge 0)
+  └─ Probe failed → OPEN (gauge 2, no event, no new trip; resetTimeout restarts)
+  └─ Probe abandoned (client closing) → OPEN, nothing counted
+  └─ RecordSuccess() on that cluster → CLOSED ("operation succeeded"); the probe's result is then ignored
+  └─ RecordFailure() → increment (stay HALF-OPEN)
 ```
 
 **When OPEN: what the caller observes:**
@@ -491,7 +497,7 @@ OPEN (failures >= threshold)
 - If B succeeds → caller gets result; B's `RecordSuccess` is called (B's counter resets)
 - If B also fails → **both circuits now track failures independently; caller gets the B error** — there is no further retry. If B's circuit was already OPEN, the caller immediately receives the error without attempting A; Helix does not return `DualClusterError` for reads (only writes).
 
-**Example timeline** (threshold = 3, resetTimeout = 30s):
+**Example timeline** (threshold = 3, resetTimeout = 30s, recovery probe every 5s):
 
 ```
  t=0s   Failure 1 on A → A.failures=1, ShouldFailover(A)=false  (error returned to caller)
@@ -499,14 +505,14 @@ OPEN (failures >= threshold)
  t=10s  Failure 3 on A → A.failures=3, ShouldFailover(A)=true   (circuit OPENS; failover to B)
            B read succeeds → B.failures=0, A stays OPEN
  t=15s  Next read → ShouldFailover(A)=true → retry on B → B succeeds
- t=20s  A read attempted directly (ShouldFailover still true) → success → A.failures=0 (CLOSES)
- t=25s  Failure 1 on A → A.failures=1, ShouldFailover(A)=false  (fresh start)
- t=90s  Failure 1 on A → gap > 30s → A.failures reset to 1 (stale failure discarded)
+ t=40s  resetTimeout elapsed since t=10s → the client's next probe tick reserves A (HALF-OPEN)
+           probe against A succeeds → A CLOSES (Reason "probe succeeded"); no caller read was sacrificed
+ t=45s  Failure 1 on A → A.failures=1, ShouldFailover(A)=false  (fresh start)
 ```
 
 **When to use:** Workloads that can tolerate a few transient errors per cluster without failing over. The threshold absorbs brief blips (single-node restarts, brief GC pauses) without switching clusters unnecessarily.
 
-**Trade-off:** The first `threshold - 1` errors are surfaced to the caller without failover. If your SLA requires failover on the very first error, use `ActiveFailover` instead.
+**Trade-off:** By default the first `threshold - 1` errors are surfaced to the caller without failover. `policy.WithFailoverBelowThreshold(true)` (or `WithLatencyFailoverBelowThreshold(true)`) lets those reads retry on the other cluster while the threshold still governs when the breaker opens; a true `ShouldFailover` follows the ordinary failover path, including `ReadStrategy.OnFailure`, so a sticky preference may move on the first failure. If your SLA requires failover on every error with no breaker at all, use `ActiveFailover`.
 
 ---
 
@@ -531,6 +537,7 @@ breaker := policy.NewLatencyCircuitBreaker(
 | `WithLatencyAbsoluteMax` | 2s | Responses slower than this count as failures |
 | `WithLatencyThreshold` | 3 | Inherited from `CircuitBreaker` |
 | `WithLatencyResetTimeout` | 30s | Inherited from `CircuitBreaker` |
+| `WithLatencyFailoverBelowThreshold` | false | Inherited from `CircuitBreaker` (`WithFailoverBelowThreshold`) |
 | `WithLatencyLogger` | no-op | Structured logger |
 | `WithLatencyMetrics` | no-op | Metrics collector |
 

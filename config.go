@@ -21,13 +21,19 @@ var (
 )
 
 // RecoveryProbe configures the background recovery probe that accelerates
-// [policy.AdaptiveDualWrite] cluster recovery.
+// [policy.AdaptiveDualWrite] cluster recovery and closes an open
+// [policy.CircuitBreaker] or [policy.LatencyCircuitBreaker].
 //
-// When a cluster is degraded, the probe fires at each Interval and executes
-// Probe against that cluster's live session. A nil (success) result credits
-// one recovery point via [policy.AdaptiveDualWrite.RecordProbeSuccess]; the
-// cluster returns to healthy state once it accumulates the strategy's
-// recovery threshold of consecutive successes.
+// The probe fires at each Interval. While the write strategy reports a
+// cluster degraded, a nil (success) result credits one recovery point via
+// [policy.AdaptiveDualWrite.RecordProbeLatency] (or RecordProbeSuccess for
+// a strategy without latency judgement); the cluster returns to healthy
+// state once it accumulates the strategy's recovery threshold of
+// consecutive successes. While the failover policy has an open breaker
+// whose reset timeout has elapsed, the same probe reserves the breaker
+// (half-open) and its outcome closes or re-opens it, so no caller's read
+// is sacrificed to test the cluster. One tick runs at most one probe per
+// cluster for both.
 //
 // The probe is intentionally lightweight: the default reads a single cell
 // from system.local to verify the driver can reach the cluster, without

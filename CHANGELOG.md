@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.WithFailoverBelowThreshold(bool)` and
+  `policy.WithLatencyFailoverBelowThreshold(bool)` let a failed read retry on
+  the other cluster while the breaker is still closed. Default `false` keeps
+  the v1 behaviour of returning the first `threshold-1` errors to the caller;
+  a client logs a startup warning while the default is in effect. The
+  breakers implement the new `FailoverBelowThresholdReporter` and
+  `FailoverProbeReporter` interfaces, and `types.ProbeOutcome` carries a
+  probe's result.
 - `WithAutoRefreshFailureClassifier(fn)` and
   `DefaultAutoRefreshFailureClassifier` select which errors count toward
   auto-refresh; `types.ErrClusterTimeout` marks a Helix-owned write-leg or
@@ -43,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behavior change
 
+- `policy.CircuitBreaker` and `policy.LatencyCircuitBreaker` no longer turn
+  a caller's read into the recovery probe. Previously, once `resetTimeout`
+  had elapsed since the last failure, `ShouldFailover` returned false so the
+  next failed read reached the caller, and the following `RecordFailure`
+  discarded the stale count and closed the open span with the reason
+  `"reset timeout elapsed"`. Now the breaker stays open (`ShouldFailover`
+  true) until a successful read on that cluster closes it or until the
+  client's recovery probe, which reserves the breaker once the timeout has
+  elapsed, succeeds; that close carries the new reason `"probe succeeded"`,
+  and the `circuit_breaker_state` gauge reports 1 (half-open) while the
+  probe is in flight. Failure counts are no longer reset by a quiet gap.
+  A breaker that is never probed (`resetTimeout` 0, `WithRecoveryProbeDisabled`,
+  single-cluster mode) stays open until a successful read.
+- The recovery probe now runs whenever the write strategy implements
+  `ProbeReporter` or the failover policy implements the new
+  `FailoverProbeReporter`; a client with a built-in breaker and a plain
+  write strategy therefore starts the probe loop. One probe per tick serves
+  both.
 - Auto-refresh counts only connectivity failures toward its failure
   threshold: errors that wrap `types.ErrClusterUnreachable` or the new
   `types.ErrClusterTimeout` (a `WithClusterWriteTimeout` leg or a recovery
