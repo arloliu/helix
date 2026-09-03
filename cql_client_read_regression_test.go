@@ -20,7 +20,7 @@ import (
 // the skip reason states, in plain language, what still misbehaves today.
 // Remove the skip once the fix is in place.
 
-var errReadProbeCluster = errors.New("read probe: cluster error")
+var errReadProbeCluster = errUnreachableForTest
 
 // readProbeSession is a cql.Session whose reads are scripted per test and
 // counted per session, so a test can assert which cluster served each read.

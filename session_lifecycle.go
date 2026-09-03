@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -318,6 +319,7 @@ func (c *CQLClient) Close() {
 	// event of theirs is already buffered.
 	c.runtime.events.stop()
 
+	c.retired.closeAll()
 	c.loadSessionA().Close()
 	if !c.singleCluster {
 		c.loadSessionB().Close()
@@ -373,14 +375,15 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 		return nil, err
 	}
 
-	old := slot.Swap(&sessionHolder{s: newSession})
+	old := slot.Swap(c.newSessionHolder(newSession))
 
 	return old.s, nil
 }
 
 // RefreshSession invokes the [SessionRefresher] registered via
 // [WithSessionRefresher], atomically installs the returned session in place
-// of the existing one for the given cluster, and closes the old session.
+// of the existing one for the given cluster, and closes the old session
+// once a grace period has passed.
 //
 // This is the high-level recovery entry point for the case where the live
 // session is permanently unrecoverable (e.g., the cluster restarted at a
@@ -394,12 +397,15 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 // refresher returns an error or a nil session, no swap occurs and the
 // existing session remains live.
 //
-// Because the old session is closed immediately after the swap, in-flight
-// ops that already captured the old session reference may be aborted by
-// drivers that fail outstanding work on Close. Use RefreshSession only
-// when the old session is already non-functional. If you need to drain
-// in-flight ops before tearing down the old session, use SwapSession and
-// close the returned session yourself once the in-flights are quiet.
+// The old session is closed after a grace period of
+// [AutoRefreshConfig.RefreshTimeout] so in-flight operations that already
+// captured it can finish; [CQLClient.Close] closes any such session at
+// once. Without [WithAutoRefresh] the grace period is zero and the old
+// session closes immediately after the swap, and drivers that fail
+// outstanding work on Close will abort in-flight operations that captured
+// it. Use RefreshSession only when the old session is already
+// non-functional; to control the teardown yourself, use SwapSession and
+// close the returned session once the in-flights are quiet.
 //
 // Behavior:
 //   - The refresher is invoked synchronously on the calling goroutine.
@@ -470,7 +476,7 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 
 		return types.ErrSessionClosed
 	}
-	if !slot.CompareAndSwap(holder, &sessionHolder{s: newSession}) {
+	if !slot.CompareAndSwap(holder, c.newSessionHolder(newSession)) {
 		newSession.Close()
 
 		return types.ErrSessionReplaced
@@ -479,12 +485,76 @@ func (c *CQLClient) RefreshSession(ctx context.Context, cluster ClusterID) error
 	// Refresh contract: the old session is dead, so close it on the
 	// caller's behalf. SwapSession's contract differs ("caller closes")
 	// because the caller may have other references they want to drain;
-	// RefreshSession owns the swap end-to-end so it owns the close too.
+	// RefreshSession owns the swap end-to-end so it owns the close too,
+	// after a grace period that lets in-flight operations finish.
 	if holder.s != nil {
-		holder.s.Close()
+		c.retired.add(holder.s, c.config.AutoRefresh.RefreshTimeout)
 	}
 
 	return nil
+}
+
+// retiredSessions holds sessions that RefreshSession replaced and closes
+// each once its grace period elapses, or all of them at once on Close.
+type retiredSessions struct {
+	mu      sync.Mutex
+	closing bool
+	entries []*retiredSession
+	wg      sync.WaitGroup
+}
+
+// retiredSession is one replaced session; closed guards its single Close
+// between the grace timer and closeAll.
+type retiredSession struct {
+	s      cql.Session
+	timer  *time.Timer
+	closed atomic.Bool
+}
+
+// closeOnce closes the session on the first call only.
+func (e *retiredSession) closeOnce() {
+	if e.closed.CompareAndSwap(false, true) {
+		e.s.Close()
+	}
+}
+
+// add schedules s to close after grace. A non-positive grace, or a client
+// that is already closing, closes s at once.
+func (r *retiredSessions) add(s cql.Session, grace time.Duration) {
+	r.mu.Lock()
+	if r.closing || grace <= 0 {
+		r.mu.Unlock()
+		s.Close()
+
+		return
+	}
+	entry := &retiredSession{s: s}
+	r.wg.Add(1)
+	entry.timer = time.AfterFunc(grace, func() {
+		defer r.wg.Done()
+		entry.closeOnce()
+	})
+	r.entries = append(r.entries, entry)
+	r.mu.Unlock()
+}
+
+// closeAll closes every pending session now and waits for any grace timer
+// that is already running.
+func (r *retiredSessions) closeAll() {
+	r.mu.Lock()
+	r.closing = true
+	entries := r.entries
+	r.entries = nil
+	r.mu.Unlock()
+	for _, entry := range entries {
+		if entry.timer.Stop() {
+			// The timer never fired, so its callback will not release the
+			// wait group; do both here.
+			entry.closeOnce()
+			r.wg.Done()
+		}
+	}
+	r.wg.Wait()
 }
 
 // sessionSlot returns the atomic holder for cluster, or

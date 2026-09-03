@@ -64,7 +64,7 @@ const (
 	errDual     errClass = "dual-cluster"
 )
 
-var errMatrixCluster = errors.New("matrix: cluster error")
+var errMatrixCluster = errUnreachableForTest
 
 var readEntries = []readEntry{
 	entryScan, entryMapScan, entryIter, entrySliceMap, entrySliceScan, entryBatchIter,
@@ -416,12 +416,13 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 		obs.err = errCtx
 	case outcomeDriverTimeout, outcomeClusterErr:
 		// A driver-side timeout with a live caller context is a cluster
-		// fault and is classified exactly like any other cluster error.
+		// fault for the failover policy, exactly like any other cluster
+		// error; only a connectivity error also counts toward auto-refresh.
 		obs.err = errCtx
 		if outcome == outcomeClusterErr {
 			obs.err = errCluster
+			obs.healthFail = []ClusterID{served}
 		}
-		obs.healthFail = []ClusterID{served}
 		obs.failures = []ClusterID{served}
 		if isIter {
 			// Iterator Close reports the failure to the policy and the
@@ -449,7 +450,9 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 		obs.err = errDual
 		obs.readErrors = append(obs.readErrors, alt)
 		obs.failures = append(obs.failures, alt)
-		obs.healthFail = append(obs.healthFail, alt)
+		if outcome == outcomeClusterErr {
+			obs.healthFail = append(obs.healthFail, alt)
+		}
 	}
 
 	return obs

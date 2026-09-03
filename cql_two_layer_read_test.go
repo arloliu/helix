@@ -2,7 +2,7 @@ package helix
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/arloliu/helix/adapter/cql"
@@ -161,7 +161,7 @@ func TestExecuteReadNoFailover_EmitsSameMetricsAsExecuteRead_OnSuccess(t *testin
 
 func TestExecuteReadNoFailover_EmitsIncReadError_OnPrimaryRealError(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	sessionB := newMockSession()
 	met := newReadTestMetrics()
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
@@ -187,7 +187,7 @@ func TestExecuteReadNoFailover_EmitsIncReadError_OnPrimaryRealError(t *testing.T
 
 func TestExecuteReadNoFailover_DoesNotEnterFailover_OnPrimaryRealError(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	sessionB := newMockSession()
 	sessionB.scanValues = []any{"would-be-failover-success"}
 	met := newReadTestMetrics()
@@ -212,7 +212,7 @@ func TestExecuteReadNoFailover_DoesNotEnterFailover_OnPrimaryRealError(t *testin
 
 func TestExecuteReadNoFailover_PreservesRecordOpOutcome_AndAutoRefresh(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	sessionB := newMockSession()
 
 	client, err := NewCQLClient(sessionA, sessionB)
@@ -232,7 +232,7 @@ func TestExecuteReadNoFailover_PreservesRecordOpOutcome_AndAutoRefresh(t *testin
 
 func TestExecuteReadNoFailover_RecordFailure_DualCluster(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	sessionB := newMockSession()
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: false}
 
@@ -254,7 +254,7 @@ func TestExecuteReadNoFailover_RecordFailure_DualCluster(t *testing.T) {
 
 func TestExecuteReadNoFailover_RecordFailure_SingleClusterPreservedBehavior(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: false}
 
 	client, err := NewCQLClient(sessionA, nil,
@@ -319,7 +319,7 @@ func TestExecuteReadNoFailover_FallbackRead_SingleClusterMode_NoSecondAttempt(t 
 
 func TestRecordFailure_ExactlyOnce_NormalFailoverPath(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	sessionB := newMockSession()
 	sessionB.scanValues = []any{"alt-success"}
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
@@ -340,7 +340,7 @@ func TestRecordFailure_ExactlyOnce_NormalFailoverPath(t *testing.T) {
 
 func TestRecordFailure_ExactlyOnce_NoFailoverPath(t *testing.T) {
 	sessionA := newMockSession()
-	sessionA.scanErr = errors.New("primary failed")
+	sessionA.scanErr = fmt.Errorf("primary failed: %w", types.ErrClusterUnreachable)
 	sessionB := newMockSession()
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
 

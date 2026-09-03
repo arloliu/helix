@@ -3,6 +3,7 @@ package helix_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -183,7 +184,7 @@ func TestRefreshSession_InvokesRefresherAndClosesOld(t *testing.T) {
 // RefreshSession is called, the most recently observed failure is
 // surfaced to the SessionRefresher's lastErr parameter.
 func TestRefreshSession_LastErrThreadedFromObservedFailure(t *testing.T) {
-	failErr := errors.New("simulated network partition")
+	failErr := fmt.Errorf("simulated network partition: %w", types.ErrClusterUnreachable)
 	mockA := newAlwaysFailSession(failErr)
 	mockB := newAlwaysOKMock()
 

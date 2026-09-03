@@ -2,6 +2,7 @@ package helix
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
@@ -1238,6 +1239,11 @@ func propagateClusterNames(c *ClientConfig) {
 // [CQLClient]. Auto-refresh is opt-in via [WithAutoRefresh] and requires
 // a [SessionRefresher] registered via [WithSessionRefresher].
 //
+// The sustained-failure window is armed from the moment a session is
+// installed: a freshly built or swapped-in session counts as having
+// succeeded at that instant, so a burst of failures on a new client cannot
+// replace it before the window has elapsed.
+//
 // The detector runs as a background goroutine that ticks every
 // CheckInterval and inspects per-cluster op-outcome stats. A cluster is
 // considered "session permanently dead" when ALL of:
@@ -1281,7 +1287,39 @@ type AutoRefreshConfig struct {
 	// RefreshTimeout is the per-call timeout context applied around
 	// [CQLClient.RefreshSession] when the detector fires. The refresher
 	// should respect this deadline. Default: 30 seconds.
+	// RefreshTimeout also serves as the grace period after which
+	// [CQLClient.RefreshSession] closes the session it replaced.
 	RefreshTimeout time.Duration
+
+	// FailureClassifier decides which errors count toward
+	// FailureThreshold. Only connectivity-class failures should count: a
+	// schema or query error proves the session is reachable, and counting
+	// it would replace a healthy session. nil selects
+	// [DefaultAutoRefreshFailureClassifier]. Set via
+	// [WithAutoRefreshFailureClassifier].
+	FailureClassifier func(error) bool
+}
+
+// DefaultAutoRefreshFailureClassifier is the default
+// [AutoRefreshConfig.FailureClassifier]: an error counts toward the
+// failure threshold when it wraps [types.ErrClusterUnreachable] (the
+// bundled adapters mark driver connectivity errors with it) or
+// [types.ErrClusterTimeout] (a Helix-owned write-leg or probe deadline
+// expired). Every other error says the session is reachable and counts
+// for nothing.
+//
+// A custom adapter that does not normalise driver errors never triggers
+// auto-refresh under this default; give it a classifier that recognises
+// its driver's connectivity errors, or restore the previous behaviour with
+// WithAutoRefreshFailureClassifier(func(error) bool { return true }).
+//
+// Parameters:
+//   - err: The error an operation against the cluster returned
+//
+// Returns:
+//   - bool: true when the error indicates the cluster could not be reached
+func DefaultAutoRefreshFailureClassifier(err error) bool {
+	return errors.Is(err, types.ErrClusterUnreachable) || errors.Is(err, types.ErrClusterTimeout)
 }
 
 // DefaultAutoRefreshConfig returns the production defaults applied by
@@ -1296,6 +1334,7 @@ func DefaultAutoRefreshConfig() AutoRefreshConfig {
 		MinRetryInterval:       1 * time.Minute,
 		CheckInterval:          30 * time.Second,
 		RefreshTimeout:         30 * time.Second,
+		FailureClassifier:      DefaultAutoRefreshFailureClassifier,
 	}
 }
 
@@ -1338,6 +1377,16 @@ func WithAutoRefreshSustainedFailureWindow(d time.Duration) AutoRefreshOption {
 // WithAutoRefreshMinRetryInterval overrides AutoRefreshConfig.MinRetryInterval.
 func WithAutoRefreshMinRetryInterval(d time.Duration) AutoRefreshOption {
 	return func(c *AutoRefreshConfig) { c.MinRetryInterval = d }
+}
+
+// WithAutoRefreshFailureClassifier overrides AutoRefreshConfig.FailureClassifier.
+//
+// The classifier runs on every failed operation, so it must be cheap and
+// must not block. See [DefaultAutoRefreshFailureClassifier] for the
+// default and for the one-line restore of the previous every-error
+// behaviour.
+func WithAutoRefreshFailureClassifier(fn func(error) bool) AutoRefreshOption {
+	return func(c *AutoRefreshConfig) { c.FailureClassifier = fn }
 }
 
 // WithAutoRefreshCheckInterval overrides AutoRefreshConfig.CheckInterval.

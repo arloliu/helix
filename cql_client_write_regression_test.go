@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -254,11 +255,8 @@ func TestAdaptiveWrite_ZeroSynchronousAckIsAnError(t *testing.T) {
 // session is dead is still refreshed when AdaptiveDualWrite has moved it to fire-and-forget.
 // The failures happen on the background leg and must still reach the auto-refresh detector.
 func TestAutoRefresh_DegradedClusterFailuresStillTriggerRefresh(t *testing.T) {
-	t.Skip("pending: failures on AdaptiveDualWrite fire-and-forget legs never reach the " +
-		"auto-refresh counters, so a degraded cluster with a dead session is never refreshed")
-
 	clock := newRegressionClock()
-	dead := errors.New("simulated connectivity failure: no connections available")
+	dead := fmt.Errorf("simulated connectivity failure: %w", types.ErrClusterUnreachable)
 	sa, sb := newRecordingSession(dead), newRecordingSession(nil)
 	adaptive := policy.NewAdaptiveDualWrite()
 	adaptive.ForceDegrade(ClusterA)
@@ -305,9 +303,6 @@ func TestAutoRefresh_DegradedClusterFailuresStillTriggerRefresh(t *testing.T) {
 // nor counts errors that say nothing about connectivity.
 // Either would close a perfectly healthy session on a fresh client.
 func TestAutoRefresh_DoesNotReplaceHealthySessionOnSchemaErrors(t *testing.T) {
-	t.Skip("pending: the auto-refresh window is unarmed until the first success and every " +
-		"error counts, so schema errors on a fresh client replace and close a healthy session")
-
 	cases := []struct {
 		name    string
 		err     error
@@ -319,9 +314,8 @@ func TestAutoRefresh_DoesNotReplaceHealthySessionOnSchemaErrors(t *testing.T) {
 			advance: 50 * time.Millisecond, // past the sustained-failure window
 		},
 		{
-			name: "window is armed at construction",
-			// Swap for the typed connectivity sentinel once it exists.
-			err:     errors.New("simulated connectivity failure: no connections available"),
+			name:    "window is armed at construction",
+			err:     fmt.Errorf("simulated connectivity failure: %w", types.ErrClusterUnreachable),
 			advance: 0,
 		},
 	}
