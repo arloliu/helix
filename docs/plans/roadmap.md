@@ -293,6 +293,23 @@ Two items deviate from the table:
 "Partial" for state convergence becomes "Yes"; S1 with `PrimaryOnlyRead` and the backlog helper
 returns reads to A only after the queue drains.
 
+**Status (2026-09-03):** 4.1 to 4.12 done on branch `feat/authorities`, plus
+`WithBehaviorProfile(Safe)` as the client-owned bundle of the Category 3 defaults.
+The still-skipped Phase 0 regression tests (auto-refresh, `ForceDegrade` latch, route veto,
+`WithFailoverBelowThreshold`) are enabled.
+Verified with `make test-unit`, `go test ./test/integration/`, and the quick simulation profile
+(3359 keys, zero drops).
+Four items deviate from the table:
+
+- 4.3 types the hub entry points instead of a single `observe(cluster, op, err, latency)` and
+  adds probe and deferred-write counters to the per-cluster stats.
+- 4.7 drops the timed close: an open breaker only closes through a completed probe or a
+  successful operation, so the gauge reflects the real state instead of a timer.
+- 4.9 has no quarantine API; the gate is drain state AND the `WithReplayGate` predicate, which
+  is where an operator expresses a quarantine.
+- The Safe profile expands only root options; it does not reach into policy or replay
+  constructors.
+
 ---
 
 ## Phase 5 — Observability (`v1.8.0`)
