@@ -80,6 +80,23 @@ A is down           A comes back      reads auto-recover to A
 - The recovering cluster missed a meaningful volume of writes
 - You need to guarantee read consistency before switching back
 
+**Automatic backlog gating.** `helix.ExcludeWhileReplayBacklog` builds an `AllowedClusters`
+function that keeps reads away from a cluster while its replay backlog is above a threshold,
+so reads return to a recovered cluster only after its backlog has drained:
+
+```go
+replayer := replay.NewMemoryReplayer()
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithReplayer(replayer),
+    helix.WithAllowedClusters(helix.ExcludeWhileReplayBacklog(replayer.PendingByCluster, 100)),
+)
+```
+
+The depth function runs on every read. `MemoryReplayer.PendingByCluster` is an atomic read and
+can be passed directly; `NATSReplayer.PendingByCluster` queries JetStream, so sample it from a
+background goroutine into atomics and pass a function that reads them. A manual `AllowedClusters`
+flag can still wrap the helper for the cases below.
+
 ---
 
 ## The Coordinated Recovery Workflow
