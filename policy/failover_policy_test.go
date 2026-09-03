@@ -576,6 +576,7 @@ func TestCircuitBreaker_ProbeSucceededClosesBreaker(t *testing.T) {
 	require.False(t, again, "one reservation at a time")
 
 	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded)
+	require.Equal(t, int64(1), mc.CircuitBreakerProbes[types.ClusterA][types.BreakerProbeSucceeded])
 
 	events := em.snapshot()
 	require.Equal(t,
@@ -594,6 +595,7 @@ func TestCircuitBreaker_ProbeSucceededClosesBreaker(t *testing.T) {
 	}, logged)
 
 	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeFailed)
+	require.Zero(t, mc.CircuitBreakerProbes[types.ClusterA][types.BreakerProbeFailed], "a stale token counts nothing")
 	require.Equal(t, 0, mc.CircuitBreakerState[types.ClusterA], "a stale token has no effect")
 	require.Len(t, em.kinds(), 2)
 }
@@ -616,6 +618,7 @@ func TestCircuitBreaker_ProbeFailedReopensAndRestartsTimeout(t *testing.T) {
 	token := reserveProbe(t, cb, types.ClusterB)
 
 	cb.CompleteFailoverProbe(types.ClusterB, token, types.ProbeFailed)
+	require.Equal(t, int64(1), mc.CircuitBreakerProbes[types.ClusterB][types.BreakerProbeFailed])
 
 	require.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds(), "a failed probe emits nothing")
 	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterB], "gauge returns to open")
@@ -643,6 +646,7 @@ func TestCircuitBreaker_ProbeAbandonedReleasesReservation(t *testing.T) {
 
 	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge returns to open")
 	require.Equal(t, failuresBefore, cb.Failures(types.ClusterA), "abandonment counts nothing")
+	require.Equal(t, int64(1), mc.CircuitBreakerProbes[types.ClusterA][types.BreakerProbeAbandoned])
 	_, ok := cb.TryBeginFailoverProbe(types.ClusterA)
 	require.True(t, ok, "the timeout had already elapsed, so the breaker can be reserved again at once")
 }
@@ -657,6 +661,8 @@ func TestCircuitBreaker_UnknownProbeOutcomeReleasesReservation(t *testing.T) {
 	cb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeOutcome(255))
 
 	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "gauge returns to open")
+	require.Equal(t, int64(1), mc.CircuitBreakerProbes[types.ClusterA][types.BreakerProbeAbandoned],
+		"an unknown outcome counts as abandoned")
 	_, ok := cb.TryBeginFailoverProbe(types.ClusterA)
 	require.True(t, ok, "an outcome the breaker does not know cannot leave it half-open")
 }

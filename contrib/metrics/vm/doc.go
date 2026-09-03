@@ -56,6 +56,8 @@
 //   - {prefix}_write_recovered_total{cluster} - Counter of degraded-to-healthy
 //     transitions
 //   - {prefix}_write_duration_seconds{cluster} - Histogram of write latencies
+//   - {prefix}_write_flapping_total{cluster} - Counter of re-degrades that
+//     reached the backoff cap (optional types.WriteFlappingMetrics)
 //
 // Failover:
 //   - {prefix}_failover_total{from,to} - Counter of failover events
@@ -68,6 +70,9 @@
 //     elapses, but writes no distinct gauge value for that window: the gauge
 //     still reads 2 until the probe's outcome closes or re-opens the breaker.
 //   - {prefix}_circuit_breaker_trips_total{cluster} - Counter of circuit trips
+//   - {prefix}_circuit_breaker_probe_total{cluster,outcome} - Counter of
+//     completed probe reservations by outcome (succeeded, failed,
+//     abandoned; optional types.BreakerProbeMetrics)
 //
 // Replay queue:
 //   - {prefix}_replay_enqueued_total{cluster} - Counter of enqueued replays
