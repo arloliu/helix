@@ -10,7 +10,7 @@ Key public packages:
 - **`adapter/cql/v2`** — Apache cassandra-gocql-driver adapter (`NewSession`)
 - **`policy/`** — Read strategies (`StickyRead`, `PrimaryOnlyRead`, `RoundRobinRead`), write strategies (`ConcurrentDualWrite`, `SyncDualWrite`, `AdaptiveDualWrite`), failover policies (`ActiveFailover`, `CircuitBreaker`, `LatencyCircuitBreaker`)
 - **`replay/`** — Replay system: `MemoryReplayer`, `NATSReplayer`, `Worker`
-- **`topology/`** — Topology awareness: `Local`, `NatsKV`
+- **`topology/`** — Topology awareness: `Local`, `NATS`
 - **`types/`** — Leaf package: shared interfaces, sentinel errors, `DualClusterError`, `ClusterError`
 
 Internal packages under `internal/` are private implementation details — do not reference them in public API or docs.

@@ -139,6 +139,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within a few ticks of `ForceDegrade`, silently undoing the operator's
   isolation. The new `helix.LatchReporter` interface and
   `AdaptiveDualWrite.IsLatched` expose the latch.
+- `replay.NATSReplayer.PendingByCluster` counts the stream's messages for
+  the cluster instead of the consumers this replayer has created, so a
+  freshly started process (or one whose worker is gated and has fetched
+  nothing yet) reports the durable backlog. Previously such a replayer
+  reported 0, which let `helix.AllowedClusters` re-admit reads to a cluster
+  whose backlog had not drained.
+- `topology.NewNATS` rejects a zero or negative `WithPollInterval` with an
+  error. Previously the value was accepted and the watcher panicked when it
+  first fell back to polling.
 
 ### Changed
 
@@ -154,7 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on every power-of-two count of consecutive failures, and at `Debug`
   otherwise; the first success after failures is logged at `Info`.
   Previously every failure was a `Debug` line.
-- `topology.NatsKV` retries the KV watch on every poll tick after falling
+- `topology.NATS` retries the KV watch on every poll tick after falling
   back to polling, so a transient watch failure no longer leaves the watcher
   polling for the rest of its life.
 - `replay.MemoryReplayer` keeps a separate queue pair per target cluster and

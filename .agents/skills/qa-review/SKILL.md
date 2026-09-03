@@ -18,7 +18,7 @@ When reviewing specific packages, specify them by name. Default scope for Helix:
 - `adapter/cql/v1`, `adapter/cql/v2`: session adapters
 - `policy/`: `StickyRead`, `PrimaryOnlyRead`, `RoundRobinRead`, `ConcurrentDualWrite`, `SyncDualWrite`, `AdaptiveDualWrite`, `ActiveFailover`, `CircuitBreaker`, `LatencyCircuitBreaker`
 - `replay/`: `MemoryReplayer`, `NATSReplayer`, `Worker`
-- `topology/`: `Local`, `NatsKV`
+- `topology/`: `Local`, `NATS`
 - `types/`: Shared interfaces, sentinel errors, `DualClusterError`, `ClusterError`
 
 ## 1. Functional Correctness and Compliance Testing

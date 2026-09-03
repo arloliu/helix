@@ -120,6 +120,8 @@ const (
 //   - EventCircuitBreakerClosed: Cluster, Reason
 //   - EventWriteDegraded: Cluster, Count (slow strikes), Reason
 //   - EventWriteRecovered: Cluster, Reason
+//   - EventWriteFlapping: Cluster, Count (consecutive re-degrades inside the
+//     backoff window), Reason
 //   - EventDrainEntered / EventDrainExited: Cluster
 //   - EventReplayDropped: Cluster (replay target), Err (enqueue error)
 //   - EventMirrorReplayDropped: Err (enqueue error), Reason; Cluster unset
