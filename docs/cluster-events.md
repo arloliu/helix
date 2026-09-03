@@ -86,8 +86,8 @@ populated; the rest hold zero values.
 **Requires** lists the configuration the kind needs beyond registering the
 handler.
 
-Eight kinds additionally require dual-cluster mode (a non-nil `sessionB`):
-`failover`, `read_divergence`, `circuit_breaker_open`, `circuit_breaker_closed`,
+Nine kinds additionally require dual-cluster mode (a non-nil `sessionB`):
+`failover`, `read_divergence`, `read_route_changed`, `circuit_breaker_open`, `circuit_breaker_closed`,
 `write_degraded`, `write_recovered`, `write_flapping`, and `replay_dropped`. A single-cluster
 client writes straight to cluster A with no write strategy, no replay enqueue,
 and no failover, so none of those producers ever runs. Drain, session-refresh,
@@ -96,6 +96,7 @@ and mirror events work in either mode.
 | Kind | Requires | Fires when | Populated fields | Suggested action |
 |---|---|---|---|---|
 | `failover` (`EventFailover`) | Nothing — on by default. A configured `FailoverPolicy` can gate it. | A read fails on the selected cluster and is retried on the alternative cluster. Fires **once per failing read**, not once per outage. | `Cluster` (= `ToCluster`), `FromCluster`, `ToCluster`, `Err` | Investigate the `FromCluster` if it recurs. Read the rate from `{prefix}_failover_total`, not from event counts. |
+| `read_route_changed` (`EventReadRouteChanged`) | A read strategy that keeps a preferred cluster: `policy.StickyRead` or `policy.PrimaryOnlyRead`. | The strategy moves its preferred cluster. Fires once per move. | `FromCluster`, `ToCluster`, `Cluster` (= `ToCluster`), `Reason` (`"failover"`, `"alternative known good"` for the cooldown swap, `"manual"` for `SetPreferred` / `Reset`, `"recovered"` when `PrimaryOnlyRead` returns to A) | Correlate with `failover` and the breaker events to see where this client's reads are pinned and why. Read the current preference from the `{prefix}_read_preferred{cluster}` gauge; a per-request override (a veto, drain, `AllowedClusters`) does not move it. |
 | `read_divergence` (`EventReadDivergence`) | A read that opted into FallbackRead: `Query.FallbackRead()`, `helix.WithFallbackRead(ctx)`, or `helix.WithDefaultFallbackRead(true)`. | A fallback read finds the row on the alternative cluster after the selected cluster returned not-found. Fires **once per divergent read**. | `Cluster` (the cluster missing the row), `Reason` (always `"row found on alternative cluster after not-found"`) | Watch for a rising rate — it signals replay lag on `Cluster`. Read the rate from `{prefix}_read_divergence_total`. |
 | `circuit_breaker_open` (`EventCircuitBreakerOpen`) | `helix.WithFailoverPolicy` holding a `policy.CircuitBreaker` or `policy.LatencyCircuitBreaker`. `policy.ActiveFailover` produces no events. | A circuit breaker trips open for a cluster. | `Cluster`, `Count` (consecutive failures at trip) | Page. With `helix.WithRouteVeto(true)` and a `LatencyCircuitBreaker`, ordinary reads are routed away from `Cluster` while the breaker is open; otherwise the breaker only decides whether a failed read retries on the other cluster, and new reads still reach `Cluster`. |
 | `circuit_breaker_closed` (`EventCircuitBreakerClosed`) | Same as `circuit_breaker_open`. | A previously open circuit breaker closes. `Reason` `"operation succeeded"` means a read on that cluster succeeded. `Reason` `"probe succeeded"` means the client's recovery probe, reserved once `resetTimeout` had elapsed since the last failure, reached the cluster. See [Circuit Breaker Close Timing](#circuit-breaker-close-timing). | `Cluster`, `Reason` (`"operation succeeded"`, or `"probe succeeded"`) | Clear the alert: on either reason the cluster answered. |
@@ -279,7 +280,7 @@ fits what you need:
 
 | Hook | Use it for |
 |---|---|
-| `helix.WithOnClusterEvent` | Alerting/paging across all 14 event kinds in one place. |
+| `helix.WithOnClusterEvent` | Alerting/paging across all 15 event kinds in one place. |
 | `helix.WithOnReplayDropped` | Access to the full dropped `types.ReplayPayload` (query, args, target cluster) — not just the fact that a drop happened. It covers **both** replay paths: it fires alongside `EventReplayDropped` for a primary-path drop and alongside `EventMirrorReplayDropped` for a mirror-path drop. Nothing in the callback signature tells the two apart — mirror payloads carry a fixed conventional `TargetCluster`, so a handler that re-drives dropped payloads against the primary clusters would also re-drive mirror-destined ones. |
 | `mirror.WithOnError` | Full control over mirror write failures. Supplying this option **replaces** Helix's internal mirror error handler entirely — and with it, `EventMirrorReplayDropped` stops firing, because that event is emitted by the internal handler you just replaced. This is existing "caller options win" behavior, not a special case for events. |
 | `replay.WithOnDrop` | Worker-side permanent drops (a replay exhausted its retry budget), a different failure mode from enqueue-time drops. |
@@ -296,6 +297,7 @@ wherever one exists. Every kind but `write_flapping` has one, and one pair does 
 |---|---|
 | `failover` | `{prefix}_failover_total{from,to}` — same call site, same meaning. |
 | `read_divergence` | `{prefix}_read_divergence_total{cluster}` — same call site, same meaning. |
+| `read_route_changed` | The `{prefix}_read_preferred{cluster}` gauge (1 for the strategy's preferred cluster, 0 for the other), written at the same transition. |
 | `circuit_breaker_open` / `_closed` | `{prefix}_circuit_breaker_trips_total{cluster}` and the `{prefix}_circuit_breaker_state{cluster}` gauge. |
 | `drain_entered` / `drain_exited` | `{prefix}_drain_mode_entered_total{cluster}` / `{prefix}_drain_mode_exited_total{cluster}`. |
 | `session_refresh_attempt` / `_success` / `_error` | `{prefix}_session_refresh_attempt_total{cluster}` and siblings. |

@@ -59,6 +59,8 @@
 //
 // Failover:
 //   - {prefix}_failover_total{from,to} - Counter of failover events
+//   - {prefix}_read_preferred{cluster} - Gauge of the read strategy's
+//     preferred cluster (1 for the preferred cluster, 0 for the other)
 //
 // Circuit breaker:
 //   - {prefix}_circuit_breaker_state{cluster} - Gauge of circuit state

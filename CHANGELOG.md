@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `types.ReadRouteMetrics` (`SetReadPreferred`) and the
+  `{prefix}_read_preferred{cluster}` gauge report which cluster
+  `policy.StickyRead` or `policy.PrimaryOnlyRead` currently prefers, and
+  the new `read_route_changed` cluster event reports every move with its
+  reason (`failover`, `alternative known good`, `manual`, `recovered`).
+  The client installs its collector and event dispatcher on a read strategy
+  that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
 - `policy.StickyRead.SetPreferred(cluster)` and `policy.StickyRead.Reset()`
   let an operator move the read preference by hand.
 - `replay.WithClusterGate(func(types.ClusterID) bool)` lets a replay worker

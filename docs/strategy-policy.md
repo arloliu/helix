@@ -271,6 +271,8 @@ strategy.Reset()                           // clear all state, both clusters →
 ### StickyRead
 
 Randomly selects an initial preferred cluster at construction and routes all reads there. Switches to the other cluster on failure (subject to cooldown).
+Every move of the preference is reported: the `{prefix}_read_preferred{cluster}` gauge (on a collector implementing `types.ReadRouteMetrics`) and a `read_route_changed` event with the reason.
+The gauge follows the strategy's preference only; a route the client overrides for one request (a veto, a draining cluster, `AllowedClusters`) does not move it.
 
 ```go
 // Random initial cluster (default)
@@ -352,6 +354,7 @@ No configuration options.
 ### PrimaryOnlyRead
 
 Always reads from cluster A. Fails over to cluster B on error. Reads return to cluster A when one of three things happens: `Reset()` is called manually, the recovery timeout elapses and a probe succeeds, or cluster B itself fails while failed-over (triggering a probe back to A).
+Both moves are reported through the `{prefix}_read_preferred{cluster}` gauge and a `read_route_changed` event (`"failover"`, `"recovered"`, or `"manual"`), like StickyRead.
 
 ```go
 // Default: permanent failover until Reset() is called

@@ -20,6 +20,14 @@ const (
 	// Reason is always "row found on alternative cluster after not-found".
 	EventReadDivergence ClusterEventKind = "read_divergence"
 
+	// EventReadRouteChanged fires when a read strategy moves its preferred
+	// cluster: on failover, on the cooldown swap to a known-good alternative,
+	// on a manual SetPreferred or Reset, and when PrimaryOnlyRead returns
+	// to cluster A. FromCluster and ToCluster carry the move, Cluster is the
+	// new preferred cluster, and Reason is one of "failover",
+	// "alternative known good", "manual", and "recovered".
+	EventReadRouteChanged ClusterEventKind = "read_route_changed"
+
 	// EventCircuitBreakerOpen fires when a circuit breaker trips open for
 	// a cluster. Count carries the consecutive-failure count at trip time.
 	EventCircuitBreakerOpen ClusterEventKind = "circuit_breaker_open"
@@ -117,6 +125,8 @@ const (
 //   - EventFailover: FromCluster, ToCluster, Cluster (= ToCluster), Err
 //   - EventReadDivergence: Cluster (cluster missing the row), Reason
 //     (always "row found on alternative cluster after not-found")
+//   - EventReadRouteChanged: FromCluster, ToCluster, Cluster (= ToCluster),
+//     Reason
 //   - EventCircuitBreakerOpen: Cluster, Count (failures at trip)
 //   - EventCircuitBreakerClosed: Cluster, Reason
 //   - EventWriteDegraded: Cluster, Count (slow strikes), Reason
