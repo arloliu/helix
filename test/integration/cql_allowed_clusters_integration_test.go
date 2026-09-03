@@ -720,13 +720,14 @@ func TestAllowedClusters_Integration_ForceDegrade_PlusOverride(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify that the write routing reflects degraded state: A was fire-and-forget
-	// (WriteAsync), B was synchronous. A replay safety-net is also enqueued for A.
+	// (WriteAsync), B was synchronous. The background write to A is replayed only
+	// if it fails, and A is reachable, so nothing is enqueued.
 	assert.Equal(t, int64(1), metrics.GetWriteAsync(helix.ClusterA),
 		"A degraded: write must be fire-and-forget (WriteAsync=1)")
 	assert.Equal(t, int64(0), metrics.GetWriteAsync(helix.ClusterB),
 		"B healthy: write must be synchronous (WriteAsync=0)")
-	assert.GreaterOrEqual(t, metrics.GetReplayEnqueued(helix.ClusterA), int64(1),
-		"A degraded: replay safety-net must be enqueued")
+	assert.Equal(t, int64(0), metrics.GetReplayEnqueued(helix.ClusterA),
+		"A degraded but reachable: the background write is not replayed")
 
 	// Read must come from B (override is active).
 	var value string
