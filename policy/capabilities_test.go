@@ -26,6 +26,7 @@ var (
 	_ helix.LatencyRecorder = (*policy.LatencyCircuitBreaker)(nil)
 
 	_ helix.ProbeReporter = (*policy.AdaptiveDualWrite)(nil)
+	_ helix.LatchReporter = (*policy.AdaptiveDualWrite)(nil)
 
 	_ helix.EventEmitterSetter = (*policy.AdaptiveDualWrite)(nil)
 	_ helix.EventEmitterSetter = (*policy.CircuitBreaker)(nil)

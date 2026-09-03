@@ -101,6 +101,10 @@ featureFlag.Set("exclude_cluster_A", true)
 
 **Why both?** ForceDegrade alone still lets read strategies route to A. AllowedClusters alone still lets writes wait on A. Both are needed for full isolation.
 
+`ForceDegrade` is a latch: fast background writes and successful recovery probes cannot restore
+synchronous writes while it is set, and the client skips the recovery probe for a latched cluster.
+Only `ForceRecover` or `Reset` clears it, so the isolation holds for as long as you need it.
+
 ### Phase 2: Wait for Cluster Recovery
 
 The cluster comes back online. Helix's background fire-and-forget writes start succeeding. The replay worker begins draining the queue.
@@ -192,7 +196,7 @@ Clusters move between HEALTHY and DEGRADED based on write latency:
 - **Recovers** after `recoveryThreshold` (default: 5) consecutive fast background writes
 - Background fire-and-forget writes credit recovery even while the cluster is degraded
 
-Manual control: `ForceDegrade(cluster)`, `ForceRecover(cluster)`, `RecordFastWrite(cluster)`, `Reset()`
+Manual control: `ForceDegrade(cluster)` (a latch that only `ForceRecover(cluster)` or `Reset()` clears), `RecordFastWrite(cluster)`, `Reset()`
 
 See [AdaptiveDualWrite Guide](adaptive-dual-write.md) for thresholds, tuning, and fire-and-forget details.
 

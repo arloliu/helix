@@ -368,9 +368,6 @@ func TestAutoRefresh_DoesNotReplaceHealthySessionOnSchemaErrors(t *testing.T) {
 // which share one interval.
 // Cluster B is latched and probes fast.
 func TestRecoveryProbe_DoesNotClearForceDegrade(t *testing.T) {
-	t.Skip("pending: a successful recovery probe credits recovery on a cluster the operator " +
-		"degraded by hand, so ForceDegrade is undone within a few probe ticks")
-
 	failA := errors.New("simulated cluster A failure")
 	sa, sb := newRecordingSession(failA), newRecordingSession(nil)
 	adaptive := policy.NewAdaptiveDualWrite(policy.WithAdaptiveStrikeThreshold(1))
@@ -402,7 +399,10 @@ func TestRecoveryProbe_DoesNotClearForceDegrade(t *testing.T) {
 	t.Cleanup(client.Close)
 
 	// One failed synchronous write on A degrades it through the strike path.
-	require.NoError(t, client.Query("INSERT INTO t (k, v) VALUES (?, ?)", 1, "v").ExecContext(t.Context()))
+	// B's leg is fire-and-forget, so no cluster acknowledged the write.
+	var noAck *types.NoSynchronousAckError
+	err = client.Query("INSERT INTO t (k, v) VALUES (?, ?)", 1, "v").ExecContext(t.Context())
+	require.ErrorAs(t, err, &noAck)
 	require.True(t, adaptive.IsDegraded(ClusterA), "cluster A must be degraded by its failed write")
 
 	// Wait for several times the recovery threshold worth of probe ticks.

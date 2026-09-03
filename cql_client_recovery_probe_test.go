@@ -43,12 +43,29 @@ func (p *probeCounters) IncRecoveryProbeFailure(cluster types.ClusterID) {
 var _ types.MetricsCollector = (*probeCounters)(nil)
 var _ types.RecoveryProbeMetrics = (*probeCounters)(nil)
 
+// degradeClusterA moves cluster A into degraded mode through the strike
+// path, so the recovery probe still runs against it: the probe skips a
+// cluster the operator latched with ForceDegrade.
+func degradeClusterA(t *testing.T, adaptive *policy.AdaptiveDualWrite) {
+	t.Helper()
+	fail := func(context.Context) error { return errors.New("simulated cluster failure") }
+	ok := func(context.Context) error { return nil }
+	for range 10 {
+		if adaptive.IsDegraded(ClusterA) {
+			break
+		}
+		_, _ = adaptive.Execute(t.Context(), fail, ok)
+	}
+	require.True(t, adaptive.IsDegraded(ClusterA), "strikes must degrade the cluster")
+	require.False(t, adaptive.IsLatched(ClusterA))
+}
+
 // TestRecoveryProbe_StartsForAdaptiveDualWrite verifies that a recovery probe
 // goroutine starts automatically when WriteStrategy is AdaptiveDualWrite.
 func TestRecoveryProbe_StartsForAdaptiveDualWrite(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	probes := &probeCounters{}
 	probeFired := make(chan struct{}, 1)
@@ -111,7 +128,7 @@ func TestRecoveryProbe_NoStartWithoutAdaptive(t *testing.T) {
 func TestRecoveryProbe_DisabledOption(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	probeFired := atomic.Bool{}
 	customProbe := RecoveryProbe{
@@ -168,7 +185,7 @@ func TestRecoveryProbe_SkipsHealthyCluster(t *testing.T) {
 func TestRecoveryProbe_AdvancesRecovery(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 	require.True(t, adaptive.IsDegraded(ClusterA), "cluster A must be degraded initially")
 
 	customProbe := RecoveryProbe{
@@ -194,7 +211,7 @@ func TestRecoveryProbe_AdvancesRecovery(t *testing.T) {
 func TestRecoveryProbe_FailingProbeDoesNotRecover(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	probes := &probeCounters{}
 	customProbe := RecoveryProbe{
@@ -234,7 +251,7 @@ func TestRecoveryProbe_FailingProbeDoesNotRecover(t *testing.T) {
 func TestRecoveryProbe_MetricsSuccess(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	probes := &probeCounters{}
 	customProbe := RecoveryProbe{
@@ -275,7 +292,7 @@ func TestRecoveryProbe_DefaultProbeAutoCreated(t *testing.T) {
 func TestRecoveryProbe_CloseWaitsForGoroutines(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	customProbe := RecoveryProbe{
 		Probe:    func(_ context.Context, _ cql.Session) error { return nil },
@@ -307,7 +324,7 @@ func TestRecoveryProbe_CloseWaitsForGoroutines(t *testing.T) {
 func TestRecoveryProbe_ZeroValueUsesDefaults(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	// Zero-value RecoveryProbe: Probe=nil, Interval=0, Timeout=0.
 	// WithRecoveryProbe must substitute defaults so recoveryProbeLoop never calls
@@ -357,7 +374,7 @@ func TestRecoveryProbe_NegativeTimeoutRejected(t *testing.T) {
 func TestRecoveryProbe_NilProbeFilled(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	probeFired := make(chan struct{}, 1)
 	// Wrap the zero-value path: nil Probe gets replaced by the default (system.local).
@@ -400,7 +417,7 @@ func TestRecoveryProbe_NilProbeFilled(t *testing.T) {
 func TestRecoveryProbe_FailureLogging(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	adaptive.ForceDegrade(ClusterA)
+	degradeClusterA(t, adaptive)
 
 	const failingProbes = 5
 	var calls atomic.Int32

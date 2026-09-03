@@ -51,6 +51,8 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 	// Metrics is immutable after construction, so resolve the optional
 	// interface once. rpm is nil for collectors that do not opt in.
 	rpm, _ := c.config.Metrics.(types.RecoveryProbeMetrics)
+	// A latched cluster is the operator's decision; probing it is pointless.
+	latch, _ := pr.(LatchReporter)
 
 	var failures uint64
 	ticker := time.NewTicker(p.Interval)
@@ -60,7 +62,7 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, p *Re
 		case <-c.recoveryProbeCtx.Done():
 			return
 		case <-ticker.C:
-			if !pr.IsDegraded(cluster) {
+			if !pr.IsDegraded(cluster) || (latch != nil && latch.IsLatched(cluster)) {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(c.recoveryProbeCtx, p.Timeout)

@@ -40,6 +40,18 @@ func BenchmarkAdaptiveDualWrite_ExecuteStrict_BothHealthy(b *testing.B) {
 	}
 }
 
+// degradeByStrikes degrades cluster through the strike path, so the cluster
+// can still recover on fast writes: ForceDegrade would latch it instead.
+func degradeByStrikes(a *AdaptiveDualWrite, cluster types.ClusterID) {
+	state := &a.stateA
+	if cluster == types.ClusterB {
+		state = &a.stateB
+	}
+	for range a.strikeThreshold {
+		a.recordStrike(state)
+	}
+}
+
 func TestAdaptiveDualWrite_Defaults(t *testing.T) {
 	a := NewAdaptiveDualWrite()
 
@@ -568,7 +580,7 @@ func TestAdaptiveDualWrite_Recovery(t *testing.T) {
 	)
 
 	// Force degrade cluster A
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
 
 	// Simulate recovery via external health probe reporting fast writes
@@ -631,39 +643,44 @@ func TestAdaptiveDualWrite_RecoveryViaFastWrites(t *testing.T) {
 // TestAdaptiveDualWrite_ForceDegrade_ResetsFastStrikes verifies that ForceDegrade
 // resets fastStrikes atomically, preventing a cluster with accumulated fast-strike
 // credit from recovering immediately after a forced degradation.
-func TestAdaptiveDualWrite_ForceDegrade_ResetsFastStrikes(t *testing.T) {
+func TestAdaptiveDualWrite_ForceDegrade_IsSticky(t *testing.T) {
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveStrikeThreshold(3),
 		WithAdaptiveRecoveryThreshold(5),
 	)
 
-	// Degrade cluster A.
 	a.ForceDegrade(types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
+	require.True(t, a.IsLatched(types.ClusterA))
+	require.False(t, a.IsLatched(types.ClusterB))
 
-	// Accumulate 4 of 5 fast strikes needed for recovery.
-	for range 4 {
+	// Fast writes and probe successes credit nothing while latched.
+	for range 20 {
 		a.recordFast(&a.stateA)
+		a.RecordProbeSuccess(types.ClusterA)
 	}
-	require.True(t, a.IsDegraded(types.ClusterA), "still degraded after 4/5 fast strikes")
-	require.Equal(t, int32(4), a.stateA.fastStrikes)
+	require.True(t, a.IsDegraded(types.ClusterA), "the operator latch must survive any number of fast observations")
+	require.Equal(t, int32(0), a.stateA.fastStrikes, "no recovery credit accumulates while latched")
 
-	// ForceDegrade again — must reset fastStrikes to 0.
-	a.ForceDegrade(types.ClusterA)
+	a.ForceRecover(types.ClusterA)
+	require.False(t, a.IsDegraded(types.ClusterA))
+	require.False(t, a.IsLatched(types.ClusterA), "ForceRecover clears the latch")
+
+	// A strike-driven degrade is not latched and recovers on fast writes.
+	for range 3 {
+		a.recordStrike(&a.stateA)
+	}
 	require.True(t, a.IsDegraded(types.ClusterA))
-	require.Equal(t, int32(0), a.stateA.fastStrikes, "ForceDegrade must zero fastStrikes")
-
-	// 4 more fast strikes must not recover the cluster (needs full 5).
-	for range 4 {
+	require.False(t, a.IsLatched(types.ClusterA))
+	for range 5 {
 		a.recordFast(&a.stateA)
 	}
-	assert.True(t, a.IsDegraded(types.ClusterA),
-		"cluster must stay degraded when fastStrikes < recoveryThreshold after ForceDegrade")
+	require.False(t, a.IsDegraded(types.ClusterA), "an automatic degrade still recovers on fast writes")
 
-	// 5th fast strike completes the threshold.
-	a.recordFast(&a.stateA)
-	assert.False(t, a.IsDegraded(types.ClusterA),
-		"cluster must recover after a full recoveryThreshold=5 run from zero")
+	a.ForceDegrade(types.ClusterB)
+	a.Reset()
+	require.False(t, a.IsDegraded(types.ClusterB))
+	require.False(t, a.IsLatched(types.ClusterB), "Reset clears the latch")
 }
 
 func TestAdaptiveDualWrite_Reset(t *testing.T) {
@@ -881,7 +898,7 @@ func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
 	require.NoError(t, errB)
 
 	// Step 2: Force degrade cluster A
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
 
 	// Step 3: Execute fire-and-forget writes that are fast (< absoluteMax)
@@ -952,8 +969,8 @@ func TestAdaptiveDualWrite_RecoveryWhenBothDegraded(t *testing.T) {
 	ctx := t.Context()
 
 	// Force degrade both clusters
-	a.ForceDegrade(types.ClusterA)
-	a.ForceDegrade(types.ClusterB)
+	degradeByStrikes(a, types.ClusterA)
+	degradeByStrikes(a, types.ClusterB)
 	require.True(t, a.IsDegraded(types.ClusterA))
 	require.True(t, a.IsDegraded(types.ClusterB))
 
@@ -1100,7 +1117,7 @@ func TestAdaptiveDualWrite_RecordFast_RaceWithForceRecover(t *testing.T) {
 	)
 
 	// Degrade A.
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
 
 	// ForceRecover runs first, resetting the cluster to healthy with fastStrikes=0.
@@ -1119,7 +1136,7 @@ func TestAdaptiveDualWrite_RecordFast_RaceWithForceRecover(t *testing.T) {
 
 	// fastStrikes must still be 0 — the stale goroutine must not have incremented it.
 	// Re-degrade A and verify it still requires a full recoveryThreshold=2 fast writes.
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	a.recordFast(&a.stateA) // fast write 1 of 2
 	assert.True(t, a.IsDegraded(types.ClusterA),
 		"cluster must still need recoveryThreshold=2 fast writes to recover; stale credit must not have been applied")
@@ -1142,7 +1159,7 @@ func TestAdaptiveDualWrite_Concurrent_RecoveryThreshold(t *testing.T) {
 		WithAdaptiveStrikeThreshold(3),
 		WithAdaptiveRecoveryThreshold(5),
 	)
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
 
 	var wg sync.WaitGroup
@@ -1419,7 +1436,7 @@ func TestAdaptiveDualWrite_ExecuteStrict_DegradedDoesNotStrike(t *testing.T) {
 func TestAdaptiveDualWrite_RecordProbeSuccess(t *testing.T) {
 	a := NewAdaptiveDualWrite(WithAdaptiveRecoveryThreshold(3))
 
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
 
 	a.RecordProbeSuccess(types.ClusterA)
@@ -1503,13 +1520,13 @@ func TestAdaptiveDualWrite_EmitsDegradeAndRecoverEvents(t *testing.T) {
 	)
 	a.SetEventEmitter(em)
 
-	a.ForceDegrade(types.ClusterA)
+	degradeByStrikes(a, types.ClusterA)
 	require.Equal(t, []types.ClusterEventKind{types.EventWriteDegraded}, em.kinds())
 	degraded := em.snapshot()[0]
 	require.Equal(t, types.ClusterA, degraded.Cluster)
-	require.Equal(t, "manual", degraded.Reason)
+	require.Equal(t, "slow-strike threshold reached", degraded.Reason)
 
-	a.ForceDegrade(types.ClusterA) // already degraded: no duplicate
+	degradeByStrikes(a, types.ClusterA) // already degraded: no duplicate
 	require.Len(t, em.kinds(), 1)
 
 	a.RecordProbeSuccess(types.ClusterA)
@@ -1658,16 +1675,19 @@ func TestAdaptiveDualWrite_ZeroValueWithEmitterReportsCorrectCluster(t *testing.
 	require.NotPanics(t, func() {
 		a.ForceDegrade(types.ClusterB)
 		a.ForceRecover(types.ClusterB)
-		a.ForceDegrade(types.ClusterB)
+		// A zero value cannot degrade through strikes (strikeThreshold is 0)
+		// and a ForceDegrade latch would refuse the probe credit, so mark the
+		// state degraded directly to reach recordFast.
+		a.stateB.isDegraded.Store(true)
 		a.RecordProbeSuccess(types.ClusterB)
 	})
 	events := em.snapshot()
-	require.Len(t, events, 4)
+	require.Len(t, events, 3)
 	for i, ev := range events {
 		require.Equal(t, types.ClusterB, ev.Cluster, "event %d must report cluster B", i)
 	}
-	require.Equal(t, types.EventWriteRecovered, events[3].Kind)
-	require.Equal(t, "fast-strike recovery", events[3].Reason,
+	require.Equal(t, types.EventWriteRecovered, events[2].Kind)
+	require.Equal(t, "fast-strike recovery", events[2].Reason,
 		"the last recovery must come from recordFast, the path that derives the cluster from the state pointer")
 }
 
