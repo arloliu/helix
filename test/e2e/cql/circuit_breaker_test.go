@@ -40,6 +40,7 @@ func TestS_PlainCircuitBreaker_TripAndClose(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			ensureReachable(t, a, d)
 			cb := policy.NewCircuitBreaker(
 				policy.WithThreshold(3),
 				policy.WithResetTimeout(3*time.Second),

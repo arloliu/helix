@@ -41,6 +41,7 @@ func TestS3_PauseA_LatencyCircuitBreaker(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			ensureReachable(t, a, d)
 			lcb := policy.NewLatencyCircuitBreaker(
 				policy.WithLatencyAbsoluteMax(500*time.Millisecond),
 				policy.WithLatencyThreshold(3),
@@ -123,6 +124,7 @@ func TestS3_PauseA_AdaptiveWriteDegrades(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			ensureReachable(t, a, d)
 			adw := policy.NewAdaptiveDualWrite(
 				policy.WithAdaptiveStrikeThreshold(3),
 				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),

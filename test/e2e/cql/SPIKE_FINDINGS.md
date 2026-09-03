@@ -56,6 +56,23 @@ v2 recovered after 1 attempts in 3.4ms
 So a Pause-based failure scenario can run a full cycle (pause → ops fail →
 unpause → ops succeed) inside a few seconds.
 
+**Amendment (2026-09-04, from CI):** that holds for a pause shorter than the
+v2 driver's heartbeat budget.
+The v2 driver (cassandra-gocql-driver 2.x) heartbeats every connection once a
+second and closes it after more than five failures, so a pause longer than
+about six seconds empties the host's pool.
+On the CI runner a scenario's pause routinely lasts 10-12 s, after which the
+v2 session answered `gocql: no hosts available in the pool` for more than
+30 s after the unpause even with `ReconnectInterval = 500 ms`, while the v1
+session recovered in milliseconds.
+Rebuilding the sessions (`CQLCluster.Reconnect`) recovers at once.
+Scenarios that run a v2 subtest after a pause therefore call
+`ensureReachable` first (see `setup_test.go`), which rebuilds the sessions
+when the driver cannot answer a `system.local` read.
+For Helix users this is the case `WithAutoRefresh` with a `SessionRefresher`
+exists for: the client observes the connectivity failures and rebuilds the
+session instead of waiting on the driver.
+
 ## 3. v1/v2 errors.Is sentinel mismatch — INVALIDATED, spike test artifact
 
 Original framing: "v1 `gocql.ErrTimeoutNoResponse` does NOT match v2 errors

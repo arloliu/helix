@@ -40,6 +40,8 @@ func TestS_StickyRead_LeavesDeadPreferredDuringCooldown(t *testing.T) {
 
 	for _, d := range allDrivers {
 		t.Run(d.name, func(t *testing.T) {
+			ensureReachable(t, a, d)
+			ensureReachable(t, b, d)
 			rs := policy.NewStickyRead(
 				policy.WithPreferredCluster(htypes.ClusterA),
 				policy.WithStickyReadCooldown(5*time.Minute),
