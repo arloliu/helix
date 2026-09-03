@@ -306,8 +306,10 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // to the replay queue, and for a background leg whose strategy reports its
 // result through [DeferredWriteResult] to complete, so every replay is
 // enqueued before the worker stops.
-// That wait is bounded by the caller's context, the strategy's background
-// timeout, and the replayer's Enqueue.
+// Close sets no bound of its own on that wait: it lasts as long as
+// [WriteStrategy.Execute], the strategy's background legs, the replayer's
+// Enqueue (called with a context that ignores the caller's cancellation),
+// and the synchronous replay-dropped handler and logger take to return.
 // A [WithOnReplayDropped] handler must not call Close: like a cluster
 // event handler, it would wait for the write that invoked it.
 //
