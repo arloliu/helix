@@ -223,6 +223,13 @@ Defaults that changed are listed under "Behavior change" with a one-line restore
 
 ### Changed
 
+- The v2 CQL adapter is built against the `arloliu/cassandra-gocql-driver` fork
+  (tag `v2.3.0-otter`) through a `replace` directive in `go.mod`; the fork
+  floors the connection heartbeat timeout so a paused node drains a session's
+  pool later than the upstream driver does. Go ignores `replace` in
+  dependencies, so a module that uses the v2 adapter must repeat the line in
+  its own `go.mod` (see the README's Requirements); without it the module
+  builds against upstream v2.1.2, which is API-compatible.
 - Session-liveness stats (the auto-refresh detector's consecutive failure
   count, last success, and last error) now live on the installed session
   rather than on the client: `SwapSession` and `RefreshSession` install a

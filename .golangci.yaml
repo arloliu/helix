@@ -77,6 +77,11 @@ linters:
           skipRecvDeref: false
     gocyclo:
       min-complexity: 30
+    gomoddirectives:
+      # The v2 CQL driver is pinned to the arloliu fork until upstream carries
+      # its fixes; consumers of Helix must repeat this replace in their own go.mod.
+      replace-allow-list:
+        - github.com/apache/cassandra-gocql-driver/v2
     gomodguard_v2:
       blocked:
         - module: github.com/golang/protobuf
