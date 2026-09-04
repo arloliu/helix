@@ -704,7 +704,6 @@ func TestStrict_RecoveryProbe_DefaultProbeRestoresCluster(t *testing.T) {
 				}),
 				helix.WithLogger(testutil.NewTestLogger(t)),
 			}
-			opts = append(opts, withSessionRebuild(b, d)...)
 			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b), opts...)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)

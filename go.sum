@@ -10,8 +10,8 @@ github.com/VictoriaMetrics/metrics v1.44.0 h1:Fr8yqQSV+ZfYaDD/anqk1E8e9YPgfleSle
 github.com/VictoriaMetrics/metrics v1.44.0/go.mod h1:xDM82ULLYCYdFRgQ2JBxi8Uf1+8En1So9YUwlGTOqTc=
 github.com/antithesishq/antithesis-sdk-go v0.7.2 h1:oEEedg1Xgi8drRjqB0f9tfjhLoInE0IYZfZ6zAhQUbY=
 github.com/antithesishq/antithesis-sdk-go v0.7.2/go.mod h1:FQyySiasQQM8735Ddel3MRojmy4dA1IqCeyJ5jmPMbI=
-github.com/arloliu/cassandra-gocql-driver/v2 v2.3.0-otter h1:NhbDI5ecycsyDp3RkmKyz1HcATDUtmSSCZZThaf1u1g=
-github.com/arloliu/cassandra-gocql-driver/v2 v2.3.0-otter/go.mod h1:0dmnhdtR6oZNnprnFSpFD9JdeaWju95KqxtnIn9nWhI=
+github.com/arloliu/cassandra-gocql-driver/v2 v2.3.1-otter h1:cYgls8nbYlKv9pL30hkOuAHgbwnhL6bPs37QTcOBmbk=
+github.com/arloliu/cassandra-gocql-driver/v2 v2.3.1-otter/go.mod h1:0dmnhdtR6oZNnprnFSpFD9JdeaWju95KqxtnIn9nWhI=
 github.com/aws/aws-sdk-go-v2 v1.32.5 h1:U8vdWJuY7ruAkzaOdD7guwJjD06YSKmnKCJs7s3IkIo=
 github.com/aws/aws-sdk-go-v2 v1.32.5/go.mod h1:P5WJBrYqqbWVaOxgH0X/FYYD47/nooaPOZPlQdmiN2U=
 github.com/aws/aws-sdk-go-v2/config v1.28.5 h1:Za41twdCXbuyyWv9LndXxZZv3QhTG1DinqlFsSuvtI0=

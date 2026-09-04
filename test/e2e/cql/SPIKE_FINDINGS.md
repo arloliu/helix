@@ -56,26 +56,38 @@ v2 recovered after 1 attempts in 3.4ms
 So a Pause-based failure scenario can run a full cycle (pause → ops fail →
 unpause → ops succeed) inside a few seconds.
 
-**Amendment (2026-09-04, from CI):** that holds for a pause shorter than the
-v2 driver's heartbeat budget.
-The v2 driver (cassandra-gocql-driver 2.x) heartbeats every connection once a
-second and closes it after more than five failures, so a pause longer than
-about six seconds empties the host's pool.
-On the CI runner a scenario's pause routinely lasts 10-12 s, after which the
-v2 session answered `gocql: no hosts available in the pool` for more than
-30 s after the unpause even with `ReconnectInterval = 500 ms`, while the v1
-session recovered in milliseconds.
-Rebuilding the sessions (`CQLCluster.Reconnect`) recovers at once.
-Scenarios that run a v2 subtest after a pause therefore call
-`ensureReachable` first (see `setup_test.go`), which rebuilds the sessions
-when the driver cannot answer a `system.local` read.
-For Helix users this is the case `WithAutoRefresh` with a `SessionRefresher`
-exists for: the client observes the connectivity failures and rebuilds the
+**Amendment (2026-09-04):** that holds for a pause shorter than the v2
+driver's heartbeat budget, and both the budget and what happens once it is
+exceeded depend on the driver version.
+
+Against upstream v2.1.2 and the fork through `v2.3.0-otter`, a pause long
+enough to empty a host's pool left the v2 session answering `gocql: no hosts
+available in the pool` for more than 30 s after the unpause even with
+`ReconnectInterval = 500 ms`, while the v1 session recovered in
+milliseconds: the driver marked a host down through an address lookup that
+missed wherever the connect and broadcast addresses differ — which is every
+port-mapped container — so `ReconnectInterval` never refilled the pool.
+On the CI runner, whose pauses routinely last 10-12 s, the breaker and probe
+scenarios hit exactly that and configured a `SessionRefresher` to rebuild the
 session instead of waiting on the driver.
-The breaker scenarios, whose own pause outlasts the budget on the CI runner,
-configure exactly that through `withSessionRebuild` (see `setup_test.go`), so
-the recovery probe's failures rebuild the session and the probe then closes
-the breaker.
+
+`v2.3.1-otter` fixes it: hosts are marked down by identity, a query against
+an empty pool waits for the fill already in flight rather than failing on
+it, and the heartbeat runs at one 5-second interval on every connection
+regardless of the connection's age, so the worst case before a dead
+connection is closed is 32.5-35 s at any `Session.Timeout` at or below the
+5-second heartbeat-timeout floor — longer than any pause this suite takes.
+The breaker and probe scenarios therefore no longer configure a session
+rebuild, and assert native v1/v2 recovery parity again.
+
+`ensureReachable` stays (see `setup_test.go`): it rebuilds the harness
+sessions when a driver cannot answer a `system.local` read, which keeps a
+scenario from starting against a session an earlier one left unusable.
+
+For Helix users, `WithAutoRefresh` with a `SessionRefresher` remains the
+answer whenever a session's driver cannot recover on its own — an address
+change, or an older driver — rather than something this suite has to
+configure to pass.
 
 ## 3. v1/v2 errors.Is sentinel mismatch — INVALIDATED, spike test artifact
 

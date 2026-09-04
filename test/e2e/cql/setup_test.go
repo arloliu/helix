@@ -13,7 +13,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/arloliu/helix"
 	"github.com/arloliu/helix/adapter/cql"
 	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
 	cqlv2 "github.com/arloliu/helix/adapter/cql/v2"
@@ -236,29 +235,4 @@ func ensureReachable(t *testing.T, cluster *testutil.CQLCluster, d driverCase) {
 	require.NoError(t, cluster.Reconnect(ctx))
 	require.Eventually(t, probe, 30*time.Second, 200*time.Millisecond,
 		"[%s] session must answer after the rebuild", d.name)
-}
-
-// withSessionRebuild returns the options that let a client rebuild its
-// session for cluster when the connectivity failures the recovery probe
-// reports say the driver's session is dead: the production answer to a v2
-// driver that does not refill its pool after a long pause (see
-// SPIKE_FINDINGS.md section 2). The refresher rebuilds the harness sessions
-// and hands the client the wrapped one.
-func withSessionRebuild(cluster *testutil.CQLCluster, d driverCase) []helix.Option {
-	return []helix.Option{
-		helix.WithSessionRefresher(func(ctx context.Context, _ helix.ClusterID, _ error) (cql.Session, error) {
-			if err := cluster.Reconnect(ctx); err != nil {
-				return nil, err
-			}
-
-			return d.wrap(cluster), nil
-		}),
-		helix.WithAutoRefresh(
-			helix.WithAutoRefreshFailureThreshold(2),
-			helix.WithAutoRefreshSustainedFailureWindow(2*time.Second),
-			helix.WithAutoRefreshCheckInterval(500*time.Millisecond),
-			helix.WithAutoRefreshMinRetryInterval(2*time.Second),
-			helix.WithAutoRefreshRefreshTimeout(10*time.Second),
-		),
-	}
 }
