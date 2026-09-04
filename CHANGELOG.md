@@ -1,4 +1,4 @@
-#
+# Changelog
 
 All notable changes to this project will be documented in this file.
 
@@ -7,26 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This release completes the health-authority, per-cluster replay, auto-recovery, and
+observability phases of the [roadmap](docs/plans/roadmap.md).
+
+Every health observation (reads, synchronous and background write legs, recovery probes) now
+enters through one hub, so the circuit breakers, the adaptive write strategy, and auto-refresh
+see the same evidence.
+`ForceDegrade` is a sticky operator latch that the probe cannot undo.
+The breakers stay open until a completed recovery probe or a successful read closes them, and
+`StickyRead` moves off a dead preferred cluster during its cooldown.
+Auto-refresh counts only connectivity failures, so a schema or query error can no longer
+replace a healthy session.
+The memory replayer keeps a queue pair per cluster, and replay execution can be gated per
+cluster on both backends, so one cluster's backlog no longer delays the other and a draining
+cluster is never replayed into.
+Route changes, write flapping, breaker probe outcomes, replay eviction, corrupt-message
+terminations, mirror drain drops, and policy outbox drops are now observable, so every cluster
+event kind has a metric counterpart.
+
+All API changes are additive: new optional collector and emitter interfaces, two event kinds
+(`read_route_changed`, `replay_evicted`), and new options that default to the previous behaviour.
+Defaults that changed are listed under "Behavior change" with a one-line restore where one exists.
+
 ### Added
 
-- `types.ReadRouteMetrics` (`SetReadPreferred`) and the
-  `{prefix}_read_preferred{cluster}` gauge report which cluster
-  `policy.StickyRead` or `policy.PrimaryOnlyRead` currently prefers, and
-  the new `read_route_changed` cluster event reports every move with its
-  reason (`failover`, `alternative known good`, `manual`, `recovered`).
-  The client installs its collector and event dispatcher on a read strategy
-  that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
-- `types.WriteFlappingMetrics` (`{prefix}_write_flapping_total{cluster}`)
-  counts the `write_flapping` transitions, and `types.BreakerProbeMetrics`
-  (`{prefix}_circuit_breaker_probe_total{cluster,outcome}`) counts how each
-  recovery probe a breaker reserved ended (`succeeded`, `failed`,
-  `abandoned`), so every cluster event kind now has a metric counterpart.
-- `mirror.WithDrainTimeout(d)` cuts the mirror engine's shutdown drain
-  short: the captures still queued after `d` are dropped once through
-  `mirror.WithOnDrop`, `Stats().Dropped`, and the new optional
-  `types.MirrorShutdownMetrics` (`{prefix}_mirror_drain_dropped_total`).
-  The synchronous drain in `Close` and the rule that replay and mirror
-  callbacks must not call `Close` are now documented.
+- `WithClusterWriteTimeout(d)` bounds each cluster's leg of a dual write
+  independently of the caller's context. A leg that exceeds `d` is replayed
+  like any other failed leg and counts as that cluster's health failure,
+  while the other leg's acknowledgement stands. It applies to normal and
+  strict dual writes, including the background legs a degraded
+  `AdaptiveDualWrite` dispatches; it does not apply to single-cluster
+  writes, reads, or mirror writes. Default 0 (disabled).
+- `WithAutoRefreshFailureClassifier(fn)` and
+  `DefaultAutoRefreshFailureClassifier` select which errors count toward
+  auto-refresh; `types.ErrClusterTimeout` marks a Helix-owned write-leg or
+  probe deadline that expired while the caller was still waiting.
+- `policy.WithAdaptiveMinDegradedDwell(d)` keeps a degraded cluster degraded
+  for at least `d`, and `policy.WithAdaptiveRedegradeBackoff(window, maxDwell)`
+  doubles that dwell on every strike-driven degrade that follows a recovery
+  within `window`, up to `maxDwell`. Reaching the cap emits the new
+  `write_flapping` cluster event (`types.EventWriteFlapping`). Both default
+  to off.
+- `WithRouteVeto(true)` lets a failover policy that implements the new
+  `RouteVeto` interface steer ordinary reads away from a cluster.
+  `policy.LatencyCircuitBreaker` implements it: while its breaker is open,
+  reads that are not pinned to a paging cursor, not under an
+  `AllowedClusters` override, and not CAS move to the other cluster when
+  that cluster is neither draining nor vetoed, and a FallbackRead probe
+  skips a vetoed alternative. Previously an open latency breaker never moved
+  the next read away from the slow cluster. Off by default in v1; a client
+  whose failover policy can veto logs a startup warning while it is off.
+- `policy.WithFailoverBelowThreshold(bool)` and
+  `policy.WithLatencyFailoverBelowThreshold(bool)` let a failed read retry on
+  the other cluster while the breaker is still closed. Default `false` keeps
+  the v1 behaviour of returning the first `threshold-1` errors to the caller;
+  a client logs a startup warning while the default is in effect. The
+  breakers implement the new `FailoverBelowThresholdReporter` and
+  `FailoverProbeReporter` interfaces, and `types.ProbeOutcome` carries a
+  probe's result.
+- `policy.StickyRead.SetPreferred(cluster)` and `policy.StickyRead.Reset()`
+  let an operator move the read preference by hand.
+- `ExcludeWhileReplayBacklog(depth, threshold)` builds an `AllowedClustersFunc`
+  that keeps reads away from a cluster while its replay backlog exceeds the
+  threshold, so reads return to a recovered cluster only after its backlog
+  has drained. `replay.MemoryReplayer.PendingByCluster` can be passed
+  directly; sample `replay.NATSReplayer.PendingByCluster` into atomics first.
+- `WithBehaviorProfile(Safe)` selects the defaults a future major version
+  will adopt for the client-owned options kept at their v1 value for
+  compatibility; today that is `WithRouteVeto(true)`. It is pure option
+  expansion, so a later option in the same call overrides it. Options owned
+  by a policy or replayer constructor (`WithFailoverBelowThreshold`,
+  `WithLatencyFailoverBelowThreshold`, the replay stream settings) keep
+  their own defaults and their startup warnings.
+- `replay.WithClusterGate(func(types.ClusterID) bool)` lets a replay worker
+  hold execution back per cluster on both backends: a gated payload is
+  parked without consuming an attempt or its retry window, a fetched NATS
+  batch is kept in progress rather than NAK'd, and repeated gates compose by
+  AND. `WithReplayGate(func(ClusterID) bool)` is the client's operator
+  control; the client composes it with drain and installs the result on the
+  worker it builds for `WithAutoMemoryWorker`, so replay never runs against
+  a draining cluster. A worker supplied through `WithReplayWorker` must
+  carry its own gate; the client warns at startup when drain or a replay
+  gate is configured with one. Mirror workers are never gated by the source
+  client. A payload the gate refuses after dequeue keeps its capacity slot
+  while it is put back; the new drop reason `requeue_failed` guards that
+  accounting invariant and is not expected in practice.
 - `replay.NATSReplayer.Enqueue` publishes every idempotent payload with a
   `Nats-Msg-Id` derived from its identity (cluster, timestamp, priority,
   consistency levels, statement and arguments), so a publish retried after
@@ -49,6 +114,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused). Under `RetryBounded` a refused `Term` on the last permitted
   delivery now records the `max_attempts` drop as well; previously neither
   was counted. See `docs/replay-system.md`.
+- `types.ReadRouteMetrics` (`SetReadPreferred`) and the
+  `{prefix}_read_preferred{cluster}` gauge report which cluster
+  `policy.StickyRead` or `policy.PrimaryOnlyRead` currently prefers, and
+  the new `read_route_changed` cluster event reports every move with its
+  reason (`failover`, `alternative known good`, `manual`, `recovered`).
+  The client installs its collector and event dispatcher on a read strategy
+  that implements `helix.Instrumentable` / `helix.EventEmitterSetter`.
+- `types.WriteFlappingMetrics` (`{prefix}_write_flapping_total{cluster}`)
+  counts the `write_flapping` transitions, and `types.BreakerProbeMetrics`
+  (`{prefix}_circuit_breaker_probe_total{cluster,outcome}`) counts how each
+  recovery probe a breaker reserved ended (`succeeded`, `failed`,
+  `abandoned`), so every cluster event kind now has a metric counterpart.
 - The cluster event buffer grows from 128 to 160 slots and the four
   per-operation kinds (`failover`, `read_divergence`, `replay_dropped`,
   `mirror_replay_dropped`) may hold at most 128 of them, so a storm of
@@ -58,67 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optional `types.ClusterEventDropReporter` interface and count in
   `{prefix}_cluster_events_dropped_total`; previously they were counted
   internally and never reported.
-- `policy.StickyRead.SetPreferred(cluster)` and `policy.StickyRead.Reset()`
-  let an operator move the read preference by hand.
-- `replay.WithClusterGate(func(types.ClusterID) bool)` lets a replay worker
-  hold execution back per cluster on both backends: a gated payload is
-  parked without consuming an attempt or its retry window, a fetched NATS
-  batch is kept in progress rather than NAK'd, and repeated gates compose by
-  AND. `WithReplayGate(func(ClusterID) bool)` is the client's operator
-  control; the client composes it with drain and installs the result on the
-  worker it builds for `WithAutoMemoryWorker`, so replay never runs against
-  a draining cluster. A worker supplied through `WithReplayWorker` must
-  carry its own gate; the client warns at startup when drain or a replay
-  gate is configured with one. Mirror workers are never gated by the source
-  client. A payload the gate refuses after dequeue keeps its capacity slot
-  while it is put back; the new drop reason `requeue_failed` guards that
-  accounting invariant and is not expected in practice.
-- `WithBehaviorProfile(Safe)` selects the defaults a future major version
-  will adopt for the client-owned options kept at their v1 value for
-  compatibility; today that is `WithRouteVeto(true)`. It is pure option
-  expansion, so a later option in the same call overrides it. Options owned
-  by a policy or replayer constructor (`WithFailoverBelowThreshold`,
-  `WithLatencyFailoverBelowThreshold`, the replay stream settings) keep
-  their own defaults and their startup warnings.
-- `policy.WithFailoverBelowThreshold(bool)` and
-  `policy.WithLatencyFailoverBelowThreshold(bool)` let a failed read retry on
-  the other cluster while the breaker is still closed. Default `false` keeps
-  the v1 behaviour of returning the first `threshold-1` errors to the caller;
-  a client logs a startup warning while the default is in effect. The
-  breakers implement the new `FailoverBelowThresholdReporter` and
-  `FailoverProbeReporter` interfaces, and `types.ProbeOutcome` carries a
-  probe's result.
-- `WithAutoRefreshFailureClassifier(fn)` and
-  `DefaultAutoRefreshFailureClassifier` select which errors count toward
-  auto-refresh; `types.ErrClusterTimeout` marks a Helix-owned write-leg or
-  probe deadline that expired while the caller was still waiting.
-- `WithRouteVeto(true)` lets a failover policy that implements the new
-  `RouteVeto` interface steer ordinary reads away from a cluster.
-  `policy.LatencyCircuitBreaker` implements it: while its breaker is open,
-  reads that are not pinned to a paging cursor, not under an
-  `AllowedClusters` override, and not CAS move to the other cluster when
-  that cluster is neither draining nor vetoed, and a FallbackRead probe
-  skips a vetoed alternative. Previously an open latency breaker never moved
-  the next read away from the slow cluster. Off by default in v1; a client
-  whose failover policy can veto logs a startup warning while it is off.
-- `ExcludeWhileReplayBacklog(depth, threshold)` builds an `AllowedClustersFunc`
-  that keeps reads away from a cluster while its replay backlog exceeds the
-  threshold, so reads return to a recovered cluster only after its backlog
-  has drained. `replay.MemoryReplayer.PendingByCluster` can be passed
-  directly; sample `replay.NATSReplayer.PendingByCluster` into atomics first.
-- `policy.WithAdaptiveMinDegradedDwell(d)` keeps a degraded cluster degraded
-  for at least `d`, and `policy.WithAdaptiveRedegradeBackoff(window, maxDwell)`
-  doubles that dwell on every strike-driven degrade that follows a recovery
-  within `window`, up to `maxDwell`. Reaching the cap emits the new
-  `write_flapping` cluster event (`types.EventWriteFlapping`). Both default
-  to off.
-- `WithClusterWriteTimeout(d)` bounds each cluster's leg of a dual write
-  independently of the caller's context. A leg that exceeds `d` is replayed
-  like any other failed leg and counts as that cluster's health failure,
-  while the other leg's acknowledgement stands. It applies to normal and
-  strict dual writes, including the background legs a degraded
-  `AdaptiveDualWrite` dispatches; it does not apply to single-cluster
-  writes, reads, or mirror writes. Default 0 (disabled).
+- `mirror.WithDrainTimeout(d)` cuts the mirror engine's shutdown drain
+  short: the captures still queued after `d` are dropped once through
+  `mirror.WithOnDrop`, `Stats().Dropped`, and the new optional
+  `types.MirrorShutdownMetrics` (`{prefix}_mirror_drain_dropped_total`).
+  The synchronous drain in `Close` and the rule that replay and mirror
+  callbacks must not call `Close` are now documented.
 
 ### Behavior change
 
