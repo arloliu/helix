@@ -83,4 +83,4 @@ require (
 	software.sslmate.com/src/go-pkcs12 v0.7.3 // indirect
 )
 
-replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.3.0-otter
+replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.3.1-otter

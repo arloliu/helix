@@ -248,12 +248,17 @@ Defaults that changed are listed under "Behavior change" with a one-line restore
 ### Changed
 
 - The v2 CQL adapter is built against the `arloliu/cassandra-gocql-driver` fork
-  (tag `v2.3.0-otter`) through a `replace` directive in `go.mod`; the fork
-  floors the connection heartbeat timeout so a paused node drains a session's
-  pool later than the upstream driver does. Go ignores `replace` in
-  dependencies, so a module that uses the v2 adapter must repeat the line in
-  its own `go.mod` (see the README's Requirements); without it the module
-  builds against upstream v2.1.2, which is API-compatible.
+  (tag `v2.3.1-otter`) through a `replace` directive in `go.mod`. The fork
+  makes a node that stops answering without dropping its sockets — a paused
+  container, a host gone behind a NAT — recoverable: it marks hosts down by
+  identity rather than by an address lookup that missed in port-mapped and
+  translated deployments, waits for a pool fill that is already in flight
+  instead of failing a query on an empty pool, bounds the TLS handshake by
+  `ConnectTimeout`, and keeps the control host's port across a ring refresh.
+  Go ignores `replace` in dependencies, so a module that uses the v2 adapter
+  must repeat the line in its own `go.mod` (see the README's Requirements);
+  without it the module builds against upstream v2.1.2, which is
+  API-compatible.
 - The fork also lets a caller's context deadline override the
   connection-level request timeout, so a read leg against the v2 adapter is
   no longer capped by `Session.Timeout`: set `WithClusterReadTimeout` when a
