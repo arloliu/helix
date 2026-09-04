@@ -77,7 +77,7 @@ FallbackRead is designed for **critical read-after-write scenarios** where a rec
 - An error observed after the caller's own context was cancelled or expired is the caller's, not the cluster's: it is returned as-is, records no `IncReadError` or `RecordFailure`, and never triggers failover or the FallbackRead probe. A driver-side timeout while the caller's context is still live is a cluster error like any other.
 - FallbackRead does not read a draining alternative: drain is the operator's "do not read here" signal, so the probe returns not-found without asking. `helix.WithFallbackReadOnDrainingCluster(true)` restores the old behaviour for `Scan` and `MapScan` when a draining cluster is known to hold current data.
 - The fallback attempt reuses the same statement, bound values, and query options on the alternative cluster.
-- Both attempts share the same context and deadline. FallbackRead does not create a fresh timeout for the second read.
+- Both attempts share the caller's context and deadline. FallbackRead does not create a fresh timeout for the second read. `helix.WithClusterReadTimeout(d)` gives each attempt its own deadline of `d` within that shared budget, so an attempt that stalls on a reachable cluster leaves the rest of the budget for the other. The deadline is not a hard cap: an attempt whose driver is re-establishing the connection returns on the driver's own request timeout instead, because cancelling the attempt does not interrupt that path (see the option's Godoc).
 
 ## Slice Methods
 
@@ -235,7 +235,7 @@ FallbackRead is **sequential, not parallel**. It issues the query to the primary
 
 * **Latency Overhead**: Successful reads (data found on the primary) incur zero extra latency. Queries for definitively missing rows (e.g., queries for a non-existent UUID) will incur the latency of *two* sequential database round-trips.
 * **Cluster Load**: FallbackRead does not double your base read load. However, the throughput cost for queries that yield zero rows will double since both clusters must confirm the row is absent.
-* **Timeout Budgeting**: The fallback attempt runs under the same context deadline as the first attempt. If your timeout budget is very tight, the second read may have little or no time left to complete.
+* **Timeout Budgeting**: The fallback attempt runs under the same context deadline as the first attempt. If your timeout budget is very tight, the second read may have little or no time left to complete. Set `helix.WithClusterReadTimeout(d)` to bound what the first attempt normally consumes, and give the caller a deadline of at least `2*d` so both attempts can have their full allowance. An attempt whose driver has to reconnect returns on the driver's request timeout `r` instead of on `d`, so a caller that must survive that case needs roughly `r + d` — the second attempt still needs its own `d` after the first has spent `r`.
 
 ## Missing Data vs. Stale Data
 

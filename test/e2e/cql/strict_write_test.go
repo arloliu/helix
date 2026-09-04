@@ -117,7 +117,11 @@ func degradeB(t *testing.T, adw *policy.AdaptiveDualWrite, client *helix.CQLClie
 	for !adw.IsDegraded(htypes.ClusterB) {
 		require.False(t, time.Now().After(deadline),
 			"%s: cluster B did not degrade within 15s", tag)
-		qCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		// The warmup budget must outlast the slowest leg: a write to the
+		// paused cluster returns on the driver's own request timeout, and a
+		// leg that finishes after the caller's deadline is attributed to the
+		// caller, so it would never count as a strike against the cluster.
+		qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		_ = client.Query(stmt, "warmup_"+tag, "v").ExecContext(qCtx)
 		cancel()
 	}

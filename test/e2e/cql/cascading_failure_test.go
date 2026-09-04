@@ -58,6 +58,12 @@ func TestS_SequentialFailures_AThenB(t *testing.T) {
 				helix.WithReadStrategy(rs),
 				helix.WithFailoverPolicy(policy.NewActiveFailover()),
 				helix.WithMetrics(mc),
+				// A read leg must give up before the caller's budget is
+				// gone: the v2 driver lets a caller deadline override the
+				// connection's request timeout, so without a deadline of
+				// Helix's own the first cluster consumes the whole 15s and
+				// failover never reaches the second.
+				helix.WithClusterReadTimeout(2*time.Second),
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)

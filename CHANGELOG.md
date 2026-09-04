@@ -37,11 +37,34 @@ Defaults that changed are listed under "Behavior change" with a one-line restore
   while the other leg's acknowledgement stands. It applies to normal and
   strict dual writes, including the background legs a degraded
   `AdaptiveDualWrite` dispatches; it does not apply to single-cluster
-  writes, reads, or mirror writes. Default 0 (disabled).
+  writes, reads, or mirror writes. A leg whose driver is re-establishing the
+  connection can still return on the driver's own request timeout instead of
+  on `d`, so give callers a deadline that outlives it — a leg that finishes
+  after the caller's deadline counts against the caller and records no health
+  failure. Outliving it is enough for the strategies that run both legs
+  together; `SyncDualWrite` runs them one after another and skips the second
+  once the context has ended, so it needs about `r + d` like a read does.
+  Default 0 (disabled).
+- `WithClusterReadTimeout(d)` bounds each cluster's leg of a read
+  independently of the caller's context. A leg that exceeds `d` counts as
+  that cluster's health failure and leaves the rest of the caller's budget
+  for the alternative, so failover still has time to reach it. It applies to
+  the selected cluster, the failover attempt, and the FallbackRead probe,
+  for both single-row and slice reads; it does not apply to single-cluster
+  reads, to writes, or to iterators from `Iter`. Give callers at least `2*d`
+  so both legs can have their full allowance; a leg whose driver is
+  re-establishing the connection returns on the driver's request timeout `r`
+  instead of on `d`, so a caller that must survive that case needs about
+  `r + d` — the alternative still needs its own `d` afterwards. Default 0
+  (disabled), which keeps a leg on the caller's context as before. Set it
+  when the driver under the v2 adapter lets a caller's deadline override the
+  connection's request timeout, because the first cluster can otherwise
+  consume the whole request budget.
 - `WithAutoRefreshFailureClassifier(fn)` and
   `DefaultAutoRefreshFailureClassifier` select which errors count toward
-  auto-refresh; `types.ErrClusterTimeout` marks a Helix-owned write-leg or
-  probe deadline that expired while the caller was still waiting.
+  auto-refresh; `types.ErrClusterTimeout` marks a Helix-owned write-leg,
+  read-leg, or probe deadline that expired while the caller was still
+  waiting.
 - `policy.WithAdaptiveMinDegradedDwell(d)` keeps a degraded cluster degraded
   for at least `d`, and `policy.WithAdaptiveRedegradeBackoff(window, maxDwell)`
   doubles that dwell on every strike-driven degrade that follows a recovery
@@ -175,8 +198,9 @@ Defaults that changed are listed under "Behavior change" with a one-line restore
   both.
 - Auto-refresh counts only connectivity failures toward its failure
   threshold: errors that wrap `types.ErrClusterUnreachable` or the new
-  `types.ErrClusterTimeout` (a `WithClusterWriteTimeout` leg or a recovery
-  probe that exceeded its Helix-owned deadline). A schema or query error
+  `types.ErrClusterTimeout` (a `WithClusterWriteTimeout` or
+  `WithClusterReadTimeout` leg, or a recovery probe, that exceeded its
+  Helix-owned deadline). A schema or query error
   proves the session is reachable and no longer counts, so it cannot
   replace a healthy session. Restore the previous behaviour with one line:
   `helix.WithAutoRefresh(helix.WithAutoRefreshFailureClassifier(func(error) bool { return true }))`.
@@ -230,6 +254,14 @@ Defaults that changed are listed under "Behavior change" with a one-line restore
   dependencies, so a module that uses the v2 adapter must repeat the line in
   its own `go.mod` (see the README's Requirements); without it the module
   builds against upstream v2.1.2, which is API-compatible.
+- The fork also lets a caller's context deadline override the
+  connection-level request timeout, so a read leg against the v2 adapter is
+  no longer capped by `Session.Timeout`: set `WithClusterReadTimeout` when a
+  caller passes a deadline, or the first cluster can consume the whole budget
+  and failover never reaches the second. Writes need a caller deadline longer than
+  the driver's own request timeout for the same reason a leg deadline exists —
+  a leg that finishes after the caller's deadline is attributed to the caller,
+  records no health failure, and so does not degrade the cluster.
 - Session-liveness stats (the auto-refresh detector's consecutive failure
   count, last success, and last error) now live on the installed session
   rather than on the client: `SwapSession` and `RefreshSession` install a

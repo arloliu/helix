@@ -226,6 +226,14 @@ type ClientConfig struct {
 	// Default: 0.
 	ClusterWriteTimeout time.Duration
 
+	// ClusterReadTimeout bounds each cluster's leg of a read independently
+	// of the caller's context. See [WithClusterReadTimeout].
+	//
+	// 0 disables the per-leg timeout. Must be >= 0.
+	//
+	// Default: 0.
+	ClusterReadTimeout time.Duration
+
 	// AckMode selects whether a write with no synchronous acknowledgement
 	// may return nil. Default: RequireSynchronousAck. Set via [WithAckMode].
 	AckMode AckMode
@@ -1298,6 +1306,20 @@ func WithDefaultMaxRows(n int) Option {
 // the background legs a degraded [policy.AdaptiveDualWrite] dispatches.
 // It does not apply to single-cluster writes, reads, or mirror writes.
 //
+// The deadline bounds the leg the driver honours it on: a leg waiting for
+// an acknowledgement on a live connection ends at d, but a leg whose
+// driver has fallen back to re-establishing the connection can return
+// later, on the driver's own request timeout, because cancelling the leg
+// does not interrupt that path. Give callers a deadline that outlives the
+// driver's request timeout as well, or such a leg finishes after the
+// caller's context ended and is attributed to the caller instead of the
+// cluster — it then records no health failure, so a strategy that degrades
+// on failures never sees it. Outliving it is enough for the strategies
+// that run the legs together; [policy.SyncDualWrite] runs them one after
+// another and skips the second once the context has ended, so it needs
+// about r+d, where r is the driver's request timeout — the second leg
+// still needs its own d after the first has spent r.
+//
 // Parameters:
 //   - d: Per-leg deadline. 0 disables the timeout. Negative values are
 //     rejected by NewCQLClient.
@@ -1314,6 +1336,62 @@ func WithDefaultMaxRows(n int) Option {
 func WithClusterWriteTimeout(d time.Duration) Option {
 	return func(c *ClientConfig) {
 		c.ClusterWriteTimeout = d
+	}
+}
+
+// WithClusterReadTimeout bounds each cluster's leg of a read.
+//
+// Without it a leg runs for as long as the caller's own deadline allows,
+// and how soon a slow cluster is given up on is decided by the driver's
+// connection-level timeout rather than by Helix. A driver that lets a
+// caller's deadline override that timeout leaves the first leg free to
+// consume the whole request budget, so failover never reaches the second
+// cluster. With d set, each leg runs under its own deadline of d: a leg
+// that expires counts as that cluster's failure, is a health signal for
+// it, and leaves the rest of the caller's budget for the alternative.
+//
+// The deadline is Helix's own, so an expiry is reported as
+// [types.ErrClusterTimeout]. A failure observed after the caller's context
+// ended is still attributed to the caller.
+//
+// The deadline bounds the leg the driver honours it on: a leg waiting for
+// an answer on a live connection ends at d, but a leg whose driver has
+// fallen back to re-establishing the connection can return later, on the
+// driver's own request timeout, because cancelling the leg does not
+// interrupt that path. Give callers a deadline that outlives the driver's
+// request timeout as well, or such a leg finishes after the caller's
+// context ended and is attributed to the caller instead of the cluster.
+//
+// The timeout applies to every cluster leg of a read — the selected
+// cluster, the failover attempt, and the FallbackRead probe — for both
+// single-row and slice reads. It does not apply to single-cluster reads,
+// where there is no alternative to preserve budget for, nor to writes, nor
+// to an iterator obtained from Query.Iter, which the caller drains outside
+// any leg.
+//
+// Size d by how long a healthy cluster may take to answer rather than by
+// the caller's budget. A caller whose deadline is shorter than 2*d can
+// still complete both legs when they answer quickly; what it cannot do is
+// give both legs their full allowance, so a first leg that uses all of d
+// leaves the alternative short. A caller that must survive the reconnect
+// case above needs about r+d, where r is the driver's request timeout: the
+// alternative still needs its own d after the first leg has spent r.
+//
+// Parameters:
+//   - d: Per-leg deadline. 0 disables the timeout. Negative values are
+//     rejected by NewCQLClient.
+//
+// Returns:
+//   - Option: Configuration option
+//
+// Example:
+//
+//	client, err := helix.NewCQLClient(sessionA, sessionB,
+//	    helix.WithClusterReadTimeout(2*time.Second),
+//	)
+func WithClusterReadTimeout(d time.Duration) Option {
+	return func(c *ClientConfig) {
+		c.ClusterReadTimeout = d
 	}
 }
 
@@ -1419,9 +1497,9 @@ type AutoRefreshConfig struct {
 // [AutoRefreshConfig.FailureClassifier]: an error counts toward the
 // failure threshold when it wraps [types.ErrClusterUnreachable] (the
 // bundled adapters mark driver connectivity errors with it) or
-// [types.ErrClusterTimeout] (a Helix-owned write-leg or probe deadline
-// expired). Every other error says the session is reachable and counts
-// for nothing.
+// [types.ErrClusterTimeout] (a Helix-owned write-leg, read-leg, or probe
+// deadline expired). Every other error says the session is reachable and
+// counts for nothing.
 //
 // A custom adapter that does not normalise driver errors never triggers
 // auto-refresh under this default; give it a classifier that recognises

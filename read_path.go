@@ -492,18 +492,44 @@ func (c *CQLClient) runPrimaryRead(
 	}
 }
 
+// readLegContext bounds one read leg by [ClientConfig.ClusterReadTimeout].
+// The leg's own deadline expiring leaves the caller's context live, so
+// classifyReadErr sees a live context and attributes the failure to the
+// cluster. Single-cluster mode has no alternative to preserve budget for,
+// so a leg there runs on the caller's context unchanged.
+func (c *CQLClient) readLegContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.config.ClusterReadTimeout <= 0 || c.IsSingleCluster() {
+		return ctx, noopCancel
+	}
+
+	return context.WithTimeout(ctx, c.config.ClusterReadTimeout)
+}
+
 // attemptRead runs readFunc once against the installed session for
 // cluster and records the per-attempt metrics. It returns the holder the
 // attempt used so the outcome can be reported against it.
+//
+// attemptRead is the only place a read reaches a session, so it is also
+// the only place a read leg's own deadline is applied. The leg context
+// never escapes: every caller keeps classifying against the caller's
+// context, and a leg that expires under Helix's deadline arrives there as
+// [types.ErrClusterTimeout].
 func (c *CQLClient) attemptRead(
 	ctx context.Context,
 	cluster ClusterID,
 	readFunc func(context.Context, cql.Session) error,
 ) (holder *sessionHolder, elapsed float64, err error) {
 	holder = c.holderFor(cluster)
+	legCtx, cancel := c.readLegContext(ctx)
+	defer cancel()
+
 	start := time.Now()
-	err = readFunc(ctx, holder.s)
+	err = readFunc(legCtx, holder.s)
 	elapsed = time.Since(start).Seconds()
+
+	// A leg ended by Helix's own deadline while the caller was still
+	// waiting is a connectivity failure, not an arbitrary driver error.
+	err = clusterTimeoutIfExpired(legCtx, ctx, err)
 
 	c.config.Metrics.IncReadTotal(cluster)
 	c.config.Metrics.ObserveReadDuration(cluster, elapsed)

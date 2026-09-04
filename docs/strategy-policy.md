@@ -18,6 +18,14 @@ Each interface has a single responsibility. Compose them to express your exact r
 
 ## Read Path Architecture
 
+Every cluster leg of a read — the selected cluster, the failover attempt, and the FallbackRead probe —
+runs on the caller's context by default, so how soon a stalled cluster is given up on is decided by the
+driver's connection-level timeout rather than by Helix. `helix.WithClusterReadTimeout(d)` gives each leg
+its own deadline of `d`, turning a leg that exceeds `d` into that cluster's failure and leaving the
+rest of the caller's budget for the alternative. The deadline is not a hard cap: a leg whose driver is
+re-establishing the connection returns on the driver's own request timeout instead, because cancelling
+the leg does not interrupt that path.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        CQLClient.executeRead()                      │

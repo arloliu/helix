@@ -34,6 +34,7 @@ func validateNewCQLClientConfig(config *ClientConfig) error {
 		validateRootMirrorMode(config),
 		validateRootDefaultMaxRows(config),
 		validateRootClusterWriteTimeout(config),
+		validateRootClusterReadTimeout(config),
 		validateRootBehaviorProfile(config),
 		validateRootRecoveryProbe(config),
 		validateRootReplayWiring(config),
@@ -130,6 +131,15 @@ func validateRootDefaultMaxRows(config *ClientConfig) error {
 func validateRootClusterWriteTimeout(config *ClientConfig) error {
 	if config.ClusterWriteTimeout < 0 {
 		return newRootOptionError("WithClusterWriteTimeout", "must be >= 0")
+	}
+
+	return nil
+}
+
+// validateRootClusterReadTimeout rejects a negative per-leg read timeout.
+func validateRootClusterReadTimeout(config *ClientConfig) error {
+	if config.ClusterReadTimeout < 0 {
+		return newRootOptionError("WithClusterReadTimeout", "must be >= 0")
 	}
 
 	return nil

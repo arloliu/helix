@@ -396,6 +396,22 @@ See the [examples](examples/) directory:
   ```
   replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.3.0-otter
   ```
+
+  The fork lets a caller's context deadline override the connection-level request timeout, so a read
+  leg is no longer capped by `Session.Timeout`. Set `helix.WithClusterReadTimeout(d)` to bound each
+  leg yourself; without it the first cluster can consume the caller's whole budget and read
+  failover never reaches the second cluster. Size `d` by how long a healthy cluster may take to
+  answer, then give callers at least `2*d` so both legs can have their full allowance. Where a leg
+  may hit the driver's reconnect path it returns on the driver's request timeout `r` instead of on
+  `d`, so a caller that must survive that case needs about `r + d`, not `max(2*d, r)`.
+
+  Give writes a caller deadline longer than the driver's own request timeout as well. A write to an
+  unreachable node returns on that timeout even when the context is already cancelled, and a leg
+  that finishes after the caller's deadline is attributed to the caller rather than to the cluster:
+  no health failure is recorded, so `AdaptiveDualWrite` does not degrade the cluster. That is
+  enough for the strategies that run both legs together; `policy.SyncDualWrite` runs them one
+  after another and skips the second once the context has ended, so budget it like a read: about
+  `r + d`.
 - For NATS Replay: `github.com/nats-io/nats.go`
 
 ## License
