@@ -53,6 +53,14 @@ func TestS_StickyRead_LeavesDeadPreferredDuringCooldown(t *testing.T) {
 				helix.WithFailoverPolicy(policy.NewActiveFailover()),
 				helix.WithMetrics(mc),
 				helix.WithLogger(testutil.NewTestLogger(t)),
+				// A read leg must give up before the caller's budget is
+				// gone: the v2 driver lets a caller deadline override the
+				// connection's request timeout, so without a deadline of
+				// Helix's own the first cluster consumes the whole 15s and
+				// failover never reaches the second. Deliberately below the
+				// driver's own request timeout, so the leg ends on Helix's
+				// deadline rather than shadowing the driver's.
+				helix.WithClusterReadTimeout(500*time.Millisecond),
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)

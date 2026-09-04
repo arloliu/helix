@@ -176,14 +176,20 @@ func TestPrimaryOnlyRead_ReportsEveryRouteReason(t *testing.T) {
 func TestPrimaryOnlyRead_ConcurrentTransitionsAlternate(t *testing.T) {
 	p := NewPrimaryOnlyRead()
 	mc := testutil.NewTestMetricsCollector()
-	em := &recordingEmitter{}
+	em := &reportingEmitter{}
 	p.SetMetrics(mc)
 	p.SetEventEmitter(em)
 
+	// 8 goroutines x 3 rounds is at most 48 moves, comfortably below the
+	// outbox's capacity. The burst has to stay under it: past outboxCap the
+	// outbox drops the newest event by design, which would leave the
+	// delivered events a subsequence of the transitions and their order
+	// unverifiable. The assertion below is about delivery order, so the test
+	// keeps the outbox from overflowing and checks that it did not.
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			for range 50 {
+			for range 3 {
 				_, _ = p.OnFailure(types.ClusterA, nil)
 				p.OnSuccess(types.ClusterA)
 			}
@@ -191,7 +197,8 @@ func TestPrimaryOnlyRead_ConcurrentTransitionsAlternate(t *testing.T) {
 	}
 	wg.Wait()
 
-	events := routeEvents(em)
+	require.Zero(t, em.dropped.Load(), "the burst must stay inside the outbox")
+	events := routeEvents(&em.recordingEmitter)
 	require.NotEmpty(t, events)
 	for i, ev := range events {
 		want := types.ClusterB

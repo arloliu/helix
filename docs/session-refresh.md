@@ -64,7 +64,7 @@ The detector goroutine ticks every `CheckInterval` (default 30s) and evaluates e
 Only connectivity failures count toward `FailureThreshold`. The default classifier
 (`helix.DefaultAutoRefreshFailureClassifier`) counts an error when it wraps
 `types.ErrClusterUnreachable` (the bundled adapters mark driver connectivity errors with it) or
-`types.ErrClusterTimeout` (a `WithClusterWriteTimeout` leg or a recovery probe exceeded its
+`types.ErrClusterTimeout` (a `WithClusterWriteTimeout` or `WithClusterReadTimeout` leg, or a recovery probe, exceeded its
 Helix-owned deadline). A schema or query error proves the session is reachable and counts for
 nothing, so a burst of `Unconfigured table` errors on a fresh client no longer replaces a healthy
 session. Override it with `helix.WithAutoRefreshFailureClassifier(func(error) bool)`; the previous

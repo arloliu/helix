@@ -485,7 +485,8 @@ var (
 
 	// ErrClusterTimeout marks an operation that a Helix-owned deadline
 	// ended: a per-cluster write leg that exceeded WithClusterWriteTimeout,
-	// or a recovery probe that exceeded its Timeout, while the caller's own
+	// a per-cluster read leg that exceeded WithClusterReadTimeout, or a
+	// recovery probe that exceeded its Timeout, while the caller's own
 	// context was still live. The expiry describes the cluster, not the
 	// caller, so it counts as a connectivity failure for auto-refresh; the
 	// driver's error stays reachable through errors.Is and errors.As.
