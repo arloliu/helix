@@ -165,6 +165,9 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent fire-and-forget goroutines |
 | `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays degraded once it degrades |
 | `WithAdaptiveRedegradeBackoff` | disabled | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
+| `WithAdaptiveLogger` | no-op | Structured logger for the fire-and-forget background path |
+| `WithAdaptiveMetrics` | no-op | Metrics collector for background writes; without it a background write's real error never reaches metrics |
+| `WithAdaptiveClusterNames` | A/B | Display names used in the background path's log messages |
 
 ### Tuning for Different Environments
 

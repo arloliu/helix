@@ -156,7 +156,8 @@ type ClusterEvent struct {
 	// Cluster is the cluster this event primarily concerns.
 	Cluster ClusterID
 
-	// FromCluster and ToCluster describe direction for EventFailover.
+	// FromCluster and ToCluster describe direction for EventFailover and
+	// EventReadRouteChanged.
 	FromCluster ClusterID
 	ToCluster   ClusterID
 

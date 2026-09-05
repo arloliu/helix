@@ -756,7 +756,7 @@ func WithMirrorPublisher(publisher Replayer, opts ...mirror.Option) Option {
 //     throttles the mirror engine's worker pool. Size
 //     [mirror.WithWorkers] accordingly when migrating against unsteady
 //     NATS infra.
-//   - The auto-built [replay.MemoryWorker] uses the replay package's own
+//   - The auto-built [replay.Worker] uses the replay package's own
 //     concurrency defaults, which are tuned for primary replay (one
 //     pair). For migration the mirror destination is often newer and
 //     less elastic — consider [replay.WithMaxAttempts] and lower
@@ -1298,9 +1298,10 @@ func WithDefaultMaxRows(n int) Option {
 // sequence may never reach the second one. With it, each leg runs under its
 // own deadline of d. A leg that expires counts as that cluster's failure:
 // it is replayed like any other failed leg, the other leg's acknowledgement
-// stands, and the expiry is a health signal for the slow cluster because the
-// deadline is Helix's own, not the caller's. A failure observed after the
-// caller's context ended is still attributed to the caller.
+// stands, and the expiry is reported as [types.ErrClusterTimeout] — a health
+// signal for the slow cluster because the deadline is Helix's own, not the
+// caller's. A failure observed after the caller's context ended is still
+// attributed to the caller.
 //
 // The timeout applies to the normal and strict dual-write legs, including
 // the background legs a degraded [policy.AdaptiveDualWrite] dispatches.

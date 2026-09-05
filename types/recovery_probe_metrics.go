@@ -7,8 +7,8 @@ package types
 // Helix's probe loop type-asserts on this interface and silently no-ops if
 // the configured collector does not implement it. By-hand [MetricsCollector]
 // implementations stay source-compatible and may opt in by adding the two
-// methods below. Bundled collectors (e.g. contrib/metrics/vm) implement
-// this interface directly.
+// methods below. The bundled contrib/metrics/vm collector does not
+// implement it.
 //
 // Counter semantics:
 //   - IncRecoveryProbeSuccess: the probe returned nil; the cluster has been

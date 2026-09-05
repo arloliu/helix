@@ -97,7 +97,7 @@ FallbackRead works with all four bounded multi-row read methods — `SliceMap`, 
 
 ### MaxRows and overflow
 
-`MaxRows` (or `Config.DefaultMaxRows`) caps the number of rows admitted by slice methods. When the (N+1)th row is read, the method aborts with `ErrRowLimitExceeded` and discards the partial accumulator. FallbackRead does not retry on `ErrRowLimitExceeded` — the limit was hit on the primary, which successfully returned data.
+`MaxRows` (or the client-wide `helix.WithDefaultMaxRows`) caps the number of rows admitted by slice methods. When the (N+1)th row is read, the method aborts with `ErrRowLimitExceeded` and discards the partial accumulator. FallbackRead does not retry on `ErrRowLimitExceeded` — the limit was hit on the primary, which successfully returned data.
 
 ```go
 rows, err := client.Query("SELECT * FROM users WHERE org = ?", orgID).
