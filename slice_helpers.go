@@ -24,7 +24,7 @@ var errNilSliceScanAsQuery = errors.New("helix: SliceScanAs query must not be ni
 // SliceScanAs is a generic free function (Go does not allow type parameters
 // on interface methods) layered on top of [Query.SliceScanContext]. All
 // semantics of the underlying SliceScan apply unchanged: [Query.FallbackRead]
-// empty-retry, [Query.MaxRows] / [Config.DefaultMaxRows] bounding, page-size
+// empty-retry, [Query.MaxRows] / [ClientConfig.DefaultMaxRows] bounding, page-size
 // clamping, no standard failover for SliceScan, and the [Query.PageState]
 // cross-cluster short-circuit.
 //

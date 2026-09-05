@@ -53,6 +53,7 @@ const (
 	PriorityLow  = types.PriorityLow
 )
 
+// ErrNotFound is [types.ErrNotFound], re-exported for convenience.
 var ErrNotFound = types.ErrNotFound
 
 // ErrRowLimitExceeded is the sentinel returned by bounded multi-row reads

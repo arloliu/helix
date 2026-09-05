@@ -192,6 +192,9 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent background writes; excess returns `ErrWriteDropped` |
 | `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays DEGRADED before recovery credit can restore it |
 | `WithAdaptiveRedegradeBackoff` | disabled | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
+| `WithAdaptiveLogger` | no-op | Structured logger for the fire-and-forget background path |
+| `WithAdaptiveMetrics` | no-op | Metrics collector for background writes; without it a background write's real error never reaches metrics |
+| `WithAdaptiveClusterNames` | A/B | Display names used in the background path's log messages |
 
 **Cluster events:** degrade and recover transitions emit
 `types.EventWriteDegraded` and `types.EventWriteRecovered`, and record the

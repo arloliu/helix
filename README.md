@@ -331,6 +331,11 @@ helix.NewCQLClient(sessionA, sessionB,
     helix.WithReplayer(replayer),
     helix.WithReplayWorker(worker),  // Optional: auto-start worker
 
+    // Observability — wired into every component that accepts one
+    helix.WithLogger(logger),                    // structured logger; no-op by default
+    helix.WithMetrics(vm.New()),                 // contrib/metrics/vm collector
+    helix.WithClusterNames("us_east", "us_west"), // labels used in metrics and logs
+
     // Timestamps (critical for idempotency)
     helix.WithTimestampProvider(func() int64 {
         return time.Now().UnixMicro()

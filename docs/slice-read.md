@@ -46,7 +46,7 @@ Drains the query and invokes `scanFn` once per row. `RowScanner` exposes only `S
 
 ## MaxRows
 
-`MaxRows(n int) Query` sets a per-query row cap. `Config.DefaultMaxRows` sets the client-wide default. When the (N+1)th row is read, the method aborts with [`ErrRowLimitExceeded`](#errrowlimitexceeded) and discards the partial accumulator.
+`MaxRows(n int) Query` sets a per-query row cap. `helix.WithDefaultMaxRows(n)` sets the client-wide default. When the (N+1)th row is read, the method aborts with [`ErrRowLimitExceeded`](#errrowlimitexceeded) and discards the partial accumulator.
 
 ```go
 rows, err := client.Query("SELECT * FROM events WHERE org = ?", orgID).
@@ -63,7 +63,7 @@ if helix.IsRowLimitExceeded(err) {
 |---------|-----------|
 | `q.MaxRows(n)` where n > 0 | Always beats the client default |
 | `q.MaxRows(0)` | Clears the per-query override; client default applies |
-| `Config.DefaultMaxRows` | Used when no per-query override is set |
+| `WithDefaultMaxRows` | Used when no per-query override is set |
 | Neither set | No cap; drain is unbounded |
 
 ### Page-size clamp

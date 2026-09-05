@@ -257,6 +257,11 @@ outage stays visible without a log line per tick; the first success after failur
 `Info`. `ForceRecover` remains available as an escape valve. Probe failures never degrade a
 healthy cluster — probes are recovery-only signals.
 
+**Probe counters:** a `MetricsCollector` that also implements
+`types.RecoveryProbeMetrics` receives `IncRecoveryProbeSuccess(cluster)` and
+`IncRecoveryProbeFailure(cluster)` for every probe against a degraded cluster.
+A healthy cluster is not probed, so it produces neither counter.
+
 ---
 
 ## FallbackRead After a Strict Partial Write

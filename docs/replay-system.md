@@ -718,6 +718,7 @@ client-side timestamp, so storing one of them is correct.
 | `WithMaxRequestBatch(n)` | 100 | Max batch size per pull request |
 | `WithAckWait(d)` | 30s | Time before unacked message is redelivered |
 | `WithMaxDeliver(n)` | 5 | Max delivery attempts before dropping message (`RetryBounded` only; `RetryWhileRetained` sets the consumer to unlimited deliveries) |
+| `WithOnCorruptMessage(fn)` | nil | Callback invoked with the decode error when a message that cannot be decoded is terminated |
 
 ### Worker Options
 
@@ -740,6 +741,8 @@ client-side timestamp, so storing one of them is correct.
 | `WithOnSuccess(fn)` | nil | Callback on successful replay |
 | `WithOnError(fn)` | nil | Callback on failed replay (fires per attempt) |
 | `WithOnDrop(fn)` | nil | Callback when a payload is permanently dropped, see [Drop reasons](#drop-reasons) |
+| `WithClusterGate(fn)` | nil | Hold replay back for a cluster while `fn` returns false, see [Hold Replay Back per Cluster](#9-hold-replay-back-per-cluster) |
+| `WithEvictionWatch()` | off | **NATS only.** Poll the stream state and report messages removed without this process's acknowledgement, see [Drop reasons](#drop-reasons) |
 
 ---
 
