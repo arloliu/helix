@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.0] — 2026-09-05
 
 This release completes the health-authority, per-cluster replay, auto-recovery, and
 observability phases of the [roadmap](docs/plans/roadmap.md).
@@ -27,6 +27,9 @@ event kind has a metric counterpart.
 
 All API changes are additive: new optional collector and emitter interfaces, two event kinds
 (`read_route_changed`, `replay_evicted`), and new options that default to the previous behaviour.
+`AutoRefreshConfig`, `policy.StickyRead`, and `policy.PrimaryOnlyRead` gained function-typed
+fields and are no longer comparable with `==`; the strategies are meant to be held by the
+pointer their constructors return.
 Defaults that changed are listed under "Behavior change" with a one-line restore where one exists.
 
 ### Added
