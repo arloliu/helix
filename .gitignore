@@ -50,6 +50,9 @@ testdata/tmp/
 .claude/settings.local.json
 .claude/*.lock
 
+# Codegraph generated files
+/.codegraph/
+
 # Generated files (keep tracked, but ignore if regenerated)
 # replay/nats_message_gen.go  # Uncomment to ignore generated msgp files
 
