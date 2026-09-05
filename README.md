@@ -310,13 +310,17 @@ client, err := helix.NewCQLClient(
 )
 ```
 
-### All Configuration Options
+### Commonly Used Options
 
 `NewCQLClient` validates root options before starting background components or
 mutating caller-owned strategies, policies, and workers. Invalid root options
 return joined `*types.OptionError` values that can be checked with
 `types.IsOptionError` or `errors.As`; mirror mode conflicts also wrap the
 relevant sentinel error such as `types.ErrMirrorModeConflict`.
+
+The block below shows the options most deployments set. The complete list of root options,
+with defaults and the rules `NewCQLClient` enforces, is in the
+[Configuration Reference](docs/configuration.md).
 
 ```go
 helix.NewCQLClient(sessionA, sessionB,
@@ -377,6 +381,7 @@ See the [examples](examples/) directory:
 
 ## Documentation
 
+- [Configuration Reference](docs/configuration.md) — Every root option with its default and validation rule
 - [Strategy & Policy](docs/strategy-policy.md) — Read/write strategies, failover policies, and `AllowedClusters` operator override
 - [Replay System](docs/replay-system.md) — Queue implementations, replay patterns, and worker configuration
 - [AdaptiveDualWrite Guide](docs/adaptive-dual-write.md) — Latency-aware write strategy: degradation thresholds, fire-and-forget, and recovery probe
