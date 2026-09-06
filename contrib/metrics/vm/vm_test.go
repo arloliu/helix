@@ -13,15 +13,16 @@ import (
 
 // Compile-time assertions that *Collector implements the optional
 // types.AdaptiveWriteMetrics, types.MirrorReplayMetrics,
-// types.ClusterEventMetrics, types.RecoveryProbeMetrics, and
-// types.StrictMetrics interfaces. Placed in a _test.go file per the
-// public-package assertion convention.
+// types.ClusterEventMetrics, types.RecoveryProbeMetrics,
+// types.StrictMetrics, and types.CallerContextMetrics interfaces. Placed in
+// a _test.go file per the public-package assertion convention.
 var (
 	_ types.AdaptiveWriteMetrics = (*Collector)(nil)
 	_ types.MirrorReplayMetrics  = (*Collector)(nil)
 	_ types.ClusterEventMetrics  = (*Collector)(nil)
 	_ types.RecoveryProbeMetrics = (*Collector)(nil)
 	_ types.StrictMetrics        = (*Collector)(nil)
+	_ types.CallerContextMetrics = (*Collector)(nil)
 )
 
 func TestCollector_DurationHistogramsUsePrometheusBuckets(t *testing.T) {
@@ -190,12 +191,18 @@ func TestCollector_RecoveryProbeAndStrictWriteMetrics(t *testing.T) {
 		"counters must be pre-created so a scrape sees them before the first probe")
 	require.Contains(t, out, `helix_recovery_probe_failure_total{cluster="B"} 0`)
 	require.Contains(t, out, `helix_write_skipped_total{cluster="A"} 0`)
+	require.Contains(t, out, `helix_read_caller_expired_total{cluster="A"} 0`)
+	require.Contains(t, out, `helix_read_caller_expired_total{cluster="B"} 0`)
+	require.Contains(t, out, `helix_write_caller_expired_total{cluster="A"} 0`)
+	require.Contains(t, out, `helix_write_caller_expired_total{cluster="B"} 0`)
 
 	c.IncRecoveryProbeSuccess(types.ClusterA)
 	c.IncRecoveryProbeFailure(types.ClusterB)
 	c.IncRecoveryProbeFailure(types.ClusterB)
 	c.IncWriteSkipped(types.ClusterA)
 	c.IncWriteSkipped(types.ClusterB)
+	c.IncReadCallerExpired(types.ClusterA)
+	c.IncWriteCallerExpired(types.ClusterB)
 
 	buf.Reset()
 	c.WritePrometheus(&buf)
@@ -209,4 +216,11 @@ func TestCollector_RecoveryProbeAndStrictWriteMetrics(t *testing.T) {
 	require.Contains(t, out, `helix_write_skipped_total{cluster="B"} 1`)
 	require.Contains(t, out, `helix_write_errors_total{cluster="A"} 0`,
 		"a skip is an operational state, not a cluster write error")
+	require.Contains(t, out, `helix_read_caller_expired_total{cluster="A"} 1`)
+	require.Contains(t, out, `helix_read_caller_expired_total{cluster="B"} 0`,
+		"a caller-expired leg on one cluster must not credit the other")
+	require.Contains(t, out, `helix_write_caller_expired_total{cluster="B"} 1`)
+	require.Contains(t, out, `helix_write_caller_expired_total{cluster="A"} 0`)
+	require.Contains(t, out, `helix_read_errors_total{cluster="A"} 0`,
+		"a caller-expired read is attributed to the caller, not to the cluster")
 }

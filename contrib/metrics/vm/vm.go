@@ -246,6 +246,12 @@ type Collector struct {
 	writeSkippedA *metrics.Counter
 	writeSkippedB *metrics.Counter
 
+	// Caller-expired legs (optional types.CallerContextMetrics)
+	readCallerExpiredA  *metrics.Counter
+	readCallerExpiredB  *metrics.Counter
+	writeCallerExpiredA *metrics.Counter
+	writeCallerExpiredB *metrics.Counter
+
 	// Mirror metrics (optional types.MirrorMetrics)
 	mirrorEnqueueSuccess *metrics.Counter
 	mirrorEnqueueDropped *metrics.Counter
@@ -424,6 +430,12 @@ func (c *Collector) initMetrics() {
 	// Skipped write legs (optional types.StrictMetrics)
 	c.writeSkippedA = c.set.NewCounter(fmt.Sprintf(`%s_write_skipped_total{cluster="%s"}`, p, nA))
 	c.writeSkippedB = c.set.NewCounter(fmt.Sprintf(`%s_write_skipped_total{cluster="%s"}`, p, nB))
+
+	// Caller-expired legs (optional types.CallerContextMetrics)
+	c.readCallerExpiredA = c.set.NewCounter(fmt.Sprintf(`%s_read_caller_expired_total{cluster="%s"}`, p, nA))
+	c.readCallerExpiredB = c.set.NewCounter(fmt.Sprintf(`%s_read_caller_expired_total{cluster="%s"}`, p, nB))
+	c.writeCallerExpiredA = c.set.NewCounter(fmt.Sprintf(`%s_write_caller_expired_total{cluster="%s"}`, p, nA))
+	c.writeCallerExpiredB = c.set.NewCounter(fmt.Sprintf(`%s_write_caller_expired_total{cluster="%s"}`, p, nB))
 
 	// Mirror metrics (optional types.MirrorMetrics)
 	c.mirrorEnqueueSuccess = c.set.NewCounter(fmt.Sprintf(`%s_mirror_enqueue_success_total`, p))
@@ -862,6 +874,35 @@ func (c *Collector) IncWriteSkipped(cluster types.ClusterID) {
 		c.writeSkippedA.Inc()
 	} else {
 		c.writeSkippedB.Inc()
+	}
+}
+
+// ----------------------
+// Caller-expired legs (optional types.CallerContextMetrics)
+// ----------------------
+
+// IncReadCallerExpired increments the counter when a read leg on cluster
+// returned an error after the caller's context was already done. The error
+// is attributed to the caller, so read_errors_total is not incremented
+// alongside it and the cluster's health is untouched; without a
+// helix.WithClusterReadTimeout leg deadline this counter is the only trace
+// a stalled cluster leaves.
+func (c *Collector) IncReadCallerExpired(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.readCallerExpiredA.Inc()
+	} else {
+		c.readCallerExpiredB.Inc()
+	}
+}
+
+// IncWriteCallerExpired increments the counter when a write leg on cluster
+// was classified as cancelled by the caller. As with the read counter,
+// write_errors_total is not incremented alongside it.
+func (c *Collector) IncWriteCallerExpired(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.writeCallerExpiredA.Inc()
+	} else {
+		c.writeCallerExpiredB.Inc()
 	}
 }
 

@@ -248,6 +248,20 @@ func (m *NopMetrics) IncRecoveryProbeFailure(_ types.ClusterID) {}
 var _ types.RecoveryProbeMetrics = (*NopMetrics)(nil)
 
 // ----------------------
+// Caller-expired legs (optional types.CallerContextMetrics)
+// ----------------------
+
+// IncReadCallerExpired discards the metric.
+func (m *NopMetrics) IncReadCallerExpired(_ types.ClusterID) {}
+
+// IncWriteCallerExpired discards the metric.
+func (m *NopMetrics) IncWriteCallerExpired(_ types.ClusterID) {}
+
+// Compile-time assertion that NopMetrics implements the optional
+// types.CallerContextMetrics interface so embedders pick up no-op coverage.
+var _ types.CallerContextMetrics = (*NopMetrics)(nil)
+
+// ----------------------
 // Replay backlog (optional types.ReplayBacklogMetrics)
 // ----------------------
 

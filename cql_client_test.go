@@ -1795,11 +1795,15 @@ func TestExecuteDualWrite_AsyncLogIsInfoNotWarn(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
+	// The constructor emits its own startup warnings; only the warnings the
+	// write itself adds are under test here.
+	startupWarns := len(warnings(logger))
+
 	err = client.Query("INSERT INTO t (id) VALUES (?)", 1).Exec()
 	require.NoError(t, err)
 
 	require.Len(t, replayer.payloads, 1, "async write must be enqueued for replay")
-	require.Empty(t, logger.warnMsgs, "ErrWriteAsync must not emit a warning log")
+	require.Len(t, warnings(logger), startupWarns, "ErrWriteAsync must not emit a warning log")
 
 	found := false
 	for _, msg := range logger.infoMsgs {

@@ -130,6 +130,31 @@
 //     {prefix}_write_errors_total is not incremented alongside it (optional
 //     types.StrictMetrics)
 //
+// Caller-expired legs:
+//   - {prefix}_read_caller_expired_total{cluster} - Counter of read attempts
+//     that returned an error after the caller's context was already
+//     cancelled or past its deadline (optional
+//     types.CallerContextMetrics)
+//   - {prefix}_write_caller_expired_total{cluster} - Counter of write legs
+//     classified as cancelled by the caller (optional
+//     types.CallerContextMetrics)
+//
+// Both are attributed to the caller rather than to the cluster, so
+// {prefix}_read_errors_total / {prefix}_write_errors_total are not
+// incremented alongside them and the cluster's health is untouched. A leg
+// has no deadline of its own unless a dual-cluster client sets
+// helix.WithClusterReadTimeout / helix.WithClusterWriteTimeout, so a cluster
+// that accepts connections and never answers shows up here and nowhere else:
+// a counter climbing while the matching errors_total stays flat is that
+// cluster. Both options are inert in single-cluster mode, where these
+// counters are the only signal and a driver-level request timeout is the
+// remedy.
+//
+// A CAS iterator (from ExecCASContext or MapExecCASContext) whose Close
+// reports a caller-expired error increments the read counter: an iterator's
+// outcome is reported through the read path, which does not distinguish CAS
+// from an ordinary read.
+//
 // Mirror (recorded when mirroring is configured):
 //   - {prefix}_mirror_enqueue_success_total - Counter of captures accepted by the engine queue
 //   - {prefix}_mirror_enqueue_dropped_total - Counter of captures rejected by a full engine queue

@@ -26,6 +26,13 @@ rest of the caller's budget for the alternative. The deadline is not a hard cap:
 re-establishing the connection returns on the driver's own request timeout instead, because cancelling
 the leg does not interrupt that path.
 
+Without `WithClusterReadTimeout` a leg has no deadline of its own, so a cluster that accepts the read
+and never answers ends every request through the caller's context instead.
+Helix attributes that error to the caller: no failover, no `RecordFailure`, no `IncReadError`.
+A dual-cluster client is warned about the missing deadline at startup, and the optional
+`types.CallerContextMetrics` counter `IncReadCallerExpired(cluster)` is the only per-cluster trace such
+a leg leaves — see [Caller-expired legs](#caller-expired-legs).
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        CQLClient.executeRead()                      │
@@ -107,6 +114,9 @@ Executes writes to both clusters in parallel using two goroutines, then waits fo
 A slow but healthy cluster therefore holds every write for as long as the caller's context allows;
 `helix.WithClusterWriteTimeout(d)` bounds each leg independently, turning a leg that exceeds `d`
 into a replayed failure while the other leg's acknowledgement stands.
+Without it, a leg that ends because the caller gave up is attributed to the caller rather than to the
+cluster and is counted only by `types.CallerContextMetrics` — see
+[Caller-expired legs](#caller-expired-legs).
 
 ```go
 strategy := policy.NewConcurrentDualWrite()
@@ -1032,6 +1042,58 @@ strategy := policy.NewAdaptiveDualWrite(
 ```
 
 Driver-level timeouts apply uniformly to all query types (reads, writes, batches) and are handled with proper internal cleanup by the driver.
+
+---
+
+## Caller-Expired Legs
+
+A leg whose error arrives after the caller's context is already cancelled or past its deadline is
+attributed to the caller, not to the cluster.
+It triggers no failover, no `RecordFailure`, no `IncReadError`/`IncWriteError`, and no session-liveness
+failure.
+The attribution is right — the caller gave up first — but it means a cluster that accepts connections
+and then never answers stays invisible in per-cluster health while every caller times out.
+
+For a dual-cluster client, `WithClusterReadTimeout` / `WithClusterWriteTimeout` are the fix: with a leg
+deadline the leg expires on Helix's own clock while the caller is still waiting, which surfaces as
+`types.ErrClusterTimeout` and does count against the cluster.
+A dual-cluster client that leaves either unset is warned about it once, at construction.
+Both options are inert in single-cluster mode — no read or write leg there is given a deadline of its
+own — so these counters are the only signal available and a driver-level request timeout on the session
+is the remedy.
+
+`types.CallerContextMetrics` is the observability half of the same problem — an optional extension of
+`MetricsCollector` that reports what nothing else records:
+
+```go
+type CallerContextMetrics interface {
+    // IncReadCallerExpired is called when a read leg on cluster returned an
+    // error after the caller's context was already cancelled or past its
+    // deadline.
+    IncReadCallerExpired(cluster types.ClusterID)
+
+    // IncWriteCallerExpired is called when a write leg on cluster was
+    // classified as cancelled by the caller.
+    IncWriteCallerExpired(cluster types.ClusterID)
+}
+```
+
+Both counters are per-cluster facts rather than health signals, so they are recorded in single-cluster
+mode as well.
+A CAS iterator (from `ExecCASContext` or `MapExecCASContext`) whose `Close` reports a caller-expired
+error increments the read counter, because an iterator's outcome is reported through the read path.
+A read counts at most once per operation, on the cluster the attempt targeted — a read that fails over
+on a cluster error and then expires on the alternative is counted only against the alternative.
+A write counts once per dispatched leg.
+A leg a write strategy skipped without sending it is not counted — `SyncDualWrite` returns the caller's
+context error for the second leg once the first has spent the budget, and a leg that never reached the
+cluster says nothing about whether it is answering.
+The late result of a background (fire-and-forget) leg never counts: it is classified against a context
+that carries the caller's values but none of its cancellation.
+
+The bundled `contrib/metrics/vm` collector implements the interface and exports the counters as
+`{prefix}_read_caller_expired_total{cluster}` and `{prefix}_write_caller_expired_total{cluster}`.
+A counter climbing while the matching `errors_total` stays flat identifies the frozen cluster.
 
 ---
 

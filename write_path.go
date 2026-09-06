@@ -168,7 +168,7 @@ func (c *CQLClient) executeWriteWithReplay(
 	if c.IsSingleCluster() {
 		holder := c.holderFor(ClusterA)
 		err := writeFunc(ctx, holder.s)
-		c.health.writeLeg(holder, classifyWriteLeg(ctx, err), err, c.config.NowProvider())
+		c.health.writeLeg(holder, ClusterA, classifyWriteLeg(ctx, err), err, c.config.NowProvider())
 
 		return err
 	}
@@ -339,8 +339,8 @@ func (c *CQLClient) executeDualWrite(
 	// Session liveness — reported PER leg so a partial success (A=ok,
 	// B=err) advances A's lastSuccess while accumulating failures on B.
 	// The hub ignores async, dropped, skipped, and caller-cancelled legs.
-	c.health.writeLeg(legStateA.holder.Load(), legA, errA, nowNano)
-	c.health.writeLeg(legStateB.holder.Load(), legB, errB, nowNano)
+	c.health.writeLeg(legStateA.holder.Load(), ClusterA, legA, errA, nowNano)
+	c.health.writeLeg(legStateB.holder.Load(), ClusterB, legB, errB, nowNano)
 
 	// Both succeeded definitively.
 	if errA == nil && errB == nil {
@@ -432,7 +432,7 @@ func (c *CQLClient) replayLeg(
 		// earlier. bg is never cancelled, so the kind is never
 		// caller-cancelled.
 		legKind := classifyWriteLeg(bg, legErr)
-		c.health.deferredWriteLeg(leg.holder.Load(), legKind, legErr)
+		c.health.deferredWriteLeg(leg.holder.Load(), cluster, legKind, legErr)
 		var dropErr error
 		if legErr != nil {
 			dropErr = c.admitReplayPayload(bg, payload, legErr, legKind)
@@ -657,8 +657,8 @@ func (c *CQLClient) executeStrictDualWrite(
 	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
 	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
 
-	c.health.writeLeg(legStateA.holder.Load(), legA, errA, nowNano)
-	c.health.writeLeg(legStateB.holder.Load(), legB, errB, nowNano)
+	c.health.writeLeg(legStateA.holder.Load(), ClusterA, legA, errA, nowNano)
+	c.health.writeLeg(legStateB.holder.Load(), ClusterB, legB, errB, nowNano)
 
 	if errA == nil && errB == nil {
 		return nil

@@ -2,6 +2,9 @@ package helix
 
 import (
 	"testing"
+	"time"
+
+	"github.com/arloliu/helix/adapter/cql"
 
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/replay"
@@ -98,16 +101,84 @@ func TestNewCQLClient_RouteVetoWarnings(t *testing.T) {
 
 func TestNewCQLClient_NoWarningWhenRecoveryProbeHasAdaptiveStrategy(t *testing.T) {
 	logger := &captureLogger{}
+	// The leg deadlines are set so the assertion below stays "no warnings at
+	// all": a dual-cluster client without them is warned about separately
+	// (see TestNewCQLClient_LegDeadlineWarnings).
 	client, err := NewCQLClient(newMockSession(), newMockSession(),
 		WithLogger(logger),
 		WithWriteStrategy(policy.NewAdaptiveDualWrite()),
 		WithRecoveryProbe(DefaultRecoveryProbe()),
 		WithAutoMemoryWorker(0),
+		WithClusterReadTimeout(time.Second),
+		WithClusterWriteTimeout(time.Second),
 	)
 	require.NoError(t, err)
 	t.Cleanup(client.Close)
 
 	require.Empty(t, warnings(logger))
+}
+
+const (
+	warnNoReadLegDeadline = "dual-cluster mode with no ClusterReadTimeout: " +
+		"a read leg that never answers is bounded only by the caller's context and is never attributed to the cluster; " +
+		"set one with WithClusterReadTimeout"
+	warnNoWriteLegDeadline = "dual-cluster mode with no ClusterWriteTimeout: " +
+		"a write leg that never answers is bounded only by the caller's context and is never attributed to the cluster; " +
+		"set one with WithClusterWriteTimeout"
+)
+
+// TestNewCQLClient_LegDeadlineWarnings pins who is told that a leg has no
+// deadline of its own: a dual-cluster client that left one unset, and
+// nobody else.
+func TestNewCQLClient_LegDeadlineWarnings(t *testing.T) {
+	tests := []struct {
+		name      string
+		sessionB  cql.Session
+		opts      []Option
+		wantRead  bool
+		wantWrite bool
+	}{
+		{
+			name:      "dual-cluster with neither deadline warns about both",
+			sessionB:  newMockSession(),
+			wantRead:  true,
+			wantWrite: true,
+		},
+		{
+			name:     "dual-cluster with both deadlines warns about neither",
+			sessionB: newMockSession(),
+			opts: []Option{
+				WithClusterReadTimeout(time.Second),
+				WithClusterWriteTimeout(time.Second),
+			},
+		},
+		{
+			name:     "single-cluster with neither deadline warns about neither",
+			sessionB: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := &captureLogger{}
+			opts := append([]Option{WithLogger(logger)}, tt.opts...)
+			client, err := NewCQLClient(newMockSession(), tt.sessionB, opts...)
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			got := warnings(logger)
+			if tt.wantRead {
+				require.Contains(t, got, warnNoReadLegDeadline)
+			} else {
+				require.NotContains(t, got, warnNoReadLegDeadline)
+			}
+			if tt.wantWrite {
+				require.Contains(t, got, warnNoWriteLegDeadline)
+			} else {
+				require.NotContains(t, got, warnNoWriteLegDeadline)
+			}
+		})
+	}
 }
 
 // warnings returns the warning messages the logger captured so far.

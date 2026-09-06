@@ -41,8 +41,12 @@ type clusterHealth struct {
 	policy   FailoverPolicy
 	latency  LatencyRecorder // policy as a LatencyRecorder, or nil
 	metrics  types.MetricsCollector
-	dual     bool         // false in single-cluster mode: no strategy or policy calls
-	now      func() int64 // the client's NowProvider; see deferredWriteLeg for the one entry point that must not call it
+	// callerCtx is metrics as a types.CallerContextMetrics, or nil when the
+	// collector does not implement the optional interface. Resolved once
+	// here so the read and write paths never type-assert per attempt.
+	callerCtx types.CallerContextMetrics
+	dual      bool         // false in single-cluster mode: no strategy or policy calls
+	now       func() int64 // the client's NowProvider; see deferredWriteLeg for the one entry point that must not call it
 
 	// countsForRefresh decides whether a failure is a connectivity failure
 	// worth counting toward auto-refresh; see AutoRefreshConfig.FailureClassifier.
@@ -73,6 +77,9 @@ func newClusterHealth(config *ClientConfig, dual bool) clusterHealth {
 	}
 	if recorder, ok := config.FailoverPolicy.(LatencyRecorder); ok {
 		h.latency = recorder
+	}
+	if cc, ok := config.Metrics.(types.CallerContextMetrics); ok {
+		h.callerCtx = cc
 	}
 
 	return h
@@ -136,7 +143,9 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 		holder.stats.succeeded(h.now())
 	case readClusterErr:
 		h.failedNow(holder, err)
-	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
+	case readCtxErr:
+		h.readCallerExpired(cluster)
+	case readNotFound, readRowLimit, readCallerNotFound:
 	}
 	switch kind {
 	case readOK:
@@ -167,7 +176,15 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 // and a failed leg is a failure; an async, dropped, skipped, or
 // caller-cancelled leg is neither. A nil holder means the leg never
 // contacted a session.
-func (h *clusterHealth) writeLeg(holder *sessionHolder, kind writeLegErrKind, err error, nowNano int64) {
+//
+// Every leg that reached a session passes through here — dual,
+// single-cluster, and the batch and query fast paths — so it is also where
+// a caller-cancelled leg is counted.
+// A leg the strategy skipped without dispatching it is not: SyncDualWrite
+// returns the caller's context error for the second leg once the first has
+// spent the budget, and a leg that was never sent says nothing about
+// whether that cluster is answering.
+func (h *clusterHealth) writeLeg(holder *sessionHolder, cluster ClusterID, kind writeLegErrKind, err error, nowNano int64) {
 	if holder == nil {
 		return
 	}
@@ -176,7 +193,9 @@ func (h *clusterHealth) writeLeg(holder *sessionHolder, kind writeLegErrKind, er
 		holder.stats.succeeded(nowNano)
 	case legFailed:
 		h.failed(holder, err, nowNano)
-	case legAsync, legDropped, legDraining, legSkipped, legCanceled:
+	case legCanceled:
+		h.writeCallerExpired(cluster)
+	case legAsync, legDropped, legDraining, legSkipped:
 	}
 }
 
@@ -185,8 +204,12 @@ func (h *clusterHealth) writeLeg(holder *sessionHolder, kind writeLegErrKind, er
 // deferred registration is released, which Close waits for, so it takes
 // its timestamp from the process clock and never calls the configurable
 // NowProvider or any other user code.
-func (h *clusterHealth) deferredWriteLeg(holder *sessionHolder, kind writeLegErrKind, err error) {
-	h.writeLeg(holder, kind, err, time.Now().UnixNano())
+//
+// The late result is classified against a context that carries the
+// caller's values but none of its cancellation, so a background leg is
+// never caller-expired and never reaches the caller-expired counter.
+func (h *clusterHealth) deferredWriteLeg(holder *sessionHolder, cluster ClusterID, kind writeLegErrKind, err error) {
+	h.writeLeg(holder, cluster, kind, err, time.Now().UnixNano())
 }
 
 // probe reports a recovery probe outcome to the holder's stats: a
@@ -200,6 +223,25 @@ func (h *clusterHealth) probe(holder *sessionHolder, kind probeKind, err error) 
 	case probeFailed:
 		h.failedNow(holder, err)
 	case probeCanceled:
+	}
+}
+
+// readCallerExpired counts one read attempt on cluster that ended after
+// the caller's context was done. The attempt is attributed to the caller
+// and leaves no other trace, so the counter is the only signal a stalled
+// cluster produces when no leg deadline is configured; see
+// [types.CallerContextMetrics].
+func (h *clusterHealth) readCallerExpired(cluster ClusterID) {
+	if h.callerCtx != nil {
+		h.callerCtx.IncReadCallerExpired(cluster)
+	}
+}
+
+// writeCallerExpired counts one write leg on cluster that ended after the
+// caller's context was done; see [types.CallerContextMetrics].
+func (h *clusterHealth) writeCallerExpired(cluster ClusterID) {
+	if h.callerCtx != nil {
+		h.callerCtx.IncWriteCallerExpired(cluster)
 	}
 }
 

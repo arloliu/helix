@@ -95,6 +95,31 @@ func warnNoEffectOptions(config *ClientConfig) {
 	}
 }
 
+// warnMissingLegDeadlines logs one warning per leg deadline a dual-cluster
+// client left unset.
+// Without a leg deadline a leg is bounded only by the caller's context, so
+// a cluster that accepts connections and then never answers is attributed
+// to the caller rather than to itself: it never fails over, never trips a
+// breaker, and never appears in the per-cluster error counters.
+// A single-cluster client is never warned, because neither option applies
+// to it — a leg there has no alternative cluster to preserve budget for —
+// which is why dual is tested here rather than at the call site.
+func warnMissingLegDeadlines(config *ClientConfig, dual bool) {
+	if !dual {
+		return
+	}
+	if config.ClusterReadTimeout <= 0 {
+		config.Logger.Warn("dual-cluster mode with no ClusterReadTimeout: " +
+			"a read leg that never answers is bounded only by the caller's context and is never attributed to the cluster; " +
+			"set one with WithClusterReadTimeout")
+	}
+	if config.ClusterWriteTimeout <= 0 {
+		config.Logger.Warn("dual-cluster mode with no ClusterWriteTimeout: " +
+			"a write leg that never answers is bounded only by the caller's context and is never attributed to the cluster; " +
+			"set one with WithClusterWriteTimeout")
+	}
+}
+
 // createEventDispatcher installs the client's event dispatcher when a handler
 // is registered, and does nothing otherwise.
 //
@@ -444,6 +469,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	if sessionB != nil && config.Replayer == nil {
 		config.Logger.Warn("dual-cluster mode with no Replayer configured - partial write failures will be lost and cannot be reconciled")
 	}
+	warnMissingLegDeadlines(config, sessionB != nil)
 	warnNoEffectOptions(config)
 	warnReplayStreamDefaults(config.Logger, "replayer", config.Replayer)
 	warnReplayStreamDefaults(config.Logger, "mirror replayer", config.MirrorReplayer)
