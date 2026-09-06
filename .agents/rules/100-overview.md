@@ -36,7 +36,7 @@ helix/                        # Root = main public package (CQLClient, options)
 │   ├── local.go              # Local/static topology
 │   └── nats.go               # NATS KV-backed topology
 ├── types/                    # Shared contracts — leaf package (interfaces, errors, constants)
-├── contrib/                  # Supplementary integrations (metrics)
+├── contrib/                  # Supplementary integrations (metrics, logging)
 ├── internal/                 # Private implementation
 │   ├── logging/              # Logger helpers
 │   └── metrics/              # Metrics helpers

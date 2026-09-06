@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a method to an exported interface breaks an out-of-tree implementation of
   `RowScanner`; the bundled `test/testutil` mock is updated, and its new
   `MockQuery.SetSliceScanColumns` configures what a callback sees.
+- `contrib/log/slog`, an adapter that wires a standard library
+  `*log/slog.Logger` into `helix.WithLogger`. `*slog.Logger` already has the
+  `(msg string, args ...any)` signature `types.Logger` requires for Debug,
+  Info, Warn and Error, so the only method it lacks is Fatal — until now every
+  slog user had to write the same small wrapper for that one method.
+  Its `New` returns a `*Logger` — the adapter's own type — embedding the
+  wrapped `*log/slog.Logger`, so the full `log/slog` API stays reachable
+  through it; passing `nil` wraps `slog.Default()` as it stands at that moment,
+  and a later `slog.SetDefault` does not redirect a logger already built. Its
+  `Fatal` logs at Error level with a leading `fatal=true` attribute and returns
+  — a record the handler filters by level like any other: Helix never calls it,
+  and a library-provided adapter must not end the caller's process, which would
+  skip every deferred `Close` and discard a replay backlog a graceful shutdown
+  would have drained. An application that wants a fatal log to exit keeps that
+  decision in its own `types.Logger`. The record is handed to the handler
+  directly rather than routed through `Error`, so a handler configured with
+  `AddSource` names the caller's file rather than the adapter's.
 - The bundled `contrib/metrics/vm` collector now implements the optional
   `types.RecoveryProbeMetrics` and `types.StrictMetrics` interfaces, which it
   had been the only bundled collector to leave unimplemented. Helix already
@@ -75,9 +92,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt count. `WithExecuteTimeout` remains the outer bound. This changes
   behaviour only for clients that set `WithClusterWriteTimeout`: with the
   option unset the attempt runs on the worker's context exactly as before.
+- `types.Logger.Fatal`'s documented contract no longer requires the
+  implementation to call `os.Exit(1)`. Helix never calls `Fatal`, and the
+  method exists only so an application can hand one logger to both its own code
+  and the library, so mandating process termination made every conforming
+  adapter — including the bundled `contrib/log/slog` — unable to be a good
+  library citizen. Terminating is now the implementation's choice: an
+  application-owned logger may still exit, a library-provided adapter must not.
+  No behaviour changes for an existing implementation that does exit.
 
 ### Fixed
 
+- `types.Logger`'s Godoc claimed compatibility with `zap.SugaredLogger`, which
+  the signature does not provide: `SugaredLogger.Debug` takes
+  `Debug(args ...any)` and builds a message from them, while `types.Logger`
+  wants `Debug(msg string, keysAndValues ...any)`. Only zap's `Debugw` family
+  matches. `helix.WithLogger`'s Godoc repeated the claim and its example,
+  `helix.WithLogger(logger.Sugar())`, did not compile. Both now state the exact
+  signature contract, point slog users at `contrib/log/slog`, and show the
+  small zap wrapper an application owns; zap is still not a dependency.
+- `helix.WithClusterWriteTimeout`'s Godoc described the deadline it puts on the
+  background legs of a degraded `policy.AdaptiveDualWrite` without saying what
+  happens to a background leg that succeeds. It now states that only a
+  background leg reporting a failure is enqueued for replay: a strategy
+  returning `types.ErrWriteAsync` through `DeferredWriteResult` defers the
+  decision, so a successful background leg is never replayed and its statement
+  is not applied twice.
 - `types.StrictMetrics`'s Godoc claimed the bundled `contrib/metrics/vm`
   collector implemented the interface, which it did not. The claim is now true
   rather than merely corrected. `types.RecoveryProbeMetrics`'s Godoc, which

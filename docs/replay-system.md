@@ -617,6 +617,39 @@ Under this policy the NATS worker keeps a dead-letter count per stream
 sequence in memory.
 A worker restart resets that count; the message is simply retried again.
 
+#### Example: dead-letter CQL syntax errors
+
+A malformed statement never becomes valid by being retried,
+so it is worth dead-lettering rather than letting it burn the retention window.
+gocql v1 has no distinct Go type for a syntax error — the driver returns an unexported value that satisfies the exported `gocql.RequestError` interface — so the classifier matches the interface and discriminates on `Code()`:
+
+```go
+import (
+    "errors"
+
+    "github.com/arloliu/helix/replay"
+    "github.com/gocql/gocql"
+)
+
+replay.WithReplayClassifier(func(err error) replay.ReplayDisposition {
+    var reqErr gocql.RequestError
+    if errors.As(err, &reqErr) && reqErr.Code() == gocql.ErrCodeSyntax { // 0x2000
+        return replay.DispositionDeadLetter
+    }
+
+    return replay.DefaultReplayClassifier(err)
+})
+```
+
+`errors.As` finds the driver error because the adapter passes a server-side query error through untouched;
+only a connectivity failure is wrapped, as `fmt.Errorf("%w: %w", types.ErrClusterUnreachable, err)`, and that wrapping leaves the driver error in the chain too.
+The v2 adapter's driver, `github.com/apache/cassandra-gocql-driver/v2`, exposes the same `RequestError` interface and `ErrCodeSyntax` constant, so only the import path changes — it additionally returns a typed `*gocql.RequestErrSyntax`, if you would rather match on the type.
+
+**Do not widen the check to `ErrCodeInvalid` (0x2200).**
+Matching the interface alone would also catch 0x2200, so the `Code()` comparison must stay narrow.
+Cassandra returns 0x2200 for an *unconfigured table* — the same code a cluster returns while a schema migration has not reached it yet.
+That lag is precisely what replay exists to absorb, so dead-lettering 0x2200 would discard writes for a table that is about to exist.
+
 ### Memory worker execution model
 
 The first attempt for a payload runs inline on the dequeue loop.
