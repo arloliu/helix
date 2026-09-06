@@ -94,6 +94,35 @@ func (c *CQLCluster) Terminate(ctx context.Context) error {
 	return nil
 }
 
+// NewSession opens an additional gocql v1 session against the cluster,
+// configured exactly like the shared [CQLCluster.Session].
+//
+// The caller owns the returned session: [CQLCluster.Close],
+// [CQLCluster.Terminate] and [CQLCluster.Reconnect] never touch it, and the
+// caller must close it. Use it for a test that has to close a driver session
+// itself — closing the shared one would break every later test against the
+// same cluster.
+//
+// Returns:
+//   - *gocql.Session: a live session bound to the cluster's keyspace
+//   - error: if the connection or keyspace setup fails
+func (c *CQLCluster) NewSession() (*gocql.Session, error) {
+	return createCQLSession(c.Host, c.keyspace, c.sessionTimeout, c.connectTimeout, c.reconnectInterval)
+}
+
+// NewSessionV2 opens an additional gocql v2 session against the cluster,
+// configured exactly like the shared [CQLCluster.SessionV2].
+//
+// The caller owns the returned session, on the same terms as
+// [CQLCluster.NewSession].
+//
+// Returns:
+//   - *gocqlv2.Session: a live session bound to the cluster's keyspace
+//   - error: if the connection fails
+func (c *CQLCluster) NewSessionV2() (*gocqlv2.Session, error) {
+	return createCQLSessionV2(c.Host, c.keyspace, c.sessionTimeout, c.connectTimeout, c.reconnectInterval)
+}
+
 // CQLClusterOptions configures the CQL cluster container.
 type CQLClusterOptions struct {
 	// Keyspace is the keyspace to create. Required.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -254,23 +255,54 @@ func TestFirstPageCtx_NonStandardParentIsDetachedByFinish(t *testing.T) {
 	inner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	before := runtime.NumGoroutine()
+	self := goroutineID()
+	require.Zero(t, parkedAfterFuncs(self))
 	fp := newFirstPageCtx(opaqueParent{ctx: inner}, legTimeoutForTest)
 	require.True(t, fp.disarm())
-	require.Greater(t, runtime.NumGoroutine(), before,
+	require.Equal(t, 1, parkedAfterFuncs(self),
 		"a parent that hides the cancel key makes context.AfterFunc park a goroutine")
 
 	// The caller is still live, so only finish can release that goroutine.
-	// The wait spins on the test's own goroutine: anything that ran the
-	// check on a goroutine of its own would inflate the count it reads.
 	fp.finish()
 	deadline := time.Now().Add(5 * time.Second)
-	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+	for parkedAfterFuncs(self) > 0 && time.Now().Before(deadline) {
 		runtime.Gosched()
 	}
-	require.LessOrEqual(t, runtime.NumGoroutine(), before,
+	require.Zero(t, parkedAfterFuncs(self),
 		"finish must release the registration parked on a non-standard parent")
 	require.False(t, fp.stopParent(), "finish already stopped it")
+}
+
+// goroutineID returns the id of the calling goroutine, read from the header
+// of its own stack dump.
+func goroutineID() string {
+	buf := make([]byte, 64)
+	n := runtime.Stack(buf, false)
+
+	return strings.Fields(string(buf[:n]))[1]
+}
+
+// parkedAfterFuncs counts the goroutines context.AfterFunc parked on behalf
+// of the goroutine with id creator.
+//
+// A parent that hides the cancel key makes propagateCancel wait on Done in a
+// goroutine of its own, and the dump names who spawned it. Counting only
+// those is blind to goroutines a sibling test left exiting; a bare
+// runtime.NumGoroutine comparison is not, which is what made the assertion
+// above flake.
+func parkedAfterFuncs(creator string) int {
+	// The trailing newline anchors the match to the end of the "created by"
+	// line, so goroutine 7 does not also match goroutine 71.
+	marker := "propagateCancel in goroutine " + creator + "\n"
+
+	buf := make([]byte, 64<<10)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Count(string(buf[:n]), marker)
+		}
+		buf = make([]byte, 2*len(buf)) // dump was truncated; retry bigger
+	}
 }
 
 func TestFirstPageCtx_AbandonedContextIsReleasedByItsParent(t *testing.T) {

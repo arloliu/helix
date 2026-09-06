@@ -118,6 +118,40 @@ necessary but not sufficient here: the pause failure this section records was
 only ever reproduced on the CI runner, so the CI `e2e` job stays the gate for
 a driver bump.
 
+**Amendment 2026-09-06 (`v2.5.0-otter`):** the fork halves default detection of
+a silent node — the heartbeat timeout no longer derives from
+`ClusterConfig.Timeout` and is now the exported `ClusterConfig.HeartbeatTimeout`
+at 5 s, so a paused host's connections close in 30-35 s instead of 66-71 s.
+The paused-host scenarios recorded above do not move, and that is the expected
+result rather than a missing effect: every one of them is gated on a leg
+timeout, a breaker threshold or a probe interval well under 30 s, so none was
+ever waiting on heartbeat detection.
+`TestS3_PauseA_LatencyCircuitBreaker` 24.65 s (was 24.7),
+`TestS_PlainCircuitBreaker_TripAndClose` 20.62 s (was 20.6),
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 14.52 s (was 14.4),
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.21 s (was 11.3).
+The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
+the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
+new `TestS_PauseA_CloseReturnsDuringFault`).
+
+`TestS_PauseA_CloseReturnsDuringFault` is where the fork's `Session.Close` work
+is observed, and it is the suite's longest scenario at 82.7 s because it holds A
+paused for 40 s per driver — long enough to outlast detection, so the driver's
+own reconnect is running when the shutdown starts.
+It is the only scenario built over dedicated driver sessions rather than the
+shared ones, since `noCloseSession` would otherwise swallow the `Close` under
+test.
+Measured with A paused: `client.Close` 1.98 s on v1 and 86.9 µs on v2, a second
+direct `Close` of each driver session in microseconds, and goroutines settled
+within +5 of the pre-test count on v1 and at or below it on v2 across three
+runs, against a tolerance of 10 that sits under one session's 12-13 goroutines.
+
+One confound for a later comparison: the new file sorts between
+`circuit_breaker_test.go` and `doc_test.go`, so it inserts a paused-A scenario
+ahead of `dual_fail`, `fallback_read`, `iter_failover` and `lcb`.
+If one of those shifts, test ordering is a candidate cause alongside the driver.
+The CI `e2e` job stays the gate for a driver bump, as above.
+
 ## 3. v1/v2 errors.Is sentinel mismatch — INVALIDATED, spike test artifact
 
 Original framing: "v1 `gocql.ErrTimeoutNoResponse` does NOT match v2 errors

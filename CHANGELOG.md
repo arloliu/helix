@@ -67,6 +67,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.5.0-otter`, up from `v2.4.2-otter`.
+  Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
+
+  ```
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.5.0-otter
+  ```
+
+  A module that stays on `v2.4.2-otter` keeps working; the fork's only exported addition is a new `ClusterConfig` field, and no exported signature changed.
+
+  **A query's context now bounds how long it waits for a prepared statement.**
+  On the v2 adapter, a leg deadline set with `WithClusterReadTimeout` or `WithClusterWriteTimeout` therefore reaches a statement's first execution too, where it used to be ignored until the driver's own `Timeout` elapsed.
+  The v1 adapter already behaved this way: `gocql` lets a caller stop waiting on its own context, so the two adapters now agree.
+  The PREPARE itself is unchanged: it is shared with every concurrent caller of the same statement, so it runs to completion and fills the cache even after the leg that started it gave up.
+  The driver treats the give-up as the caller's cancellation rather than as a host failure, so it does not retry the query on another node.
+
+  **Default detection of a node that stops answering drops from roughly 66-71 seconds to 30-35.**
+  The heartbeat timeout no longer derives from `ClusterConfig.Timeout`; it is the fork's new `ClusterConfig.HeartbeatTimeout`, which `NewCluster` sets to 5 seconds.
+  A cluster that keeps its sockets open and answers nothing therefore has its connections torn down about twice as fast, which is how soon the recovery probe, the breakers, and auto-refresh see a hard failure rather than a stalled read.
+  If you raised `Timeout` on a v2 cluster config *because* you wanted a longer heartbeat round-trip — a cross-region link where a multi-second OPTIONS is normal — that no longer follows: set `HeartbeatTimeout` explicitly to the value you relied on.
+  Everyone else needs no change.
+  A `HeartbeatTimeout` below 5 seconds is now honoured rather than raised to the old floor, so a short value can turn transient jitter into a closed connection.
+
+  **`Session.Close` is terminal.**
+  It cancels the session context before joining the refreshers, so a reconnect parked in a per-host dial — unbounded while a node is paused — no longer holds `Close` open, and it closes every dialled candidate still in flight, so a reconnect that lands after `Close` can no longer leak a connection or re-publish its host to the selection policy.
+  A post-reconnect schema refresh no longer deadlocks the control connection against the schema flusher, which was the other way `Close` could hang.
+  Three reachable panics are gone: a CQL `NULL` scanned into a nil `interface{}` through `Scan`, `MapScan` or a `Scanner`; `TokenAwareHostPolicy`'s DC- and rack-aware fallbacks on a ring holding no tokens; and a panic in an application `HostUp`, `OnHostUp` or logger callback fired from a pool refill, which every dropped connection on a live host takes.
+
+  The fork still gates the recovery of a host it has marked down on `ReconnectInterval` rather than retrying sooner, so how soon Helix's recovery probe can succeed against a cluster that has just come back is still bounded by that interval.
+
 - A dual-cluster client that leaves `WithClusterReadTimeout` or
   `WithClusterWriteTimeout` unset is now warned about it once, at construction,
   next to the existing "no Replayer configured" warning. Each warning names the

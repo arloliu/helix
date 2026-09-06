@@ -114,6 +114,13 @@ func sharedClusters(t *testing.T) (a, b *testutil.CQLCluster) {
 type driverCase struct {
 	name string
 	wrap func(c *testutil.CQLCluster) cql.Session
+
+	// newDedicated opens a driver session that belongs to one test, wrapped
+	// in the adapter but NOT in noCloseSession, and returns a closer for the
+	// driver session underneath it. A scenario that must exercise the
+	// driver's own Session.Close needs this instead of wrap, whose no-op
+	// Close never reaches the driver.
+	newDedicated func(c *testutil.CQLCluster) (sess cql.Session, closeDriver func(), err error)
 }
 
 // allDrivers is the canonical table for any e2e scenario that should be
@@ -125,12 +132,34 @@ type driverCase struct {
 // close the underlying gocql session shared with the next test. Same
 // pattern as test/simulation/chaos/session.go.
 var allDrivers = []driverCase{
-	{name: "v1", wrap: func(c *testutil.CQLCluster) cql.Session {
-		return &noCloseSession{Session: cqlv1.NewSession(c.Session)}
-	}},
-	{name: "v2", wrap: func(c *testutil.CQLCluster) cql.Session {
-		return &noCloseSession{Session: cqlv2.NewSession(c.SessionV2)}
-	}},
+	{
+		name: "v1",
+		wrap: func(c *testutil.CQLCluster) cql.Session {
+			return &noCloseSession{Session: cqlv1.NewSession(c.Session)}
+		},
+		newDedicated: func(c *testutil.CQLCluster) (cql.Session, func(), error) {
+			s, err := c.NewSession()
+			if err != nil {
+				return nil, nil, err
+			}
+
+			return cqlv1.NewSession(s), s.Close, nil
+		},
+	},
+	{
+		name: "v2",
+		wrap: func(c *testutil.CQLCluster) cql.Session {
+			return &noCloseSession{Session: cqlv2.NewSession(c.SessionV2)}
+		},
+		newDedicated: func(c *testutil.CQLCluster) (cql.Session, func(), error) {
+			s, err := c.NewSessionV2()
+			if err != nil {
+				return nil, nil, err
+			}
+
+			return cqlv2.NewSession(s), s.Close, nil
+		},
+	},
 }
 
 // noCloseSession wraps a cql.Session and converts Close() into a no-op.
