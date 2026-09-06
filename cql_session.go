@@ -311,10 +311,11 @@ type Query interface {
 	// A query carrying a PageState stays on the cluster that issued it
 	// whatever happens to its first page.
 	//
-	// Always call Close: it reports the read's outcome and releases the
-	// iterator's resources.
-	// A Scanner consumer calls Scanner().Err() instead, which releases
-	// those resources but reports no outcome.
+	// Always end the read: Close reports its outcome and releases the
+	// iterator's resources, and a Scanner consumer's Scanner().Err() does
+	// the same. A Scanner loop under a deferred Close reports once.
+	// An iterator that is simply abandoned reports nothing and leaks the
+	// driver's iterator, as it always has.
 	//
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout
