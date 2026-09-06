@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+This release moves the v2 CQL adapter's fork pin forward. No Helix source changes.
+
+### Changed
+
+- The v2 CQL adapter's `replace` directive now pins the
+  `arloliu/cassandra-gocql-driver` fork at `v2.4.2-otter`, up from
+  `v2.3.1-otter`. Go ignores `replace` in dependencies, so a module that uses
+  the v2 adapter must update the line in its own `go.mod` to pick this up (see
+  the README's Requirements); a module that stays on `v2.3.1-otter` keeps
+  working, since nothing exported changed.
+
+  The fork makes a node that rejoins the cluster at a different address under
+  the same host id rediscoverable without server events: every reconnect tick
+  that finds a host down now also re-reads the peers tables, so a moved node is
+  found within `ReconnectInterval` even when the topology event was lost.
+  Chasing that fix closed three defects in the same paths — a control-connection
+  reconnect that could wait on itself and hang `Session.Close`, pool admission
+  and host removal that could act on a host object the ring had already
+  replaced, and a ring snapshot read across two control connections that could
+  evict the healthy new control host. The last two matter most in the
+  port-mapped and translated deployments where a connect address differs from a
+  broadcast address, which is also where Helix's paused-node recovery is
+  exercised.
+
+  The cost is bounded: while any host is down, each `ReconnectInterval` tick
+  adds two control queries per session (a third where the server rejects
+  `system.peers_v2`), and nothing at all while every host is up. Sessions that
+  set `ReconnectInterval` to zero are unaffected, as the reconnect sweep is off
+  for them too.
+
+  The fork's other changes since `v2.3.1-otter` do not reach Helix: `Query.Binding`
+  and the `Query.Bind` callback fix apply to queries that carry a binding
+  callback, and the retry fixes apply to `HostPoolHostPolicy` and to speculative
+  execution. Helix uses none of them.
+
+- `github.com/pierrec/lz4/v4` moves from v4.1.8 to v4.1.27, pulled in by the
+  fork. It appears in a consumer's `go.sum` even though Helix does not call it
+  directly. The block API the driver uses is unchanged; the decoder drops the
+  fast paths that carried its out-of-bounds problems and gains explicit
+  empty-input and length-overflow guards, which is the point of the upgrade for
+  a driver that decompresses frames off a socket.
+
 ## [1.8.0] — 2026-09-05
 
 This release completes the health-authority, per-cluster replay, auto-recovery, and

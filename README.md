@@ -398,13 +398,13 @@ See the [examples](examples/) directory:
 
 - Go 1.26+
 - For CQL: v1: `github.com/gocql/gocql` or v2: `github.com/apache/cassandra-gocql-driver`
-- Helix builds the v2 adapter against the `arloliu/cassandra-gocql-driver` fork (tag `v2.3.1-otter`)
+- Helix builds the v2 adapter against the `arloliu/cassandra-gocql-driver` fork (tag `v2.4.2-otter`)
   through a `replace` directive.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must add the same
   line to its own `go.mod`:
 
   ```
-  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.3.1-otter
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.4.2-otter
   ```
 
   The fork lets a caller's context deadline override the connection-level request timeout, so a read
