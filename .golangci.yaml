@@ -1,4 +1,9 @@
 version: "2"
+run:
+  # e2e tests are behind a build tag; without it the linter never sees them.
+  # The throwaway spike (`spike` tag) stays out on purpose.
+  build-tags:
+    - e2e
 linters:
   enable:
     - asasalint
