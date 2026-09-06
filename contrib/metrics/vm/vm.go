@@ -236,6 +236,16 @@ type Collector struct {
 	sessionRefreshErrorA   *metrics.Counter
 	sessionRefreshErrorB   *metrics.Counter
 
+	// Recovery probe metrics (optional types.RecoveryProbeMetrics)
+	recoveryProbeSuccessA *metrics.Counter
+	recoveryProbeSuccessB *metrics.Counter
+	recoveryProbeFailureA *metrics.Counter
+	recoveryProbeFailureB *metrics.Counter
+
+	// Skipped write legs (optional types.StrictMetrics)
+	writeSkippedA *metrics.Counter
+	writeSkippedB *metrics.Counter
+
 	// Mirror metrics (optional types.MirrorMetrics)
 	mirrorEnqueueSuccess *metrics.Counter
 	mirrorEnqueueDropped *metrics.Counter
@@ -404,6 +414,16 @@ func (c *Collector) initMetrics() {
 	c.sessionRefreshSuccessB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_success_total{cluster="%s"}`, p, nB))
 	c.sessionRefreshErrorA = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_error_total{cluster="%s"}`, p, nA))
 	c.sessionRefreshErrorB = c.set.NewCounter(fmt.Sprintf(`%s_session_refresh_error_total{cluster="%s"}`, p, nB))
+
+	// Recovery probe metrics (optional types.RecoveryProbeMetrics)
+	c.recoveryProbeSuccessA = c.set.NewCounter(fmt.Sprintf(`%s_recovery_probe_success_total{cluster="%s"}`, p, nA))
+	c.recoveryProbeSuccessB = c.set.NewCounter(fmt.Sprintf(`%s_recovery_probe_success_total{cluster="%s"}`, p, nB))
+	c.recoveryProbeFailureA = c.set.NewCounter(fmt.Sprintf(`%s_recovery_probe_failure_total{cluster="%s"}`, p, nA))
+	c.recoveryProbeFailureB = c.set.NewCounter(fmt.Sprintf(`%s_recovery_probe_failure_total{cluster="%s"}`, p, nB))
+
+	// Skipped write legs (optional types.StrictMetrics)
+	c.writeSkippedA = c.set.NewCounter(fmt.Sprintf(`%s_write_skipped_total{cluster="%s"}`, p, nA))
+	c.writeSkippedB = c.set.NewCounter(fmt.Sprintf(`%s_write_skipped_total{cluster="%s"}`, p, nB))
 
 	// Mirror metrics (optional types.MirrorMetrics)
 	c.mirrorEnqueueSuccess = c.set.NewCounter(fmt.Sprintf(`%s_mirror_enqueue_success_total`, p))
@@ -803,6 +823,47 @@ func (c *Collector) IncSessionRefreshError(cluster types.ClusterID) {
 // Compile-time assertion that *Collector implements the optional
 // types.SessionRefreshMetrics interface.
 var _ types.SessionRefreshMetrics = (*Collector)(nil)
+
+// ----------------------
+// Recovery probe metrics (optional types.RecoveryProbeMetrics)
+// ----------------------
+
+// IncRecoveryProbeSuccess increments the counter after a recovery probe
+// returned nil, which credits the degraded cluster with one recovery point.
+func (c *Collector) IncRecoveryProbeSuccess(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.recoveryProbeSuccessA.Inc()
+	} else {
+		c.recoveryProbeSuccessB.Inc()
+	}
+}
+
+// IncRecoveryProbeFailure increments the counter after a recovery probe
+// returned an error, leaving the cluster degraded and crediting no recovery
+// point.
+func (c *Collector) IncRecoveryProbeFailure(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.recoveryProbeFailureA.Inc()
+	} else {
+		c.recoveryProbeFailureB.Inc()
+	}
+}
+
+// ----------------------
+// Skipped write legs (optional types.StrictMetrics)
+// ----------------------
+
+// IncWriteSkipped increments the counter when a cluster's write leg is skipped
+// because the cluster is degraded (Strict() writes only) or draining (any
+// write). A skip is an operational state rather than a cluster error, so
+// IncWriteError is not incremented alongside it.
+func (c *Collector) IncWriteSkipped(cluster types.ClusterID) {
+	if cluster == types.ClusterA {
+		c.writeSkippedA.Inc()
+	} else {
+		c.writeSkippedB.Inc()
+	}
+}
 
 // ----------------------
 // Mirror metrics (optional types.MirrorMetrics)

@@ -114,6 +114,22 @@
 //   - {prefix}_session_refresh_success_total{cluster} - Counter of successful refreshes
 //   - {prefix}_session_refresh_error_total{cluster} - Counter of failed refreshes
 //
+// Recovery probe (recorded when helix.WithRecoveryProbe probes a degraded
+// cluster; a healthy cluster produces neither counter):
+//   - {prefix}_recovery_probe_success_total{cluster} - Counter of probes that
+//     returned nil and credited the cluster with a recovery point (optional
+//     types.RecoveryProbeMetrics)
+//   - {prefix}_recovery_probe_failure_total{cluster} - Counter of probes that
+//     returned an error and left the cluster degraded (optional
+//     types.RecoveryProbeMetrics)
+//
+// Skipped write legs:
+//   - {prefix}_write_skipped_total{cluster} - Counter of write legs skipped
+//     because the cluster was degraded (Strict() writes only) or draining
+//     (any write). A skip is an operational state, so
+//     {prefix}_write_errors_total is not incremented alongside it (optional
+//     types.StrictMetrics)
+//
 // Mirror (recorded when mirroring is configured):
 //   - {prefix}_mirror_enqueue_success_total - Counter of captures accepted by the engine queue
 //   - {prefix}_mirror_enqueue_dropped_total - Counter of captures rejected by a full engine queue

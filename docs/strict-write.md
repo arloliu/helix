@@ -261,6 +261,8 @@ healthy cluster — probes are recovery-only signals.
 `types.RecoveryProbeMetrics` receives `IncRecoveryProbeSuccess(cluster)` and
 `IncRecoveryProbeFailure(cluster)` for every probe against a degraded cluster.
 A healthy cluster is not probed, so it produces neither counter.
+The bundled `contrib/metrics/vm` collector implements the interface and exports the pair as
+`{prefix}_recovery_probe_success_total{cluster}` and `{prefix}_recovery_probe_failure_total{cluster}`.
 
 ---
 
@@ -379,12 +381,12 @@ func (s *myStrategy) ExecuteStrict(
 
 ## Metrics
 
-`StrictMetrics` is an optional extension of `MetricsCollector`. Implement it to receive
-strict-write-specific counters:
+`StrictMetrics` is an optional extension of `MetricsCollector`. Implement it to receive the
+skipped-write counter:
 
 ```go
 type StrictMetrics interface {
-    // IncWriteSkipped is called when a Strict() write skips a cluster due
+    // IncWriteSkipped is called when a cluster's write leg is skipped due
     // to ErrClusterDegraded or ErrClusterDraining.
     IncWriteSkipped(cluster types.ClusterID)
 }
@@ -392,6 +394,13 @@ type StrictMetrics interface {
 
 Skipped writes (`ErrClusterDegraded`, `ErrClusterDraining`) do **not** increment `IncWriteError`.
 They are operational state, not failures.
+
+Despite the interface name, the counter is not confined to strict writes. A degraded cluster is
+skipped only by a `Strict()` write, but a draining cluster's leg is skipped by every write, so an
+ordinary write to a draining cluster increments it too.
+
+The bundled `contrib/metrics/vm` collector implements the interface and exports the counter as
+`{prefix}_write_skipped_total{cluster}`.
 
 ---
 

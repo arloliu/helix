@@ -12,13 +12,16 @@ import (
 )
 
 // Compile-time assertions that *Collector implements the optional
-// types.AdaptiveWriteMetrics, types.MirrorReplayMetrics, and
-// types.ClusterEventMetrics interfaces. Placed in a _test.go file per the
+// types.AdaptiveWriteMetrics, types.MirrorReplayMetrics,
+// types.ClusterEventMetrics, types.RecoveryProbeMetrics, and
+// types.StrictMetrics interfaces. Placed in a _test.go file per the
 // public-package assertion convention.
 var (
 	_ types.AdaptiveWriteMetrics = (*Collector)(nil)
 	_ types.MirrorReplayMetrics  = (*Collector)(nil)
 	_ types.ClusterEventMetrics  = (*Collector)(nil)
+	_ types.RecoveryProbeMetrics = (*Collector)(nil)
+	_ types.StrictMetrics        = (*Collector)(nil)
 )
 
 func TestCollector_DurationHistogramsUsePrometheusBuckets(t *testing.T) {
@@ -175,4 +178,35 @@ func TestCollector_AdaptiveMirrorAndClusterEventMetrics(t *testing.T) {
 	c.WritePrometheus(&buf)
 	require.Contains(t, buf.String(), `helix_write_degraded{cluster="A"} 0`,
 		"recovery must return the gauge to healthy")
+}
+
+func TestCollector_RecoveryProbeAndStrictWriteMetrics(t *testing.T) {
+	c := New(WithMetricsSet(metrics.NewSet()))
+
+	var buf bytes.Buffer
+	c.WritePrometheus(&buf)
+	out := buf.String()
+	require.Contains(t, out, `helix_recovery_probe_success_total{cluster="A"} 0`,
+		"counters must be pre-created so a scrape sees them before the first probe")
+	require.Contains(t, out, `helix_recovery_probe_failure_total{cluster="B"} 0`)
+	require.Contains(t, out, `helix_write_skipped_total{cluster="A"} 0`)
+
+	c.IncRecoveryProbeSuccess(types.ClusterA)
+	c.IncRecoveryProbeFailure(types.ClusterB)
+	c.IncRecoveryProbeFailure(types.ClusterB)
+	c.IncWriteSkipped(types.ClusterA)
+	c.IncWriteSkipped(types.ClusterB)
+
+	buf.Reset()
+	c.WritePrometheus(&buf)
+	out = buf.String()
+	require.Contains(t, out, `helix_recovery_probe_success_total{cluster="A"} 1`)
+	require.Contains(t, out, `helix_recovery_probe_success_total{cluster="B"} 0`,
+		"a probe on one cluster must not credit the other")
+	require.Contains(t, out, `helix_recovery_probe_failure_total{cluster="B"} 2`)
+	require.Contains(t, out, `helix_recovery_probe_failure_total{cluster="A"} 0`)
+	require.Contains(t, out, `helix_write_skipped_total{cluster="A"} 1`)
+	require.Contains(t, out, `helix_write_skipped_total{cluster="B"} 1`)
+	require.Contains(t, out, `helix_write_errors_total{cluster="A"} 0`,
+		"a skip is an operational state, not a cluster write error")
 }
