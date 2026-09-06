@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.5.1-otter`, up from `v2.5.0-otter`.
+  Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
+
+  ```
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.5.1-otter
+  ```
+
+  A module that stays on `v2.5.0-otter` keeps working: the fork adds no exported symbol and changes no exported signature or meaning.
+
+  **The fix that matters most is a panic that used to freeze ring maintenance for the life of a session.**
+  A `system.peers` row the driver could not parse killed the goroutine that maintains the ring, and nothing restarted it, so the session ran on with a topology view frozen at that moment — new nodes never appeared and departed ones never left.
+  Three narrower ring bugs go with it: a node that changed only its port was never reconciled; a single transiently invalid peer row could evict a healthy node with nothing left to rediscover it; and node-event debouncing was unbounded, so a sustained burst of churn could defer topology events for the whole burst.
+
+  Two timing changes come with the fix, neither of them configurable:
+
+  - Node-event debouncing is now bounded at 4 seconds. During sustained churn, topology events land within that window instead of being deferred until the burst ends.
+  - A departed node can linger in the ring slightly longer in the narrow case where a peers snapshot contains a row that cannot be attributed to any host. The periodic full ring refresh that closes that window is not in this release.
+
 ## [1.9.0] — 2026-09-06
 
 This release answers the fault-suite feedback on 1.8.1: a leg deadline now bounds an
