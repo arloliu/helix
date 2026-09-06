@@ -745,6 +745,44 @@ If the override rerouted a CAS to a different cluster, it would silently move co
 
 **Always call `Close()` and check its error.** Callers that iterate with `for iter.Scan(&x) { ... }` and never call `Close()` will observe an empty result set with no error indication — this is a constraint of the `Iter` API shape.
 
+### The First Page Is a Read Leg
+
+`IterContext()` does not return until the driver has fetched the first page.
+For a dual-cluster client with `WithClusterReadTimeout(d)`, that page is a read leg like any other:
+
+| Stage | Context | Reporting |
+|---|---|---|
+| First page, inside `IterContext()` | bounded by `d` | `read_total` and `read_duration` for every leg attempt; a leg that expires also records `read_error`, the session stats and `RecordFailure` |
+| Later pages, drained by the caller | the caller's own context | attributed at `Close()` |
+
+A first page that expires is `ErrClusterTimeout` for its cluster,
+and the read is retried once on the alternative under the same failover gating a `Scan` uses:
+the failover policy's `ShouldFailover`, then the read strategy's `OnFailure`, then the drain check.
+When the alternative answers, the iterator that comes back belongs to it:
+`PageState()` encodes the alternative and `Close()` reports to it.
+When failover is refused or both legs expire, `Close()` returns `ErrClusterTimeout` or a `*types.DualClusterError`.
+A first page ended by the caller's own context is the caller's doing, not the cluster's:
+no cluster-health signal is recorded and no failover follows.
+The attempt still counts one `read_total` and one `read_duration`,
+and it increments `read_caller_expired_total` for the cluster it targeted.
+
+A query carrying a `PageState` never moves cluster.
+Its first page is still bounded and still counted,
+but an expiry returns `ErrClusterTimeout` rather than replaying a cursor on a cluster that never issued it.
+
+Without `WithClusterReadTimeout`, or in single-cluster mode,
+the first page runs on the caller's context exactly as it always has and reports nothing before `Close()`.
+
+**Call `Close()`, or `Scanner().Err()` for a `Scanner` consumer.**
+`Close()` reports the read's outcome and releases the leg context the first page ran under.
+`Scanner().Err()` releases that leg context but reports nothing, as it always has.
+An abandoned iterator does neither, the same way it already leaks the driver's own iterator.
+
+One limit is worth knowing:
+the first execution of a *cold* statement is prepared under the driver's connection context rather than the request's,
+so a cold statement against a frozen host can still wait for the driver's own timeout before the leg deadline is consulted.
+Warm statements — steady-state traffic — get the leg deadline.
+
 ### Operator Workflow
 
 ```

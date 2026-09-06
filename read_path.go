@@ -498,11 +498,20 @@ func (c *CQLClient) runPrimaryRead(
 // cluster. Single-cluster mode has no alternative to preserve budget for,
 // so a leg there runs on the caller's context unchanged.
 func (c *CQLClient) readLegContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.config.ClusterReadTimeout <= 0 || c.IsSingleCluster() {
+	if !c.legTimeoutActive() {
 		return ctx, noopCancel
 	}
 
 	return context.WithTimeout(ctx, c.config.ClusterReadTimeout)
+}
+
+// legTimeoutActive reports whether a read leg gets a deadline of its own.
+// It is the single gate both [CQLClient.readLegContext] and the iterator's
+// first page consult, so the two cannot drift: a single-cluster client has
+// no alternative to preserve budget for, and an unset timeout keeps every
+// leg on the caller's context.
+func (c *CQLClient) legTimeoutActive() bool {
+	return c.config.ClusterReadTimeout > 0 && !c.IsSingleCluster()
 }
 
 // attemptRead runs readFunc once against the installed session for
@@ -660,25 +669,12 @@ func (c *CQLClient) executeOverrideFailover(
 	primaryErr error,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	selected := rt.cluster
-
-	// No failover target in the override list
-	if rt.snap.fallback == "" || rt.snap.fallback == selected {
+	fallback, ok := c.overrideFailoverTarget(ctx, rt, primaryErr)
+	if !ok {
 		return primaryErr
 	}
 
-	// FailoverPolicy still gates failover
-	if c.config.FailoverPolicy != nil &&
-		!c.config.FailoverPolicy.ShouldFailover(selected, primaryErr) {
-		return primaryErr
-	}
-
-	// A dead caller context cannot succeed on the other cluster either.
-	if ctx.Err() != nil {
-		return primaryErr
-	}
-
-	return c.tryFallbackCluster(ctx, selected, rt.snap.fallback, primaryErr, true, readFunc)
+	return c.tryFallbackCluster(ctx, rt.cluster, fallback, primaryErr, true, readFunc)
 }
 
 // executeNormalFailover handles failover using the ReadStrategy (no override active).
@@ -688,10 +684,70 @@ func (c *CQLClient) executeNormalFailover(
 	primaryErr error,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
+	fallback, ok := c.normalFailoverTarget(ctx, selectedCluster, primaryErr)
+	if !ok {
+		return primaryErr
+	}
+
+	return c.tryFallbackCluster(ctx, selectedCluster, fallback, primaryErr, false, readFunc)
+}
+
+// failoverTarget returns the cluster a read that failed on rt.cluster may
+// retry on, and whether it may retry at all.
+// It picks the gating an active AllowedClusters override needs over the
+// ReadStrategy's, exactly as executeRead does.
+//
+// Returns:
+//   - ClusterID: The cluster to retry on; empty when the read may not retry
+//   - bool: Whether a retry is allowed
+func (c *CQLClient) failoverTarget(ctx context.Context, rt readTarget, primaryErr error) (ClusterID, bool) {
+	if rt.snap.active {
+		return c.overrideFailoverTarget(ctx, rt, primaryErr)
+	}
+
+	return c.normalFailoverTarget(ctx, rt.cluster, primaryErr)
+}
+
+// overrideFailoverTarget gates failover while an AllowedClusters override
+// is active: the target comes from the override snapshot rather than from
+// the ReadStrategy, the FailoverPolicy still has a veto, and a caller
+// whose context already ended cannot succeed on the other cluster either.
+func (c *CQLClient) overrideFailoverTarget(ctx context.Context, rt readTarget, primaryErr error) (ClusterID, bool) {
+	selected := rt.cluster
+
+	// No failover target in the override list
+	if rt.snap.fallback == "" || rt.snap.fallback == selected {
+		return "", false
+	}
+
+	// FailoverPolicy still gates failover
+	if c.config.FailoverPolicy != nil &&
+		!c.config.FailoverPolicy.ShouldFailover(selected, primaryErr) {
+		return "", false
+	}
+
+	// A dead caller context cannot succeed on the other cluster either.
+	if ctx.Err() != nil {
+		return "", false
+	}
+
+	return rt.snap.fallback, true
+}
+
+// normalFailoverTarget gates failover with no override active: the
+// FailoverPolicy decides whether this request may retry, the ReadStrategy
+// names the alternative (and moves its preference doing so), a draining
+// alternative is skipped unless the read came from a draining cluster too,
+// and a caller whose context already ended cannot succeed elsewhere.
+func (c *CQLClient) normalFailoverTarget(
+	ctx context.Context,
+	selectedCluster ClusterID,
+	primaryErr error,
+) (ClusterID, bool) {
 	// The hub has already recorded the failure; the policy now only decides
 	// whether this request may retry on the other cluster.
 	if c.config.FailoverPolicy != nil && !c.config.FailoverPolicy.ShouldFailover(selectedCluster, primaryErr) {
-		return primaryErr
+		return "", false
 	}
 
 	// Ask strategy for alternative.
@@ -714,15 +770,15 @@ func (c *CQLClient) executeNormalFailover(
 	}
 
 	if !shouldFailover {
-		return primaryErr
+		return "", false
 	}
 
 	// A dead caller context cannot succeed on the other cluster either.
 	if ctx.Err() != nil {
-		return primaryErr
+		return "", false
 	}
 
-	return c.tryFallbackCluster(ctx, selectedCluster, alternativeCluster, primaryErr, false, readFunc)
+	return alternativeCluster, true
 }
 
 // tryFallbackCluster executes a read on the fallback cluster after the primary
@@ -736,19 +792,7 @@ func (c *CQLClient) tryFallbackCluster(
 	overrideActive bool,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	c.config.Metrics.IncFailoverTotal(selected, fallback)
-	c.config.Logger.Warn("read failed, failing over to alternative cluster",
-		"fromCluster", c.clusterName(selected),
-		"toCluster", c.clusterName(fallback),
-		"error", primaryErr.Error(),
-	)
-	c.emitClusterEvent(types.ClusterEvent{
-		Kind:        types.EventFailover,
-		Cluster:     fallback,
-		FromCluster: selected,
-		ToCluster:   fallback,
-		Err:         primaryErr,
-	})
+	c.announceFailover(selected, fallback, primaryErr)
 
 	holder, elapsed, err := c.attemptRead(ctx, fallback, readFunc)
 	if err == nil {
@@ -769,11 +813,38 @@ func (c *CQLClient) tryFallbackCluster(
 
 	c.health.readFailed(holder, fallback, kind, err)
 
+	return dualReadError(selected, primaryErr, err)
+}
+
+// announceFailover publishes the decision to retry a failed read on
+// fallback: the failover metric, a warning naming both clusters, and an
+// [types.EventFailover] cluster event.
+// It is called once per failover attempt, before the alternative leg runs.
+func (c *CQLClient) announceFailover(selected, fallback ClusterID, primaryErr error) {
+	c.config.Metrics.IncFailoverTotal(selected, fallback)
+	c.config.Logger.Warn("read failed, failing over to alternative cluster",
+		"fromCluster", c.clusterName(selected),
+		"toCluster", c.clusterName(fallback),
+		"error", primaryErr.Error(),
+	)
+	c.emitClusterEvent(types.ClusterEvent{
+		Kind:        types.EventFailover,
+		Cluster:     fallback,
+		FromCluster: selected,
+		ToCluster:   fallback,
+		Err:         primaryErr,
+	})
+}
+
+// dualReadError pairs the error of the leg that ran on selected with the
+// error of the leg that ran on the alternative, in cluster order, so the
+// caller reads ErrorA and ErrorB as the clusters they name.
+func dualReadError(selected ClusterID, primaryErr, altErr error) error {
 	if selected == ClusterA {
-		return &types.DualClusterError{ErrorA: primaryErr, ErrorB: err}
+		return &types.DualClusterError{ErrorA: primaryErr, ErrorB: altErr}
 	}
 
-	return &types.DualClusterError{ErrorA: err, ErrorB: primaryErr}
+	return &types.DualClusterError{ErrorA: altErr, ErrorB: primaryErr}
 }
 
 // fallbackReadOptions customizes executeFallbackRead's alt-leg semantics.

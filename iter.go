@@ -18,6 +18,7 @@ type cqlIter struct {
 	holder         *sessionHolder  // the session the iterator was opened on
 	ctx            context.Context // the caller's context, for error provenance on Close
 	overrideActive bool            // captured from readTarget at creation, not re-evaluated
+	firstPage      *firstPageCtx   // the leg context the driver keeps; nil when the first page was not bounded
 
 	closeOnce sync.Once
 	closeErr  error
@@ -62,9 +63,25 @@ func (i *cqlIter) Close() error {
 
 func (i *cqlIter) closeAndReport() error {
 	err := i.iter.Close()
+	i.finishFirstPage()
 	i.client.health.iterClosed(i.holder, i.cluster, classifyReadErr(i.ctx, err), err, i.overrideActive)
 
 	return err
+}
+
+// finishFirstPage releases the leg context the first page ran under,
+// however the caller is done with the iterator.
+//
+// It runs after the driver's own Close has returned, so a prefetch the
+// driver was still reading from is cancelled only once the driver has let
+// it go, and cleanup can never turn a clean close into an error.
+// finish is idempotent, so a Scanner consumer that also closes the
+// iterator releases the context once.
+func (i *cqlIter) finishFirstPage() {
+	if i.firstPage == nil {
+		return
+	}
+	i.firstPage.finish()
 }
 
 // pageStateHeader identifies a paging token issued by Helix: a magic and a
@@ -160,7 +177,7 @@ func (i *cqlIter) Columns() []ColumnInfo {
 }
 
 func (i *cqlIter) Scanner() Scanner {
-	return &cqlScanner{scanner: i.iter.Scanner()}
+	return &cqlScanner{scanner: i.iter.Scanner(), owner: i}
 }
 
 func (i *cqlIter) Warnings() []string {
@@ -168,8 +185,12 @@ func (i *cqlIter) Warnings() []string {
 }
 
 // cqlScanner wraps cql.Scanner to implement helix.Scanner.
+// It keeps the iterator it came from, because a consumer that switches to
+// the Scanner API stops using that iterator directly and releases its
+// resources through Err instead of Close.
 type cqlScanner struct {
 	scanner cql.Scanner
+	owner   *cqlIter
 }
 
 func (s *cqlScanner) Next() bool {
@@ -180,6 +201,11 @@ func (s *cqlScanner) Scan(dest ...any) error {
 	return s.scanner.Scan(dest...)
 }
 
+// Err returns the iterator's error and releases its resources, including
+// the leg context the first page ran under.
 func (s *cqlScanner) Err() error {
-	return s.scanner.Err()
+	err := s.scanner.Err()
+	s.owner.finishFirstPage()
+
+	return err
 }

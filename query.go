@@ -271,20 +271,32 @@ func (q *cqlQuery) Iter() Iter {
 
 // IterContext executes the query and returns an iterator.
 //
-// NOTE: Iterators do NOT support automatic failover. If the selected cluster
-// fails during iteration, the error is returned to the caller. Close still
-// reports the outcome: a clean Close is a success for the read strategy
-// (unless an AllowedClusters override is active) and the failover policy,
-// and a cluster error is a failure for both, so an iterator-heavy workload
-// trips the breaker and moves the sticky preference like Scan traffic does.
-// Only the retry itself is skipped. Auto-refresh accounting is updated on
-// Close for every outcome except a caller-context error.
+// NOTE: there is no failover mid-stream.
+// If the selected cluster fails while the caller is draining rows, the
+// error is returned to the caller.
+// Close still reports the outcome: a clean Close is a success for the read
+// strategy (unless an AllowedClusters override is active) and the failover
+// policy, and a cluster error is a failure for both, so an iterator-heavy
+// workload trips the breaker and moves the sticky preference like Scan
+// traffic does.
+// Only the retry itself is skipped.
+// Auto-refresh accounting is updated on Close for every outcome except a
+// caller-context error.
+//
+// The first page is the exception, and only for a dual-cluster client that
+// sets [WithClusterReadTimeout]: the page the driver fetches inside this
+// call is a read leg like any other, bounded by that timeout, counted
+// against the cluster that owns it, and eligible for one attempt on the
+// alternative when the leg expires and the failover gating allows it.
+// The pages the caller drains afterwards run on the caller's own context,
+// so the leg deadline never cuts a drain short.
 //
 // A query that carries a PageState is sent to the cluster that issued the
 // token, whatever the read strategy or drain state say now: a paging cursor
-// is only meaningful on the cluster that produced it. A token without the
-// Helix routing header keeps whatever cluster resolves first and skips the
-// drain-aware re-selection.
+// is only meaningful on the cluster that produced it.
+// Such a read never moves cluster, not even when its first page expires.
+// A token without the Helix routing header keeps whatever cluster resolves
+// first and skips the drain-aware re-selection.
 //
 // If resolveReadTarget returns an error (fail-closed), an errorIter is returned
 // that defers the error to Close(). Always call Close() and check its error.
@@ -296,6 +308,10 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 	rt := q.client.resolveReadTarget(ctx, q.pagedReadOptions())
 	if rt.err != nil {
 		return &errorIter{err: rt.err}
+	}
+
+	if q.client.legTimeoutActive() {
+		return q.iterFirstPage(ctx, rt)
 	}
 
 	holder := q.client.holderFor(rt.cluster)

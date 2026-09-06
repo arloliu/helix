@@ -1390,10 +1390,19 @@ func WithClusterWriteTimeout(d time.Duration) Option {
 //
 // The timeout applies to every cluster leg of a read — the selected
 // cluster, the failover attempt, and the FallbackRead probe — for both
-// single-row and slice reads. It does not apply to single-cluster reads,
-// where there is no alternative to preserve budget for, nor to writes, nor
-// to an iterator obtained from Query.Iter, which the caller drains outside
-// any leg.
+// single-row and slice reads.
+// It does not apply to single-cluster reads, where there is no
+// alternative to preserve budget for, nor to writes.
+//
+// An iterator's first page is a leg like any other: the page
+// [Query.IterContext] fetches before it hands the iterator over is bounded
+// by d, counts as its cluster's failure when it expires, and is eligible
+// for one attempt on the alternative.
+// The pages the caller drains afterwards run on the caller's own context
+// and are reported at Close, so d never cuts a drain short.
+// A read carrying a PageState never moves cluster: its first page is
+// bounded and counted like any other, but a paging cursor is only
+// meaningful on the cluster that issued it.
 //
 // Size d by how long a healthy cluster may take to answer rather than by
 // the caller's budget. A caller whose deadline is shorter than 2*d can
