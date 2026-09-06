@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `helix.RowScanner`, the narrow surface a `SliceScan` / `SliceScanContext`
+  callback receives, now has `Columns() []ColumnInfo` alongside `Scan`. A
+  callback could previously only map a row by destination position, which is
+  brittle for a `SELECT *` and unusable for a generic struct mapper; it can now
+  read the result's column metadata and map by name. The metadata describes the
+  query rather than the row, so the drain converts it once and hands every row
+  the same slice — the column conversion costs nothing per row. Adding
+  a method to an exported interface breaks an out-of-tree implementation of
+  `RowScanner`; the bundled `test/testutil` mock is updated, and its new
+  `MockQuery.SetSliceScanColumns` configures what a callback sees.
 - The bundled `contrib/metrics/vm` collector now implements the optional
   `types.RecoveryProbeMetrics` and `types.StrictMetrics` interfaces, which it
   had been the only bundled collector to leave unimplemented. Helix already
@@ -21,6 +31,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   draining. All three are pre-created at zero, so a scrape sees them before the
   first event. A skip stays an operational state: `{prefix}_write_errors_total`
   is not incremented alongside it.
+
+### Changed
+
+- `CQLClient.DefaultExecuteFunc` now bounds each replay attempt by
+  `WithClusterWriteTimeout`, the same deadline a live write leg runs under. A
+  replay is a leg of the write that failed, so a cluster that accepts
+  connections but never answers used to hold an attempt open for the worker's
+  whole `replay.WithExecuteTimeout` budget (30s by default) instead of the much
+  shorter leg timeout the same client applies to its live writes. An attempt the
+  leg deadline ends now returns `types.ErrClusterTimeout` after that timeout,
+  and `replay.DefaultReplayClassifier` still classifies it as retryable rather
+  than dead-lettering it. Under `RetryWhileRetained`, the default, a retryable
+  attempt spends no poison budget, so the payload stays queued and is attempted
+  again. Under `RetryBounded` every failed attempt spends one of
+  `WithMaxAttempts`, so a stalled cluster now exhausts that budget in
+  `MaxAttempts` x `ClusterWriteTimeout` instead of `MaxAttempts` x
+  `ExecuteTimeout` — the payload is dropped sooner than before, on the same
+  attempt count. `WithExecuteTimeout` remains the outer bound. This changes
+  behaviour only for clients that set `WithClusterWriteTimeout`: with the
+  option unset the attempt runs on the worker's context exactly as before.
 
 ### Fixed
 

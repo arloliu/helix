@@ -1305,7 +1305,14 @@ func WithDefaultMaxRows(n int) Option {
 //
 // The timeout applies to the normal and strict dual-write legs, including
 // the background legs a degraded [policy.AdaptiveDualWrite] dispatches.
-// It does not apply to single-cluster writes, reads, or mirror writes.
+// It does not apply to single-cluster writes issued through the client's own
+// API, nor to reads or mirror writes.
+// It does apply to each replay attempt a worker built on
+// [CQLClient.DefaultExecuteFunc] makes, which is a cluster leg of the same
+// write.
+// A replay attempt runs outside the client's health accounting, so its
+// expiry reaches the worker's replay classifier as [types.ErrClusterTimeout]
+// and records no cluster failure.
 //
 // The deadline bounds the leg the driver honours it on: a leg waiting for
 // an acknowledgement on a live connection ends at d, but a leg whose

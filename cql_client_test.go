@@ -29,6 +29,7 @@ type mockSession struct {
 	closed     atomic.Bool
 	closedAt   atomic.Int64 // Unix nanoseconds of the first Close
 	lastQuery  *mockQuery   // Track last query for inspection
+	lastBatch  *mockBatch   // Track last batch for inspection
 }
 
 func newMockSession() *mockSession {
@@ -47,8 +48,11 @@ func (m *mockSession) Query(stmt string, values ...any) cql.Query {
 	return q
 }
 
-func (m *mockSession) Batch(kind cql.BatchType) cql.Batch {
-	return &mockBatch{session: m}
+func (m *mockSession) Batch(_ cql.BatchType) cql.Batch {
+	b := &mockBatch{session: m}
+	m.lastBatch = b
+
+	return b
 }
 
 func (m *mockSession) Close() {
@@ -1829,8 +1833,24 @@ func newBlockingSession() *blockingSession {
 }
 
 func (s *blockingSession) Query(_ string, _ ...any) cql.Query { return &blockingQuery{session: s} }
-func (s *blockingSession) Batch(_ cql.BatchType) cql.Batch    { return nil }
+func (s *blockingSession) Batch(_ cql.BatchType) cql.Batch    { return &blockingBatch{session: s} }
 func (s *blockingSession) Close()                             {}
+
+// block reports the session entered, then holds until the session is
+// released or ctx ends. It is the write body both blockingQuery and
+// blockingBatch execute.
+func (s *blockingSession) block(ctx context.Context) error {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+		return s.releaseErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 type blockingQuery struct {
 	session *blockingSession
@@ -1845,18 +1865,7 @@ func (q *blockingQuery) Statement() string                             { return 
 func (q *blockingQuery) Values() []any                                 { return nil }
 func (q *blockingQuery) Release()                                      {}
 func (q *blockingQuery) Exec() error                                   { return q.ExecContext(context.Background()) }
-func (q *blockingQuery) ExecContext(ctx context.Context) error {
-	select {
-	case q.session.entered <- struct{}{}:
-	default:
-	}
-	select {
-	case <-q.session.release:
-		return q.session.releaseErr
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+func (q *blockingQuery) ExecContext(ctx context.Context) error         { return q.session.block(ctx) }
 func (q *blockingQuery) Scan(_ ...any) error                           { return nil }
 func (q *blockingQuery) ScanContext(_ context.Context, _ ...any) error { return nil }
 func (q *blockingQuery) Iter() cql.Iter                                { return &mockIter{} }
@@ -1872,6 +1881,45 @@ func (q *blockingQuery) ScanCASContext(_ context.Context, _ ...any) (bool, error
 func (q *blockingQuery) MapScanCAS(_ map[string]any) (bool, error) { return false, nil }
 func (q *blockingQuery) MapScanCASContext(_ context.Context, _ map[string]any) (bool, error) {
 	return false, nil
+}
+
+// blockingBatch is blockingQuery's batch twin: it blocks in ExecContext until
+// the session is released or the context ends, so a batch payload exercises
+// the same stalled-cluster paths a single query does.
+type blockingBatch struct {
+	session *blockingSession
+	entries []cql.BatchEntry
+}
+
+func (b *blockingBatch) Query(stmt string, args ...any) cql.Batch {
+	b.entries = append(b.entries, cql.BatchEntry{Statement: stmt, Args: args})
+
+	return b
+}
+
+func (b *blockingBatch) Consistency(_ cql.Consistency) cql.Batch       { return b }
+func (b *blockingBatch) SerialConsistency(_ cql.Consistency) cql.Batch { return b }
+func (b *blockingBatch) WithTimestamp(_ int64) cql.Batch               { return b }
+func (b *blockingBatch) Size() int                                     { return len(b.entries) }
+func (b *blockingBatch) Statements() []cql.BatchEntry                  { return slices.Clone(b.entries) }
+func (b *blockingBatch) Exec() error                                   { return b.ExecContext(context.Background()) }
+func (b *blockingBatch) ExecContext(ctx context.Context) error         { return b.session.block(ctx) }
+func (b *blockingBatch) IterContext(_ context.Context) cql.Iter        { return &mockIter{} }
+
+func (b *blockingBatch) ExecCAS(_ ...any) (bool, cql.Iter, error) {
+	return false, &mockIter{}, nil
+}
+
+func (b *blockingBatch) ExecCASContext(_ context.Context, _ ...any) (bool, cql.Iter, error) {
+	return false, &mockIter{}, nil
+}
+
+func (b *blockingBatch) MapExecCAS(_ map[string]any) (bool, cql.Iter, error) {
+	return false, &mockIter{}, nil
+}
+
+func (b *blockingBatch) MapExecCASContext(_ context.Context, _ map[string]any) (bool, cql.Iter, error) {
+	return false, &mockIter{}, nil
 }
 
 // TestExecuteDualWrite_DefaultPath_BothClustersRunConcurrently is a

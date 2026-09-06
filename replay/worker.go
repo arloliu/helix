@@ -191,6 +191,9 @@ func WithMaxRetryDelay(d time.Duration) WorkerOption {
 }
 
 // WithExecuteTimeout sets the execution timeout per replay.
+// It is the outer bound: a worker built on the client's DefaultExecuteFunc
+// bounds each attempt by helix.WithClusterWriteTimeout as well, when that
+// option is set.
 func WithExecuteTimeout(d time.Duration) WorkerOption {
 	return func(c *WorkerConfig) {
 		c.ExecuteTimeout = d

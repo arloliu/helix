@@ -48,23 +48,32 @@ func isShieldedScanFnNotFound(err error) bool {
 }
 
 // rowScannerAdapter narrows a driver [cql.Scanner] down to the public
-// [RowScanner] surface (Scan only). Helix's counted-drain loop owns Next()
-// and Err()/Close(); exposing them through the user callback would let a
-// caller advance or close the iterator out from under the loop.
+// [RowScanner] surface (reads only).
+// Helix's counted-drain loop owns Next() and Err()/Close(); exposing them
+// through the user callback would let a caller advance or close the
+// iterator out from under the loop.
 //
 // The pointer receiver matters: drainIterScanWithLimit allocates one adapter
 // before the drain loop and pre-boxes it into a RowScanner interface so
-// per-row scanFn calls do not re-allocate. A value receiver would force the
-// compiler to re-box the value into the interface on every call site, adding
-// one allocation per row.
+// per-row scanFn calls do not re-allocate.
+// A value receiver would force the compiler to re-box the value into the
+// interface on every call site, adding one allocation per row.
 type rowScannerAdapter struct {
 	scanner cql.Scanner
+	columns []ColumnInfo
 }
 
-// Scan delegates to the underlying driver scanner. The destination types
-// follow the driver's unmarshalling conventions (custom UnmarshalCQL etc.).
+// Scan delegates to the underlying driver scanner.
+// The destination types follow the driver's unmarshalling conventions
+// (custom UnmarshalCQL etc.).
 func (r *rowScannerAdapter) Scan(dest ...any) error {
 	return r.scanner.Scan(dest...)
+}
+
+// Columns returns the column metadata the drain converted once up front, so
+// a name-mapping callback costs nothing per row.
+func (r *rowScannerAdapter) Columns() []ColumnInfo {
+	return r.columns
 }
 
 // drainIterScanWithLimit drains iter row-by-row through scanFn, returning the
@@ -101,7 +110,11 @@ func drainIterScanWithLimit(
 	// RowScanner interface inside the loop). gocql's iterScanner.Next reassigns
 	// its internal iter pointer across page boundaries while the scanner
 	// value itself stays stable, so reuse is safe.
-	adapter := &rowScannerAdapter{scanner: scanner}
+	//
+	// The columns are converted here, once, for the same reason and one more:
+	// the scanner's page-boundary reassignment leaves the iter read below
+	// drained, so a later lazy read would be taken from a closed page.
+	adapter := &rowScannerAdapter{scanner: scanner, columns: toColumnInfo(iter.Columns())}
 	var rs RowScanner = adapter
 	for scanner.Next() {
 		if limit > 0 && rowCount >= limit {
