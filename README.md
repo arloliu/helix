@@ -233,6 +233,29 @@ The [Cluster Events Guide](docs/cluster-events.md) has a per-kind
 prerequisites table, plus the full event reference, delivery/shutdown
 semantics, and standalone policy usage.
 
+## Structured Logging (`contrib/log/slog`)
+
+`*log/slog.Logger` already matches `types.Logger` for Debug, Info, Warn and
+Error; the bundled adapter adds the one method it lacks, `Fatal`, which logs at
+Error level with a `fatal=true` attribute and returns rather than ending the
+process — a record your handler filters by level like any other:
+
+```go
+import (
+    "log/slog"
+
+    helixslog "github.com/arloliu/helix/contrib/log/slog"
+)
+
+client, err := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithLogger(helixslog.New(slog.Default())),
+)
+```
+
+Without `WithLogger` Helix uses a no-op logger, so every startup warning,
+circuit breaker transition and replay drop is silent. `types.Logger`'s Godoc
+has the wrapper for zap and other loggers whose signatures differ.
+
 ## Duration Histograms (`contrib/metrics/vm`)
 
 **Breaking — dashboard migration required.** The bundled collector now exposes
@@ -336,9 +359,9 @@ helix.NewCQLClient(sessionA, sessionB,
     helix.WithReplayWorker(worker),  // Optional: auto-start worker
 
     // Observability — wired into every component that accepts one
-    helix.WithLogger(logger),                    // structured logger; no-op by default
-    helix.WithMetrics(vm.New()),                 // contrib/metrics/vm collector
-    helix.WithClusterNames("us_east", "us_west"), // labels used in metrics and logs
+    helix.WithLogger(helixslog.New(slog.Default())), // contrib/log/slog adapter; omit the option for a no-op logger
+    helix.WithMetrics(vm.New()),                     // contrib/metrics/vm collector
+    helix.WithClusterNames("us_east", "us_west"),    // labels used in metrics and logs
 
     // Timestamps (critical for idempotency)
     helix.WithTimestampProvider(func() int64 {

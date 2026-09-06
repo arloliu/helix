@@ -292,6 +292,8 @@ strategy.Reset()                           // clear all state, both clusters →
 ### StickyRead
 
 Randomly selects an initial preferred cluster at construction and routes all reads there. Switches to the other cluster on failure (subject to cooldown).
+The initial choice is a 50/50 draw made once per `NewStickyRead` call, so a fleet of processes starts out split roughly evenly across both clusters rather than piling every reader onto cluster A.
+`policy.WithPreferredCluster(cluster)` pins it instead, and `Reset()` returns the preference to whichever cluster the draw or the option settled on.
 Every move of the preference is reported: the `{prefix}_read_preferred{cluster}` gauge (on a collector implementing `types.ReadRouteMetrics`) and a `read_route_changed` event with the reason.
 The gauge follows the strategy's preference only; a route the client overrides for one request (a veto, a draining cluster, `AllowedClusters`) does not move it.
 

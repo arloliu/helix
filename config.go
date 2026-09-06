@@ -1062,8 +1062,16 @@ func WithMetrics(collector MetricsCollector) Option {
 
 // WithLogger sets the structured logger.
 //
-// If not set, a no-op logger is used that discards all messages.
-// The logger interface is compatible with zap.SugaredLogger.
+// If not set, a no-op logger is used that discards all messages, so every
+// startup warning, circuit breaker transition and replay drop is silent.
+//
+// [types.Logger] wants methods of the form
+// Debug(msg string, keysAndValues ...any).
+// *log/slog.Logger matches that for every level except Fatal, which the
+// bundled contrib/log/slog adapter supplies.
+// *zap.SugaredLogger does not match: its Debug takes Debug(args ...any),
+// so a zap user wraps it and forwards to Debugw and the other "w"
+// methods. See [types.Logger] for the wrapper.
 //
 // Parameters:
 //   - logger: The logger implementation
@@ -1073,9 +1081,14 @@ func WithMetrics(collector MetricsCollector) Option {
 //
 // Example:
 //
-//	logger, _ := zap.NewProduction()
+//	import (
+//	    "log/slog"
+//
+//	    helixslog "github.com/arloliu/helix/contrib/log/slog"
+//	)
+//
 //	client, _ := helix.NewCQLClient(sessionA, sessionB,
-//	    helix.WithLogger(logger.Sugar()),
+//	    helix.WithLogger(helixslog.New(slog.Default())),
 //	)
 func WithLogger(logger types.Logger) Option {
 	return func(c *ClientConfig) {
@@ -1305,6 +1318,11 @@ func WithDefaultMaxRows(n int) Option {
 //
 // The timeout applies to the normal and strict dual-write legs, including
 // the background legs a degraded [policy.AdaptiveDualWrite] dispatches.
+// A background leg is replayed only when it reports a failure — the
+// expiry of its deadline included: a strategy that returns
+// [types.ErrWriteAsync] through [DeferredWriteResult] defers the decision,
+// so a background leg that later succeeds is never enqueued for replay and
+// its statement is not applied a second time.
 // It does not apply to single-cluster writes issued through the client's own
 // API, nor to reads or mirror writes.
 // It does apply to each replay attempt a worker built on

@@ -12,6 +12,7 @@ import (
 	"github.com/arloliu/helix"
 	"github.com/arloliu/helix/adapter/cql"
 	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
+	helixslog "github.com/arloliu/helix/contrib/log/slog"
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/replay"
 	"github.com/arloliu/helix/test/simulation/chaos"
@@ -340,7 +341,7 @@ func (s *Simulation) setupEnvironment() error {
 	// Wire replay worker to the client's default executor so it honors batch payloads.
 	workerOpts := []replay.WorkerOption{
 		replay.WithWorkerMetrics(mc),
-		replay.WithWorkerLogger(slogLogger{s.logger}),
+		replay.WithWorkerLogger(helixslog.New(s.logger)),
 	}
 	if s.config.Settings != nil && s.config.Settings.Helix.Replay.RetryPolicy == "bounded" {
 		workerOpts = append(workerOpts, replay.WithRetryPolicy(replay.RetryBounded))
@@ -754,14 +755,4 @@ func (s *Simulation) runPruner(ctx context.Context) {
 			}
 		}
 	}
-}
-
-// slogLogger adapts *slog.Logger to types.Logger so the replay worker can
-// share the simulation's logger and its drop decisions land in the run log.
-type slogLogger struct{ *slog.Logger }
-
-// Fatal logs the message at error level and aborts the run.
-func (l slogLogger) Fatal(msg string, keysAndValues ...any) {
-	l.Error(msg, keysAndValues...)
-	panic(msg)
 }
