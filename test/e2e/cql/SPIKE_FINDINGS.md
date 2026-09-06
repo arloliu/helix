@@ -130,6 +130,22 @@ ever waiting on heartbeat detection.
 `TestS_PlainCircuitBreaker_TripAndClose` 20.62 s (was 20.6),
 `TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 14.52 s (was 14.4),
 `TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.21 s (was 11.3).
+
+**Amendment 2026-09-06 (`v2.5.1-otter`):** the fork's ring-convergence stage
+bounds node-event debouncing at 4 s, where a sustained burst of churn could
+previously defer topology events until the burst ended. That is the one change
+here with the potential to move a timing, so the same four scenarios were
+re-measured: `TestS3_PauseA_LatencyCircuitBreaker` 24.62 s (was 24.65),
+`TestS_PlainCircuitBreaker_TripAndClose` 20.57 s (was 20.62),
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 15.14 s (was 14.52),
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.20 s (was 10.21).
+Three are flat and the fourth moves 0.6 s, within the run-to-run spread these
+container-bound scenarios already show. None of them drives sustained churn, so
+a debounce bound is not something they were positioned to feel.
+`TestS_PauseA_CloseReturnsDuringFault` passed at 82.64 s and its goroutine-leak
+assertion held at the tolerance of 10. The suite was 52 pass / 0 fail / 0 skip
+in 602 s. As above, local green is necessary but not sufficient: the CI `e2e`
+job stays the gate.
 The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
 the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
 new `TestS_PauseA_CloseReturnsDuringFault`).
