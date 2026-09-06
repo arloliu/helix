@@ -775,7 +775,8 @@ the first page runs on the caller's context exactly as it always has and reports
 
 **Call `Close()`, or `Scanner().Err()` for a `Scanner` consumer.**
 `Close()` reports the read's outcome and releases the leg context the first page ran under.
-`Scanner().Err()` releases that leg context but reports nothing, as it always has.
+`Scanner().Err()` does the same, so a Scanner consumer's cluster failures reach the failover policy and the circuit breaker;
+a Scanner loop under a deferred `Close()` reports the read once.
 An abandoned iterator does neither, the same way it already leaks the driver's own iterator.
 
 One residual is worth knowing:

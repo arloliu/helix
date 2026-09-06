@@ -2,6 +2,7 @@ package helix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -1212,11 +1213,39 @@ func TestIterFirstPage_ScannerErrReleasesTheLegContext(t *testing.T) {
 	require.False(t, fp.stopParent(), "the parent registration is detached")
 
 	closes, _ := sa.counts()
-	require.Equal(t, 1, closes, "Helix never calls the driver's Scanner.Err on the caller's behalf")
+	require.Equal(t, 1, closes, "the driver's own Scanner.Err closed the iterator; Helix adds no second close")
 
-	require.Empty(t, h.strategy.OnSuccessCalls, "a Scanner consumer reports what it reports today: nothing")
-	require.Empty(t, h.policy.RecordSuccessCalls)
+	require.Equal(t, []ClusterID{ClusterA}, h.strategy.OnSuccessCalls, "Err ends the read and reports it, as Close does")
+	require.Equal(t, []ClusterID{ClusterA}, h.policy.RecordSuccessCalls)
 	require.Empty(t, h.policy.RecordFailureCalls)
+}
+
+func TestIterFirstPage_ScannerErrReportsAClusterFailure(t *testing.T) {
+	sa := newFirstPageSession(iterAnswers)
+	sa.rows = []string{"r1"}
+	sa.closeErr = errors.New("cluster A gave up mid-stream")
+	h := newAnsweringClient(t, sa)
+
+	// A Scanner consumer that never calls Close: Err is the only place the
+	// failure can reach the policy, and a cluster that fails every read
+	// must not keep a clean record.
+	iter := h.query().IterContext(t.Context())
+	scanner := iter.Scanner()
+	for scanner.Next() {
+		require.NoError(t, scanner.Scan())
+	}
+	require.ErrorIs(t, scanner.Err(), sa.closeErr)
+
+	require.Equal(t, []ClusterID{ClusterA}, h.policy.RecordFailureCalls,
+		"the failover policy sees a Scanner consumer's cluster failure")
+	require.Empty(t, h.policy.RecordSuccessCalls)
+	require.Empty(t, h.strategy.OnSuccessCalls)
+
+	require.ErrorIs(t, iter.Close(), sa.closeErr,
+		"Close after Err returns the error the read ended with, and neither re-reports nor re-closes")
+	closes, _ := sa.counts()
+	require.Equal(t, 1, closes)
+	require.Len(t, h.policy.RecordFailureCalls, 1, "the read is reported exactly once")
 }
 
 func TestIterFirstPage_ScannerErrThenCloseReportsOneCleanRead(t *testing.T) {
