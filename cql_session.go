@@ -291,14 +291,30 @@ type Query interface {
 
 	// Iter returns an iterator for reading multiple rows.
 	//
-	// This triggers the Read Strategy. The iterator reads from
-	// the selected cluster based on sticky routing and failover.
+	// This triggers the Read Strategy.
+	// The iterator reads from the selected cluster based on sticky routing
+	// and failover; see IterContext for what "failover" covers.
 	//
 	// Returns:
 	//   - Iter: Iterator for scanning rows
 	Iter() Iter
 
 	// IterContext returns an iterator with the given context.
+	//
+	// There is no failover mid-stream: once the iterator is handed over, a
+	// cluster error reaches the caller and is reported at Close rather than
+	// retried on the other cluster.
+	// The first page is the exception, and only for a dual-cluster client
+	// that sets [WithClusterReadTimeout]: the page fetched before this call
+	// returns is a read leg bounded by that timeout, counted against its
+	// cluster, and eligible for one attempt on the alternative.
+	// A query carrying a PageState stays on the cluster that issued it
+	// whatever happens to its first page.
+	//
+	// Always call Close: it reports the read's outcome and releases the
+	// iterator's resources.
+	// A Scanner consumer calls Scanner().Err() instead, which releases
+	// those resources but reports no outcome.
 	//
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout

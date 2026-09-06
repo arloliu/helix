@@ -330,7 +330,8 @@ func TestClusterReadTimeout_LeavesAPublicIteratorOnTheCallerContext(t *testing.T
 	left, ok := sa.budget()
 	require.True(t, ok, "the iterator ran on a context with a deadline")
 	require.Greater(t, left, time.Second,
-		"an iterator the caller drains itself keeps the caller's budget, not a leg deadline")
+		"an iterator the caller drains itself keeps the caller's budget, not a leg deadline: "+
+			"the first page's leg context delegates Deadline to the caller")
 }
 
 func TestClusterReadTimeout_BoundsASliceFallbackReadProbe(t *testing.T) {

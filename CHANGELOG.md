@@ -101,6 +101,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   application-owned logger may still exit, a library-provided adapter must not.
   No behaviour changes for an existing implementation that does exit.
 
+- **Behaviour change.**
+  With a dual-cluster client and `WithClusterReadTimeout(d)`,
+  the page an iterator fetches inside `Query.IterContext` is now a read leg
+  like any other: it is bounded by `d`, it counts as that cluster's failure
+  when it expires (`read_error`, the session stats,
+  `FailoverPolicy.RecordFailure`), and the read may then be served by the
+  other cluster under the same failover gating a `Scan` uses.
+  Such a page used to run until the caller's own deadline ended it and to
+  report nothing, so a frozen cluster held every iterator read for the
+  caller's whole budget and neither tripped the breaker nor moved the sticky
+  preference.
+  The pages the caller drains afterwards are unchanged: they run on the
+  caller's context and are attributed at `Close`.
+  A query carrying a `PageState` is still bounded and counted but never
+  moves cluster.
+  Single-cluster clients and clients that leave the timeout unset are
+  unaffected; the restore path is `WithClusterReadTimeout(0)`.
+
+- For dashboards: `read_total` and `read_duration` now count iterator first
+  pages, one of each per leg attempt, so an iterator-heavy workload with a
+  read timeout sees its read rate rise (a first page that fails over counts
+  two of each).
+  Neither series moves for a single-cluster client or with the timeout unset.
+
 ### Fixed
 
 - `types.Logger`'s Godoc claimed compatibility with `zap.SugaredLogger`, which
