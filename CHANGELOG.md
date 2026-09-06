@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] — 2026-09-06
+
+This release answers the fault-suite feedback on 1.8.1: a leg deadline now bounds an
+iterator's first page and every replay attempt, a dual-cluster client warns at startup when a
+leg timeout is left at 0, a caller can count how often its own context expired a leg,
+`contrib/log/slog` wires a standard library logger in, and the v2 CQL adapter's fork pin moves
+to `v2.5.0-otter`, which halves the time a silent node takes to be detected.
+
+It is a MINOR release by intent. The one change `gorelease` reports as incompatible is
+`RowScanner.Columns`, which affects only an out-of-tree implementation of that interface.
 
 ### Added
 
