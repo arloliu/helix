@@ -811,6 +811,7 @@ func TestStrict_RecoveryProbe_StopAndStart_RestoresCluster(t *testing.T) {
 				if err := b.Reconnect(rctx); err != nil {
 					return nil, fmt.Errorf("rebuild cluster B session: %w", err)
 				}
+
 				return d.wrap(b), nil
 			}
 

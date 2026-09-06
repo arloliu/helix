@@ -207,11 +207,6 @@ func tryCountRows(c *testutil.CQLCluster, table string) (int, error) {
 	return n, nil
 }
 
-func countRows(t *testing.T, c *testutil.CQLCluster, table string) int {
-	t.Helper()
-	return countRowsEventually(t, c, table)
-}
-
 func countRowsEventually(t *testing.T, c *testutil.CQLCluster, table string) int {
 	t.Helper()
 	var (
