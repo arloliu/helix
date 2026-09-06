@@ -481,6 +481,34 @@ func TestStrict_WriteSkippedMetric_BothDraining(t *testing.T) {
 	assert.Equal(t, int32(1), mc.skippedB.Load(), "IncWriteSkipped must fire for draining cluster B")
 }
 
+// TestWriteSkippedMetric_NonStrictWriteToDrainingCluster pins the actual scope of
+// IncWriteSkipped: a draining cluster's leg is skipped by every write, not only by
+// a Strict() one, so an ordinary write to a draining cluster increments the counter.
+// The interface name says "Strict"; the contract is broader.
+func TestWriteSkippedMetric_NonStrictWriteToDrainingCluster(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	watcher := newMockTopologyWatcher()
+
+	mc := &strictMetricsCollector{}
+	client := newDualClient(t, sa, sb,
+		WithWriteStrategy(policy.NewConcurrentDualWrite()),
+		WithTopologyWatcher(watcher),
+		WithMetrics(mc),
+	)
+
+	watcher.SetDrain(ClusterA, true)
+	time.Sleep(50 * time.Millisecond)
+
+	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").ExecContext(t.Context())
+
+	require.NoError(t, err, "cluster B acknowledged, so the caller sees success")
+	assert.Equal(t, int32(1), mc.skippedA.Load(),
+		"a draining cluster's leg is skipped and counted without Strict()")
+	assert.Equal(t, int32(0), mc.skippedB.Load(), "B was written to, not skipped")
+	require.Empty(t, sa.queries, "the draining cluster must not be contacted")
+	require.Len(t, sb.queries, 1)
+}
+
 // TestStrict_CustomStrategy_AsyncSentinel_SurfacedAsPartialWriteError verifies that
 // ErrWriteAsync returned by a custom ExecuteStrict surfaces as PartialWriteError.Cause
 // with the correct Acknowledged/Unacknowledged cluster assignment.

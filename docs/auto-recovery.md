@@ -349,6 +349,7 @@ if errors.As(err, &noAck) && noAck.Replay == nil {
 | CircuitBreaker trip/close events | Read-path health transitions | Usually informational |
 | `helix_failover_total` metric | Frequency of read failovers | High rate = instability |
 | `helix_read_errors_total` metric | Read failures per cluster | Correlate with circuit breaker |
+| `helix_recovery_probe_success_total{cluster}` / `helix_recovery_probe_failure_total{cluster}` metrics | Whether the background probe is healing a degraded cluster or still failing against it | Failures climbing with no successes = the cluster is not recovering |
 
 ---
 

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The bundled `contrib/metrics/vm` collector now implements the optional
+  `types.RecoveryProbeMetrics` and `types.StrictMetrics` interfaces, which it
+  had been the only bundled collector to leave unimplemented. Helix already
+  type-asserted on both and silently no-opped, so a `vm` user got no
+  recovery-probe or skipped-write counters at all. The new series are
+  `{prefix}_recovery_probe_success_total{cluster}` and
+  `{prefix}_recovery_probe_failure_total{cluster}`, incremented for every probe
+  against a degraded cluster, and `{prefix}_write_skipped_total{cluster}`,
+  incremented when a write leg is skipped because the cluster is degraded or
+  draining. All three are pre-created at zero, so a scrape sees them before the
+  first event. A skip stays an operational state: `{prefix}_write_errors_total`
+  is not incremented alongside it.
+
+### Fixed
+
+- `types.StrictMetrics`'s Godoc claimed the bundled `contrib/metrics/vm`
+  collector implemented the interface, which it did not. The claim is now true
+  rather than merely corrected. `types.RecoveryProbeMetrics`'s Godoc, which
+  correctly said the opposite, was updated for the same reason.
+- `types.StrictMetrics`'s Godoc described `IncWriteSkipped` as firing only for
+  `Strict()` writes. A degraded cluster is indeed skipped only by a strict
+  write, but since 1.7.0 moved the drain check inside the write legs, a
+  draining cluster's leg is skipped by every write and increments the counter
+  too. The Godoc and the strict-write guide now say so, and a test pins it;
+  the behaviour is unchanged.
+
 ## [1.8.1] — 2026-09-06
 
 This release moves the v2 CQL adapter's fork pin forward. No Helix source changes.
