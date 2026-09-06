@@ -89,6 +89,35 @@ answer whenever a session's driver cannot recover on its own — an address
 change, or an older driver — rather than something this suite has to
 configure to pass.
 
+**Amendment (2026-09-06):** the fork's `v2.4.2-otter` changes what the driver
+does *during* a pause, without changing what this suite observes after one.
+Every `ReconnectInterval` tick that finds a host down now also re-reads the
+peers tables, so a node that rejoined at a different address under the same
+host id is rediscovered without a server event. At the suite's
+`ReconnectInterval = 500 ms` (`setup_test.go`) a paused host therefore draws
+two extra control queries per session every 500 ms for as long as it stays
+down, and none once every host is up. Three defects on the same paths were
+fixed with it: a control-connection reconnect that could wait on its own ring
+refresh and hang `Session.Close`, pool admission and host removal that could
+act on a host object the ring had already replaced, and a ring snapshot read
+across two control connections that could evict the healthy new control host.
+The last two are reachable precisely where the connect and broadcast addresses
+differ, which is every port-mapped container this suite runs.
+
+The full suite passes on `v2.4.2-otter` locally: 50 tests, 0 failures, 562 s.
+The scenarios that hold a host down longest are the ones to watch; recorded
+here so a later run has something to compare against —
+`TestS3_PauseA_LatencyCircuitBreaker` 24.7 s,
+`TestS_PlainCircuitBreaker_TripAndClose` 20.6 s,
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 14.4 s,
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 11.3 s. No per-test
+baseline was captured on `v2.3.1-otter`, so these establish one rather than
+confirm the timings are unchanged; every scenario passed its own recovery
+assertions, which is the property that matters. Local green is
+necessary but not sufficient here: the pause failure this section records was
+only ever reproduced on the CI runner, so the CI `e2e` job stays the gate for
+a driver bump.
+
 ## 3. v1/v2 errors.Is sentinel mismatch — INVALIDATED, spike test artifact
 
 Original framing: "v1 `gocql.ErrTimeoutNoResponse` does NOT match v2 errors
