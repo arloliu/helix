@@ -433,10 +433,13 @@ type Query interface {
 	//
 	// scanFn receives a [RowScanner] positioned at the current row; the
 	// caller uses RowScanner.Scan(dest...) to copy column values via the
-	// driver's destination-driven unmarshalling path. Returning a non-nil
-	// error from scanFn aborts iteration and propagates the error. The
-	// RowScanner is valid only for the duration of the callback — do not
-	// retain it after scanFn returns.
+	// driver's destination-driven unmarshalling path, and
+	// RowScanner.Columns() to map them by column name instead of by
+	// position.
+	// Returning a non-nil error from scanFn aborts iteration and
+	// propagates the error.
+	// The RowScanner is valid only for the duration of the callback — do
+	// not retain it after scanFn returns.
 	//
 	// If scanFn is nil, SliceScan returns an error before any cluster
 	// contact — neither the primary nor the alternative cluster is queried.
@@ -482,14 +485,17 @@ type Query interface {
 }
 
 // RowScanner is the narrow scan surface presented to a [Query.SliceScan]
-// callback. It exposes only [RowScanner.Scan] so a callback cannot accidentally
-// advance or close the underlying iterator — both are owned by Helix's
-// counted-drain loop.
+// callback.
+// It exposes reading only — [RowScanner.Scan] for the row's values and
+// [RowScanner.Columns] for the result's column metadata — so a callback
+// cannot accidentally advance or close the underlying iterator, both of
+// which are owned by Helix's counted-drain loop.
 //
 // The pointer types passed to Scan follow the same destination-driven
 // convention as [Query.Scan]: custom UnmarshalCQL, blob coercion, and any
-// other driver unmarshalling rules apply unchanged. The RowScanner is valid
-// only for the duration of a single scanFn invocation.
+// other driver unmarshalling rules apply unchanged.
+// The RowScanner is valid only for the duration of a single scanFn
+// invocation.
 type RowScanner interface {
 	// Scan reads the current row's columns into the destination pointers.
 	//
@@ -499,6 +505,22 @@ type RowScanner interface {
 	// Returns:
 	//   - error: Any error from the underlying driver scan
 	Scan(dest ...any) error
+
+	// Columns returns the column metadata of the result the drain is
+	// reading, in the order Scan expects its destinations.
+	//
+	// It lets a callback map a row onto a struct by column name instead of
+	// by position.
+	// The metadata describes the query, not the row, so it is the same on
+	// every invocation; the drain converts it once and hands back the same
+	// slice each time.
+	// Treat it as read-only — mutating it changes what later rows in the
+	// same drain observe.
+	//
+	// Returns:
+	//   - []ColumnInfo: One entry per selected column, empty if the driver
+	//     reports none
+	Columns() []ColumnInfo
 }
 
 // Batch mirrors gocql.Batch for grouping multiple mutations.

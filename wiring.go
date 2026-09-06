@@ -540,6 +540,22 @@ func (c *CQLClient) replayAllowed(cluster ClusterID) bool {
 //   - Preserves the original write timestamp for idempotent replays
 //   - Respects context cancellation and timeouts via ExecContext
 //
+// When [WithClusterWriteTimeout] is set, each replay attempt runs under its
+// own deadline of that duration, exactly like a live write leg.
+// An attempt the deadline ends returns [types.ErrClusterTimeout], which
+// [replay.DefaultReplayClassifier] treats as retryable, so a stalled cluster
+// costs the leg timeout per attempt instead of holding the attempt open for
+// the worker's whole budget.
+// Under [replay.RetryWhileRetained], the default, a retryable attempt does
+// not consume the poison budget, so the payload stays queued and is
+// attempted again.
+// Under [replay.RetryBounded] every failed attempt spends one of
+// [replay.WithMaxAttempts], so the shorter leg timeout also reaches the drop
+// sooner.
+// [replay.WithExecuteTimeout] remains the outer bound on the attempt.
+// A replay attempt runs outside the client's health accounting, so an expiry
+// here reaches the worker's classifier without recording a cluster failure.
+//
 // Example:
 //
 //	client, _ := helix.NewCQLClient(sessionA, sessionB, helix.WithReplayer(replayer))
@@ -565,6 +581,14 @@ func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 		}
 		session := c.getSession(payload.TargetCluster)
 
+		// A replay attempt is a cluster leg like any other write leg,
+		// so it is bounded the same way.
+		// With no ClusterWriteTimeout configured legContext hands back the
+		// worker's own context unchanged, and clusterTimeoutIfExpired then
+		// never fires because the expired context is the parent itself.
+		legCtx, cancel := c.legContext(ctx)
+		defer cancel()
+
 		if payload.IsBatch {
 			batch := session.Batch(payload.BatchType)
 			for _, stmt := range payload.BatchStatements {
@@ -577,7 +601,8 @@ func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 				batch = batch.SerialConsistency(*payload.SerialConsistency)
 			}
 
-			return batch.WithTimestamp(payload.Timestamp).ExecContext(ctx)
+			return clusterTimeoutIfExpired(legCtx, ctx,
+				batch.WithTimestamp(payload.Timestamp).ExecContext(legCtx))
 		}
 
 		query := session.Query(payload.Query, payload.Args...)
@@ -588,7 +613,8 @@ func (c *CQLClient) DefaultExecuteFunc() replay.ExecuteFunc {
 			query = query.SerialConsistency(*payload.SerialConsistency)
 		}
 
-		return query.WithTimestamp(payload.Timestamp).ExecContext(ctx)
+		return clusterTimeoutIfExpired(legCtx, ctx,
+			query.WithTimestamp(payload.Timestamp).ExecContext(legCtx))
 	}
 }
 

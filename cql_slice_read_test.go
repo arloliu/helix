@@ -140,8 +140,18 @@ func (i *sliceTestIter) MapScan(m map[string]any) bool {
 func (i *sliceTestIter) SliceMap() ([]map[string]any, error) { return nil, nil }
 func (i *sliceTestIter) PageState() []byte                   { return nil }
 func (i *sliceTestIter) NumRows() int                        { return len(i.spec.rows) }
-func (i *sliceTestIter) Columns() []cql.ColumnInfo           { return nil }
 func (i *sliceTestIter) Warnings() []string                  { return nil }
+
+// Columns plays back the spec's column names the way a driver reports them,
+// so the RowScanner a scanFn receives carries real metadata.
+func (i *sliceTestIter) Columns() []cql.ColumnInfo {
+	cols := make([]cql.ColumnInfo, len(i.spec.cols))
+	for k, name := range i.spec.cols {
+		cols[k] = cql.ColumnInfo{Keyspace: "ks", Table: "t", Name: name}
+	}
+
+	return cols
+}
 
 func (i *sliceTestIter) Scanner() cql.Scanner {
 	return &sliceTestScanner{iter: i}
@@ -632,6 +642,81 @@ func TestDrainIterScanWithLimit_LimitExceeded_ReturnsRowCountAndSentinel(t *test
 	require.ErrorIs(t, err, types.ErrRowLimitExceeded)
 	assert.Equal(t, 2, rowCount, "rowCount reflects the limit, not the underlying row count")
 	assert.Equal(t, 2, invoked, "scanFn invoked exactly limit times; abort fires before invocation N+1")
+}
+
+// ─────────────────────────────────────────────
+// RowScanner.Columns
+// ─────────────────────────────────────────────
+
+func TestSliceScan_RowScannerColumns_ReportsResultMetadata(t *testing.T) {
+	spec := &sliceSpec{
+		cols: []string{"id", "name"},
+		rows: rowsOf([]any{1, "alice"}, []any{2, "bob"}),
+	}
+	client, _ := newSingleSliceClient(t, spec)
+
+	var seen [][]ColumnInfo
+	rowCount, err := client.Query("SELECT id, name FROM t").
+		SliceScanContext(context.Background(), func(r RowScanner) error {
+			cols := r.Columns()
+			require.NotNil(t, cols, "a callback must always see the result's column metadata")
+			seen = append(seen, cols)
+
+			return nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, 2, rowCount)
+	require.Len(t, seen, 2)
+
+	names := make([]string, 0, len(seen[0]))
+	for _, col := range seen[0] {
+		names = append(names, col.Name)
+		assert.Equal(t, "ks", col.Keyspace)
+		assert.Equal(t, "t", col.Table)
+	}
+	assert.Equal(t, []string{"id", "name"}, names, "columns are reported in the order Scan expects them")
+}
+
+// The drain converts the driver's column metadata once and hands every row
+// the same slice: a name-mapping callback must not pay a conversion per row.
+func TestSliceScan_RowScannerColumns_ConvertedOncePerDrain(t *testing.T) {
+	const numRows = 64
+	rows := make([][]any, numRows)
+	for i := range rows {
+		rows[i] = []any{i, "n"}
+	}
+	iter := &sliceTestIter{spec: &sliceSpec{cols: []string{"id", "name"}, rows: rows}}
+
+	var first []ColumnInfo
+	rowCount, err := drainIterScanWithLimit(iter, 0, func(r RowScanner) error {
+		cols := r.Columns()
+		require.Len(t, cols, 2)
+		if first == nil {
+			first = cols
+
+			return nil
+		}
+		assert.Same(t, &first[0], &cols[0], "every row must observe the one converted slice")
+
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, numRows, rowCount)
+}
+
+// A query selecting nothing the driver reports metadata for still hands the
+// callback a usable, empty slice rather than nil.
+func TestSliceScan_RowScannerColumns_EmptyMetadataIsNotNil(t *testing.T) {
+	iter := &sliceTestIter{spec: &sliceSpec{rows: rowsOf([]any{1})}}
+
+	rowCount, err := drainIterScanWithLimit(iter, 0, func(r RowScanner) error {
+		assert.NotNil(t, r.Columns())
+		assert.Empty(t, r.Columns())
+
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, rowCount)
 }
 
 // BenchmarkSliceScanAs measures SliceScanAs's row accumulation (the

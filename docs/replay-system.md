@@ -122,6 +122,19 @@ client's `Close()`: both wait for the goroutine that invoked the callback.
 `Stop()` is terminal for a worker instance. After a worker has been stopped,
 construct a new worker rather than calling `Start()` again.
 
+`WithExecuteTimeout` is the outer bound on one attempt.
+A worker built on `client.DefaultExecuteFunc()` also bounds each attempt by
+`helix.WithClusterWriteTimeout` when that option is set, exactly as it bounds a
+live write leg.
+An attempt that expires returns `types.ErrClusterTimeout`, which
+`DefaultReplayClassifier` treats as retryable, so a stalled cluster costs the
+leg timeout per attempt rather than the worker's whole execute budget.
+Under `RetryWhileRetained` (the default) a retryable attempt spends no poison
+budget, so the payload stays queued and is attempted again.
+Under `RetryBounded` every failed attempt spends one of `WithMaxAttempts`, so
+the shorter per-attempt bound also reaches the drop sooner: `MaxAttempts x
+ClusterWriteTimeout` rather than `MaxAttempts x ExecuteTimeout`.
+
 **Implementations:**
 
 | Implementation | Processing Model | Use Case |
@@ -193,7 +206,9 @@ func main() {
     }
 
     // Create worker using DefaultExecuteFunc - automatically routes
-    // replays to the correct cluster and preserves timestamps
+    // replays to the correct cluster and preserves timestamps.
+    // ExecuteTimeout is the outer bound; add helix.WithClusterWriteTimeout
+    // to the client to bound each attempt more tightly.
     worker := replay.NewMemoryWorker(replayer, client.DefaultExecuteFunc(),
         replay.WithPollInterval(100*time.Millisecond),
         replay.WithExecuteTimeout(30*time.Second),

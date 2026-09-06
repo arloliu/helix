@@ -23,6 +23,26 @@ type cqlIter struct {
 	closeErr  error
 }
 
+// toColumnInfo restates the adapter's column metadata in the public
+// [ColumnInfo] shape.
+// It is the single conversion both column surfaces share: [Iter.Columns] and
+// the [RowScanner] a [Query.SliceScan] callback receives.
+// The result is freshly allocated for the caller, and empty rather than nil
+// when the adapter reports no columns.
+func toColumnInfo(cqlCols []cql.ColumnInfo) []ColumnInfo {
+	cols := make([]ColumnInfo, len(cqlCols))
+	for idx, col := range cqlCols {
+		cols[idx] = ColumnInfo{
+			Keyspace: col.Keyspace,
+			Table:    col.Table,
+			Name:     col.Name,
+			TypeInfo: col.TypeInfo,
+		}
+	}
+
+	return cols
+}
+
 func (i *cqlIter) Scan(dest ...any) bool {
 	return i.iter.Scan(dest...)
 }
@@ -136,18 +156,7 @@ func (i *cqlIter) NumRows() int {
 }
 
 func (i *cqlIter) Columns() []ColumnInfo {
-	cqlCols := i.iter.Columns()
-	result := make([]ColumnInfo, len(cqlCols))
-	for idx, col := range cqlCols {
-		result[idx] = ColumnInfo{
-			Keyspace: col.Keyspace,
-			Table:    col.Table,
-			Name:     col.Name,
-			TypeInfo: col.TypeInfo,
-		}
-	}
-
-	return result
+	return toColumnInfo(i.iter.Columns())
 }
 
 func (i *cqlIter) Scanner() Scanner {

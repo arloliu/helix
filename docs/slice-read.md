@@ -31,7 +31,10 @@ func (q Query) SliceScan(scanFn func(r RowScanner) error) (rowCount int, err err
 func (q Query) SliceScanContext(ctx context.Context, scanFn func(r RowScanner) error) (rowCount int, err error)
 ```
 
-Drains the query and invokes `scanFn` once per row. `RowScanner` exposes only `Scan(dest ...any) error` — the callback cannot advance or close the underlying iterator.
+Drains the query and invokes `scanFn` once per row.
+`RowScanner` exposes reading only: `Scan(dest ...any) error` for the row's values,
+and `Columns() []ColumnInfo` for the result's column metadata.
+The callback cannot advance or close the underlying iterator.
 
 | Return | Meaning |
 |--------|---------|
@@ -41,6 +44,36 @@ Drains the query and invokes `scanFn` once per row. `RowScanner` exposes only `S
 | `(N, err)` | `scanFn` returned `err` on row N+1, or cluster/context error |
 
 **No standard failover.** `SliceScan` does not participate in the normal `executeRead` failover path (primary error → retry on secondary). [FallbackRead](fallback-read.md) empty-retry still applies when `FallbackRead()` is set.
+
+`Columns()` reports the same metadata on every row, so a callback can map a row onto a struct by column name instead of by position.
+`Scan` still consumes the whole row, so build one destination per reported column and leave a `nil` in every slot the mapping does not want — both drivers skip a `nil` destination:
+
+```go
+var orders []Order
+
+_, err := client.Query("SELECT id, status FROM orders WHERE user = ?", userID).
+    SliceScanContext(ctx, func(r helix.RowScanner) error {
+        var order Order
+        cols := r.Columns()
+        dest := make([]any, len(cols))
+        for i, col := range cols {
+            switch col.Name {
+            case "id":
+                dest[i] = &order.ID
+            case "status":
+                dest[i] = &order.Status
+            default:
+                dest[i] = nil // column present in the result, not mapped
+            }
+        }
+        if err := r.Scan(dest...); err != nil {
+            return err
+        }
+        orders = append(orders, order)
+
+        return nil
+    })
+```
 
 ---
 

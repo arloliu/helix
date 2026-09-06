@@ -127,6 +127,8 @@ type MockQuery struct {
 	mapData       map[string]any
 	sliceMapData  []map[string]any
 	sliceScanData [][]any
+
+	sliceScanColumns []helix.ColumnInfo
 }
 
 // Compile-time assertion that MockQuery implements helix.Query.
@@ -268,6 +270,7 @@ func (m *MockQuery) SliceScan(scanFn func(r helix.RowScanner) error) (int, error
 	}
 	m.mu.RLock()
 	rows := m.sliceScanData
+	cols := m.sliceScanColumns
 	scanErr := m.scanErr
 	m.mu.RUnlock()
 
@@ -277,7 +280,7 @@ func (m *MockQuery) SliceScan(scanFn func(r helix.RowScanner) error) (int, error
 
 	rowCount := 0
 	for i := range rows {
-		if err := scanFn(&mockRowScanner{values: rows[i]}); err != nil {
+		if err := scanFn(&mockRowScanner{values: rows[i], columns: cols}); err != nil {
 			return rowCount, err
 		}
 		rowCount++
@@ -460,10 +463,24 @@ func (m *MockQuery) SetSliceScanData(rows [][]any) *MockQuery {
 	return m
 }
 
+// SetSliceScanColumns configures the metadata RowScanner.Columns reports to
+// scanFn, for callbacks that map a row by column name rather than by
+// position.
+// Leave it unset when the callback only scans positionally.
+func (m *MockQuery) SetSliceScanColumns(cols []helix.ColumnInfo) *MockQuery {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sliceScanColumns = cols
+
+	return m
+}
+
 // mockRowScanner satisfies helix.RowScanner for tests by copying preset
 // column values into the caller's destination pointers via copyValue.
 type mockRowScanner struct {
-	values []any
+	values  []any
+	columns []helix.ColumnInfo
 }
 
 func (s *mockRowScanner) Scan(dest ...any) error {
@@ -471,6 +488,12 @@ func (s *mockRowScanner) Scan(dest ...any) error {
 		copyValue(dest[i], s.values[i])
 	}
 	return nil
+}
+
+// Columns returns the metadata configured through SetSliceScanColumns,
+// mirroring production: every row of one drain sees the same slice.
+func (s *mockRowScanner) Columns() []helix.ColumnInfo {
+	return s.columns
 }
 
 // MockBatch is a mock implementation of helix.Batch for testing.
