@@ -233,7 +233,7 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		query = query.WithTimestamp(ts)
 
 		err = query.ExecContext(ctx)
-		q.client.health.writeLeg(holder, classifyWriteLeg(ctx, err), err, q.client.config.NowProvider())
+		q.client.health.writeLeg(holder, ClusterA, classifyWriteLeg(ctx, err), err, q.client.config.NowProvider())
 
 		return err
 	}

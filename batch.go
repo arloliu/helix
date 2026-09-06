@@ -271,7 +271,7 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		batch = batch.WithTimestamp(ts)
 
 		err = batch.ExecContext(ctx)
-		b.client.health.writeLeg(holder, classifyWriteLeg(ctx, err), err, b.client.config.NowProvider())
+		b.client.health.writeLeg(holder, ClusterA, classifyWriteLeg(ctx, err), err, b.client.config.NowProvider())
 
 		return err
 	}

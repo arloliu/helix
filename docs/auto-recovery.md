@@ -350,6 +350,7 @@ if errors.As(err, &noAck) && noAck.Replay == nil {
 | `helix_failover_total` metric | Frequency of read failovers | High rate = instability |
 | `helix_read_errors_total` metric | Read failures per cluster | Correlate with circuit breaker |
 | `helix_recovery_probe_success_total{cluster}` / `helix_recovery_probe_failure_total{cluster}` metrics | Whether the background probe is healing a degraded cluster or still failing against it | Failures climbing with no successes = the cluster is not recovering |
+| `helix_read_caller_expired_total{cluster}` / `helix_write_caller_expired_total{cluster}` metrics | Legs that ended because the caller gave up first; a cluster that accepts requests and never answers shows up here and in no health counter | Climbing while `*_errors_total` stays flat = (dual-cluster only) set `WithClusterReadTimeout` / `WithClusterWriteTimeout` so the stall is attributed to the cluster; in single-cluster mode both options are inert, so this counter is the only signal and a driver-level request timeout is the remedy |
 
 ---
 

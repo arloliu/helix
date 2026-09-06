@@ -534,6 +534,13 @@ func (c *CQLClient) attemptRead(
 	c.config.Metrics.IncReadTotal(cluster)
 	c.config.Metrics.ObserveReadDuration(cluster, elapsed)
 
+	// Every caller classifies the returned error against this same ctx, so
+	// this is also the one place a caller-expired attempt can be counted
+	// exactly once — on the cluster the attempt actually targeted.
+	if err != nil && classifyReadErr(ctx, err) == readCtxErr {
+		c.health.readCallerExpired(cluster)
+	}
+
 	return holder, elapsed, err
 }
 

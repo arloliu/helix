@@ -31,8 +31,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   draining. All three are pre-created at zero, so a scrape sees them before the
   first event. A skip stays an operational state: `{prefix}_write_errors_total`
   is not incremented alongside it.
+- `types.CallerContextMetrics` is a new optional `MetricsCollector` extension
+  that reports legs Helix attributes to the caller rather than to the cluster.
+  A leg whose error arrives after the caller's context is already done triggers
+  no failover, no `RecordFailure`, and no error counter — correct attribution,
+  but it left a frozen cluster invisible: with no `WithClusterReadTimeout` or
+  `WithClusterWriteTimeout` a leg has no deadline of its own, so a cluster that
+  accepts connections and never answers ends every request that way while its
+  health counters stay clean. `IncReadCallerExpired(cluster)` fires once per
+  read attempt that ended after the caller's context was done (an iterator's
+  `Close` included) and `IncWriteCallerExpired(cluster)` once per dispatched
+  write leg, in single-cluster mode as well as dual. The bundled
+  `contrib/metrics/vm` collector implements the interface and exports
+  `{prefix}_read_caller_expired_total{cluster}` and
+  `{prefix}_write_caller_expired_total{cluster}`, both pre-created at zero; a
+  counter climbing while the matching `errors_total` stays flat identifies the
+  cluster.
 
 ### Changed
+
+- A dual-cluster client that leaves `WithClusterReadTimeout` or
+  `WithClusterWriteTimeout` unset is now warned about it once, at construction,
+  next to the existing "no Replayer configured" warning. Each warning names the
+  option that fixes it, and every dual-cluster client on default settings will
+  see both lines in its startup log. Single-cluster clients are not warned:
+  neither option applies there, because a leg has no alternative cluster to
+  preserve budget for.
 
 - `CQLClient.DefaultExecuteFunc` now bounds each replay attempt by
   `WithClusterWriteTimeout`, the same deadline a live write leg runs under. A
