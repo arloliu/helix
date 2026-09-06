@@ -75,9 +75,10 @@ func TestS_PauseA_IterFirstPageMovesToTheOtherCluster(t *testing.T) {
 			stmt := "SELECT value FROM " + table + " WHERE key = ?"
 
 			// Warm this exact statement on both clusters.
-			// A cold statement is prepared under the driver's connection
-			// context, which no leg deadline bounds, and ensureReachable
-			// prepares system.local rather than this read.
+			// A token-aware read can wait on another caller's
+			// routing-metadata load on either driver, and
+			// ensureReachable prepares system.local rather than
+			// this read.
 			warm := func(cluster *testutil.CQLCluster) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()

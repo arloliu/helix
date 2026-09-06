@@ -778,10 +778,8 @@ the first page runs on the caller's context exactly as it always has and reports
 `Scanner().Err()` releases that leg context but reports nothing, as it always has.
 An abandoned iterator does neither, the same way it already leaks the driver's own iterator.
 
-One limit is worth knowing:
-the first execution of a *cold* statement is prepared under the driver's connection context rather than the request's,
-so a cold statement against a frozen host can still wait for the driver's own timeout before the leg deadline is consulted.
-Warm statements — steady-state traffic — get the leg deadline.
+One residual is worth knowing:
+a token-aware first page can wait on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable.
 
 ### Operator Workflow
 
