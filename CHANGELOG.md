@@ -15,23 +15,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.5.1-otter`, up from `v2.5.0-otter`.
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.0-otter`, up from `v2.5.0-otter`.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
 
   ```
-  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.5.1-otter
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.0-otter
   ```
 
-  A module that stays on `v2.5.0-otter` keeps working: the fork adds no exported symbol and changes no exported signature or meaning.
+  The fork adds no exported symbol and changes no exported signature, but one exported field changes meaning — see the `ReconnectInterval` note below.
 
   **The fix that matters most is a panic that used to freeze ring maintenance for the life of a session.**
   A `system.peers` row the driver could not parse killed the goroutine that maintains the ring, and nothing restarted it, so the session ran on with a topology view frozen at that moment — new nodes never appeared and departed ones never left.
   Three narrower ring bugs go with it: a node that changed only its port was never reconciled; a single transiently invalid peer row could evict a healthy node with nothing left to rediscover it; and node-event debouncing was unbounded, so a sustained burst of churn could defer topology events for the whole burst.
 
-  Two timing changes come with the fix, neither of them configurable:
+  **`ReconnectInterval` is now the cap on the retry delay, not the interval between retries.**
+  A host marked DOWN is retried one second after the outage begins, and the delay doubles until it reaches `ReconnectInterval` — at the 60 s default, 1 s, 2 s, 4 s, … 32 s, 60 s, 60 s.
+  The practical effect is that the first readmission attempt for a node that has just recovered arrives in about a second instead of up to a minute, so a client left at the default sees its recovery probes and its circuit breaker close sooner.
+  The backoff is per session rather than per host and resets only once every known host is UP, so a host that fails while another is already down inherits the outage's current delay rather than starting again at one second.
+  A value below one second is unchanged in effect, because the first step is already the cap.
+  `ReconnectInterval = 0` still disables scheduled retries.
 
+  Three further changes come with the release, none of them configurable:
+
+  - A full ring refresh now runs every five minutes even while every host is UP, and it runs regardless of `ReconnectInterval`. It closes the window where a departed node lingers because a peers snapshot held a row that could not be attributed to any host. Topology logging will see it as background activity that was not there before.
+  - A session with `ReconnectInterval = 0` carries one extra goroutine for that refresh. `Close` cancels its context but does not wait for it to return, so a goroutine-leak assertion taken immediately after `Close` may need a slightly wider tolerance.
   - Node-event debouncing is now bounded at 4 seconds. During sustained churn, topology events land within that window instead of being deferred until the burst ends.
-  - A departed node can linger in the ring slightly longer in the narrow case where a peers snapshot contains a row that cannot be attributed to any host. The periodic full ring refresh that closes that window is not in this release.
 
 ### Documentation
 
