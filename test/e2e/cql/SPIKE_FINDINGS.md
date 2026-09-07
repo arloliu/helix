@@ -187,16 +187,26 @@ Results: 52 pass / 0 fail / 0 skip.
 `TestS_PauseA_CloseReturnsDuringFault` 82.83 s (was 82.86), its goroutine-leak
 assertion holding at the tolerance of 10.
 
-`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` is the one to look at:
-16.80 s, against 15.31 s at the previous bump and 14.52 s two before that. It
-has risen at every bump, and the total drift is now over 2 s. Read it as a
-question rather than a finding, for two reasons. It restarts a container rather
-than pausing one, so it is the scenario most exposed to Docker's own timing.
-And this run was **split into two `go test` processes** to work around a
-memory watchdog killing the single-process run, so each half started its own
-cluster pair and the container lifecycle differs from every earlier
-measurement here — enough on its own to move a restart-bound scenario. Worth
-re-measuring in one process at the next bump before treating the trend as real.
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` came back at 16.80 s,
+against 15.31 s at the previous bump and 14.52 s two before that — a rise at
+every bump, which looked like a trend. It is not one, and the local numbers are
+too quiet to show why.
+
+The same scenario on CI, one `go test` process each time: 16.95 s at
+`v2.5.1-otter`, **27.77 s** on the PR that made `Scanner.Err` report an outcome
+and did not touch the driver at all, 19.10 s at `v2.6.0-otter`, and 19.05 s
+here. That is a spread of more than ten seconds with no direction, and its
+largest value sits on the one change that could not have caused it. This
+scenario stops and starts a container rather than pausing one, so it inherits
+Docker's own restart timing, and that noise floor is wider than any of the
+local deltas.
+
+Two lessons worth keeping. A local series of four is not enough to call a trend
+in a container-bound scenario. And when checking one, compare against CI rather
+than across local runs: CI is the same machine shape every time, whereas a
+local run competes with whatever else is on the workstation — this one had to be
+split into two `go test` processes to get past a memory watchdog, giving each
+half its own cluster pair.
 The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
 the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
 new `TestS_PauseA_CloseReturnsDuringFault`).
