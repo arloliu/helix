@@ -147,8 +147,11 @@ type CQLClusterOptions struct {
 	// ConnectTimeout overrides gocql's ConnectTimeout for both drivers.
 	// Defaults to SessionTimeout when SessionTimeout is non-zero.
 	ConnectTimeout time.Duration
-	// ReconnectInterval sets the drivers' ReconnectInterval (v1 and v2), how
-	// often a host marked DOWN is retried. Zero keeps the drivers' 60 s default.
+	// ReconnectInterval sets the drivers' ReconnectInterval (v1 and v2). In v1
+	// it is how often a host marked DOWN is retried; in v2 it is the cap the
+	// retry delay backs off towards, starting at one second and doubling. A
+	// sub-second value therefore behaves the same in both. Zero keeps the
+	// drivers' 60 s default.
 	ReconnectInterval time.Duration
 }
 
