@@ -46,18 +46,33 @@ go get github.com/arloliu/helix
 
 ### CQL (Cassandra/ScyllaDB)
 
+The examples below use the **v2 adapter**, which is the recommended path for new
+code. Helix builds it against the `arloliu/cassandra-gocql-driver` fork, and Go
+ignores a `replace` directive that lives in a dependency, so your own `go.mod`
+needs the same line before this compiles:
+
+```
+require github.com/apache/cassandra-gocql-driver/v2 v2.1.2
+
+replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.0-otter
+```
+
+The v1 adapter (`adapter/cql/v1`, over `github.com/gocql/gocql`) is still
+supported and needs no `replace` line. It is the older of the two: the fork's
+fault-tolerance work lands in the v2 driver, while v1 follows upstream gocql's
+own pace. Prefer v2 unless you are already on gocql v1.
+
 ```go
 package main
 
 import (
     "log"
-    "time"
 
+    gocql "github.com/apache/cassandra-gocql-driver/v2"
     "github.com/arloliu/helix"
-    v1 "github.com/arloliu/helix/adapter/cql/v1"
+    v2 "github.com/arloliu/helix/adapter/cql/v2"
     "github.com/arloliu/helix/policy"
     "github.com/arloliu/helix/replay"
-    "github.com/gocql/gocql"
 )
 
 func main() {
@@ -74,8 +89,8 @@ func main() {
 
     // Create Helix client
     client, err := helix.NewCQLClient(
-        v1.NewSession(sessionA),
-        v1.NewSession(sessionB),
+        v2.NewSession(sessionA),
+        v2.NewSession(sessionB),
         helix.WithReplayer(replay.NewMemoryReplayer()),
         helix.WithReadStrategy(policy.NewStickyRead()),
         helix.WithWriteStrategy(policy.NewConcurrentDualWrite()),
@@ -87,9 +102,10 @@ func main() {
     defer client.Close()
 
     // Dual-write to both clusters
+    userID := gocql.TimeUUID()
     err = client.Query(
         "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
-        gocql.TimeUUID(), "Alice", "alice@example.com",
+        userID, "Alice", "alice@example.com",
     ).Exec()
     if err != nil {
         log.Printf("Both clusters failed: %v", err)
@@ -102,6 +118,9 @@ func main() {
         "SELECT name, email FROM users WHERE id = ?",
         userID,
     ).Scan(&name, &email)
+    if err != nil {
+        log.Printf("Read failed on both clusters: %v", err)
+    }
 }
 ```
 
@@ -303,8 +322,8 @@ For production dual-cluster deployments, always configure:
 
 ```go
 client, err := helix.NewCQLClient(
-    v1.NewSession(sessionA),
-    v1.NewSession(sessionB),
+    v2.NewSession(sessionA),
+    v2.NewSession(sessionB),
     // REQUIRED for production: enables failure recovery (in-memory, auto-started)
     helix.WithAutoMemoryWorker(10000),
 
@@ -323,8 +342,8 @@ if err != nil {
     log.Fatal(err)
 }
 client, err := helix.NewCQLClient(
-    v1.NewSession(sessionA),
-    v1.NewSession(sessionB),
+    v2.NewSession(sessionA),
+    v2.NewSession(sessionB),
     helix.WithReplayer(natsReplayer),
     helix.WithReplayWorker(replay.NewNATSWorker(natsReplayer, executorFunc)),
     helix.WithReadStrategy(policy.NewStickyRead()),
@@ -385,8 +404,8 @@ helix.NewCQLClient(sessionA, sessionB,
     // rebuilding the client. See docs/session-refresh.md.
     helix.WithSessionRefresher(func(ctx context.Context, cluster helix.ClusterID, lastErr error) (cql.Session, error) {
         // Caller code: rebuild gocql session against the cluster's
-        // current endpoint, wrapped with the v1/v2 adapter.
-        return v1.NewSession(rebuildGocqlSession(cluster)), nil
+        // current endpoint, wrapped with the v2 adapter.
+        return v2.NewSession(rebuildGocqlSession(cluster)), nil
     }),
     helix.WithAutoRefresh(),  // Helix-driven refresh on observed dead session
 )
@@ -420,7 +439,7 @@ See the [examples](examples/) directory:
 ## Requirements
 
 - Go 1.26+
-- For CQL: v1: `github.com/gocql/gocql` or v2: `github.com/apache/cassandra-gocql-driver`
+- For CQL: v2 (recommended): `github.com/apache/cassandra-gocql-driver`, or v1: `github.com/gocql/gocql`
 - Helix builds the v2 adapter against the `arloliu/cassandra-gocql-driver` fork (tag `v2.6.0-otter`)
   through a `replace` directive.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must add the same
