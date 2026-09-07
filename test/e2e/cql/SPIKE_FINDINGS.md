@@ -167,6 +167,46 @@ zero, which is not what this suite builds. The suite was 52 pass / 0 fail /
 Because the suite pins a sub-second `ReconnectInterval`, it cannot observe the
 change this release is named for; a client left at the 60 s default is where
 the faster readmission shows up.
+
+**Amendment 2026-09-08 (`v2.6.1-otter`):** three driver fixes, and the suite was
+expected in advance to show nothing from two of them. `F-EH-4` shortens the
+close of a connection stuck mid-read from five `Timeout`s to one — at this
+suite's `SessionTimeout` of 2 s, 10 s down to 2 s — and `F-stream-1` stops a
+cancelled request from losing its connection stream. Both need a node that
+answers *late*; every fault scenario here pauses a node, which answers *never*,
+and `F-stream-1` cannot trigger at all without a response arriving. `F-frame-1`
+is the one with a plausible visible effect, since a connection that loses a
+frame boundary is now retired rather than left serving, and it is reachable at
+native protocol v4 — which is what ScyllaDB 6.2 negotiates here, its
+`native_protocol_version` being 4.
+
+Results: 52 pass / 0 fail / 0 skip.
+`TestS3_PauseA_LatencyCircuitBreaker` 24.78 s (was 24.76),
+`TestS_PlainCircuitBreaker_TripAndClose` 20.61 s (was 20.64),
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.31 s (was 10.23),
+`TestS_PauseA_CloseReturnsDuringFault` 82.83 s (was 82.86), its goroutine-leak
+assertion holding at the tolerance of 10.
+
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` came back at 16.80 s,
+against 15.31 s at the previous bump and 14.52 s two before that — a rise at
+every bump, which looked like a trend. It is not one, and the local numbers are
+too quiet to show why.
+
+The same scenario on CI, one `go test` process each time: 16.95 s at
+`v2.5.1-otter`, **27.77 s** on the PR that made `Scanner.Err` report an outcome
+and did not touch the driver at all, 19.10 s at `v2.6.0-otter`, and 19.05 s
+here. That is a spread of more than ten seconds with no direction, and its
+largest value sits on the one change that could not have caused it. This
+scenario stops and starts a container rather than pausing one, so it inherits
+Docker's own restart timing, and that noise floor is wider than any of the
+local deltas.
+
+Two lessons worth keeping. A local series of four is not enough to call a trend
+in a container-bound scenario. And when checking one, compare against CI rather
+than across local runs: CI is the same machine shape every time, whereas a
+local run competes with whatever else is on the workstation — this one had to be
+split into two `go test` processes to get past a memory watchdog, giving each
+half its own cluster pair.
 The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
 the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
 new `TestS_PauseA_CloseReturnsDuringFault`).
