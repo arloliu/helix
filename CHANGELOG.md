@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- The README's CQL examples now use the v2 adapter, which is the recommended path for new code. The Quick Start carries the `go.mod` lines the v2 adapter needs, since Go ignores a `replace` directive that lives in a dependency and the example does not compile without them. The v1 adapter remains supported and needs no `replace` line; the guidance is simply that the fork's fault-tolerance work lands in the v2 driver while v1 follows upstream gocql's pace.
 - `WithClusterReadTimeout` now records the one case where its deadline is not a bound: a token-aware first page can block on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable, so such a leg can overrun `d` and end on the driver's own request timeout instead. The caveat was already in `docs/strategy-policy.md`; it was missing from the godoc a caller sizing timeouts actually reads.
 
 ## [1.9.0] — 2026-09-06
