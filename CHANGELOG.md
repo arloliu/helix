@@ -15,11 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.0-otter`, up from `v2.5.0-otter`.
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.1-otter`, up from `v2.5.0-otter`.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
 
   ```
-  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.0-otter
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.1-otter
   ```
 
   The fork adds no exported symbol and changes no exported signature, but one exported field changes meaning — see the `ReconnectInterval` note below.
@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A full ring refresh now runs every five minutes even while every host is UP, and it runs regardless of `ReconnectInterval`. It closes the window where a departed node lingers because a peers snapshot held a row that could not be attributed to any host. Topology logging will see it as background activity that was not there before.
   - A session with `ReconnectInterval = 0` carries one extra goroutine for that refresh. `Close` cancels its context but does not wait for it to return, so a goroutine-leak assertion taken immediately after `Close` may need a slightly wider tolerance.
   - Node-event debouncing is now bounded at 4 seconds. During sustained churn, topology events land within that window instead of being deferred until the burst ends.
+
+  **A cancelled read no longer risks losing its connection slot.**
+  Cancelling an in-flight request is not an edge case in Helix — it is how `WithClusterReadTimeout` ends a leg — and a cancelled request whose answer then arrived had roughly a coin-flip chance of never returning its stream to the connection.
+  Nothing logged it, and the loss only accumulated where the cluster was healthy enough to answer at all, just later than the leg deadline: exactly the tail-latency case the option exists to cut.
+  The effect was a connection whose capacity narrowed until its own heartbeat could not get a stream either, about 30 seconds after which the connection was rebuilt and the cycle began again.
+  Both sides of the handoff now drain, so the slot always comes back once the answer arrives.
+
+  Two smaller fixes ride along.
+  A connection that lost a frame boundary — a body-read failure that was misclassified as non-terminal — kept serving and read the leftover body bytes as the next frame's header; it is now retired instead.
+  That path is reachable on native protocol v4, which is what ScyllaDB negotiates.
+  And a read's deadline was armed inside a five-attempt retry loop, so a connection stuck mid-read took up to five `Timeout`s to be closed rather than one.
 
 ### Documentation
 
