@@ -146,6 +146,27 @@ a debounce bound is not something they were positioned to feel.
 assertion held at the tolerance of 10. The suite was 52 pass / 0 fail / 0 skip
 in 602 s. As above, local green is necessary but not sufficient: the CI `e2e`
 job stays the gate.
+
+**Amendment 2026-09-07 (`v2.6.0-otter`):** the fork's `ReconnectInterval` now
+caps the retry delay instead of setting it, and a full ring refresh runs every
+five minutes even while every host is UP. Neither reaches these scenarios:
+`e2eOptions` sets `ReconnectInterval` to 500 ms, which is below the one-second
+first step, so the backoff collapses back to the fixed rhythm the suite already
+measured, and the refresh period is an order of magnitude longer than every
+scenario here but one. The same four were re-measured anyway:
+`TestS3_PauseA_LatencyCircuitBreaker` 24.76 s (was 24.62),
+`TestS_PlainCircuitBreaker_TripAndClose` 20.64 s (was 20.57),
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 15.31 s (was 15.14),
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.23 s (was 10.20).
+All four are flat within the run-to-run spread.
+`TestS_PauseA_CloseReturnsDuringFault` passed at 82.86 s (was 82.64) and its
+goroutine-leak assertion held at the tolerance of 10 — the extra refresh
+goroutine the release adds belongs to a session with `ReconnectInterval` at
+zero, which is not what this suite builds. The suite was 52 pass / 0 fail /
+0 skip in 602 s.
+Because the suite pins a sub-second `ReconnectInterval`, it cannot observe the
+change this release is named for; a client left at the 60 s default is where
+the faster readmission shows up.
 The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
 the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
 new `TestS_PauseA_CloseReturnsDuringFault`).
