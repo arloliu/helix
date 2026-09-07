@@ -63,20 +63,40 @@ func (i *cqlIter) Close() error {
 
 func (i *cqlIter) closeAndReport() error {
 	err := i.iter.Close()
-	i.finishFirstPage()
-	i.client.health.iterClosed(i.holder, i.cluster, classifyReadErr(i.ctx, err), err, i.overrideActive)
+	i.report(err)
 
 	return err
+}
+
+// endFromScanner ends the iterator on behalf of a Scanner consumer, whose
+// Err has already closed the driver iterator.
+//
+// It shares closeOnce with Close, so the everyday idiom — a Scanner loop
+// under a deferred Close — reports the read exactly once, and a Close that
+// follows returns the error the Scanner already saw rather than closing the
+// driver iterator a second time.
+func (i *cqlIter) endFromScanner(err error) {
+	i.closeOnce.Do(func() {
+		i.closeErr = err
+		i.report(err)
+	})
+}
+
+// report releases the leg context and records the read's outcome. It never
+// touches the driver iterator, so both the Close path and the Scanner path
+// reach it once the driver has let its own resources go.
+func (i *cqlIter) report(err error) {
+	i.finishFirstPage()
+	i.client.health.iterClosed(i.holder, i.cluster, classifyReadErr(i.ctx, err), err, i.overrideActive)
 }
 
 // finishFirstPage releases the leg context the first page ran under,
 // however the caller is done with the iterator.
 //
-// It runs after the driver's own Close has returned, so a prefetch the
-// driver was still reading from is cancelled only once the driver has let
-// it go, and cleanup can never turn a clean close into an error.
-// finish is idempotent, so a Scanner consumer that also closes the
-// iterator releases the context once.
+// It runs after the driver has closed its iterator — from Close, or from a
+// Scanner consumer's Err — so a prefetch the driver was still reading from
+// is cancelled only once the driver has let it go, and cleanup can never
+// turn a clean close into an error.
 func (i *cqlIter) finishFirstPage() {
 	if i.firstPage == nil {
 		return
@@ -186,8 +206,8 @@ func (i *cqlIter) Warnings() []string {
 
 // cqlScanner wraps cql.Scanner to implement helix.Scanner.
 // It keeps the iterator it came from, because a consumer that switches to
-// the Scanner API stops using that iterator directly and releases its
-// resources through Err instead of Close.
+// the Scanner API stops using that iterator directly and ends the read
+// through Err instead of Close.
 type cqlScanner struct {
 	scanner cql.Scanner
 	owner   *cqlIter
@@ -201,11 +221,21 @@ func (s *cqlScanner) Scan(dest ...any) error {
 	return s.scanner.Scan(dest...)
 }
 
-// Err returns the iterator's error and releases its resources, including
-// the leg context the first page ran under.
+// Err returns the iterator's error and ends the read with it: the outcome
+// reaches the read strategy, the failover policy and auto-refresh exactly
+// as it does from Close, and the leg context the first page ran under is
+// released.
+//
+// Reporting from here is what keeps a Scanner consumer's cluster failures
+// visible. Without it a caller that drains with Scanner and never calls
+// Close would leave a failing cluster with a clean record: no breaker
+// input, no degraded marking, and reads still routed to it.
+//
+// The driver's own Err has already closed the iterator, so this adds no
+// second close.
 func (s *cqlScanner) Err() error {
 	err := s.scanner.Err()
-	s.owner.finishFirstPage()
+	s.owner.endFromScanner(err)
 
 	return err
 }

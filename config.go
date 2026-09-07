@@ -1404,6 +1404,13 @@ func WithClusterWriteTimeout(d time.Duration) Option {
 // bounded and counted like any other, but a paging cursor is only
 // meaningful on the cluster that issued it.
 //
+// One residual is worth knowing: d bounds the wait for the cluster's
+// answer, not every wait inside the driver. A token-aware first page can
+// block on another caller's in-flight routing-metadata load before its own
+// context is consulted, because neither driver makes that cache
+// cancellable, so such a leg can overrun d and end on the driver's own
+// request timeout instead.
+//
 // Size d by how long a healthy cluster may take to answer rather than by
 // the caller's budget. A caller whose deadline is shorter than 2*d can
 // still complete both legs when they answer quickly; what it cannot do is

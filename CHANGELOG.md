@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `Scanner` consumer's cluster failures now reach the read strategy, the failover policy and auto-refresh.
+  `Scanner().Err()` previously released the iterator's resources but reported no outcome, so a caller that drained with `Scanner()` and never called `Close()` left a failing cluster with a clean record — the circuit breaker took no input, the cluster was never marked degraded, and reads kept being routed to it.
+  `Err()` now ends the read exactly as `Close` does. It shares the same guard, so the everyday idiom — a `Scanner` loop under a deferred `Close` — still reports once, and a `Close` that follows returns the error the `Scanner` already saw without closing the driver's iterator a second time.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.5.1-otter`, up from `v2.5.0-otter`.
@@ -26,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   - Node-event debouncing is now bounded at 4 seconds. During sustained churn, topology events land within that window instead of being deferred until the burst ends.
   - A departed node can linger in the ring slightly longer in the narrow case where a peers snapshot contains a row that cannot be attributed to any host. The periodic full ring refresh that closes that window is not in this release.
+
+### Documentation
+
+- `WithClusterReadTimeout` now records the one case where its deadline is not a bound: a token-aware first page can block on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable, so such a leg can overrun `d` and end on the driver's own request timeout instead. The caveat was already in `docs/strategy-policy.md`; it was missing from the godoc a caller sizing timeouts actually reads.
 
 ## [1.9.0] — 2026-09-06
 
