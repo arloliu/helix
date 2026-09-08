@@ -744,6 +744,49 @@ func TestAdaptiveDualWrite_ErrorCountsAsStrike(t *testing.T) {
 	assert.False(t, a.IsDegraded(types.ClusterB))
 }
 
+// TestAdaptiveDualWrite_FailureBeforeTheCallerExpiredIsAStrike pins
+// provenance to the moment a leg returns: cluster A fails while the caller
+// is still waiting, and only afterwards does the caller's deadline end the
+// leg that B is holding. A's failure preceded the caller's expiry, so it
+// earns a strike and degrades A; B's leg ended with the caller and earns
+// none. Gating strikes on the context after both legs joined would spare A
+// as well, so a cluster that is down while its sibling is slow would never
+// degrade, and every such write would fail outright instead of falling back
+// to fire-and-forget.
+func TestAdaptiveDualWrite_FailureBeforeTheCallerExpiredIsAStrike(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(1))
+	errRefused := errors.New("connection refused")
+
+	run := func(t *testing.T, exec func(context.Context, func(context.Context) error, func(context.Context) error) (error, error)) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+
+		errA, errB := exec(ctx,
+			func(context.Context) error { return errRefused },
+			func(ctx context.Context) error {
+				<-ctx.Done()
+
+				return ctx.Err()
+			},
+		)
+		require.ErrorIs(t, errA, errRefused)
+		require.ErrorIs(t, errB, context.DeadlineExceeded)
+
+		assert.True(t, a.IsDegraded(types.ClusterA), "A failed while the caller was still waiting")
+		assert.False(t, a.IsDegraded(types.ClusterB), "B's leg ended with the caller's deadline")
+	}
+
+	t.Run("Execute", func(t *testing.T) {
+		run(t, a.Execute)
+	})
+
+	t.Run("ExecuteStrict", func(t *testing.T) {
+		a.Reset()
+		run(t, a.ExecuteStrict)
+	})
+}
+
 func TestAdaptiveDualWrite_ImplementsWriteStrategy(t *testing.T) {
 	// Verify AdaptiveDualWrite can be used where WriteStrategy is expected
 	var _ interface {
@@ -1065,8 +1108,8 @@ func TestAdaptiveDualWrite_HandleErrors_ExcludesDropped(t *testing.T) {
 	// If it were recorded as a strike, the slow counter would advance.
 	// We verify this does not happen by checking that B (which gets a nil)
 	// also stays unaffected and that A remains at 0 slow strikes.
-	a.handleErrors(types.ErrWriteDropped, nil)
-	a.handleErrors(types.ErrWriteDropped, nil)
+	a.handleErrors(types.ErrWriteDropped, nil, false, false)
+	a.handleErrors(types.ErrWriteDropped, nil, false, false)
 
 	// A was already degraded; verify it did not accumulate slow strikes from dropped errors.
 	// We use ForceRecover to reset degraded status and then check that strikes
@@ -1075,7 +1118,7 @@ func TestAdaptiveDualWrite_HandleErrors_ExcludesDropped(t *testing.T) {
 	require.False(t, a.IsDegraded(types.ClusterA), "after ForceRecover, cluster A must be healthy")
 
 	// One more dropped call — must not degrade with strikeThreshold=2.
-	a.handleErrors(types.ErrWriteDropped, nil)
+	a.handleErrors(types.ErrWriteDropped, nil, false, false)
 	assert.False(t, a.IsDegraded(types.ClusterA), "ErrWriteDropped must not count as a slow strike")
 }
 
@@ -1453,8 +1496,8 @@ func TestAdaptiveDualWrite_HandleErrors_ExcludesStrict(t *testing.T) {
 	a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(1))
 
 	// Two strict-sentinel calls must not record any strikes
-	a.handleErrors(types.ErrClusterDegraded, nil)
-	a.handleErrors(types.ErrClusterDraining, nil)
+	a.handleErrors(types.ErrClusterDegraded, nil, false, false)
+	a.handleErrors(types.ErrClusterDraining, nil, false, false)
 
 	assert.Equal(t, int32(0), a.stateA.slowStrikes)
 	assert.False(t, a.IsDegraded(types.ClusterA), "ErrClusterDegraded/ErrClusterDraining must not cause degradation")
