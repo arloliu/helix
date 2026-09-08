@@ -104,6 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The last drain state is still kept, since the cluster may in fact be draining;
   the warning is the signal to restart the watcher or clear the drain by hand.
 
+- `WithReadStrategy`, `WithWriteStrategy`, `WithFailoverPolicy`, `WithReplayWorker` and `WithTopologyWatcher`'s Godoc described what each instance does without saying that it serves one client.
+  `NewCQLClient` installs its event dispatcher, cluster names, metrics and logger into `StickyRead`, `PrimaryOnlyRead`, `CircuitBreaker`, `LatencyCircuitBreaker`, `AdaptiveDualWrite` and the replay worker as single slots, so a second client sharing an instance redirected the first client's events to its own dispatcher and gave both clients its cluster names.
+  `topology.Local` and `topology.NATS` hand every `Watch` caller the same channel, so two clients on one watcher each saw only some of the drain updates, and the first `Close` cancelled the watch for both.
+  The five options, the two watcher types and the configuration reference now state that an instance serves exactly one client for its lifetime;
+  a `Replayer` carries no client state and may still be shared.
+  No guard was added: the instances are caller-owned and the sharing was never supported.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.
