@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each leg now records whether the caller's context was already done at the moment it returned and is classified by that record;
   a leg that ended after the caller gave up is still the caller's, as before.
 
+- `NewCQLClient` now logs a startup warning when `WithRouteVeto(true)` (or `WithBehaviorProfile(Safe)`) is combined with `WithRecoveryProbeDisabled()`.
+  A vetoed cluster receives no ordinary or fallback read, so its breaker is reopened only by the recovery probe or by a failover leg that lands on it when the *other* cluster fails a read.
+  With the probe disabled, a `LatencyCircuitBreaker` that opened on a slow cluster while its sibling stayed healthy never closed, and reads stayed single-cluster for the life of the process with nothing logged.
+  Routing is unchanged; the warning names both options and how to resolve the combination, and the `WithRouteVeto` and `WithBehaviorProfile` godoc now state who can reopen a vetoed cluster.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.
