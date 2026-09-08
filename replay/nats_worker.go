@@ -87,8 +87,18 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		default:
 		}
 
+		// The depth gauge is read from the stream, not the consumers, so
+		// it is kept current while the cluster is gated too: the backlog
+		// it holds is what an operator watches while the gate is closed.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if now := time.Now(); !now.Before(nextDepthAt) {
+			b.reportDepth(ctx, cluster)
+			nextDepthAt = now.Add(depthRefreshInterval)
+		}
+
 		if !b.config.allows(cluster) {
 			// Leave the cluster's messages server-side while it is gated.
+			cancel()
 			b.config.observeIdle(cluster)
 			select {
 			case <-b.stopCh:
@@ -98,12 +108,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		result := b.dequeueWithPriority(ctx, cluster, highProcessed, ratio)
-		if now := time.Now(); !now.Before(nextDepthAt) {
-			b.reportDepth(ctx, cluster)
-			nextDepthAt = now.Add(depthRefreshInterval)
-		}
 		cancel()
 
 		highProcessed = result.highProcessed

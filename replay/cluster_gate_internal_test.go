@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/require"
 
 	"github.com/arloliu/helix/internal/logging"
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/types"
 )
 
@@ -182,4 +184,67 @@ func TestNATSBackend_StopWhileGatedNaksTailOnce(t *testing.T) {
 	}
 	require.Zero(t, executed.Load())
 	require.Equal(t, int32(3), naks.Load(), "each unprocessed message is NAK'd exactly once")
+}
+
+// depthGauge records every queue depth the worker reports.
+type depthGauge struct {
+	metrics.NopMetrics
+	mu     sync.Mutex
+	depths []int
+}
+
+func (g *depthGauge) SetReplayQueueDepth(_ types.ClusterID, depth int) {
+	g.mu.Lock()
+	g.depths = append(g.depths, depth)
+	g.mu.Unlock()
+}
+
+// backlogStream answers every Info with the same per-subject backlog.
+type backlogStream struct {
+	jetstream.Stream
+	msgs uint64
+}
+
+func (s *backlogStream) Info(context.Context, ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
+	return &jetstream.StreamInfo{
+		State: jetstream.StreamState{Subjects: map[string]uint64{"helix.replay.high.A": s.msgs}},
+	}, nil
+}
+
+// TestNATSBackend_ReportsDepthWhileGated proves a closed gate leaves the
+// cluster's messages server-side but still publishes their count as the
+// depth gauge, so an operator watching the quarantined cluster sees its
+// backlog rather than a frozen value.
+func TestNATSBackend_ReportsDepthWhileGated(t *testing.T) {
+	gauge := &depthGauge{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Metrics = gauge
+	WithClusterGate(func(types.ClusterID) bool { return false })(&cfg)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	parked := make(chan struct{})
+	b := &natsBackend{
+		replayer: &NATSReplayer{stream: &backlogStream{msgs: 3}},
+		config:   &cfg,
+		stopCh:   stop,
+		wg:       &wg,
+		backoffWait: func(time.Duration) <-chan time.Time {
+			parked <- struct{}{}
+
+			return nil // never fires; the test stops the worker
+		},
+	}
+	wg.Add(1)
+	go b.start(types.ClusterA)
+	select {
+	case <-parked:
+	case <-time.After(time.Second):
+		t.Fatal("the gated worker never reached its poll wait")
+	}
+	close(stop)
+	wg.Wait()
+
+	gauge.mu.Lock()
+	defer gauge.mu.Unlock()
+	require.Equal(t, []int{3}, gauge.depths, "the gated cluster's backlog is reported as its depth")
 }
