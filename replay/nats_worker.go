@@ -399,6 +399,10 @@ func (b *natsBackend) holdWhileGated(tail []ReplayMessage) bool {
 // terminates the message once it is exhausted; every other disposition
 // asks the server to redeliver after the backoff delay, for as long as the
 // stream retains the message.
+//
+// The budget is released only once the server accepts the Term. A refused
+// Term brings the message back after AckWait, and it is terminated again
+// then rather than starting a fresh budget.
 func (b *natsBackend) settleRetained(msg ReplayMessage, err error) {
 	disposition := b.config.Classifier(err)
 	attempt := int(min(msg.DeliveryCount, 1<<30)) //nolint:gosec // clamped before conversion
@@ -408,8 +412,8 @@ func (b *natsBackend) settleRetained(msg ReplayMessage, err error) {
 		if count >= b.config.MaxAttempts {
 			if b.termMessage(msg, "dead-lettered") {
 				b.recordDrop(msg, err, types.ReplayDropDeadLetter)
+				b.forgetDeadLetters(msg.StreamSequence)
 			}
-			b.forgetDeadLetters(msg.StreamSequence)
 
 			return
 		}

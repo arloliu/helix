@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/types"
 )
 
@@ -109,6 +110,62 @@ func TestNATSBackend_SettleRetained_TerminatesAfterDeadLetterBudget(t *testing.T
 	assert.Equal(t, 1, terms, "second dead-letter attempt exhausts MaxAttempts=2")
 	assert.Equal(t, 1, dropped)
 	assert.Empty(t, b.deadLetters, "the counter is released with the message")
+}
+
+// A refused Term on an exhausted poison budget keeps the budget: the
+// message comes back after AckWait, the next settlement Terms it again and
+// drops it as soon as the server accepts, instead of starting a fresh
+// budget for the same poison payload.
+func TestNATSBackend_SettleRetained_RefusedTermKeepsDeadLetterBudget(t *testing.T) {
+	const seq = 7
+
+	var naks, terms int
+	msg := ReplayMessage{
+		Payload:          types.ReplayPayload{TargetCluster: types.ClusterA, Query: "INSERT test"},
+		nakWithDelayFunc: func(time.Duration) error { naks++; return nil },
+		termFunc:         func() error { terms++; return errors.New("term refused") },
+		DeliveryCount:    1,
+		StreamSequence:   seq,
+	}
+
+	drops := &dropReasonCounter{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Metrics = drops
+	cfg.RetryPolicy = RetryWhileRetained
+	cfg.MaxAttempts = 2
+	cfg.Classifier = func(error) ReplayDisposition { return DispositionDeadLetter }
+	var dropped int
+	cfg.OnDrop = func(types.ReplayPayload, error) { dropped++ }
+	b := &natsBackend{config: &cfg, deadLetters: make(map[uint64]int)}
+
+	poison := errors.New("poison")
+	b.settleRetained(msg, poison)
+	require.Equal(t, 1, naks, "first dead-letter attempt is still retried")
+
+	b.settleRetained(msg, poison)
+	require.Equal(t, 1, terms, "second dead-letter attempt exhausts MaxAttempts=2")
+	assert.Zero(t, dropped, "a refused Term is not a drop: the message comes back")
+	assert.Equal(t, 2, b.deadLetters[seq], "the refused Term keeps the budget")
+
+	// The server redelivers the message after AckWait; this time it accepts the Term.
+	msg.termFunc = func() error { terms++; return nil }
+	msg.DeliveryCount = 2
+	b.settleRetained(msg, poison)
+	assert.Equal(t, 1, naks, "the redelivery is not retried again")
+	assert.Equal(t, 2, terms, "the redelivery is terminated at once")
+	assert.Equal(t, 1, dropped, "and dropped as soon as the server accepts the Term")
+	assert.Equal(t, []string{types.ReplayDropDeadLetter}, drops.reasons)
+	assert.Empty(t, b.deadLetters, "the counter is released with the message")
+}
+
+// dropReasonCounter records the reason label of every worker drop.
+type dropReasonCounter struct {
+	metrics.NopMetrics
+	reasons []string
+}
+
+func (d *dropReasonCounter) IncReplayWorkerDropped(_ types.ClusterID, reason string) {
+	d.reasons = append(d.reasons, reason)
 }
 
 func TestRedeliverySchedule(t *testing.T) {
