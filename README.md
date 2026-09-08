@@ -54,7 +54,7 @@ needs the same line before this compiles:
 ```
 require github.com/apache/cassandra-gocql-driver/v2 v2.1.2
 
-replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.1-otter
+replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.2-otter
 ```
 
 The v1 adapter (`adapter/cql/v1`, over `github.com/gocql/gocql`) is still
@@ -440,13 +440,13 @@ See the [examples](examples/) directory:
 
 - Go 1.26+
 - For CQL: v2 (recommended): `github.com/apache/cassandra-gocql-driver`, or v1: `github.com/gocql/gocql`
-- Helix builds the v2 adapter against the `arloliu/cassandra-gocql-driver` fork (tag `v2.6.1-otter`)
+- Helix builds the v2 adapter against the `arloliu/cassandra-gocql-driver` fork (tag `v2.6.2-otter`)
   through a `replace` directive.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must add the same
   line to its own `go.mod`:
 
   ```
-  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.1-otter
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.2-otter
   ```
 
   The fork lets a caller's context deadline override the connection-level request timeout, so a read

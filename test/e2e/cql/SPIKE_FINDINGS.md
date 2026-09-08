@@ -207,6 +207,31 @@ than across local runs: CI is the same machine shape every time, whereas a
 local run competes with whatever else is on the workstation — this one had to be
 split into two `go test` processes to get past a memory watchdog, giving each
 half its own cluster pair.
+
+**Amendment 2026-09-08 (`v2.6.2-otter`):** the fork's speculative-execution
+stage. Speculative execution itself never runs here — nothing in Helix sets a
+`SpeculativeExecutionPolicy` — but three of its changes are live on ordinary
+paths. The paging race fix reaches every read, since the driver's default page
+size of 5000 makes every query a paged one: a page after the first used to be
+built by copying the whole query struct, and is now carried field by field with
+the consistency read atomically. The retry loop now closes the iterator it
+supersedes, which is live for any statement not marked `NonIdempotent` — the
+default. And a panic out of an observer or retry-policy callback now closes the
+iterator it was holding, without altering the panic.
+
+None of that is expected to move a timing, and none did: 52 pass / 0 fail /
+0 skip, `TestS3_PauseA_LatencyCircuitBreaker` 24.63 s (was 24.78),
+`TestS_PlainCircuitBreaker_TripAndClose` 20.64 s (was 20.61),
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.25 s (was 10.31),
+`TestS_PauseA_CloseReturnsDuringFault` 82.90 s (was 82.83) with its
+goroutine-leak assertion at the tolerance of 10, and
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 17.95 s against 16.80 s
+— which is exactly the spread the amendment above established as this
+scenario's noise floor, and is not read as anything.
+
+Split into two `go test` processes again, for the same memory-watchdog reason.
+The observable this release actually changes is framers reclaimed under
+retry-heavy load, which nothing here measures.
 The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
 the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
 new `TestS_PauseA_CloseReturnsDuringFault`).
