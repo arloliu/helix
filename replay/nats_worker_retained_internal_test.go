@@ -46,7 +46,7 @@ func TestNATSBackend_ProcessMessages_MarksInProgressBeforeEachExecute(t *testing
 		stopCh: make(chan struct{}),
 	}
 
-	b.processMessages(msgs, true)
+	b.processMessages(t.Context(), msgs, true)
 
 	assert.Equal(t, []string{"progress", "execute", "progress", "execute", "progress", "execute"}, events)
 }

@@ -71,6 +71,12 @@ type natsDequeueResult struct {
 func (b *natsBackend) start(cluster types.ClusterID) {
 	defer b.wg.Done()
 
+	// Stop cancels the depth read, the fetch and the attempt in flight, so
+	// a server or a cluster that stops answering cannot hold Worker.Stop
+	// for their timeouts.
+	base, cancelBase := b.stopContext()
+	defer cancelBase()
+
 	highProcessed := 0
 	ratio := b.config.HighPriorityRatio
 	if ratio <= 0 {
@@ -90,7 +96,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		// The depth gauge is read from the stream, not the consumers, so
 		// it is kept current while the cluster is gated too: the backlog
 		// it holds is what an operator watches while the gate is closed.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(base, 5*time.Second)
 		if now := time.Now(); !now.Before(nextDepthAt) {
 			b.reportDepth(ctx, cluster)
 			nextDepthAt = now.Add(depthRefreshInterval)
@@ -120,10 +126,13 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 		// otherwise each occurrence would burn a JetStream delivery attempt
 		// without execute() ever running on the fetched messages.
 		if len(result.msgs) > 0 {
-			b.processMessages(result.msgs, retained)
+			b.processMessages(base, result.msgs, retained)
 		}
 
 		if result.err != nil {
+			if base.Err() != nil {
+				return // Stop cut the fetch short; that is not a failure.
+			}
 			b.config.Logger.Error("failed to dequeue replay messages",
 				"cluster", b.clusterName(cluster),
 				"error", result.err.Error(),
@@ -241,18 +250,21 @@ func (b *natsBackend) dequeueHighFirst(ctx context.Context, cluster types.Cluste
 	return natsDequeueResult{msgs: msgs, err: err, highProcessed: newCount}
 }
 
-// processMessages processes a batch of NATS replay messages.
+// processMessages processes a batch of NATS replay messages; ctx ends
+// when the worker stops and bounds every attempt.
 //
 // On shutdown, the current message AND all remaining messages in the batch
 // are Nak'd so they redeliver immediately. Without naking the tail, those
 // messages would sit unacknowledged until AckWait expires (default 30s)
 // before a restarted worker could re-process them — a long visible delay
 // during graceful restarts.
+// An attempt that ctx cancels is treated the same way:
+// the message was not tried, so it is not charged a failure.
 //
 // Under RetryWhileRetained every message is marked in progress before it
 // is executed, so a slow batch is not redelivered while it is still being
 // worked through, and failures are settled by settleRetained.
-func (b *natsBackend) processMessages(msgs []ReplayMessage, retained bool) {
+func (b *natsBackend) processMessages(ctx context.Context, msgs []ReplayMessage, retained bool) {
 	for i, msg := range msgs {
 		select {
 		case <-b.stopCh:
@@ -278,8 +290,16 @@ func (b *natsBackend) processMessages(msgs []ReplayMessage, retained bool) {
 		b.config.observeAge(msg.Payload)
 
 		start := time.Now()
-		err := b.executeOnce(msg.Payload)
+		err := b.executeOnce(ctx, msg.Payload)
 		elapsed := time.Since(start).Seconds()
+
+		if err != nil && ctx.Err() != nil {
+			// Stop cancelled the attempt: the message goes back with the
+			// rest of the batch rather than being settled as a failure.
+			b.nakTail(msgs[i:])
+
+			return
+		}
 
 		if err != nil {
 			b.config.Metrics.IncReplayError(msg.Payload.TargetCluster)
@@ -345,6 +365,24 @@ func (b *natsBackend) after(d time.Duration) <-chan time.Time {
 	}
 
 	return time.After(d)
+}
+
+// stopContext returns a context that ends when the worker stops or when
+// the returned cancel runs, so a remote call in flight cannot hold
+// Worker.Stop for its own timeout.
+// The goroutine that bridges stopCh to the context lives until either
+// happens; call cancel when the goroutine that owns the context returns.
+func (b *natsBackend) stopContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-b.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	return ctx, cancel
 }
 
 // nakTail NAKs every message in tail; see processMessages for why a
@@ -576,9 +614,10 @@ func (b *natsBackend) termMessage(msg ReplayMessage, reason string) bool {
 	return true
 }
 
-// executeOnce executes a single replay attempt with timeout.
-func (b *natsBackend) executeOnce(payload types.ReplayPayload) error {
-	ctx, cancel := context.WithTimeout(context.Background(), b.config.ExecuteTimeout)
+// executeOnce executes a single replay attempt, bounded by ExecuteTimeout
+// and by ctx.
+func (b *natsBackend) executeOnce(ctx context.Context, payload types.ReplayPayload) error {
+	ctx, cancel := context.WithTimeout(ctx, b.config.ExecuteTimeout)
 	defer cancel()
 
 	return b.execute(ctx, payload)
