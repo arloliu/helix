@@ -238,8 +238,15 @@ func (q *cqlQuery) ExecContext(ctx context.Context) (err error) {
 		return err
 	}
 
+	// A write strategy may keep a leg running after this call returns, and the
+	// driver marshals the arguments when the leg runs.
+	// Copy the byte-slice contents once, before dispatch, so the caller may
+	// reuse its buffers as soon as Exec returns.
+	values := snapshotByteArgs(q.values)
+	wc.args = values
+
 	err = q.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
-		query := session.Query(q.statement, q.values...)
+		query := session.Query(q.statement, values...)
 		query = q.applyConfig(query)
 		// Important for writes to generate the timestamp on the client side
 		// to ensure consistency across clusters

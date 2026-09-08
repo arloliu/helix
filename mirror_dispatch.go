@@ -353,6 +353,69 @@ func cloneBatchEntries(entries []batchEntry) []types.BatchStatement {
 	return out
 }
 
+// hasCopyableByteArg reports whether args holds a []byte with content, that
+// is, whether [snapshotByteArgs] has anything to copy.
+func hasCopyableByteArg(args []any) bool {
+	for _, a := range args {
+		if b, ok := a.([]byte); ok && len(b) > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// snapshotByteArgs returns args with the contents of every []byte element
+// copied, so a write leg that a strategy keeps running after Exec returned
+// marshals the bytes the caller passed rather than whatever the caller wrote
+// into its buffer afterwards.
+//
+// args itself is returned when no element holds bytes to copy, so a write
+// without byte arguments allocates nothing.
+// A nil []byte stays nil, keeping a NULL value distinct from an empty one.
+// Every other type is carried over by value, with the same semantics as [cloneArgs].
+func snapshotByteArgs(args []any) []any {
+	if !hasCopyableByteArg(args) {
+		return args
+	}
+
+	out := make([]any, len(args))
+	for i, a := range args {
+		if b, ok := a.([]byte); ok && b != nil {
+			cp := make([]byte, len(b))
+			copy(cp, b)
+			out[i] = cp
+
+			continue
+		}
+		out[i] = a
+	}
+
+	return out
+}
+
+// snapshotBatchByteArgs applies [snapshotByteArgs] to the arguments of every
+// entry.
+// entries itself is returned when no entry holds bytes to copy.
+func snapshotBatchByteArgs(entries []batchEntry) []batchEntry {
+	out := entries
+	copied := false
+
+	for i, e := range entries {
+		if !hasCopyableByteArg(e.args) {
+			continue
+		}
+		if !copied {
+			out = make([]batchEntry, len(entries))
+			copy(out, entries)
+			copied = true
+		}
+		out[i].args = snapshotByteArgs(e.args)
+	}
+
+	return out
+}
+
 // mirrorTargetCluster is the conventional TargetCluster value attached to
 // every mirror payload. Mirror writes target the mirror destination as a
 // single logical sink — the destination's own write strategy (dual-write,
