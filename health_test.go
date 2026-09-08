@@ -2,6 +2,7 @@ package helix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -65,6 +66,41 @@ type spyLatencyPolicy struct{ spyPolicy }
 func (p *spyLatencyPolicy) RecordLatency(cluster ClusterID, _ time.Duration) {
 	p.log.add("policy.RecordLatency(" + string(cluster) + ")")
 }
+
+// errClosedByDriver is what a driver returns for work outstanding when its
+// session is closed.
+var errClosedByDriver = errors.New("driver: session closed")
+
+// closeAbortingSession is a readProbeSession whose reads block until the
+// session is closed and then fail with errClosedByDriver, the way a driver
+// fails outstanding work on Close. entered receives once per read that
+// has loaded the session and is blocked inside it.
+type closeAbortingSession struct {
+	readProbeSession
+	entered   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newCloseAbortingSession() *closeAbortingSession {
+	s := &closeAbortingSession{
+		entered: make(chan struct{}, 8),
+		closed:  make(chan struct{}),
+	}
+	s.setScan(func(ctx context.Context) error {
+		s.entered <- struct{}{}
+		select {
+		case <-s.closed:
+			return errClosedByDriver
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	return s
+}
+
+func (s *closeAbortingSession) Close() { s.closeOnce.Do(func() { close(s.closed) }) }
 
 type hubFixture struct {
 	log    *authorityLog
@@ -283,4 +319,48 @@ func TestHub_SwappedSessionStartsFresh(t *testing.T) {
 	require.Zero(t, client.statsForCluster(ClusterA).consecutiveFailures.Load())
 }
 
+// A read that captured the old session and is then aborted by
+// RefreshSession's own teardown of that session is not charged to the
+// cluster: the failover policy hears nothing about a session that is no
+// longer installed, while a read on the installed session still reports.
+func TestHub_RetiredSessionOutcomeIsWithheld(t *testing.T) {
+	log := &authorityLog{}
+	old := newCloseAbortingSession()
+	fresh := newReadProbeSession()
+	fresh.setScan(func(context.Context) error { return errUnreachableForTest })
+	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return fresh, nil }
+	// No WithAutoRefresh: RefreshSession closes the old session at once.
+	client, err := NewCQLClient(old, newReadProbeSession(),
+		WithReadStrategy(&spyStrategy{log: log}),
+		WithFailoverPolicy(&spyPolicy{log: log}),
+		WithSessionRefresher(refresher),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	done := make(chan error, 1)
+	go func() {
+		var v int
+		done <- client.Query("SELECT v FROM t WHERE k = ?", 1).ScanContext(context.Background(), &v)
+	}()
+	<-old.entered // the read has loaded the old holder and is blocked inside the session
+
+	require.NoError(t, client.RefreshSession(t.Context(), ClusterA))
+	require.NoError(t, <-done, "the aborted read fails over to cluster B")
+	require.NotContains(t, log.snapshot(), "policy.RecordFailure(A)",
+		"the old session's teardown must not be charged to the cluster")
+
+	// The installed session's own failure still reaches the policy.
+	var v int
+	require.NoError(t, client.Query("SELECT v FROM t WHERE k = ?", 2).ScanContext(t.Context(), &v))
+	var charged int
+	for _, call := range log.snapshot() {
+		if call == "policy.RecordFailure(A)" {
+			charged++
+		}
+	}
+	require.Equal(t, 1, charged, "exactly the installed session's failure is recorded")
+}
+
 var _ cql.Session = (*blockingSession)(nil)
+var _ cql.Session = (*closeAbortingSession)(nil)

@@ -368,6 +368,8 @@ func (c *CQLClient) Close() {
 //     decides when in-flights are quiet and calls [cql.Session.Close]
 //     accordingly. Calling Close on the returned session before in-flights
 //     drain may abort them.
+//     Whatever an in-flight on the old session reports after the swap is not charged to the cluster:
+//     the failover policy and the read strategy hear only about the installed session.
 //
 // Parameters:
 //   - cluster: The cluster whose session to replace.
@@ -393,6 +395,7 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 	}
 
 	old := slot.Swap(c.newSessionHolder(newSession))
+	old.retired.Store(true)
 
 	return old.s, nil
 }
@@ -420,7 +423,10 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 // once. Without [WithAutoRefresh] the grace period is zero and the old
 // session closes immediately after the swap, and drivers that fail
 // outstanding work on Close will abort in-flight operations that captured
-// it. Use RefreshSession only when the old session is already
+// it.
+// Their callers see the driver's error, but the outcome is not charged to the cluster:
+// once the swap has happened, the failover policy and the read strategy hear nothing about the old session.
+// Use RefreshSession only when the old session is already
 // non-functional; to control the teardown yourself, use SwapSession and
 // close the returned session once the in-flights are quiet.
 //
@@ -506,6 +512,8 @@ func (c *CQLClient) replaceHolder(
 
 		return types.ErrSessionReplaced
 	}
+	// Retire before closing, so whatever the close aborts is already withheld from the routing authorities when it reports.
+	holder.retired.Store(true)
 
 	// Refresh contract: the old session is dead, so close it on the
 	// caller's behalf. SwapSession's contract differs ("caller closes")
