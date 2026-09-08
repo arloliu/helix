@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With one cluster down and the NATS server unreachable, every default-strategy write therefore held the caller for the leg timeout plus the publish timeout and then reported the replay dropped.
   `WithClusterWriteTimeout`, `WithReplayer`, `replay.WithPublishTimeout` and the replay guide now state the extra bound;
   the behaviour is unchanged, because a shorter bound would drop admissions that would have succeeded.
+- The client now logs a warning when the topology watcher's update channel closes while the client is still open,
+  naming the drain state each cluster is frozen at.
+  Previously the watch loop returned silently,
+  so a cluster left marked as draining
+  — because the caller closed the `topology.Local` or `topology.NATS` watcher, or the NATS watch loop exited —
+  kept having every write skipped and enqueued for replay while the replay gate refused that same cluster,
+  and the backlog grew with no operator signal.
+  The last drain state is still kept, since the cluster may in fact be draining;
+  the warning is the signal to restart the watcher or clear the drain by hand.
 
 ### Changed
 

@@ -154,6 +154,15 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 // otherwise block this goroutine forever and defeat [CQLClient.Close]'s
 // cancellation of topologyCtx. The select loop below (mirroring
 // autoRefreshLoop) gives topologyCtx.Done() an independent exit path.
+//
+// An update channel that closes while the client is still open
+// (the caller closed the watcher, or its watch loop exited)
+// leaves the drain flags at their last value:
+// nothing will ever clear them,
+// a cluster frozen as draining keeps having its writes skipped and enqueued for replay,
+// and the replay gate keeps refusing that same cluster.
+// The flags are deliberately not reset — the cluster may well still be draining —
+// so the exit is logged with the state each cluster is frozen at.
 func (c *CQLClient) watchTopology() {
 	updates := c.config.TopologyWatcher.Watch(c.topologyCtx)
 	if updates == nil {
@@ -166,6 +175,10 @@ func (c *CQLClient) watchTopology() {
 			return
 		case update, ok := <-updates:
 			if !ok {
+				if c.topologyCtx.Err() == nil {
+					c.warnTopologyStopped()
+				}
+
 				return
 			}
 
@@ -201,6 +214,22 @@ func (c *CQLClient) watchTopology() {
 			}
 		}
 	}
+}
+
+// warnTopologyStopped logs that the watcher's update channel closed while the client is open,
+// with the drain state each cluster is now frozen at.
+func (c *CQLClient) warnTopologyStopped() {
+	kvs := []any{
+		"clusterA", c.clusterName(ClusterA),
+		"drainingA", c.drainA.Load(),
+	}
+	if !c.singleCluster {
+		kvs = append(kvs,
+			"clusterB", c.clusterName(ClusterB),
+			"drainingB", c.drainB.Load(),
+		)
+	}
+	c.config.Logger.Warn("topology updates stopped; keeping last drain state", kvs...)
 }
 
 // IsDraining returns whether the specified cluster is currently in drain mode.
