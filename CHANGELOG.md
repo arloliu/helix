@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An outcome observed against a retired holder still updates that holder's stats and the read metrics, but reaches neither the failover policy nor the read strategy.
   A probe that ran on a retired holder settles as `ProbeAbandoned` exactly as one the client cancelled, so the breaker gets its reservation back and nothing is recorded.
 
+- A write leg that fails while the caller is still waiting is now the cluster's failure even when the caller's context ends before the sibling leg returns.
+  Each leg of a dual write was classified only after both legs had joined, against the caller's context as it stood at that moment —
+  so when one cluster refused the write at once and the other held it until the caller's deadline, the fast failure was reclassified as the caller's along with the slow one.
+  That cluster recorded no write error, no session-liveness failure and nothing for auto-refresh,
+  and `AdaptiveDualWrite` gave it no strike,
+  so a cluster that was down while its sibling was slow never degraded
+  and every such write returned `*types.DualClusterError` instead of falling back to fire-and-forget with replay.
+  Each leg now records whether the caller's context was already done at the moment it returned and is classified by that record;
+  a leg that ended after the caller gave up is still the caller's, as before.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.

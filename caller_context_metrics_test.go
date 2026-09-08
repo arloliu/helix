@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/policy"
 	"github.com/arloliu/helix/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -329,4 +331,54 @@ func TestCallerContextMetrics_ClusterErrorsAreNotCounted(t *testing.T) {
 		require.Equal(t, int32(0), mc.writeExpiredB.Load())
 		require.Equal(t, int32(1), mc.writeErrors.Load(), "A's failed leg is A's own")
 	})
+}
+
+// TestCallerContextMetrics_FailureBeforeTheCallerExpiredIsTheClusters pins
+// provenance to the moment a leg returns: cluster A refuses the write while
+// the caller is still waiting, and only afterwards does the caller's
+// deadline end the sibling leg that B is holding. A's failure preceded the
+// caller's expiry, so it is A's own — a write error, a health strike — and
+// only B's leg is the caller's. Classifying both legs against the context
+// after the sibling joined would hand A's failure to the caller too, and a
+// cluster that is down would leave no trace while its sibling is slow.
+func TestCallerContextMetrics_FailureBeforeTheCallerExpiredIsTheClusters(t *testing.T) {
+	errRefused := fmt.Errorf("connection refused: %w", types.ErrClusterUnreachable)
+
+	tests := []struct {
+		name   string
+		strict bool
+	}{
+		{name: "replaying path"},
+		{name: "strict path", strict: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sa, sb := newMockSession(), newBlockingSession()
+			sa.execErr = errRefused
+			client, mc := newCallerExpiredClient(t, sa, sb, WithReplayer(&mockReplayer{}))
+
+			// A answers at once; B holds the write until the caller's deadline
+			// ends it, so the legs join only after the context is done.
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+
+			q := client.Query("INSERT INTO t (k) VALUES (?)", "x")
+			if tt.strict {
+				q = q.Strict()
+			}
+			err := q.ExecContext(ctx)
+			var dual *types.DualClusterError
+			require.ErrorAs(t, err, &dual)
+			require.ErrorIs(t, dual.ErrorA, errRefused)
+			require.ErrorIs(t, dual.ErrorB, context.DeadlineExceeded)
+
+			assert.Equal(t, int32(1), client.statsForCluster(ClusterA).consecutiveFailures.Load(),
+				"A failed while the caller was still waiting, so the failure is A's own")
+			assert.Equal(t, int32(1), mc.writeErrors.Load(), "A's failed leg is a write error")
+			assert.Equal(t, int32(0), mc.writeExpiredA.Load(), "A did not outlive the caller")
+			assert.Equal(t, int32(1), mc.writeExpiredB.Load(), "B's leg ended with the caller's deadline")
+			assert.Equal(t, int32(0), client.statsForCluster(ClusterB).consecutiveFailures.Load())
+		})
+	}
 }
