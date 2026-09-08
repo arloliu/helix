@@ -89,7 +89,7 @@ func TestNATSBackend_HoldsFetchedBatchWhileGated(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go func() { b.processMessages(msgs, false); close(done) }()
+	go func() { b.processMessages(t.Context(), msgs, false); close(done) }()
 
 	// Several hold intervals pass: every message is kept in progress
 	// (refreshed at most once per third of AckWait, so exactly once
@@ -174,7 +174,7 @@ func TestNATSBackend_StopWhileGatedNaksTailOnce(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go func() { b.processMessages(msgs, false); close(done) }()
+	go func() { b.processMessages(t.Context(), msgs, false); close(done) }()
 	ticks <- time.Time{} // one hold interval, so the hold loop is running
 	close(stopCh)
 	select {

@@ -74,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The depth is read from the stream rather than the consumers,
   so it is now reported on the same cadence whether or not the gate admits the cluster.
 
+- `Worker.Stop` on a NATS worker — and so `CQLClient.Close` — now returns as soon as the worker's remote calls honour cancellation,
+  instead of waiting out the attempt in flight and the stream lookup behind it.
+  The attempt's context came from `context.Background()` with `WithExecuteTimeout` (30s by default),
+  and each cluster goroutine's depth read from a 5s `context.Background()` context serialised behind a mutex,
+  so a slow-but-alive cluster plus a NATS server that stopped answering could hold `Close` for the sum of those timeouts.
+  Both contexts now descend from one that `Stop` cancels, as the eviction watch's already did;
+  the timeouts themselves are unchanged.
+  A message whose attempt `Stop` cancels is NAK'd for immediate redelivery with the rest of its batch, as a message never reached was,
+  so it is neither counted as a replay error nor charged a delivery,
+  and a fetch `Stop` cuts short is no longer logged as a dequeue failure.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.

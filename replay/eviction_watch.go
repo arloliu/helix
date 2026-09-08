@@ -62,15 +62,8 @@ func (b *natsBackend) watchEvictions() {
 
 	// Stop cancels a poll in flight, so a server that stops answering
 	// cannot hold Worker.Stop for the poll's timeout.
-	base, cancelBase := context.WithCancel(context.Background())
+	base, cancelBase := b.stopContext()
 	defer cancelBase()
-	go func() {
-		select {
-		case <-b.stopCh:
-			cancelBase()
-		case <-base.Done():
-		}
-	}()
 
 	var ledger evictionLedger
 	for {
