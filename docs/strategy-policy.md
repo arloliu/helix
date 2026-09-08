@@ -757,7 +757,7 @@ For a dual-cluster client with `WithClusterReadTimeout(d)`, that page is a read 
 
 A first page that expires is `ErrClusterTimeout` for its cluster,
 and the read is retried once on the alternative under the same failover gating a `Scan` uses:
-the failover policy's `ShouldFailover`, then the read strategy's `OnFailure`, then the drain check.
+the failover policy's `ShouldFailover`, then the drain check, then the read strategy's `OnFailure`.
 When the alternative answers, the iterator that comes back belongs to it:
 `PageState()` encodes the alternative and `Close()` reports to it.
 When failover is refused or both legs expire, `Close()` returns `ErrClusterTimeout` or a `*types.DualClusterError`.

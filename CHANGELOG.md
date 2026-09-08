@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A vetoed cluster receives no ordinary or fallback read, so its breaker is reopened only by the recovery probe or by a failover leg that lands on it when the *other* cluster fails a read.
   With the probe disabled, a `LatencyCircuitBreaker` that opened on a slow cluster while its sibling stayed healthy never closed, and reads stayed single-cluster for the life of the process with nothing logged.
   Routing is unchanged; the warning names both options and how to resolve the combination, and the `WithRouteVeto` and `WithBehaviorProfile` godoc now state who can reopen a vetoed cluster.
+- A read failover the client refuses no longer moves the read strategy's preference, so the `read_preferred` gauge and `read_route_changed` events keep describing the cluster reads actually go to.
+  The failover gating asked `ReadStrategy.OnFailure` for the alternative before checking whether that alternative was draining or whether the caller's context had already ended,
+  and `StickyRead` and `PrimaryOnlyRead` move their preference as they answer.
+  So while cluster B was draining, a failing read on A moved the preference, the gauge and the event stream to B even though every following read was steered back to A,
+  and the routing dashboard disagreed with the traffic for the whole drain window.
+  The drain gate and the context check now run first,
+  and the strategy is only consulted for a failover the client will take.
 
 ### Changed
 
