@@ -55,10 +55,11 @@ func (m *mockSession) Batch(_ cql.BatchType) cql.Batch {
 	return b
 }
 
+// Close records the first Close's timestamp before it flips closed,
+// so a test that observes closed==true can read a non-zero closedAt.
 func (m *mockSession) Close() {
-	if m.closed.CompareAndSwap(false, true) {
-		m.closedAt.Store(time.Now().UnixNano())
-	}
+	m.closedAt.CompareAndSwap(0, time.Now().UnixNano())
+	m.closed.Store(true)
 }
 
 // mockQuery implements cql.Query for testing.
