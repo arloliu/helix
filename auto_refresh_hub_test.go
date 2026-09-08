@@ -222,6 +222,69 @@ func TestRecoveryProbe_CancelledByCloseRecordsNothing(t *testing.T) {
 	require.Zero(t, probes.failureA.Load(), "nor a probe failure")
 }
 
+// probeOutcomeSpy is a failover policy that reserves one probe for cluster
+// A and reports how the client settled it.
+type probeOutcomeSpy struct {
+	reserved atomic.Bool
+	outcomes chan types.ProbeOutcome
+}
+
+func (p *probeOutcomeSpy) ShouldFailover(ClusterID, error) bool { return true }
+func (p *probeOutcomeSpy) RecordFailure(ClusterID)              {}
+func (p *probeOutcomeSpy) RecordSuccess(ClusterID)              {}
+
+func (p *probeOutcomeSpy) TryBeginFailoverProbe(cluster ClusterID) (uint64, bool) {
+	if cluster != ClusterA || !p.reserved.CompareAndSwap(false, true) {
+		return 0, false
+	}
+
+	return 1, true
+}
+
+func (p *probeOutcomeSpy) CompleteFailoverProbe(_ ClusterID, _ uint64, outcome types.ProbeOutcome) {
+	p.outcomes <- outcome
+}
+
+// A probe whose session RefreshSession retires while it runs proves
+// nothing about the session now installed: it is abandoned, exactly as a
+// probe the client cancelled, not reported as a failure that would restart
+// the breaker's reset timeout.
+func TestRecoveryProbe_RetiredMidProbeIsAbandoned(t *testing.T) {
+	old := newCloseAbortingSession()
+	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return newReadProbeSession(), nil }
+	fp := &probeOutcomeSpy{outcomes: make(chan types.ProbeOutcome, 1)}
+	probe := RecoveryProbe{
+		Probe: func(ctx context.Context, s cql.Session) error {
+			var v int
+
+			return s.Query("SELECT now() FROM system.local").ScanContext(ctx, &v)
+		},
+		Interval: 5 * time.Millisecond,
+		Timeout:  time.Hour,
+	}
+	probes := &probeCounters{}
+	// No WithAutoRefresh: RefreshSession closes the old session at once,
+	// and the driver fails the probe's read that is outstanding on it.
+	client, err := NewCQLClient(old, newReadProbeSession(),
+		WithFailoverPolicy(fp),
+		WithRecoveryProbe(probe),
+		WithSessionRefresher(refresher),
+		WithMetrics(probes),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	<-old.entered // the probe has loaded the old holder and is blocked inside the session
+
+	require.NoError(t, client.RefreshSession(t.Context(), ClusterA))
+	select {
+	case outcome := <-fp.outcomes:
+		require.Equal(t, types.ProbeAbandoned, outcome, "the reservation goes back; nothing was learnt about the installed session")
+	case <-time.After(time.Second):
+		t.Fatal("the probe never settled")
+	}
+	require.Zero(t, probes.failureA.Load(), "an abandoned probe is not a probe failure")
+}
+
 func TestRefreshSession_ClosesOldSessionAfterGrace(t *testing.T) {
 	old := newMockSession()
 	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return newMockSession(), nil }

@@ -22,9 +22,12 @@ import (
 // an already classified kind next to the original error.
 //
 // Stats live on the holder an attempt used, so a report that lands after a
-// session swap updates the replaced holder and never the installed one;
-// the routing authorities still hear it, because they describe the
-// cluster rather than the session.
+// session swap updates the replaced holder and never the installed one.
+// The routing authorities do not hear such a report either:
+// an outcome observed against a retired holder describes a session that is no longer installed,
+// and charging RefreshSession's own teardown of the old session to the cluster could open the breaker
+// on a cluster that has just been given a healthy session.
+// The metrics still count it, because they count what the client did.
 //
 // Deliberately outside the hub: immediate query CAS (reports no health
 // today), source-side mirror execution (its payloads name a logical sink,
@@ -57,9 +60,9 @@ type clusterHealth struct {
 type probeKind uint8
 
 const (
-	probeOK       probeKind = iota
-	probeFailed             // a cluster error, or the probe's own timeout
-	probeCanceled           // the client's probe context ended (Close)
+	probeOK        probeKind = iota
+	probeFailed              // a cluster error, or the probe's own timeout
+	probeAbandoned           // the client's probe context ended (Close), or the probed session was retired meanwhile
 )
 
 // newClusterHealth resolves the authorities once at construction.
@@ -92,9 +95,9 @@ func newClusterHealth(config *ClientConfig, dual bool) clusterHealth {
 // (the sample is its success signal, and calling RecordSuccess as well
 // would erase the slow-read count a latency breaker keeps), otherwise
 // [FailoverPolicy.RecordSuccess]; then the holder's stats.
-// A single-cluster client updates only the stats.
+// A single-cluster client, or a retired holder, updates only the stats.
 func (h *clusterHealth) readSucceeded(holder *sessionHolder, cluster ClusterID, overrideActive bool, elapsed float64) {
-	if h.dual {
+	if h.dual && !holder.retired.Load() {
 		if !overrideActive && h.strategy != nil {
 			h.strategy.OnSuccess(cluster)
 		}
@@ -114,13 +117,14 @@ func (h *clusterHealth) readSucceeded(holder *sessionHolder, cluster ClusterID, 
 // Order: the read error metric; the holder's stats when kind is a cluster
 // error; then [FailoverPolicy.RecordFailure]. A single-cluster client
 // records no policy failure, because there is no cluster to fail over to.
+// Neither does a retired holder, whose failure may be its own teardown.
 // Data sentinels and caller-context errors never reach this entry point.
 func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kind readErrKind, err error) {
 	h.metrics.IncReadError(cluster)
 	if kind == readClusterErr {
 		h.failedNow(holder, err)
 	}
-	if h.dual && h.policy != nil {
+	if h.dual && h.policy != nil && !holder.retired.Load() {
 		h.policy.RecordFailure(cluster)
 	}
 }
@@ -137,6 +141,7 @@ func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kin
 // The strategy's suggested alternative on failure is ignored: an iterator
 // cannot be retried. A single-cluster client reports a clean close to the
 // strategy but nothing to the policy, and reports failures to neither.
+// A retired holder reports nothing beyond its stats.
 func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kind readErrKind, err error, overrideActive bool) {
 	switch kind {
 	case readOK:
@@ -146,6 +151,9 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 	case readCtxErr:
 		h.readCallerExpired(cluster)
 	case readNotFound, readRowLimit, readCallerNotFound:
+	}
+	if holder.retired.Load() {
+		return
 	}
 	switch kind {
 	case readOK:
@@ -214,15 +222,14 @@ func (h *clusterHealth) deferredWriteLeg(holder *sessionHolder, cluster ClusterI
 
 // probe reports a recovery probe outcome to the holder's stats: a
 // successful probe is a success, a failed probe (including one ended by
-// its own timeout) is a failure, and a probe the client cancelled records
-// nothing.
+// its own timeout) is a failure, and an abandoned probe records nothing.
 func (h *clusterHealth) probe(holder *sessionHolder, kind probeKind, err error) {
 	switch kind {
 	case probeOK:
 		holder.stats.succeeded(h.now())
 	case probeFailed:
 		h.failedNow(holder, err)
-	case probeCanceled:
+	case probeAbandoned:
 	}
 }
 

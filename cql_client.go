@@ -170,6 +170,12 @@ type clientRuntime struct {
 type sessionHolder struct {
 	s     cql.Session
 	stats clusterStats
+	// retired is set the moment SwapSession or RefreshSession uninstalls the holder,
+	// before the old session may be closed.
+	// An outcome observed against a retired holder describes a session that is no longer installed,
+	// so the observation hub and the recovery probe withhold it from the failover policy and the read strategy;
+	// the holder's own stats and the metrics still record it.
+	retired atomic.Bool
 }
 
 // clusterStats holds the op-outcome counters observed against one session.

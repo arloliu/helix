@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The dead-letter count was released whether or not the `Term` went through. A refused `Term` issues no NAK, so the message came back after `AckWait` with a fresh budget, and a poison payload churned for the stream's `MaxAge` — about 2,880 attempts at the default 24h `MaxAge` and 30s `AckWait` — with no `OnDrop` call and no `dead_letter` drop sample.
   A refused `Term` still issues no NAK and is still counted on `replay_term_failed_total`; only the budget now survives it.
 
+- `RefreshSession` no longer charges its own teardown of the old session to the cluster, and a recovery probe that was running on that session is abandoned rather than reported as failed.
+  Without `WithAutoRefresh` the old session is closed as soon as the new one is installed, so every read still in flight on it failed with the driver's "session closed" error; each of those failures reached `FailoverPolicy.RecordFailure`, and enough of them could open the circuit breaker on the cluster that had just been given a healthy session.
+  A recovery probe caught the same way settled as `ProbeFailed`, which restarted the breaker's reset timeout and logged a probe failure for a cluster that was up.
+  A session holder is now marked retired the moment `RefreshSession` or `SwapSession` uninstalls it, before the old session may be closed.
+  An outcome observed against a retired holder still updates that holder's stats and the read metrics, but reaches neither the failover policy nor the read strategy.
+  A probe that ran on a retired holder settles as `ProbeAbandoned` exactly as one the client cancelled, so the breaker gets its reservation back and nothing is recorded.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.
