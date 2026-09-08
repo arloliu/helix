@@ -12,6 +12,23 @@
 - **Commits:** Conventional format. Present tense. First line < 50 chars.
     - `feat: add adaptive dual-write strategy`
     - `fix: handle nil replayer on partial write failure`
+- **Merging a PR:** rebase and merge, so `main` stays linear.
+
+    ```bash
+    gh pr merge <n> --rebase --delete-branch
+    ```
+
+    A merge commit is the exception, not the default, and needs a reason worth
+    stating. Two consequences follow from rebasing that do not apply to a merge
+    commit:
+
+    - **Every commit on the branch lands on `main` individually**, so each one
+      must build and pass tests on its own. Squash or reorder work-in-progress
+      commits before merging rather than after.
+    - **A rebase merge is refused when the branch is behind and conflicts**, so
+      bring the branch up to date first (`git fetch origin && git rebase
+      origin/main`) and re-run the checks — a rebase produces commits that were
+      never tested in that order.
 
 ## Code Review Checklist
 - [ ] Correctness
