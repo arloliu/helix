@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Scanner().Err()` previously released the iterator's resources but reported no outcome, so a caller that drained with `Scanner()` and never called `Close()` left a failing cluster with a clean record — the circuit breaker took no input, the cluster was never marked degraded, and reads kept being routed to it.
   `Err()` now ends the read exactly as `Close` does. It shares the same guard, so the everyday idiom — a `Scanner` loop under a deferred `Close` — still reports once, and a `Close` that follows returns the error the `Scanner` already saw without closing the driver's iterator a second time.
 
+- `Scan` and `MapScan` now send a query that carries a `PageState` token to the cluster that issued it,
+  as `Iter`, `SliceMap` and `SliceScan` already did.
+  They were the only read entry points that ignored the routing header in the token,
+  so a page resumed with `Scan` went wherever the read strategy pointed — under default routing, cluster A, even for a token cluster B had produced.
+  A driver that rejects the foreign cursor made the read fail over to B and succeed, so the caller saw nothing,
+  but the rejection was charged to A as a read error and a circuit-breaker failure, one per resumed page;
+  a driver that accepts it returned rows from the wrong cursor.
+  The paging rule now lives in the one place every entry point resolves its read options, so no path can skip it.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.

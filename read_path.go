@@ -421,13 +421,20 @@ type readOptions struct {
 	fallbackOpts  fallbackReadOptions
 }
 
+// resolveReadOptions derives the readOptions for one query: the FallbackRead
+// hierarchy (per-query > context > client default) and the PageState routing
+// fields, so Scan, MapScan, and the slice reads all route a paging token to
+// the cluster that issued it.
 func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOptions {
 	enabled := q.fallbackRead || hasFallbackRead(ctx) || c.config.DefaultFallbackRead
 
-	return readOptions{
+	opts := readOptions{
 		fallbackRead: enabled,
 		fallbackOpts: fallbackReadOptions{readDrainingAlt: c.config.FallbackReadOnDrainingCluster},
 	}
+	q.applyPagedRouting(&opts)
+
+	return opts
 }
 
 // primaryAttemptResult captures the outcome of one primary-cluster read
