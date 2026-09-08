@@ -437,12 +437,13 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 			// SliceScan never fails over: the caller's callback already ran.
 			break
 		}
+		if mode == modeDrain {
+			// The only alternative is draining, so the primary error stands
+			// and the strategy is never asked for a failover it would not get.
+			break
+		}
 		if mode != modeOverride {
 			obs.onFailure = []ClusterID{served}
-		}
-		if mode == modeDrain {
-			// The only alternative is draining, so the primary error stands.
-			break
 		}
 		// Failover contacts the other cluster, which fails the same way,
 		// and the caller sees both errors.
