@@ -387,6 +387,11 @@ type Option func(*ClientConfig)
 
 // WithReadStrategy sets the read routing strategy.
 //
+// A strategy instance serves exactly one [CQLClient] for that client's lifetime:
+// the client installs its own event dispatcher, cluster names and metrics into the instance,
+// so a second client sharing it takes them over.
+// Build a new instance for another client.
+//
 // Parameters:
 //   - strategy: The read strategy to use (e.g., StickyRead)
 //
@@ -400,6 +405,11 @@ func WithReadStrategy(strategy ReadStrategy) Option {
 
 // WithWriteStrategy sets the write execution strategy.
 //
+// A strategy instance serves exactly one [CQLClient] for that client's lifetime:
+// the client installs its own event dispatcher, cluster names, metrics and logger into the instance,
+// so a second client sharing it takes them over.
+// Build a new instance for another client.
+//
 // Parameters:
 //   - strategy: The write strategy to use (e.g., ConcurrentDualWrite)
 //
@@ -412,6 +422,11 @@ func WithWriteStrategy(strategy WriteStrategy) Option {
 }
 
 // WithFailoverPolicy sets the failover policy for reads.
+//
+// A policy instance serves exactly one [CQLClient] for that client's lifetime:
+// the client installs its own event dispatcher, cluster names, metrics and logger into the instance,
+// so a second client sharing it takes them over.
+// Build a new instance for another client.
 //
 // Parameters:
 //   - policy: The failover policy to use
@@ -842,6 +857,8 @@ func WithReplayer(replayer Replayer) Option {
 //
 // The worker will be started automatically when the client is created
 // and stopped when the client is closed.
+// A worker instance therefore serves exactly one [CQLClient] for that client's lifetime;
+// build a new worker for another client.
 //
 // Parameters:
 //   - worker: The replay worker implementation (e.g., MemoryWorker, NATSWorker)
@@ -1037,6 +1054,12 @@ func WithTimestampProvider(fn TimestampProvider) Option {
 }
 
 // WithTopologyWatcher sets the topology watcher for drain mode support.
+//
+// A watcher instance serves exactly one [CQLClient] for that client's lifetime.
+// The client calls [TopologyWatcher.Watch] once with a context that its Close cancels;
+// the bundled watchers hand every caller the same channel, so a second client
+// sharing the instance competes for each update, and a client that closes ends the watch for both.
+// Build a new watcher for another client.
 //
 // If the watcher's update channel closes while the client is still open,
 // the client keeps the last drain state it received and logs a warning.
