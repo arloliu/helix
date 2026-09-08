@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -214,7 +215,7 @@ func TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown(t *testing.T) {
 		stopCh:  stopCh,
 	}
 
-	b.processMessages(msgs, false)
+	b.processMessages(t.Context(), msgs, false)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -225,6 +226,92 @@ func TestNATSBackend_ProcessMessages_NaksWholeBatchOnShutdown(t *testing.T) {
 		"every unprocessed message in the batch must be Nak'd; tail messages can no longer rely on AckWait timeout")
 	assert.Equal(t, []int{1, 2, 3, 4}, nakedIdxs,
 		"Nak must hit the contiguous tail starting at the message that observed stopCh")
+}
+
+// TestNATSBackend_StopCancelsInFlightExecute proves Stop does not wait for
+// an attempt that only honours its context: the attempt is cancelled, and
+// the interrupted message is NAK'd for redelivery like the rest of a batch
+// cut short by shutdown, neither charged a failure nor terminated.
+func TestNATSBackend_StopCancelsInFlightExecute(t *testing.T) {
+	settlements := make(chan testEvent, 4)
+	consumer := &fakeFetchConsumer{batches: []jetstream.MessageBatch{
+		fakeBatchWithTrackedMessages(t, 1, nil, settlements),
+	}}
+	replayer := newReplayerWithFakeConsumer("helix-worker-high-A", consumer)
+
+	cfg := newTestNATSBackendConfig()
+	cfg.ExecuteTimeout = 5 * time.Second // well past the bound Stop is held to below
+	cfg.Classifier = DefaultReplayClassifier
+	var failures atomic.Int32
+	cfg.OnError = func(types.ReplayPayload, error, int) { failures.Add(1) }
+
+	entered := make(chan struct{})
+	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+	b := &natsBackend{
+		replayer: replayer,
+		config:   &cfg,
+		execute: func(ctx context.Context, _ types.ReplayPayload) error {
+			close(entered)
+			<-ctx.Done()
+
+			return ctx.Err()
+		},
+		stopCh:      stopCh,
+		wg:          &wg,
+		deadLetters: make(map[uint64]int),
+		backoffWait: func(time.Duration) <-chan time.Time { return nil }, // never fires; the test stops the worker
+	}
+	h := startWorker(t, b, stopCh, &wg, make(chan testEvent, 1))
+	select {
+	case <-entered:
+	case <-time.After(eventTimeout):
+		t.Fatal("the worker never executed the fetched message")
+	}
+	h.stop(t) // fails when Stop is held by the attempt
+
+	require.Equal(t, "nak", recvEvent(t, settlements, "settlement of the interrupted message").kind,
+		"the interrupted message is returned for redelivery")
+	require.Empty(t, settlements, "and settled exactly once")
+	require.Zero(t, failures.Load(), "an attempt Stop cancelled is not a failed attempt")
+}
+
+// TestNATSBackend_StopCancelsAParkedDepthRead proves Stop does not wait for
+// a depth read the server is not answering, and that the fetch it cuts
+// short on the way out is not reported as a dequeue failure.
+func TestNATSBackend_StopCancelsAParkedDepthRead(t *testing.T) {
+	stream := &parkedStream{entered: make(chan struct{})}
+	consumer := &fakeFetchConsumer{batches: []jetstream.MessageBatch{
+		fakeBatchWithMessagesAndError(t, 0, errors.New("fetch cut short")),
+	}}
+	replayer := newReplayerWithFakeConsumer("helix-worker-high-A", consumer)
+	replayer.stream = stream
+
+	logger := &recordingWorkerLogger{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Logger = logger
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	b := &natsBackend{
+		replayer:    replayer,
+		config:      &cfg,
+		stopCh:      stop,
+		wg:          &wg,
+		backoffWait: func(time.Duration) <-chan time.Time { return nil }, // never fires; the test stops the worker
+	}
+	wg.Add(1)
+	go b.start(types.ClusterA)
+	<-stream.entered
+
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop waited for the parked depth read instead of cancelling it")
+	}
+	require.Zero(t, logger.errorCount.Load(), "a fetch cut short by Stop is not a dequeue failure")
 }
 
 // TestNATSBackend_ProcessMessages_NakErrorsAreNonBlocking verifies that an
@@ -262,7 +349,7 @@ func TestNATSBackend_ProcessMessages_NakErrorsAreNonBlocking(t *testing.T) {
 		execute: func(_ context.Context, _ types.ReplayPayload) error { return nil },
 		stopCh:  stopCh,
 	}
-	b.processMessages(msgs, false)
+	b.processMessages(t.Context(), msgs, false)
 
 	assert.Equal(t, int32(3), nakedCount.Load(),
 		"every message in the batch must have its Nak attempted, errors don't abort the loop")
@@ -297,7 +384,7 @@ func TestNATSBackend_ProcessMessages_AckFailureIsReportedAsError(t *testing.T) {
 		execute: func(_ context.Context, _ types.ReplayPayload) error { return nil },
 		stopCh:  make(chan struct{}),
 	}
-	b.processMessages([]ReplayMessage{msg}, false)
+	b.processMessages(t.Context(), []ReplayMessage{msg}, false)
 
 	assert.Equal(t, int32(0), success.Load(), "ack failure makes broker state uncertain; do not report success")
 	assert.Equal(t, int32(1), errorCount.Load())
@@ -341,7 +428,7 @@ func TestNATSBackend_ProcessMessages_TermFailureOnLastDeliveryStillReportsDrop(t
 		execute: func(_ context.Context, _ types.ReplayPayload) error { return errors.New("execute failed") },
 		stopCh:  make(chan struct{}),
 	}
-	b.processMessages([]ReplayMessage{msg}, false)
+	b.processMessages(t.Context(), []ReplayMessage{msg}, false)
 
 	assert.Equal(t, int32(1), dropped.Load(), "the server will not deliver the message again, so it is lost")
 	assert.Equal(t, int32(1), sc.termFailed.Load())
