@@ -132,7 +132,7 @@ A DEGRADED cluster can recover to HEALTHY after `recoveryThreshold` (default: 5)
 Recovery requires:
 1. Write succeeds (no error)
 2. Latency < absoluteMax
-3. Latency within deltaThreshold of sibling (if sibling has valid latency)
+3. Latency within deltaThreshold of the sibling's last write — or, when the sibling holds no sample or is itself degraded, below minFloor
 
 ## Configuration Options
 
