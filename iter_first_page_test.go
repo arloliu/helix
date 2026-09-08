@@ -1397,7 +1397,7 @@ func TestFailoverGating_IteratorFollowsTheScanSequence(t *testing.T) {
 			drainB: true,
 			want: []string{
 				"read_total:A", "read_error:A", "record_failure:A",
-				"should_failover:A", "on_failure:A",
+				"should_failover:A",
 			},
 		},
 		{
@@ -1417,7 +1417,7 @@ func TestFailoverGating_IteratorFollowsTheScanSequence(t *testing.T) {
 			cancelInCB: true,
 			want: []string{
 				"read_total:A", "read_error:A", "record_failure:A",
-				"should_failover:A", "on_failure:A",
+				"should_failover:A",
 			},
 		},
 	}

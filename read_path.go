@@ -742,10 +742,14 @@ func (c *CQLClient) overrideFailoverTarget(ctx context.Context, rt readTarget, p
 }
 
 // normalFailoverTarget gates failover with no override active: the
-// FailoverPolicy decides whether this request may retry, the ReadStrategy
-// names the alternative (and moves its preference doing so), a draining
+// FailoverPolicy decides whether this request may retry, a draining
 // alternative is skipped unless the read came from a draining cluster too,
-// and a caller whose context already ended cannot succeed elsewhere.
+// a caller whose context already ended cannot succeed elsewhere, and only
+// then is the ReadStrategy asked to name the alternative.
+// The strategy is consulted last because [ReadStrategy.OnFailure] moves
+// its preference as it answers; asking it for a failover the client then
+// refuses would move the preference, the gauge, and the event stream to a
+// cluster no read follows.
 func (c *CQLClient) normalFailoverTarget(
 	ctx context.Context,
 	selectedCluster ClusterID,
@@ -757,31 +761,26 @@ func (c *CQLClient) normalFailoverTarget(
 		return "", false
 	}
 
-	// Ask strategy for alternative.
-	var alternativeCluster ClusterID
-	var shouldFailover bool
-
-	if c.config.ReadStrategy != nil {
-		alternativeCluster, shouldFailover = c.config.ReadStrategy.OnFailure(selectedCluster, primaryErr)
-	} else {
-		alternativeCluster = c.alternativeCluster(selectedCluster)
-		shouldFailover = true
-	}
-
 	// Don't failover to a draining cluster unless we came from a draining cluster too.
+	// With two clusters the alternative is fixed, so the gate needs no answer from the strategy.
 	drainA, drainB := c.getDrainStates()
-	if shouldFailover && c.clusterIsDraining(alternativeCluster, drainA, drainB) {
-		if !c.clusterIsDraining(selectedCluster, drainA, drainB) {
-			shouldFailover = false
-		}
-	}
-
-	if !shouldFailover {
+	if c.clusterIsDraining(c.alternativeCluster(selectedCluster), drainA, drainB) &&
+		!c.clusterIsDraining(selectedCluster, drainA, drainB) {
 		return "", false
 	}
 
 	// A dead caller context cannot succeed on the other cluster either.
 	if ctx.Err() != nil {
+		return "", false
+	}
+
+	// Ask strategy for alternative.
+	if c.config.ReadStrategy == nil {
+		return c.alternativeCluster(selectedCluster), true
+	}
+
+	alternativeCluster, shouldFailover := c.config.ReadStrategy.OnFailure(selectedCluster, primaryErr)
+	if !shouldFailover {
 		return "", false
 	}
 
