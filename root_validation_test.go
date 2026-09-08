@@ -97,6 +97,31 @@ func TestNewCQLClient_RouteVetoWarnings(t *testing.T) {
 			require.NotContains(t, w, "RouteVeto")
 		}
 	})
+	t.Run("option on but the recovery probe is disabled", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithFailoverPolicy(policy.NewLatencyCircuitBreaker()),
+			WithBehaviorProfile(Safe),
+			WithRecoveryProbeDisabled(),
+		)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		require.Contains(t, warnings(logger), warnRouteVetoWithoutProbe)
+	})
+	t.Run("recovery probe disabled with the option off does not warn about the veto", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithFailoverPolicy(policy.NewLatencyCircuitBreaker()),
+			WithRecoveryProbeDisabled(),
+		)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		require.NotContains(t, warnings(logger), warnRouteVetoWithoutProbe)
+	})
 }
 
 func TestNewCQLClient_NoWarningWhenRecoveryProbeHasAdaptiveStrategy(t *testing.T) {
@@ -119,6 +144,10 @@ func TestNewCQLClient_NoWarningWhenRecoveryProbeHasAdaptiveStrategy(t *testing.T
 }
 
 const (
+	warnRouteVetoWithoutProbe = "WithRecoveryProbeDisabled with WithRouteVeto on (also set by WithBehaviorProfile(Safe)): " +
+		"a vetoed cluster is reopened only by a recovery probe or by a failover leg landing on it, " +
+		"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
+		"drop WithRecoveryProbeDisabled or set WithRouteVeto(false)"
 	warnNoReadLegDeadline = "dual-cluster mode with no ClusterReadTimeout: " +
 		"a read leg that never answers is bounded only by the caller's context and is never attributed to the cluster; " +
 		"set one with WithClusterReadTimeout"

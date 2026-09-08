@@ -63,10 +63,12 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 }
 
 // warnNoEffectOptions logs one warning per option that the rest of the
-// configuration renders inert, and one per legacy default that a configured
+// configuration renders inert, one per legacy default that a configured
 // component could improve on (such as a failover policy that can veto
-// routes while WithRouteVeto is off), so a misconfiguration is discovered
-// at startup rather than during an incident.
+// routes while WithRouteVeto is off), and one for a route veto that
+// nothing but a failover leg can lift (the recovery probe is disabled), so
+// a misconfiguration is discovered at startup rather than during an
+// incident.
 func warnNoEffectOptions(config *ClientConfig) {
 	if config.MirrorReplayer != nil && !config.mirrorTargetSet {
 		config.Logger.Warn("WithMirrorReplayer has no effect without WithMirror; failed mirror writes are only retried in target mode")
@@ -92,6 +94,14 @@ func warnNoEffectOptions(config *ClientConfig) {
 	case !config.RouteVeto && canVeto:
 		config.Logger.Warn("the failover policy can veto routes but WithRouteVeto is off (the v1 default): " +
 			"reads keep going to a cluster whose breaker is open; enable it with WithRouteVeto(true)")
+	case config.RouteVeto && canVeto && config.recoveryProbeOff:
+		// A vetoed cluster receives no ordinary or fallback read, so the
+		// policy's RecordSuccess is reached only by a failover leg from
+		// the other cluster; without the probe nothing else closes it.
+		config.Logger.Warn("WithRecoveryProbeDisabled with WithRouteVeto on (also set by WithBehaviorProfile(Safe)): " +
+			"a vetoed cluster is reopened only by a recovery probe or by a failover leg landing on it, " +
+			"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
+			"drop WithRecoveryProbeDisabled or set WithRouteVeto(false)")
 	}
 }
 
