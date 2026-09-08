@@ -255,6 +255,12 @@ type Query interface {
 	// runs with [AckOnReplayAdmission]; both clusters failing returns
 	// [types.DualClusterError].
 	//
+	// The contents of byte-slice arguments are copied before the write is
+	// dispatched, so a buffer may be reused as soon as this call returns even
+	// while a cluster leg is still in flight.
+	// Arguments of any other type are passed by value and must not be mutated
+	// after this call is made.
+	//
 	// Returns:
 	//   - error: nil when at least one cluster acknowledged the write
 	Exec() error
@@ -637,6 +643,10 @@ type Batch interface {
 	// Exec executes the batch using the Write Strategy.
 	//
 	// This triggers concurrent dual-write to both clusters.
+	//
+	// Statement arguments follow the copy rules described on [Query.Exec]:
+	// byte slices are copied before dispatch, everything else is passed by
+	// value and must not be mutated after this call is made.
 	//
 	// Returns:
 	//   - error: nil when at least one cluster acknowledged the write; see [Query.Exec]

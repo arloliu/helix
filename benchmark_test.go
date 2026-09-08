@@ -634,6 +634,29 @@ func BenchmarkCQLDualClusterExec(b *testing.B) {
 	}
 }
 
+// BenchmarkCQLDualClusterExecByteArg measures the dual-cluster write path with
+// a byte-slice argument, the case where the argument copy that protects a
+// background write leg has work to do.
+func BenchmarkCQLDualClusterExecByteArg(b *testing.B) {
+	mockA := &mockCQLSession{}
+	mockB := &mockCQLSession{}
+	client, err := helix.NewCQLClient(mockA, mockB)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	blob := make([]byte, 64)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for b.Loop() {
+		_ = client.Query("INSERT INTO t (id, v) VALUES (?, ?)", 1, blob).ExecContext(ctx)
+	}
+}
+
 // BenchmarkCQLDualClusterStrictExec measures the default (no StrictWriter
 // configured) strict dual-write path — cql_client.go's executeStrictDualWrite
 // — mirroring BenchmarkCQLDualClusterExec for the alloc-perf finding at
