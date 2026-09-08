@@ -66,6 +66,8 @@ type Replayer interface {
 }
 ```
 
+The client calls `Enqueue` on the goroutine of the write whose leg failed, on a context that keeps the caller's values but not its deadline, so a slow `Enqueue` holds the caller beyond the leg's own `WithClusterWriteTimeout` — with `NATSReplayer`, for up to `WithPublishTimeout` (5s by default) when the server does not acknowledge the publish.
+
 **Implementations:**
 
 | Implementation | Durability | Use Case |
