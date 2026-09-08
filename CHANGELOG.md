@@ -15,11 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.1-otter`, up from `v2.5.0-otter`.
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
 
   ```
-  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.1-otter
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.2-otter
   ```
 
   The fork adds no exported symbol and changes no exported signature, but one exported field changes meaning — see the `ReconnectInterval` note below.
@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A connection that lost a frame boundary — a body-read failure that was misclassified as non-terminal — kept serving and read the leftover body bytes as the next frame's header; it is now retired instead.
   That path is reachable on native protocol v4, which is what ScyllaDB negotiates.
   And a read's deadline was armed inside a five-attempt retry loop, so a connection stuck mid-read took up to five `Timeout`s to be closed rather than one.
+
+  **A paged read no longer races on the consistency it carries forward.**
+  Every query is paged — the driver's default page size is 5000 — and each page after the first was built by copying the whole query struct, so a retry policy lowering consistency on one page could be read while the next page was being assembled.
+  Each field is now carried across explicitly with the consistency read atomically.
+  Nothing about paging changes otherwise: the same fields carry over, the page state is copied, and a pinned page stays on its connection.
+
+  Two smaller reclamation fixes ride along, neither changing a return value.
+  A retry that supersedes an iterator now closes it before going round again, returning its response framer to the pool; this is live for any statement not marked [`NonIdempotent`](https://pkg.go.dev/github.com/arloliu/helix#Query), which is the default.
+  And a panic out of an observer, host-marking or retry-policy callback now closes the iterator it was holding on the way out — the panic itself still reaches the caller unchanged, with the same value and type.
 
 ### Documentation
 
