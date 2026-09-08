@@ -86,3 +86,44 @@ func TestSliceMap_PageStatePinsIssuingCluster(t *testing.T) {
 	require.Zero(t, sa.iterCtxCalls.Load())
 	require.Equal(t, int32(1), sb.iterCtxCalls.Load())
 }
+
+// TestScan_PageStatePinsIssuingCluster asserts that the single-row entry
+// points follow their token to the issuing cluster like every other read:
+// a token from cluster B resumed under default routing (primary A) must be
+// sent to B, with the routing header stripped before the driver sees it.
+func TestScan_PageStatePinsIssuingCluster(t *testing.T) {
+	tests := []struct {
+		name string
+		read func(q Query) error
+	}{
+		{
+			name: "Scan",
+			read: func(q Query) error {
+				var v int
+				return q.Scan(&v)
+			},
+		},
+		{
+			name: "MapScan",
+			read: func(q Query) error {
+				return q.MapScan(map[string]any{})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionA, sessionB := newMockSession(), newMockSession()
+			client, err := NewCQLClient(sessionA, sessionB)
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			token := encodePageState(ClusterB, []byte("cursor-from-b"))
+			require.NoError(t, tt.read(client.Query("SELECT v FROM t").PageState(token)))
+
+			require.Empty(t, sessionA.queries, "the token names cluster B, so cluster A is not asked")
+			require.Len(t, sessionB.queries, 1)
+			require.Equal(t, []byte("cursor-from-b"), sessionB.lastQuery.pageState,
+				"the driver receives its own cursor without the routing header")
+		})
+	}
+}
