@@ -93,11 +93,23 @@ const (
 
 // classifyWriteLeg assigns the kind of one leg's result for a write issued
 // with ctx. Classification is by provenance: once ctx is done, a failure is
-// attributed to the caller rather than to the cluster.
+// attributed to the caller rather than to the cluster. It reads ctx as it
+// stands now, so it is for a leg whose result is classified as soon as it
+// returns; a leg that has to wait for a sibling records its provenance on
+// return and is classified through [writeLegState.classify].
 func classifyWriteLeg(ctx context.Context, err error) writeLegErrKind {
-	switch {
-	case err == nil:
+	if err == nil {
 		return legOK
+	}
+
+	return classifyWriteErr(err, ctx.Err() != nil)
+}
+
+// classifyWriteErr assigns the kind of one leg's non-nil result. callerDone
+// reports whether the caller's context was already done when the leg
+// returned: a failure after that point is the caller's, not the cluster's.
+func classifyWriteErr(err error, callerDone bool) writeLegErrKind {
+	switch {
 	case errors.Is(err, types.ErrWriteAsync):
 		return legAsync
 	case errors.Is(err, types.ErrWriteDropped):
@@ -106,7 +118,7 @@ func classifyWriteLeg(ctx context.Context, err error) writeLegErrKind {
 		return legDraining
 	case errors.Is(err, types.ErrClusterDegraded):
 		return legSkipped
-	case ctx.Err() != nil:
+	case callerDone:
 		return legCanceled
 	default:
 		return legFailed
@@ -207,26 +219,48 @@ func (c *CQLClient) executeWriteWithReplay(
 // touching the session or the start time, so the leg is neither timed nor
 // counted as an error; the callers classify it as a skipped leg.
 func (c *CQLClient) writeLegs(
+	ctx context.Context,
 	writeFunc func(context.Context, cql.Session) error,
 	drainA, drainB bool,
 	legA, legB *writeLegState,
 ) (writeA, writeB func(context.Context) error) {
-	return c.writeLeg(writeFunc, drainA, legA, &c.sessionA),
-		c.writeLeg(writeFunc, drainB, legB, &c.sessionB)
+	return c.writeLeg(ctx, writeFunc, drainA, legA, &c.sessionA),
+		c.writeLeg(ctx, writeFunc, drainB, legB, &c.sessionB)
 }
 
 // writeLegState is what one leg publishes for the aggregation that follows
-// the strategy: when it started and which session holder it used. Both are
-// atomics because a fire-and-forget leg writes them from its own goroutine.
+// the strategy: when it started, which session holder it used, and whether
+// the caller's context was already done when it returned. All are atomics
+// because a fire-and-forget leg writes them from its own goroutine.
 type writeLegState struct {
-	start  atomic.Int64
-	holder atomic.Pointer[sessionHolder]
+	start      atomic.Int64
+	holder     atomic.Pointer[sessionHolder]
+	callerDone atomic.Bool
+}
+
+// classify assigns the kind of the leg's result. A leg that ran recorded
+// whether the caller's context was still live when it returned, and is
+// classified by that record: a failure that preceded the caller's expiry
+// is the cluster's however long the sibling leg took afterwards. A leg the
+// strategy never dispatched recorded nothing and is classified against ctx
+// as it stands now.
+func (s *writeLegState) classify(ctx context.Context, err error) writeLegErrKind {
+	switch {
+	case err == nil:
+		return legOK
+	case s.holder.Load() == nil:
+		return classifyWriteErr(err, ctx.Err() != nil)
+	default:
+		return classifyWriteErr(err, s.callerDone.Load())
+	}
 }
 
 // writeLeg builds one cluster's leg: a draining cluster is skipped, the
-// start time and the session holder are published, and the write runs
-// under legContext.
+// start time and the session holder are published, the write runs under
+// legContext, and whether ctx — the caller's context — was already done
+// when the write returned is recorded for classify.
 func (c *CQLClient) writeLeg(
+	ctx context.Context,
 	writeFunc func(context.Context, cql.Session) error,
 	draining bool,
 	state *writeLegState,
@@ -239,18 +273,23 @@ func (c *CQLClient) writeLeg(
 		state.start.Store(time.Now().UnixNano())
 		holder := slot.Load()
 		state.holder.Store(holder)
-		ctx, cancel := c.legContext(parent)
+		legCtx, cancel := c.legContext(parent)
 		defer cancel()
 
 		// A leg ended by Helix's own deadline while the caller was still
 		// waiting is a connectivity failure, not an arbitrary driver error.
-		return clusterTimeoutIfExpired(ctx, parent, writeFunc(ctx, holder.s))
+		err := clusterTimeoutIfExpired(legCtx, parent, writeFunc(legCtx, holder.s))
+		// Provenance is fixed here, not after the sibling leg has joined:
+		// the caller's context may end while the sibling is still running.
+		state.callerDone.Store(ctx.Err() != nil)
+
+		return err
 	}
 }
 
 // legContext bounds one write leg by [ClientConfig.ClusterWriteTimeout].
-// The leg's own deadline expiring leaves the parent context live, so
-// classifyWriteLeg attributes the failure to the cluster.
+// The leg's own deadline expiring leaves the caller's context live, so
+// the failure is attributed to the cluster.
 func (c *CQLClient) legContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if c.config.ClusterWriteTimeout <= 0 {
 		return ctx, noopCancel
@@ -292,7 +331,7 @@ func (c *CQLClient) executeDualWrite(
 	// Each leg publishes its start time and session holder through atomics
 	// because a fire-and-forget strategy runs it on a background goroutine.
 	var legStateA, legStateB writeLegState
-	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &legStateA, &legStateB)
+	writeA, writeB := c.writeLegs(ctx, writeFunc, drainA, drainB, &legStateA, &legStateB)
 
 	var errA, errB error
 
@@ -324,9 +363,10 @@ func (c *CQLClient) executeDualWrite(
 	// ErrWriteAsync     — write is in flight via fire-and-forget (not a cluster error).
 	// ErrWriteDropped   — write was not attempted due to concurrency limit (not a cluster error).
 	// ErrClusterDraining — leg skipped because the cluster is draining (not a cluster error).
-	// A failure after the caller's context ended is the caller's, not the cluster's.
-	legA := classifyWriteLeg(ctx, errA)
-	legB := classifyWriteLeg(ctx, errB)
+	// A failure after the caller's context ended is the caller's, not the
+	// cluster's; each leg recorded which it was when it returned.
+	legA := legStateA.classify(ctx, errA)
+	legB := legStateB.classify(ctx, errB)
 
 	// Record metrics for both clusters.
 	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines.
@@ -627,7 +667,7 @@ func (c *CQLClient) executeStrictDualWrite(
 	drainA, drainB bool,
 ) error {
 	var legStateA, legStateB writeLegState
-	writeA, writeB := c.writeLegs(writeFunc, drainA, drainB, &legStateA, &legStateB)
+	writeA, writeB := c.writeLegs(ctx, writeFunc, drainA, drainB, &legStateA, &legStateB)
 
 	var errA, errB error
 
@@ -652,8 +692,8 @@ func (c *CQLClient) executeStrictDualWrite(
 	now := time.Now()
 	nowNano := now.UnixNano()
 
-	legA := classifyWriteLeg(ctx, errA)
-	legB := classifyWriteLeg(ctx, errB)
+	legA := legStateA.classify(ctx, errA)
+	legB := legStateB.classify(ctx, errB)
 	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
 	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
 
