@@ -210,8 +210,8 @@ func (h *clusterHealth) writeLeg(holder *sessionHolder, cluster ClusterID, kind 
 // deferredWriteLeg reports the late result of a background write leg (see
 // [DeferredWriteResult]) to the holder's stats. It runs before the leg's
 // deferred registration is released, which Close waits for, so it takes
-// its timestamp from the process clock and never calls the configurable
-// NowProvider or any other user code.
+// its timestamp from the process clock rather than the configurable
+// NowProvider; the failure classifier it consults is still user code.
 //
 // The late result is classified against a context that carries the
 // caller's values but none of its cancellation, so a background leg is
