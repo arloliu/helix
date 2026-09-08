@@ -41,6 +41,15 @@ type AllowedClustersFunc func() []ClusterID
 type Replayer interface {
 	// Enqueue adds a failed write to the replay queue.
 	//
+	// The client calls Enqueue once per failed leg on a context that carries the caller's values but is never cancelled,
+	// and it does not bound how many calls are pending at once:
+	// a leg that a strategy completes in the background (see [DeferredWriteResult]) is admitted from that goroutine,
+	// which holds the payload until Enqueue returns, and nothing limits their number.
+	// Enqueue must therefore return within a bounded time — by rejecting when the queue is full or by timing out —
+	// rather than block until space appears.
+	// The bundled replayers do: [replay.MemoryReplayer] returns [types.ErrReplayQueueFull] at once,
+	// and [replay.NATSReplayer] gives up after its publish timeout.
+	//
 	// Parameters:
 	//   - ctx: Context for cancellation
 	//   - payload: The write operation to replay

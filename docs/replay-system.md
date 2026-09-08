@@ -67,6 +67,7 @@ type Replayer interface {
 ```
 
 The client calls `Enqueue` on the goroutine of the write whose leg failed, on a context that keeps the caller's values but not its deadline, so a slow `Enqueue` holds the caller beyond the leg's own `WithClusterWriteTimeout` — with `NATSReplayer`, for up to `WithPublishTimeout` (5s by default) when the server does not acknowledge the publish.
+A leg that a strategy completes in the background (an `AdaptiveDualWrite` leg on a degraded cluster) is admitted from that goroutine instead, and the client does not bound how many such admissions are pending at once, so a custom `Enqueue` must return within a bounded time — reject or time out — rather than block until space appears; `MemoryReplayer` returns `ErrReplayQueueFull` at once and `NATSReplayer` gives up after `WithPublishTimeout`.
 
 **Implementations:**
 

@@ -315,6 +315,9 @@ func WithAdaptiveClusterNames(names types.ClusterNames) AdaptiveDualWriteOption 
 // prevents resource exhaustion from too many pending goroutines. If the limit
 // is reached, new fire-and-forget writes are dropped (returning ErrWriteDropped)
 // and the replay system handles reconciliation.
+// The limit covers a leg while its write runs:
+// a leg that fails releases its slot before the client admits it for replay,
+// so the goroutines waiting in the replayer's Enqueue are bounded by how long Enqueue takes, not by n.
 //
 // Default: 100
 //

@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A vetoed cluster receives no ordinary or fallback read, so its breaker is reopened only by the recovery probe or by a failover leg that lands on it when the *other* cluster fails a read.
   With the probe disabled, a `LatencyCircuitBreaker` that opened on a slow cluster while its sibling stayed healthy never closed, and reads stayed single-cluster for the life of the process with nothing logged.
   Routing is unchanged; the warning names both options and how to resolve the combination, and the `WithRouteVeto` and `WithBehaviorProfile` godoc now state who can reopen a vetoed cluster.
+
 - A read failover the client refuses no longer moves the read strategy's preference, so the `read_preferred` gauge and `read_route_changed` events keep describing the cluster reads actually go to.
   The failover gating asked `ReadStrategy.OnFailure` for the alternative before checking whether that alternative was draining or whether the caller's context had already ended,
   and `StickyRead` and `PrimaryOnlyRead` move their preference as they answer.
@@ -67,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the routing dashboard disagreed with the traffic for the whole drain window.
   The drain gate and the context check now run first,
   and the strategy is only consulted for a failover the client will take.
+
 - The NATS worker now keeps `replay_queue_depth` current for a cluster whose replay gate is closed.
   The gated branch of the worker's cluster loop reset the oldest-age gauge to zero and went back to sleep before the once-a-second depth report,
   so the depth gauge froze at whatever it showed when the gate closed while the age gauge read zero —
@@ -84,16 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A message whose attempt `Stop` cancels is NAK'd for immediate redelivery with the rest of its batch, as a message never reached was,
   so it is neither counted as a replay error nor charged a delivery,
   and a fetch `Stop` cuts short is no longer logged as a dequeue failure.
+
 - `Close` no longer hangs after a `Replayer.Enqueue` or auto-refresh `FailureClassifier` panicked while a background write leg (a `DeferredWriteResult`, as `AdaptiveDualWrite` returns for a degraded cluster) reported its failure.
   The leg's completion callback released its registration with the client only after classifying the result and admitting it for replay;
   a panic in either that was recovered by whoever ran the callback — the caller's own `Exec` when the leg had already finished before the client registered, or the strategy's completing goroutine — left the leg registered, and `Close` waited for it forever.
   The registration is now released on every exit from the callback.
+
 - `WithClusterWriteTimeout`'s Godoc described the deadline it puts on a write leg without saying what follows a leg that fails.
   The failed leg is enqueued for replay on the caller's goroutine, on a context that keeps the caller's values but not its deadline, so the caller's own deadline cannot bound the enqueue;
   with the bundled `NATSReplayer` the publish waits for the server's acknowledgement for up to `WithPublishTimeout` (5s by default).
   With one cluster down and the NATS server unreachable, every default-strategy write therefore held the caller for the leg timeout plus the publish timeout and then reported the replay dropped.
   `WithClusterWriteTimeout`, `WithReplayer`, `replay.WithPublishTimeout` and the replay guide now state the extra bound;
   the behaviour is unchanged, because a shorter bound would drop admissions that would have succeeded.
+
 - The client now logs a warning when the topology watcher's update channel closes while the client is still open,
   naming the drain state each cluster is frozen at.
   Previously the watch loop returned silently,
@@ -110,10 +115,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The five options, the two watcher types and the configuration reference now state that an instance serves exactly one client for its lifetime;
   a `Replayer` carries no client state and may still be shared.
   No guard was added: the instances are caller-owned and the sharing was never supported.
+
 - `types.MetricsCollector.IncReadError`'s Godoc did not say when an iterator counts.
   It now states that an iterator increments `read_errors_total` only when `WithClusterReadTimeout` ends its first page,
   and that a cluster error surfacing at `Close` or `Scanner.Err` reaches the failover policy and auto-refresh but not the counter.
   The behaviour is unchanged, and the read classification matrix now pins both cases.
+
+- `Replayer.Enqueue`'s Godoc described the call without saying that the client never bounds how many are pending, and `WithAdaptiveFireForgetLimit`'s claimed its limit prevented too many pending goroutines.
+  A background leg that `AdaptiveDualWrite` runs for a degraded cluster releases its fire-and-forget slot before the client admits its failure for replay, and the admission runs on that leg's goroutine, on a context that is never cancelled, holding the payload until `Enqueue` returns.
+  With a replayer whose `Enqueue` blocks, 32 such writes under a fire-and-forget limit of 4 left 32 goroutines and 32 payloads waiting in `Enqueue` at once, with no write dropped and nothing to bound the count.
+  `Replayer.Enqueue`, `WithReplayer`, `WithAdaptiveFireForgetLimit` and the replay guide now state that `Enqueue` must return within a bounded time, as both bundled replayers do:
+  `MemoryReplayer` returns `ErrReplayQueueFull` at once and `NATSReplayer` gives up after `WithPublishTimeout`.
+  No bound was added: rejecting an admission loses a write, and no size has been chosen.
 
 ### Changed
 
