@@ -431,6 +431,9 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 // It is pure option expansion: [Safe] is exactly WithRouteVeto(true) and
 // [Legacy] exactly WithRouteVeto(false), so the last profile or option in
 // the same NewCQLClient call wins. It adds no behaviour of its own.
+// Under [Safe] a vetoed cluster is reopened only by the recovery probe or
+// by a failover leg landing on it, so with [WithRecoveryProbeDisabled]
+// only a failover leg can reopen it (see [WithRouteVeto]).
 //
 // Parameters:
 //   - profile: [Legacy] (the default) or [Safe]
@@ -512,6 +515,11 @@ func WithReplayGate(allow func(cluster ClusterID) bool) Option {
 // (see [RouteVeto] for the exact precedence). Off by default in v1; a
 // client whose failover policy implements RouteVeto logs a startup Warn
 // while the option is off.
+//
+// A vetoed cluster receives no ordinary or fallback read, so its breaker is
+// reopened only by the recovery probe (see [WithRecoveryProbe]) or by a
+// failover leg landing on it; the client logs a startup Warn when the veto
+// is on and [WithRecoveryProbeDisabled] has removed the probe.
 //
 // Parameters:
 //   - enabled: true to consult the policy's veto on ordinary reads
