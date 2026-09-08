@@ -26,6 +26,8 @@ type MetricsCollector interface {
 	IncReadTotal(cluster ClusterID)
 
 	// IncReadError increments the read error counter.
+	// An iterator increments it only when helix.WithClusterReadTimeout ends its first page;
+	// a cluster error surfacing at Close or Scanner.Err reaches the failover policy and auto-refresh, but not this counter.
 	// Metric: [prefix]_read_errors_total{cluster="..."}
 	IncReadError(cluster ClusterID)
 
