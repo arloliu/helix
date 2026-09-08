@@ -1038,6 +1038,9 @@ func WithTimestampProvider(fn TimestampProvider) Option {
 
 // WithTopologyWatcher sets the topology watcher for drain mode support.
 //
+// If the watcher's update channel closes while the client is still open,
+// the client keeps the last drain state it received and logs a warning.
+//
 // Parameters:
 //   - watcher: The topology watcher implementation
 //

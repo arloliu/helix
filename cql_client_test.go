@@ -535,6 +535,73 @@ func TestWatchTopology_FinalBufferedUpdateAppliedBeforeCloseReturn(t *testing.T)
 	}, time.Second, 5*time.Millisecond, "watchTopology must return once the update channel is drained and closed")
 }
 
+// TestWatchTopology_ChannelClosedWhileDrainingWarnsAndKeepsState covers
+// the watcher's update channel closing while the client is still open:
+// the caller closed the topology.Local/topology.NATS watcher, or its watch loop exited.
+// The drain flags stay at their last value,
+// so every write to a cluster frozen as draining keeps being skipped and enqueued for replay
+// while the replay gate refuses that same cluster.
+// Nothing resets the flags; the client must at least say so.
+func TestWatchTopology_ChannelClosedWhileDrainingWarnsAndKeepsState(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	watcher := newFinalUpdateThenCloseWatcher()
+	logger := &captureLogger{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithTopologyWatcher(watcher),
+		WithLogger(logger),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+
+	watcher.updates <- TopologyUpdate{Cluster: ClusterA, Available: false, DrainMode: true}
+	close(watcher.updates)
+
+	// The warning is written before watchTopology returns,
+	// so the goroutine's exit proves the log call has happened.
+	require.Eventually(t, func() bool {
+		return !watchTopologyGoroutineRunning()
+	}, time.Second, 5*time.Millisecond, "watchTopology must return once the update channel is closed")
+
+	kvs, logged := logger.warnKVsFor("topology updates stopped; keeping last drain state")
+	require.True(t, logged, "closing the update channel while the client is open must log a warning; warnings seen: %v", logger.warnMsgs)
+	require.Equal(t, []any{
+		"clusterA", "A", "drainingA", true,
+		"clusterB", "B", "drainingB", false,
+	}, kvs, "the warning must report the drain state each cluster is frozen at")
+
+	require.True(t, client.IsDraining(ClusterA), "the last drain state must be kept, not cleared, when updates stop")
+	require.False(t, client.IsDraining(ClusterB))
+}
+
+// TestWatchTopology_ChannelClosedByCloseDoesNotWarn pins the other side of the same warning:
+// a watcher that closes its channel because Close cancelled its context is behaving,
+// and must not be reported as a stalled topology feed.
+// Close joins watchTopology, so the logger is final once Close returns.
+func TestWatchTopology_ChannelClosedByCloseDoesNotWarn(t *testing.T) {
+	sessionA := newMockSession()
+	sessionB := newMockSession()
+	watcher := newMockTopologyWatcher()
+	logger := &captureLogger{}
+
+	client, err := NewCQLClient(sessionA, sessionB,
+		WithTopologyWatcher(watcher),
+		WithLogger(logger),
+	)
+	require.NoError(t, err)
+
+	watcher.SetDrain(ClusterA, true)
+	require.Eventually(t, func() bool {
+		return client.IsDraining(ClusterA)
+	}, time.Second, 5*time.Millisecond)
+
+	client.Close()
+
+	_, logged := logger.warnKVsFor("topology updates stopped; keeping last drain state")
+	require.False(t, logged, "a channel closed in response to Close is not a stalled watcher; warnings seen: %v", logger.warnMsgs)
+}
+
 func TestNewCQLClient(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
@@ -1978,6 +2045,7 @@ type captureLogger struct {
 	infoMsgs []string
 	infoKVs  [][]any
 	warnMsgs []string
+	warnKVs  [][]any
 }
 
 func (l *captureLogger) Debug(_ string, _ ...any) {}
@@ -1988,10 +2056,25 @@ func (l *captureLogger) Info(msg string, keysAndValues ...any) {
 	l.infoKVs = append(l.infoKVs, keysAndValues)
 }
 
-func (l *captureLogger) Warn(msg string, _ ...any) {
+func (l *captureLogger) Warn(msg string, keysAndValues ...any) {
 	l.Lock()
 	defer l.Unlock()
 	l.warnMsgs = append(l.warnMsgs, msg)
+	l.warnKVs = append(l.warnKVs, keysAndValues)
+}
+
+// warnKVsFor returns the key/value pairs of the first Warn call that logged msg,
+// and whether one was seen.
+func (l *captureLogger) warnKVsFor(msg string) ([]any, bool) {
+	l.Lock()
+	defer l.Unlock()
+	for i, m := range l.warnMsgs {
+		if m == msg {
+			return l.warnKVs[i], true
+		}
+	}
+
+	return nil, false
 }
 func (l *captureLogger) Error(_ string, _ ...any) {}
 func (l *captureLogger) Fatal(_ string, _ ...any) {}
