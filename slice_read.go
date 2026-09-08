@@ -229,9 +229,10 @@ func (q *cqlQuery) applyMaxRowsClamp(query cql.Query, limit int) cql.Query {
 //
 //   - opts.fallbackRead = false → wrapper's executeFallbackRead empty-retry
 //     gate stays closed.
-//   - opts.preserveSelectedCluster = true → runPrimaryRead skips drain-aware
-//     re-selection and resolveReadTarget skips the AllowedClusters override
-//     drain-filter fallback.
+//   - opts.preserveSelectedCluster = true (set by resolveReadOptions for
+//     every paged read) → runPrimaryRead skips drain-aware re-selection and
+//     resolveReadTarget skips the AllowedClusters override drain-filter
+//     fallback.
 //   - useNoFailover = true → caller routes through executeReadNoFailover,
 //     so standard executeRead failover is bypassed too.
 //
@@ -242,7 +243,6 @@ func (q *cqlQuery) sliceReadOpts(ctx context.Context) (opts readOptions, useNoFa
 	opts = q.client.resolveReadOptions(ctx, q)
 	if q.pageState != nil {
 		opts.fallbackRead = false
-		q.applyPagedRouting(&opts)
 
 		return opts, true
 	}
