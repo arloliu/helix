@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the routing dashboard disagreed with the traffic for the whole drain window.
   The drain gate and the context check now run first,
   and the strategy is only consulted for a failover the client will take.
+- The NATS worker now keeps `replay_queue_depth` current for a cluster whose replay gate is closed.
+  The gated branch of the worker's cluster loop reset the oldest-age gauge to zero and went back to sleep before the once-a-second depth report,
+  so the depth gauge froze at whatever it showed when the gate closed while the age gauge read zero —
+  during a quarantine, exactly the window an operator watches.
+  The depth is read from the stream rather than the consumers,
+  so it is now reported on the same cadence whether or not the gate admits the cluster.
 
 ### Changed
 
