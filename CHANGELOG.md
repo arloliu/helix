@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a driver that accepts it returned rows from the wrong cursor.
   The paging rule now lives in the one place every entry point resolves its read options, so no path can skip it.
 
+- The NATS worker under `RetryWhileRetained` now keeps a payload's poison budget when the server refuses the `Term` that would have dropped it, so the redelivery is terminated again and dropped as soon as a `Term` is accepted.
+  The dead-letter count was released whether or not the `Term` went through. A refused `Term` issues no NAK, so the message came back after `AckWait` with a fresh budget, and a poison payload churned for the stream's `MaxAge` — about 2,880 attempts at the default 24h `MaxAge` and 30s `AckWait` — with no `OnDrop` call and no `dead_letter` drop sample.
+  A refused `Term` still issues no NAK and is still counted on `replay_term_failed_total`; only the budget now survives it.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.
