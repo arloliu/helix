@@ -110,6 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The five options, the two watcher types and the configuration reference now state that an instance serves exactly one client for its lifetime;
   a `Replayer` carries no client state and may still be shared.
   No guard was added: the instances are caller-owned and the sharing was never supported.
+- `types.MetricsCollector.IncReadError`'s Godoc did not say when an iterator counts.
+  It now states that an iterator increments `read_errors_total` only when `WithClusterReadTimeout` ends its first page,
+  and that a cluster error surfacing at `Close` or `Scanner.Err` reaches the failover policy and auto-refresh but not the counter.
+  The behaviour is unchanged, and the read classification matrix now pins both cases.
 
 ### Changed
 
