@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/types"
@@ -39,32 +40,39 @@ const (
 	outcomeRowLimit      readOutcome = "row-limit"
 	outcomeCtxErr        readOutcome = "ctx-error"      // the caller's context ended before the cluster answered
 	outcomeDriverTimeout readOutcome = "driver-timeout" // the driver reports a context error while the caller's context is live
-	outcomeClusterErr    readOutcome = "cluster-error"
+	outcomeClusterErr    readOutcome = "cluster-error"  // under modeLegTimeout: the cluster never answers inside the leg deadline
 )
 
-// readMode names the routing mode the client is in.
+// readMode names the routing mode the client is in, or the leg deadline it runs under.
 type readMode string
 
 const (
-	modePlain    readMode = "plain"
-	modeOverride readMode = "override"
-	modeDrain    readMode = "drain"
-	modeFallback readMode = "fallback"
+	modePlain      readMode = "plain"
+	modeOverride   readMode = "override"
+	modeDrain      readMode = "drain"
+	modeFallback   readMode = "fallback"
+	modeLegTimeout readMode = "leg-timeout" // WithClusterReadTimeout bounds every read leg
 )
 
 // errClass classifies the error the caller receives.
 type errClass string
 
 const (
-	errNone     errClass = "nil"
-	errNotFound errClass = "not-found"
-	errRowLimit errClass = "row-limit"
-	errCtx      errClass = "ctx-error"
-	errCluster  errClass = "cluster-error"
-	errDual     errClass = "dual-cluster"
+	errNone           errClass = "nil"
+	errNotFound       errClass = "not-found"
+	errRowLimit       errClass = "row-limit"
+	errCtx            errClass = "ctx-error"
+	errCluster        errClass = "cluster-error"
+	errClusterTimeout errClass = "cluster-timeout" // types.ErrClusterTimeout: a leg deadline ended the read
+	errDual           errClass = "dual-cluster"
 )
 
 var errMatrixCluster = errUnreachableForTest
+
+// matrixLegTimeout is the leg deadline modeLegTimeout runs under.
+// A stalled session never answers before its context ends,
+// so the value only decides how long an expiring cell takes, never what it observes.
+const matrixLegTimeout = 10 * time.Millisecond
 
 var readEntries = []readEntry{
 	entryScan, entryMapScan, entryIter, entrySliceMap, entrySliceScan, entryBatchIter,
@@ -74,7 +82,7 @@ var readOutcomes = []readOutcome{
 	outcomeOK, outcomeNotFound, outcomeRowLimit, outcomeCtxErr, outcomeDriverTimeout, outcomeClusterErr,
 }
 
-var readModes = []readMode{modePlain, modeOverride, modeDrain, modeFallback}
+var readModes = []readMode{modePlain, modeOverride, modeDrain, modeFallback, modeLegTimeout}
 
 // readObservation is everything the matrix records about one read.
 type readObservation struct {
@@ -91,10 +99,14 @@ type readObservation struct {
 // matrixSession is a cql.Session whose every read returns one scripted
 // result: scanErr for Scan / MapScan, and an iterator that yields rows
 // rows and then reports iterErr from Close and Scanner.Err.
+// A stalled session answers only once the context it was handed ends,
+// as a frozen cluster does under a leg deadline,
+// and Scan / MapScan then report that context's error.
 type matrixSession struct {
 	scanErr error
 	iterErr error
 	rows    int
+	stall   bool
 	clock   *atomic.Int32 // shared between both sessions of one client
 	first   atomic.Int32  // clock value at first contact, 0 if never contacted
 }
@@ -136,25 +148,42 @@ func (s *matrixSession) Close() {}
 
 func (s *matrixSession) newIter() cql.Iter { return &matrixIter{session: s} }
 
-func (q *matrixQuery) Consistency(_ cql.Consistency) cql.Query       { return q }
-func (q *matrixQuery) SerialConsistency(_ cql.Consistency) cql.Query { return q }
-func (q *matrixQuery) PageSize(_ int) cql.Query                      { return q }
-func (q *matrixQuery) PageState(_ []byte) cql.Query                  { return q }
-func (q *matrixQuery) WithTimestamp(_ int64) cql.Query               { return q }
-func (q *matrixQuery) Statement() string                             { return "" }
-func (q *matrixQuery) Values() []any                                 { return nil }
-func (q *matrixQuery) Release()                                      {}
-func (q *matrixQuery) Exec() error                                   { return nil }
-func (q *matrixQuery) ExecContext(_ context.Context) error           { return nil }
-func (q *matrixQuery) Scan(_ ...any) error                           { return q.session.scanErr }
-func (q *matrixQuery) ScanContext(_ context.Context, _ ...any) error { return q.session.scanErr }
-func (q *matrixQuery) MapScan(_ map[string]any) error                { return q.session.scanErr }
-func (q *matrixQuery) MapScanContext(_ context.Context, _ map[string]any) error {
-	return q.session.scanErr
+// scan is the single-row read: the scripted error, or, for a stalled
+// session, the error of the context it was handed once that context ends.
+func (s *matrixSession) scan(ctx context.Context) error {
+	if !s.stall {
+		return s.scanErr
+	}
+	<-ctx.Done()
+
+	return ctx.Err()
 }
-func (q *matrixQuery) Iter() cql.Iter                         { return q.session.newIter() }
-func (q *matrixQuery) IterContext(_ context.Context) cql.Iter { return q.session.newIter() }
-func (q *matrixQuery) ScanCAS(_ ...any) (bool, error)         { return true, nil }
+
+func (q *matrixQuery) Consistency(_ cql.Consistency) cql.Query         { return q }
+func (q *matrixQuery) SerialConsistency(_ cql.Consistency) cql.Query   { return q }
+func (q *matrixQuery) PageSize(_ int) cql.Query                        { return q }
+func (q *matrixQuery) PageState(_ []byte) cql.Query                    { return q }
+func (q *matrixQuery) WithTimestamp(_ int64) cql.Query                 { return q }
+func (q *matrixQuery) Statement() string                               { return "" }
+func (q *matrixQuery) Values() []any                                   { return nil }
+func (q *matrixQuery) Release()                                        {}
+func (q *matrixQuery) Exec() error                                     { return nil }
+func (q *matrixQuery) ExecContext(_ context.Context) error             { return nil }
+func (q *matrixQuery) Scan(_ ...any) error                             { return q.session.scanErr }
+func (q *matrixQuery) ScanContext(ctx context.Context, _ ...any) error { return q.session.scan(ctx) }
+func (q *matrixQuery) MapScan(_ map[string]any) error                  { return q.session.scanErr }
+func (q *matrixQuery) MapScanContext(ctx context.Context, _ map[string]any) error {
+	return q.session.scan(ctx)
+}
+func (q *matrixQuery) Iter() cql.Iter { return q.session.newIter() }
+func (q *matrixQuery) IterContext(ctx context.Context) cql.Iter {
+	if q.session.stall {
+		<-ctx.Done()
+	}
+
+	return q.session.newIter()
+}
+func (q *matrixQuery) ScanCAS(_ ...any) (bool, error) { return true, nil }
 func (q *matrixQuery) ScanCASContext(_ context.Context, _ ...any) (bool, error) {
 	return true, nil
 }
@@ -211,9 +240,17 @@ func (s *matrixScanner) Next() bool          { return s.iter.next() }
 func (s *matrixScanner) Scan(_ ...any) error { return nil }
 func (s *matrixScanner) Err() error          { return s.iter.session.iterErr }
 
-// scriptSession configures a session so that entry observes outcome.
-func scriptSession(entry readEntry, outcome readOutcome) *matrixSession {
-	s := &matrixSession{}
+// legExpires reports whether the cell reads from a cluster that never
+// answers inside the leg deadline.
+// The batch iterator is excluded: no leg bounds it,
+// so a stalled batch would wait on the caller's own context.
+func legExpires(entry readEntry, outcome readOutcome, mode readMode) bool {
+	return mode == modeLegTimeout && outcome == outcomeClusterErr && entry != entryBatchIter
+}
+
+// scriptSession configures a session so that entry observes outcome in mode.
+func scriptSession(entry readEntry, outcome readOutcome, mode readMode) *matrixSession {
+	s := &matrixSession{stall: legExpires(entry, outcome, mode)}
 	switch outcome {
 	case outcomeOK:
 		s.rows = 1
@@ -291,6 +328,8 @@ func classifyMatrixErr(err error) errClass {
 		return errNone
 	case errors.As(err, &dual):
 		return errDual
+	case errors.Is(err, types.ErrClusterTimeout):
+		return errClusterTimeout
 	case errors.Is(err, types.ErrNotFound):
 		return errNotFound
 	case errors.Is(err, types.ErrRowLimitExceeded):
@@ -310,8 +349,8 @@ func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMo
 	t.Helper()
 
 	clock := &atomic.Int32{}
-	sessionA := scriptSession(entry, outcome)
-	sessionB := scriptSession(entry, outcome)
+	sessionA := scriptSession(entry, outcome, mode)
+	sessionB := scriptSession(entry, outcome, mode)
 	sessionA.clock, sessionB.clock = clock, clock
 	metrics := newReadTestMetrics()
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
@@ -329,6 +368,8 @@ func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMo
 		}))
 	case modeFallback:
 		opts = append(opts, WithDefaultFallbackRead(true))
+	case modeLegTimeout:
+		opts = append(opts, WithClusterReadTimeout(matrixLegTimeout))
 	case modePlain, modeDrain:
 	}
 
@@ -380,6 +421,7 @@ func orderFrom(first ClusterID, clusters []ClusterID) []ClusterID {
 func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) readObservation {
 	isIter := entry == entryIter || entry == entryBatchIter
 	isSlice := entry == entrySliceMap || entry == entrySliceScan
+	expires := legExpires(entry, outcome, mode)
 
 	// Every entry point moves the primary attempt away from a draining cluster.
 	served := ClusterA
@@ -418,15 +460,21 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 		// A driver-side timeout with a live caller context is a cluster
 		// fault for the failover policy, exactly like any other cluster
 		// error; only a connectivity error also counts toward auto-refresh.
+		// A leg its deadline ends is ErrClusterTimeout, a connectivity error.
 		obs.err = errCtx
 		if outcome == outcomeClusterErr {
 			obs.err = errCluster
 			obs.healthFail = []ClusterID{served}
 		}
+		if expires {
+			obs.err = errClusterTimeout
+		}
 		obs.failures = []ClusterID{served}
-		if isIter {
+		if isIter && !expires {
 			// Iterator Close reports the failure to the policy and the
 			// strategy but cannot retry, and emits no read-error metric.
+			// A first page the leg deadline ends never reaches Close:
+			// it is reported and retried like a Scan, so it follows the rules below.
 			if mode != modeOverride {
 				obs.onFailure = []ClusterID{served}
 			}
