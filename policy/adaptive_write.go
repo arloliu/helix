@@ -115,7 +115,7 @@ type clusterWriteState struct {
 	fastStrikes int32        // Consecutive fast writes for recovery; guarded by mu.
 	isDegraded  atomic.Bool  // Lock-free read in Execute fast path; written under mu.
 	latched     atomic.Bool  // Operator latch set by ForceDegrade; written under mu.
-	lastLatency atomic.Int64 // Last write latency in nanoseconds; written from goroutines.
+	lastLatency atomic.Int64 // Last write latency in nanoseconds; written from goroutines. Cleared on recovery: only a healthy sample is a baseline.
 
 	// Hysteresis bookkeeping, all guarded by mu.
 	degradedAt  int64         // When the current degraded span began (Unix nanoseconds).
@@ -832,40 +832,54 @@ func (a *AdaptiveDualWrite) observeFireAndForget(
 		)
 		return
 	}
+	// Record the observation before the credit test, so that subsequent
+	// fire-and-forget cycles and the sibling's delta check see a fresh sample
+	// rather than the stale pre-degradation value even when this write earns
+	// no credit.
+	state.lastLatency.Store(latency.Nanoseconds())
+
 	if !a.creditsRecovery(latency, siblingState) {
 		return
 	}
 
-	// Write succeeded, was fast, and within delta of sibling - record for recovery.
-	// Update lastLatency so subsequent fire-and-forget cycles and the sibling's
-	// delta check see a fresh observation rather than a stale pre-degradation value.
-	state.lastLatency.Store(latency.Nanoseconds())
+	// Write succeeded and was fast enough - record it for recovery.
 	a.recordFast(state)
 }
 
 // creditsRecovery reports whether a successful operation that took latency
 // against a degraded cluster counts toward its recovery: it must be under
 // the absolute cap and within the delta threshold of the sibling's last
-// write, or under the minimum floor when the sibling has no baseline.
+// write, or under the minimum floor when that comparison is not trustworthy
+// — the sibling holds no sample, or is itself degraded and its sample may
+// still be the slow one that degraded it.
 func (a *AdaptiveDualWrite) creditsRecovery(latency time.Duration, siblingState *clusterWriteState) bool {
 	if latency >= a.absoluteMax {
 		return false // Succeeded but too slow.
 	}
 	siblingLatencyNs := siblingState.lastLatency.Load()
 	if siblingLatencyNs <= 0 {
-		// Sibling has no baseline yet (also degraded or never written to).
-		// Use minFloor as a conservative substitute for the delta check:
-		// only grant recovery credit if the operation was comfortably fast
-		// on its own, so the cluster cannot bounce in and out of
-		// degradation while the sibling's true cost is unknown.
+		// Sibling has no baseline at all (never written to). Use minFloor as
+		// a conservative substitute for the delta check: only grant recovery
+		// credit if the operation was comfortably fast on its own, so the
+		// cluster cannot bounce in and out of degradation while the sibling's
+		// true cost is unknown.
 		return latency < a.minFloor
 	}
 	delta := latency - time.Duration(siblingLatencyNs)
 	if delta < 0 {
 		delta = -delta
 	}
+	if delta <= a.deltaThreshold {
+		return true
+	}
 
-	return delta <= a.deltaThreshold
+	// The delta failed. When the sibling is degraded too, its sample may be
+	// the slow one that degraded it, and comparing against that would deny
+	// credit to every fast write and hold both clusters in fire-and-forget
+	// indefinitely. Fall back to the same floor used when there is no
+	// baseline at all. isDegraded is read lock-free, exactly as Execute
+	// reads it, so the background write path takes no extra lock.
+	return siblingState.isDegraded.Load() && latency < a.minFloor
 }
 
 // nowNanos is time.Now in Unix nanoseconds, or the injected test clock.
@@ -1178,7 +1192,10 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 //
 // slowStrikes is always cleared — even on a healthy cluster — so that a
 // slow→fast→slow sequence does not let stale strikes accumulate across the
-// gap. The isDegraded check is performed inside the lock so that a concurrent
+// gap. A cluster that recovers also drops its latency sample: the one it
+// carries was taken during the degraded span, so it is not a healthy
+// baseline for the sibling's recovery credit until the next synchronous
+// write records a fresh one. The isDegraded check is performed inside the lock so that a concurrent
 // ForceRecover or Reset cannot change the degraded state between the check
 // and the fastStrikes increment.
 //
@@ -1211,6 +1228,7 @@ func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
 		}
 		state.isDegraded.Store(false)
 		state.fastStrikes = 0
+		state.lastLatency.Store(0)
 		state.recoveredAt = now
 		justRecovered = true
 		cluster = a.stateCluster(state)
@@ -1526,9 +1544,11 @@ func (a *AdaptiveDualWrite) RecordProbeSuccess(cluster types.ClusterID) {
 //
 // The probe counts toward recovery only when it would count as a fast
 // write: under the absolute cap and within the delta threshold of the
-// sibling's last write (or under the minimum floor when the sibling has no
-// baseline). A probe that answers slowly earns nothing, so a cluster whose
-// probe query is cheap but whose writes are still slow is not restored.
+// sibling's last write (or under the minimum floor when the sibling holds
+// no sample, or is itself degraded and its sample is no longer a
+// trustworthy baseline). A probe that answers slowly earns nothing, so a
+// cluster whose probe query is cheap but whose writes are still slow is
+// not restored.
 // The probe's latency is not recorded as a write latency sample.
 //
 // Parameters:

@@ -1903,3 +1903,126 @@ func TestAdaptiveDualWrite_ConcurrentTransitionsSupersededGaugeSkipped(t *testin
 		"the superseded transition still increments its cumulative counter")
 	require.Equal(t, int64(1), g.GetWriteRecoveredTransitions(types.ClusterA))
 }
+
+// TestAdaptiveDualWrite_RecoversWhenBothDegradedBySlowWrites pins the case where
+// a shared slowdown degrades both clusters through the absolute cap, so both carry
+// a slow latency sample. Once the clusters answer quickly again, both must recover:
+// recovery credit must not be judged against a degraded sibling's stale sample.
+func TestAdaptiveDualWrite_RecoversWhenBothDegradedBySlowWrites(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveAbsoluteMax(20*time.Millisecond),
+		WithAdaptiveDeltaThreshold(5*time.Millisecond),
+		WithAdaptiveMinFloor(10*time.Millisecond),
+		WithAdaptiveStrikeThreshold(2),
+		WithAdaptiveRecoveryThreshold(2),
+		WithAdaptiveFireForgetTimeout(5*time.Second),
+	)
+	ctx := t.Context()
+
+	slow := func(context.Context) error {
+		time.Sleep(30 * time.Millisecond) // Over the 20ms absolute cap.
+		return nil
+	}
+
+	// Both legs are synchronous while healthy, so strikeThreshold rounds of
+	// slow writes degrade both clusters and record their slow latency.
+	for range 2 {
+		errA, errB := a.Execute(ctx, slow, slow)
+		require.NoError(t, errA)
+		require.NoError(t, errB)
+	}
+
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.True(t, a.IsDegraded(types.ClusterB))
+	require.Positive(t, a.stateA.lastLatency.Load(),
+		"precondition: cluster A carries a slow latency sample into degradation")
+	require.Positive(t, a.stateB.lastLatency.Load(),
+		"precondition: cluster B carries a slow latency sample into degradation")
+
+	fast := func(context.Context) error { return nil }
+
+	require.Eventually(t, func() bool {
+		_, _ = a.Execute(ctx, fast, fast)
+
+		return !a.IsDegraded(types.ClusterA) && !a.IsDegraded(types.ClusterB)
+	}, 2*time.Second, 5*time.Millisecond,
+		"both clusters must recover once their writes are fast again")
+}
+
+// TestAdaptiveDualWrite_ProbeRecoversWhenBothDegraded pins recovery through the
+// probe path alone, with no write traffic during the outage: both clusters are
+// degraded and hold a stale slow latency sample, and fast probes must restore
+// both of them, not just the first one to reach the recovery threshold.
+func TestAdaptiveDualWrite_ProbeRecoversWhenBothDegraded(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveAbsoluteMax(2*time.Second),
+		WithAdaptiveDeltaThreshold(5*time.Millisecond),
+		WithAdaptiveMinFloor(10*time.Millisecond),
+		WithAdaptiveRecoveryThreshold(2),
+	)
+
+	degradeByStrikes(a, types.ClusterA)
+	degradeByStrikes(a, types.ClusterB)
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.True(t, a.IsDegraded(types.ClusterB))
+
+	// Both clusters were last seen slow, far outside the delta threshold.
+	slow := (500 * time.Millisecond).Nanoseconds()
+	a.stateA.lastLatency.Store(slow)
+	a.stateB.lastLatency.Store(slow)
+
+	const fast = 1 * time.Millisecond
+	for range 2 {
+		a.RecordProbeLatency(types.ClusterA, fast)
+	}
+	for range 2 {
+		a.RecordProbeLatency(types.ClusterB, fast)
+	}
+
+	assert.False(t, a.IsDegraded(types.ClusterA),
+		"cluster A must recover on fast probes while its sibling is degraded")
+	assert.False(t, a.IsDegraded(types.ClusterB),
+		"cluster B must recover on fast probes after its sibling recovered")
+}
+
+// TestAdaptiveDualWrite_RecoversWhenBothDegradedAboveMinFloor pins the recovery
+// band between minFloor and absoluteMax: two clusters that degraded together and
+// now answer in step, fast enough but not fast enough to clear the noise floor,
+// must still recover on the delta between their own fresh samples.
+func TestAdaptiveDualWrite_RecoversWhenBothDegradedAboveMinFloor(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveAbsoluteMax(200*time.Millisecond),
+		WithAdaptiveDeltaThreshold(50*time.Millisecond),
+		WithAdaptiveMinFloor(20*time.Millisecond),
+		WithAdaptiveStrikeThreshold(2),
+		WithAdaptiveRecoveryThreshold(2),
+		WithAdaptiveFireForgetTimeout(5*time.Second),
+	)
+	ctx := t.Context()
+
+	slow := func(context.Context) error {
+		time.Sleep(300 * time.Millisecond) // Over the 200ms absolute cap.
+		return nil
+	}
+	for range 2 {
+		errA, errB := a.Execute(ctx, slow, slow)
+		require.NoError(t, errA)
+		require.NoError(t, errB)
+	}
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.True(t, a.IsDegraded(types.ClusterB))
+
+	// Recovered latency: under the cap and in step across the clusters, but
+	// above minFloor, so credit has to come from the delta comparison.
+	recovered := func(context.Context) error {
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	}
+
+	require.Eventually(t, func() bool {
+		_, _ = a.Execute(ctx, recovered, recovered)
+
+		return !a.IsDegraded(types.ClusterA) && !a.IsDegraded(types.ClusterB)
+	}, 3*time.Second, 10*time.Millisecond,
+		"both clusters must recover on matching latencies above minFloor")
+}
