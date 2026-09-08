@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A message whose attempt `Stop` cancels is NAK'd for immediate redelivery with the rest of its batch, as a message never reached was,
   so it is neither counted as a replay error nor charged a delivery,
   and a fetch `Stop` cuts short is no longer logged as a dequeue failure.
+- `Close` no longer hangs after a `Replayer.Enqueue` or auto-refresh `FailureClassifier` panicked while a background write leg (a `DeferredWriteResult`, as `AdaptiveDualWrite` returns for a degraded cluster) reported its failure.
+  The leg's completion callback released its registration with the client only after classifying the result and admitting it for replay;
+  a panic in either that was recovered by whoever ran the callback — the caller's own `Exec` when the leg had already finished before the client registered, or the strategy's completing goroutine — left the leg registered, and `Close` waited for it forever.
+  The registration is now released on every exit from the callback.
 
 ### Changed
 

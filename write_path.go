@@ -464,6 +464,12 @@ func (c *CQLClient) replayLeg(
 		done atomic.Bool
 	}
 	deferred.OnComplete(func(legErr error) {
+		// Release the leg however this callback exits: the failure
+		// classifier, the replayer, and the drop handler below are all
+		// user code, and a panic one of them raises may be recovered by
+		// whoever runs the callback, after which Close would otherwise
+		// wait for this leg forever.
+		defer c.deferred.done()
 		// The late result is the session's real outcome: report it to the
 		// hub so a dead session behind a degraded cluster is still
 		// refreshed. The leg has finished by now, so the holder it
@@ -479,9 +485,8 @@ func (c *CQLClient) replayLeg(
 		}
 		admission.err = dropErr
 		admission.done.Store(true)
-		// Report before releasing the leg, so Close returns only after the
-		// drop handler ran and the event was admitted.
-		defer c.deferred.done()
+		// Close returns only after the drop handler ran and the event was
+		// admitted, since the deferred release runs last.
 		if dropErr != nil {
 			c.emitReplayDropped(payload.TargetCluster, payload, dropErr)
 		}

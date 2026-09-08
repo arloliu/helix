@@ -289,3 +289,74 @@ func TestClose_WaitsForDeferredDropHandler(t *testing.T) {
 		t.Fatal("Close must return once the drop handler finished")
 	}
 }
+
+// panickingReplayer panics on every enqueue.
+type panickingReplayer struct{}
+
+func (panickingReplayer) Enqueue(context.Context, types.ReplayPayload) error {
+	panic("replayer: enqueue exploded")
+}
+
+// TestClose_ReturnsAfterDeferredLegReplayerPanics asserts that a panic
+// raised by the replayer while a background leg's failure is admitted
+// does not leave the leg registered with the client: once whoever ran the
+// completion callback has recovered the panic, Close still returns.
+func TestClose_ReturnsAfterDeferredLegReplayerPanics(t *testing.T) {
+	tests := []struct {
+		name     string
+		complete func(t *testing.T, client *CQLClient, deferred *manualDeferredError)
+	}{
+		{
+			// The leg completed before the client registered, so the
+			// callback runs inline inside Exec and the panic unwinds to
+			// the caller, which recovers it as an HTTP server would.
+			name: "completed before registration",
+			complete: func(t *testing.T, client *CQLClient, deferred *manualDeferredError) {
+				deferred.complete(errors.New("background failure"))
+				require.Panics(t, func() { _ = client.Query("INSERT INTO t (id) VALUES (1)").Exec() })
+			},
+		},
+		{
+			// The callback runs on the goroutine that completes the leg,
+			// which recovers the panic as a strategy might.
+			name: "completed in the background",
+			complete: func(t *testing.T, client *CQLClient, deferred *manualDeferredError) {
+				require.NoError(t, client.Query("INSERT INTO t (id) VALUES (1)").Exec())
+				recovered := make(chan any, 1)
+				go func() {
+					defer func() { recovered <- recover() }()
+					deferred.complete(errors.New("background failure"))
+				}()
+				select {
+				case r := <-recovered:
+					require.NotNil(t, r, "the replayer's panic reaches the completing goroutine")
+				case <-time.After(regressionWaitTimeout):
+					t.Fatal("the completing goroutine must return")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deferred := &manualDeferredError{}
+			client, err := NewCQLClient(newMockSession(), newMockSession(),
+				WithWriteStrategy(&deferredStrategy{result: deferred}),
+				WithReplayer(panickingReplayer{}),
+			)
+			require.NoError(t, err)
+
+			tt.complete(t, client, deferred)
+
+			closed := make(chan struct{})
+			go func() {
+				client.Close()
+				close(closed)
+			}()
+			select {
+			case <-closed:
+			case <-time.After(regressionWaitTimeout):
+				t.Fatal("Close must return once the leg's completion callback exited")
+			}
+		})
+	}
+}
