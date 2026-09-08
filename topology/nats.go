@@ -24,6 +24,9 @@ import (
 // Watch() should be called once per instance. Subsequent calls return the
 // same channel. The channel is closed when Close() is called or the context
 // is cancelled.
+// A NATS therefore serves exactly one [helix.CQLClient] for that client's lifetime:
+// a second client sharing it competes for each update and a client that closes ends the watch for both.
+// Build a new NATS for another client.
 type NATS struct {
 	kv     jetstream.KeyValue
 	config WatcherConfig

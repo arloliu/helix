@@ -14,6 +14,11 @@ import (
 // of drain states, making it ideal for unit tests and demos.
 // It implements both TopologyWatcher (for observing) and TopologyOperator
 // (for controlling drain states).
+//
+// A Local serves exactly one [helix.CQLClient] for that client's lifetime:
+// every Watch call returns the same channel and the first call's context ends the watch,
+// so a second client sharing it competes for each update and a client that closes ends the watch for both.
+// Build a new Local for another client.
 type Local struct {
 	drainA      bool
 	drainB      bool

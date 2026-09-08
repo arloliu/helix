@@ -9,6 +9,11 @@ This page lists every option the root `helix` package accepts.
 Options belonging to `policy/`, `replay/`, `topology/`, `mirror/`, and `contrib/metrics/vm` are documented in their own guides,
 linked from the rows that take them.
 
+A read strategy, write strategy, failover policy, replay worker or topology watcher instance serves exactly one client for that client's lifetime.
+`NewCQLClient` installs its own event dispatcher, cluster names, metrics and logger into the strategies and policies that accept them, each as a single slot, so a second client sharing an instance takes them over and the first client's events and names go to the second.
+A topology watcher hands every `Watch` caller the same channel, so two clients on one watcher compete for each drain update and the first `Close` ends the watch for both.
+Build a new instance for each client; a `Replayer` carries no client state and may be shared.
+
 ---
 
 ## Strategies & policies
