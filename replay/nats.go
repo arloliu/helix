@@ -278,6 +278,11 @@ func WithReplicas(n int) NATSReplayerOption {
 
 // WithPublishTimeout sets the timeout for publishing messages.
 //
+// The timeout bounds how long [NATSReplayer.Enqueue] waits for the server's acknowledgement.
+// The client enqueues a failed write leg on the caller's goroutine, outside the caller's deadline,
+// so this is also the longest a failed leg can hold the caller beyond [helix.WithClusterWriteTimeout]
+// when the server does not answer.
+//
 // Parameters:
 //   - d: Publish timeout duration
 //

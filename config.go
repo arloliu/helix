@@ -821,6 +821,12 @@ func WithAckMode(mode AckMode) Option {
 
 // WithReplayer sets the replayer for failed writes.
 //
+// The client calls [Replayer.Enqueue] on the goroutine of the write whose leg failed,
+// on a context that keeps the caller's values but not its deadline,
+// so a slow Enqueue holds the caller beyond the leg's own bound
+// (see [WithClusterWriteTimeout]).
+// The bundled NATS replayer bounds each publish by [replay.WithPublishTimeout].
+//
 // Parameters:
 //   - replayer: The replayer implementation
 //
@@ -1353,6 +1359,13 @@ func WithDefaultMaxRows(n int) Option {
 // another and skips the second once the context has ended, so it needs
 // about r+d, where r is the driver's request timeout — the second leg
 // still needs its own d after the first has spent r.
+//
+// The deadline bounds the leg, not the replay admission that follows it.
+// A leg that fails is enqueued on the caller's goroutine,
+// on a context that keeps the caller's values but not its deadline,
+// so the write holds the caller for up to d plus the time [Replayer.Enqueue] takes —
+// with the bundled NATS replayer, up to its publish timeout
+// (see [replay.WithPublishTimeout]) when the server does not acknowledge the publish.
 //
 // Parameters:
 //   - d: Per-leg deadline. 0 disables the timeout. Negative values are

@@ -88,6 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The leg's completion callback released its registration with the client only after classifying the result and admitting it for replay;
   a panic in either that was recovered by whoever ran the callback — the caller's own `Exec` when the leg had already finished before the client registered, or the strategy's completing goroutine — left the leg registered, and `Close` waited for it forever.
   The registration is now released on every exit from the callback.
+- `WithClusterWriteTimeout`'s Godoc described the deadline it puts on a write leg without saying what follows a leg that fails.
+  The failed leg is enqueued for replay on the caller's goroutine, on a context that keeps the caller's values but not its deadline, so the caller's own deadline cannot bound the enqueue;
+  with the bundled `NATSReplayer` the publish waits for the server's acknowledgement for up to `WithPublishTimeout` (5s by default).
+  With one cluster down and the NATS server unreachable, every default-strategy write therefore held the caller for the leg timeout plus the publish timeout and then reported the replay dropped.
+  `WithClusterWriteTimeout`, `WithReplayer`, `replay.WithPublishTimeout` and the replay guide now state the extra bound;
+  the behaviour is unchanged, because a shorter bound would drop admissions that would have succeeded.
 
 ### Changed
 
