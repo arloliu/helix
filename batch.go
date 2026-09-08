@@ -276,9 +276,16 @@ func (b *cqlBatch) ExecContext(ctx context.Context) (err error) {
 		return err
 	}
 
+	// A write strategy may keep a leg running after this call returns, and the
+	// driver marshals the arguments when the leg runs.
+	// Copy the byte-slice contents once, before dispatch, so the caller may
+	// reuse its buffers as soon as Exec returns.
+	entries := snapshotBatchByteArgs(b.entries)
+	wc.batchEntries = entries
+
 	err = b.client.executeWriteWithReplay(ctx, wc, func(ctx context.Context, session cql.Session) error {
 		batch := session.Batch(b.kind)
-		for _, entry := range b.entries {
+		for _, entry := range entries {
 			batch = batch.Query(entry.statement, entry.args...)
 		}
 		if b.consistency != nil {
