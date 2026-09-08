@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `[]byte(nil)` query or batch argument (a NULL blob) is now replayed and mirrored as NULL instead of an empty value.
+  `cloneArgs` copied a nil `[]byte` into a non-nil zero-length `[]byte`, and the driver encodes the two differently.
+  So a leg that failed and was later replayed — or a query dispatched through `Mirror()` — wrote an empty blob where the original write had left the column NULL.
+
 - A `Scanner` consumer's cluster failures now reach the read strategy, the failover policy and auto-refresh.
   `Scanner().Err()` previously released the iterator's resources but reported no outcome, so a caller that drained with `Scanner()` and never called `Close()` left a failing cluster with a clean record — the circuit breaker took no input, the cluster was never marked degraded, and reads kept being routed to it.
   `Err()` now ends the read exactly as `Close` does. It shares the same guard, so the everyday idiom — a `Scanner` loop under a deferred `Close` — still reports once, and a `Close` that follows returns the error the `Scanner` already saw without closing the driver's iterator a second time.

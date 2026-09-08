@@ -298,15 +298,19 @@ func (c *CQLClient) Mirror() *mirror.Engine {
 }
 
 // cloneArgs returns a copy of args that is safe for the mirror engine to
-// retain after the caller's Exec returns. The outer slice is always copied;
-// each element that is a []byte is also copied so caller-side buffer reuse
-// (pooling, in-place mutation) does not corrupt mirror payloads.
+// retain after the caller's Exec returns.
+// The outer slice is always copied; each element that is a []byte is also
+// copied so caller-side buffer reuse (pooling, in-place mutation) does not
+// corrupt mirror payloads.
+// A nil []byte (a NULL blob) is preserved as a typed nil []byte rather than
+// turned into a non-nil empty slice, since the driver encodes the two
+// differently (NULL vs. a zero-length value).
 //
 // Other types (primitives, strings, time.Time, gocql.UUID, value structs)
-// are passed through. Callers that mutate non-byte-slice arg values after
-// Exec returns get the standard "do not retain mutable args after a
-// fire-and-forget call" semantics already implicit in the existing replay
-// path.
+// are passed through.
+// Callers that mutate non-byte-slice arg values after Exec returns get the
+// standard "do not retain mutable args after a fire-and-forget call"
+// semantics already implicit in the existing replay path.
 func cloneArgs(args []any) []any {
 	if len(args) == 0 {
 		return nil
@@ -314,9 +318,15 @@ func cloneArgs(args []any) []any {
 	out := make([]any, len(args))
 	for i, a := range args {
 		if b, ok := a.([]byte); ok {
+			if b == nil {
+				out[i] = []byte(nil)
+
+				continue
+			}
 			cp := make([]byte, len(b))
 			copy(cp, b)
 			out[i] = cp
+
 			continue
 		}
 		out[i] = a
