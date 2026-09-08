@@ -146,6 +146,26 @@ func TestMirrorDeepCopyArgsSurvivesCallerMutation(t *testing.T) {
 	require.Equal(t, []byte{1, 2, 3, 4}, captured, "mirror must observe pre-mutation bytes")
 }
 
+// A nil []byte arg (a NULL blob) must reach the mirror engine as a nil
+// []byte, not an empty one: the driver encodes the two differently on
+// the wire, so collapsing nil into empty silently writes the wrong
+// value to the mirror target.
+func TestMirrorPreservesNilByteArg(t *testing.T) {
+	rec := newRecordingMirror()
+	client, err := NewCQLClient(newMockSession(), nil)
+	require.NoError(t, err)
+	defer client.Close()
+	installMirrorEngine(t, client, rec.execute(), mirror.WithWorkers(1))
+
+	require.NoError(t, client.Query("INSERT INTO t (b) VALUES (?)", []byte(nil)).Mirror().ExecContext(context.Background()))
+
+	rec.waitForOne(t, 2*time.Second)
+	got := rec.snapshot()[0]
+	b, ok := got.Args[0].([]byte)
+	require.True(t, ok)
+	require.Nil(t, b, "a nil []byte arg must remain nil on mirror dispatch")
+}
+
 func TestMirrorControllerIsNilWhenUnconfigured(t *testing.T) {
 	client, err := NewCQLClient(newMockSession(), nil)
 	require.NoError(t, err)
@@ -766,6 +786,23 @@ func TestCloneArgs(t *testing.T) {
 func TestCloneArgsEmpty(t *testing.T) {
 	require.Nil(t, cloneArgs(nil))
 	require.Nil(t, cloneArgs([]any{}))
+}
+
+// A nil []byte element must stay a typed nil []byte after cloning, not
+// become a non-nil empty slice: the driver encodes the two differently
+// (NULL vs. zero-length value), so cloning must not change which one an
+// argument represents.
+func TestCloneArgsPreservesNilByteSlice(t *testing.T) {
+	out := cloneArgs([]any{[]byte(nil), []byte{}})
+
+	b0, ok := out[0].([]byte)
+	require.True(t, ok)
+	require.Nil(t, b0)
+
+	b1, ok := out[1].([]byte)
+	require.True(t, ok)
+	require.NotNil(t, b1)
+	require.Empty(t, b1)
 }
 
 func TestCloneBatchEntries(t *testing.T) {
