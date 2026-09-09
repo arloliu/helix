@@ -134,6 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The built-in breakers report their schedule through the new `helix.FailoverProbeScheduleReporter`,
   so a policy can tell the client whether a probe is scheduled at all.
   Routing is unchanged.
+- `AdaptiveDualWrite.ForceDegrade` now logs the operator latch it sets on a cluster that is already degraded, so the call is no longer invisible.
+  The whole method reported only through the healthy-to-degraded transition, and a cluster that had degraded on its own has no transition left to report.
+  So an operator isolating a cluster that had just degraded by itself got no log line at all, while the latch quietly turned off automatic recovery: the recovery probe and fast background writes could no longer restore that cluster.
+  The latch now writes the degrade line at the same level with `alreadyDegraded=true`.
+  The transition event and the transition metrics are unchanged and still fire once per real transition, since the cluster was already counted as degraded.
+  A second `ForceDegrade` on a cluster that is already latched still changes nothing and still reports nothing.
 
 ### Changed
 
