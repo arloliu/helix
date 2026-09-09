@@ -164,6 +164,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a swap that installed its session after `Close` had already closed the one it found reported success and left the new session open for the life of the process,
   with no holder anyone would ever tear down.
   The flag is re-checked after the swap — `Close` sets it before it tears anything down — and a swap that finds the client closed retires the holder it just installed, closes the session it was given, and returns `types.ErrSessionClosed`, the same error a swap on an already-closed client returns.
+- The NATS worker's dead-letter budgets no longer accumulate for the life of the process.
+  Under `RetryWhileRetained` a payload's poison budget was released only when its `Term` was accepted or its budget ran out,
+  so a sequence that dead-lettered once and then left the stream some other way — `MaxAge` expiry, `DiscardOld` under a limit, a purge — kept its entry forever,
+  and a long-lived worker on a busy stream grew a map it never emptied.
+  Each eviction-watch poll now drops the budgets of the sequences the stream reports it no longer holds.
+  The cleanup rides on `WithEvictionWatch`, which is where the stream state is already read, so a worker that runs `RetryWhileRetained` without the eviction watch is unchanged.
 
 ### Changed
 

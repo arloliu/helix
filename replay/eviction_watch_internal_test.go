@@ -110,3 +110,46 @@ func TestNATSBackend_StopCancelsAParkedEvictionPoll(t *testing.T) {
 		t.Fatal("Stop waited for the parked poll instead of cancelling it")
 	}
 }
+
+// infoStream answers every poll with one canned stream state.
+type infoStream struct {
+	jetstream.Stream
+	info *jetstream.StreamInfo
+}
+
+func (s *infoStream) Info(context.Context, ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
+	return s.info, nil
+}
+
+func TestNATSBackend_EvictionPollForgetsDeadLettersTheStreamNoLongerHolds(t *testing.T) {
+	stream := &infoStream{info: &jetstream.StreamInfo{
+		Created: ledgerCreated,
+		State:   jetstream.StreamState{Msgs: 2, FirstSeq: 5, LastSeq: 6},
+	}}
+	cfg := newTestNATSBackendConfig()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	ticks := make(chan time.Time)
+	b := &natsBackend{
+		replayer:    &NATSReplayer{stream: stream},
+		config:      &cfg,
+		stopCh:      stop,
+		wg:          &wg,
+		deadLetters: map[uint64]int{3: 1, 4: 2, 5: 1, 9: 3},
+		backoffWait: func(time.Duration) <-chan time.Time { return ticks },
+	}
+	wg.Add(1)
+	go b.watchEvictions()
+	t.Cleanup(func() { close(stop); wg.Wait() })
+
+	// The second tick is only received once the first poll has been
+	// processed, so it is the handshake that makes the assertion below
+	// deterministic without waiting on the clock.
+	ticks <- time.Time{}
+	ticks <- time.Time{}
+
+	b.dlMu.Lock()
+	defer b.dlMu.Unlock()
+	require.Equal(t, map[uint64]int{5: 1, 9: 3}, b.deadLetters,
+		"a sequence the stream dropped by any means other than this worker's Term must not keep its poison budget forever")
+}
