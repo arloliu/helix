@@ -232,6 +232,27 @@ scenario's noise floor, and is not read as anything.
 Split into two `go test` processes again, for the same memory-watchdog reason.
 The observable this release actually changes is framers reclaimed under
 retry-heavy load, which nothing here measures.
+
+**Amendment 2026-09-09 (`v2.7.0-otter`):** the fork's speculative-execution
+retirement stage. Speculative execution still never runs here, so the
+retirement change itself is inert; two of its companions are live on ordinary
+paths. A query whose context ends is no longer put to the retry policy again
+and makes no further attempt, and the iterator returned in that window carries
+`context.Canceled` or `context.DeadlineExceeded` rather than the attempt's own
+error, with host and warnings intact — which is what a leg ended by
+`WithClusterReadTimeout` now sees, and `classifyReadErr` already attributed a
+context error after the caller's deadline to the caller. And an idempotent
+query that exhausted its hosts returns the last attempt's real iterator, so
+`Iter.Host()` is non-nil there; Helix never reads it.
+
+None of that moved a timing: 52 pass / 0 fail / 0 skip, 600 s total (was 598),
+`TestS3_PauseA_LatencyCircuitBreaker` 24.65 s (was 24.63),
+`TestS_PlainCircuitBreaker_TripAndClose` 20.64 s (was 20.64),
+`TestStrict_RecoveryProbe_DefaultProbeRestoresCluster` 10.31 s (was 10.25),
+`TestS_PauseA_CloseReturnsDuringFault` 82.85 s (was 82.90), and
+`TestStrict_RecoveryProbe_StopAndStart_RestoresCluster` 15.32 s against 17.95 s
+— inside the spread already recorded as that scenario's noise floor. Run as a
+single `go test` process this time; the memory watchdog did not fire.
 The full suite passes locally: 52 tests, 0 failures, 598 s (was 50 tests, 562 s;
 the two additions are `TestS_PauseA_IterFirstPageMovesToTheOtherCluster` and the
 new `TestS_PauseA_CloseReturnsDuringFault`).
