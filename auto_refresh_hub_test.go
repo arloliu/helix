@@ -285,6 +285,49 @@ func TestRecoveryProbe_RetiredMidProbeIsAbandoned(t *testing.T) {
 	require.Zero(t, probes.failureA.Load(), "an abandoned probe is not a probe failure")
 }
 
+// A refresh whose swap lands after Close has finished installs a session
+// nothing else will ever close, on a holder that is not the installed one.
+// It disposes of both itself, exactly as SwapSession does.
+func TestRefreshSession_ClientClosedDuringTheRefreshDisposesOfTheNewSession(t *testing.T) {
+	old, fresh := newMockSession(), newMockSession()
+	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return fresh, nil }
+	client, err := NewCQLClient(old, newMockSession(), WithSessionRefresher(refresher))
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+
+	// The refresh asks the client's NowProvider for the stamp of the holder
+	// it is about to install, which happens after the closed check and
+	// before the swap. Parking the provider there puts the refresh in
+	// exactly the window a concurrent Close has to lose.
+	var armed atomic.Bool
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	SetClientNowFuncForTest(client, func() int64 {
+		if armed.CompareAndSwap(true, false) {
+			close(entered)
+			<-release
+		}
+
+		return 0
+	})
+
+	refreshed := make(chan error, 1)
+	armed.Store(true)
+	go func() { refreshed <- client.RefreshSession(context.Background(), ClusterA) }()
+
+	<-entered
+	client.Close()
+	close(release)
+
+	require.ErrorIs(t, <-refreshed, types.ErrSessionClosed,
+		"a refresh the client outlived reports the client as closed, like one that starts closed")
+	require.True(t, fresh.closed.Load(),
+		"a session installed after Close finished must be closed by the refresh that installed it")
+	require.True(t, client.holderFor(ClusterA).retired.Load(),
+		"the holder is retired, so an in-flight outcome against it reaches neither the policy nor the strategy")
+	require.True(t, old.closed.Load(), "the replaced session is closed as the refresh contract promises")
+}
+
 func TestRefreshSession_ClosesOldSessionAfterGrace(t *testing.T) {
 	old := newMockSession()
 	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return newMockSession(), nil }

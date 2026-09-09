@@ -439,13 +439,9 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 	// Close marks the client closed before it tears anything down, so a
 	// swap that finds the flag set here may have installed its holder
 	// after Close closed the session it found. Nothing would ever close
-	// the new one, so this swap disposes of it: the holder is retired
-	// first, as an uninstalled holder always is, so an outcome an
-	// in-flight operation reports against it reaches neither the failover
-	// policy nor the read strategy.
+	// the new one, so this swap disposes of it.
 	if c.closed.Load() {
-		holder.retired.Store(true)
-		newSession.Close()
+		disposeUninstalled(holder)
 
 		return nil, types.ErrSessionClosed
 	}
@@ -493,7 +489,10 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 //     was closed, or someone else installed a session for the cluster
 //     while the refresher ran), the newly-built session is closed before
 //     returning the error so no connection is leaked, and the session
-//     that is installed stays untouched.
+//     that is installed stays untouched. A client that closes once the
+//     swap has landed is the one case where the refresher's session was
+//     installed: it is retired and closed as well, so nothing outlives
+//     Close.
 //   - The lastErr passed to the refresher is the most recently observed
 //     failure error against this cluster (or nil if no op has failed
 //     yet). Refreshers can inspect it to tailor reconnection strategy.
@@ -503,7 +502,9 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 //   - cluster: The cluster to refresh.
 //
 // Returns:
-//   - error: [types.ErrSessionClosed] if the client has been closed,
+//   - error: [types.ErrSessionClosed] if the client has been closed, or if
+//     it closed while the refresh was in progress — in which case the
+//     refresher's session is closed before returning,
 //     [types.ErrNoSessionRefresher] if no refresher was configured,
 //     [types.ErrInvalidCluster] for an unsupported cluster on this client,
 //     [types.ErrNilSession] if the refresher returned a nil session,
@@ -562,7 +563,8 @@ func (c *CQLClient) replaceHolder(
 
 		return types.ErrSessionClosed
 	}
-	if !slot.CompareAndSwap(holder, c.newSessionHolder(newSession)) {
+	installed := c.newSessionHolder(newSession)
+	if !slot.CompareAndSwap(holder, installed) {
 		newSession.Close()
 
 		return types.ErrSessionReplaced
@@ -575,11 +577,35 @@ func (c *CQLClient) replaceHolder(
 	// because the caller may have other references they want to drain;
 	// RefreshSession owns the swap end-to-end so it owns the close too,
 	// after a grace period that lets in-flight operations finish.
+	// A client that is already closing takes the grace away and closes the
+	// old session at once, so this hands it over whichever side of Close
+	// the swap landed on.
 	if holder.s != nil {
 		c.retired.add(holder.s, c.config.AutoRefresh.RefreshTimeout)
 	}
 
+	// The same window SwapSession has: Close marks the client closed before
+	// it tears anything down, so a refresh that finds the flag set here may
+	// have installed its holder after Close closed the session it found.
+	// Nothing would ever close the refresher's session, so dispose of it.
+	if c.closed.Load() {
+		disposeUninstalled(installed)
+
+		return types.ErrSessionClosed
+	}
+
 	return nil
+}
+
+// disposeUninstalled retires holder and closes its session, for a holder a
+// swap or a refresh installed after Close had already torn the client down.
+// Retiring comes first, as it does for a holder the swap uninstalls: an
+// outcome an in-flight operation reports against a holder that is not
+// installed reaches neither the failover policy nor the read strategy,
+// whichever end of the swap it describes.
+func disposeUninstalled(holder *sessionHolder) {
+	holder.retired.Store(true)
+	holder.s.Close()
 }
 
 // retiredSessions holds sessions that RefreshSession replaced and closes

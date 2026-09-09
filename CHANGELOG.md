@@ -201,6 +201,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IncReadTotal`, `IncReadError` and `ObserveReadDuration`'s Godoc now state these rules,
   and the read classification matrix pins them.
 
+- `RefreshSession` no longer leaves behind a session nobody closes when the client is closed while the refresh is in progress.
+  `SwapSession` was given this guard already; the refresh path had the same window and kept it.
+  The closed flag was read once before the swap, so a refresh whose session landed after `Close` had already closed the one it found reported success and left the refresher's session open for the life of the process.
+  A refresh that finds the client closed after the swap now retires the holder it just installed, closes the session the refresher built, and returns `types.ErrSessionClosed`, the same error a refresh on an already-closed client returns.
+  The session it replaced is handed over for closing first, so it is torn down whichever side of `Close` the swap landed on.
+  The auto-refresh detector reports the outcome as a refresh error, as it already did for a client that was closed before the swap.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.7.0-otter`, up from `v2.5.0-otter`.
