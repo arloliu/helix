@@ -187,6 +187,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The README's CQL examples now use the v2 adapter, which is the recommended path for new code. The Quick Start carries the `go.mod` lines the v2 adapter needs, since Go ignores a `replace` directive that lives in a dependency and the example does not compile without them. The v1 adapter remains supported and needs no `replace` line; the guidance is simply that the fork's fault-tolerance work lands in the v2 driver while v1 follows upstream gocql's pace.
 - `WithClusterReadTimeout` now records the one case where its deadline is not a bound: a token-aware first page can block on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable, so such a leg can overrun `d` and end on the driver's own request timeout instead. The caveat was already in `docs/strategy-policy.md`; it was missing from the godoc a caller sizing timeouts actually reads.
+- `docs/strategy-policy.md` now describes `AdaptiveDualWrite`'s actual recovery gate instead of a stale "recoveryThreshold consecutive fast writes" summary.
+  A background write or probe only credits recovery through the delta test against the sibling's last latency, or under `minFloor` when the sibling has no baseline or is itself degraded.
+  The credited count is then held until `minDegradedDwell` elapses.
+  And `ForceDegrade` latches a cluster so nothing credits recovery until `ForceRecover` or `Reset` clears it.
+  The `LatencyCircuitBreaker` section also now says that with route veto on, a vetoed cluster receives no ordinary or fallback read, so only the recovery probe or a failover leg landing on it can reopen the breaker —
+  fast responses alone no longer close it.
+- `docs/mirror.md` no longer claims mirror and replay payload arguments are deep-copied.
+  Only `[]byte` values are deep-copied into a fresh buffer.
+  `[]string`, `map[K]V`, and other nested Cassandra list/set/map column values are copied by reference and share the caller's slice or map header, so a caller must not mutate or reuse one of those values after `Exec` returns until the mirror leg has run.
+- `CircuitBreaker`'s Godoc no longer claims a `VetoRoute` method it does not have.
+  Only `LatencyCircuitBreaker` implements route veto; its type doc now says so.
+  `CircuitBreaker`'s concurrency-model comments now attribute `VetoRoute` correctly.
+- `Batch.IterContext`'s Godoc, `WithClusterReadTimeout`'s Godoc, and the read-timeout section of `docs/strategy-policy.md` now say that a batch iterator's first page is never bounded by `WithClusterReadTimeout`, unlike a query iterator's.
+  A frozen selected cluster can strand a batch iterator for the caller's whole context budget with no health signal and no failover attempt.
+- `Close`'s Godoc now lists a caller-supplied `RecoveryProbe` that ignores its context among the things that can block it.
+  Close cancels the recovery probe loops and waits for them to return,
+  but a probe that does not check the context passed to it keeps running regardless.
+- `NATSReplayer.Dequeue` and `Pending`'s Godoc now say they are for driving replay processing without a running `Worker`.
+  `Dequeue` creates a consumer that collides with a `Worker`'s own consumers on the same stream, so the two must not run against the same cluster at once.
+  `Pending` is documented as `Dequeue`'s companion for sizing a manual batch.
+- `WithMaxDeliver`'s Godoc now says its value is honoured only under `RetryBounded`.
+  Under the default `RetryWhileRetained` the value is still validated (it must be positive) but is overwritten and never reaches the consumer.
 
 ## [1.9.0] — 2026-09-06
 
