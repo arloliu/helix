@@ -5,332 +5,268 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.10.0] — 2026-09-09
+
+A correctness release. The themes are dual-write data integrity (a background leg could
+observe a caller's reused buffer, and a NULL blob was replayed as an empty one), read
+accounting (iterator reads were invisible to the metrics and to the failover policy), a
+`Close` that could hang or leave a session open, and the v2 CQL adapter's fork pin moving to
+`v2.7.0-otter`, which fixes a panic that froze ring maintenance for the life of a session.
+
+It is a MINOR release by intent. The one change `gorelease` reports as incompatible is the
+renumbering of `types.ProbeOutcome`, which affects only a caller that persists the underlying
+integers — see **Behavior change** below.
+
+### Added
+
+- `helix.FailoverProbeScheduleReporter`, an optional interface a `FailoverPolicy` can
+  implement to tell the client whether a recovery probe is scheduled at all. Both bundled
+  breakers implement it through the new `policy.CircuitBreaker.ProbeScheduled` and
+  `policy.LatencyCircuitBreaker.ProbeScheduled`. It backs the startup warnings for a vetoed
+  cluster that no probe can reopen; a policy that does not implement it is unaffected.
+
+### Behavior change
+
+- **`types.ProbeAbandoned` is now the zero value of `types.ProbeOutcome`**, ahead of
+  `ProbeSucceeded` and `ProbeFailed` (the integers move: 2→0, 0→1, 1→2). The most permissive
+  outcome used to be the one a caller got for free, so a `FailoverProbeReporter` consumer that
+  left the outcome unset closed an open circuit breaker on a probe that had never succeeded.
+  All three names are unchanged and code that reports an outcome by name is unaffected; only a
+  caller that persists or transmits the underlying integers needs to look.
+
+- **`WithAdaptiveFireForgetLimit` now bounds the replay admissions** a degraded cluster's
+  background writes wait in, not only the writes themselves. A leg previously released its slot
+  before reporting its failure, so with a blocking `Enqueue`, 32 writes under a limit of 4 left
+  32 goroutines and 32 payloads waiting at once. A leg now holds its slot until its completion
+  callback returns; a write that finds every slot held is dropped as before (`ErrWriteDropped`,
+  which the client replays) and its payload is admitted on the caller's goroutine, so a slow
+  `Enqueue` is felt by the caller instead of accumulating goroutines behind it.
+
+- **`Scanner().Err()` now ends the read exactly as `Close` does**, so a consumer that drains
+  with `Scanner()` and never calls `Close()` no longer leaves a failing cluster with a clean
+  record. See **Fixed** for the accounting this restores.
+
+- **`WithMaxDeliver` is now checked where the value is used** rather than at every
+  `NewNATSReplayer`. It is the delivery budget only under `RetryBounded`; the default
+  `RetryWhileRetained` overwrites the consumer's `MaxDeliver` with -1. `NewNATSReplayer` now
+  accepts any value, and a worker built with `RetryBounded` over a replayer whose `MaxDeliver`
+  is not positive reports it — from `NewNATSWorkerChecked`, or from `Start` on a worker built
+  with `NewNATSWorker`. A consumer created outside a worker is refused on the same rule.
 
 ### Fixed
 
-- A `[]byte(nil)` query or batch argument (a NULL blob) is now replayed and mirrored as NULL instead of an empty value.
-  `cloneArgs` copied a nil `[]byte` into a non-nil zero-length `[]byte`, and the driver encodes the two differently.
-  So a leg that failed and was later replayed — or a query dispatched through `Mirror()` — wrote an empty blob where the original write had left the column NULL.
+**Dual writes**
 
-- `AdaptiveDualWrite` now recovers both clusters after they were degraded together by slow writes; recovery credit no longer compares against a degraded sibling's stale latency sample.
-  A shared slowdown that pushed both clusters past `absoluteMax` left each of them holding the slow latency that degraded it, and recovery credit was judged by comparing a candidate write against the sibling's last sample — so every fast background write and every recovery probe measured "fast" against "stale slow", failed the delta check, and earned nothing. Both clusters stayed in fire-and-forget until an operator called `ForceRecover` or `Reset`.
-  A successful background write now records its latency whether or not it earns credit, so a degraded pair rebuilds a usable baseline from its own traffic within one round; a write that fails the delta check against a *degraded* sibling still earns credit when it is under `minFloor` on its own; and a cluster that recovers drops the sample it took while degraded, matching what `ForceRecover` and `Reset` have always done, so it does not become a stale baseline for the sibling still waiting to recover.
+- Byte-slice arguments are now copied before a dual write is dispatched, so a background leg
+  can no longer marshal a buffer the caller reused after `Exec` returned. The leg then reported
+  success and the correct replay snapshot was discarded, leaving the two clusters with
+  different data. A write with no bytes to copy allocates nothing extra.
+- A `[]byte(nil)` argument (a NULL blob) is replayed and mirrored as NULL instead of an empty
+  value; `cloneArgs` copied it into a non-nil zero-length slice, which the driver encodes
+  differently.
+- A leg that fails while the caller is still waiting is the cluster's failure even when the
+  caller's context ends before the sibling leg returns. Both legs were previously classified
+  after joining, so a fast refusal on one cluster was reclassified as the caller's alongside a
+  slow sibling: that cluster recorded no write error, took no `AdaptiveDualWrite` strike, and
+  the write returned `*types.DualClusterError` instead of falling back to fire-and-forget with
+  replay.
+- `AdaptiveDualWrite` recovers both clusters after they were degraded together by slow writes.
+  Recovery credit was judged against the sibling's stale slow sample, so every fast write
+  measured "fast against stale slow", failed the delta check, and earned nothing — both
+  clusters stayed in fire-and-forget until `ForceDegrade`/`Reset`. A successful background
+  write now records its latency whether or not it earns credit, a write under `minFloor` earns
+  credit on its own against a degraded sibling, and a recovered cluster drops the sample it
+  took while degraded.
+- `AdaptiveDualWrite`'s degrade hysteresis is measured on a monotonic clock. A backward wall
+  clock step made the interval since the last recovery negative, so a degrade hours later was
+  classified as a re-degrade: doubled dwell, and `write_flapping` for a cluster that had not
+  flapped.
+- `WithAdaptiveMinDegradedDwell` on its own now switches on the re-degrade backoff. The window
+  and cap are derived as four times the minimum dwell unless `WithAdaptiveRedegradeBackoff`
+  sets them; previously a caller who set only the dwell got the hold on recovery but
+  `write_flapping_total` could never fire. Defaults are unchanged.
+- `AdaptiveDualWrite.ForceDegrade` logs the operator latch it sets on an already-degraded
+  cluster, with `alreadyDegraded=true`. The call reported only through the healthy-to-degraded
+  transition, so isolating a cluster that had just degraded on its own was invisible while the
+  latch quietly turned off automatic recovery.
+- `Close` no longer hangs after a `Replayer.Enqueue` or auto-refresh `FailureClassifier`
+  panicked while a background write leg reported its failure. The leg's registration is now
+  released on every exit from the completion callback.
 
-- Byte-slice arguments are now copied before a dual write is dispatched, so a background leg run by `AdaptiveDualWrite` (or any strategy that defers a leg) can no longer observe a buffer the caller reused after `Exec` returned.
-  The leg's driver marshals the arguments when the leg runs, which for a degraded cluster is after `Exec` has already returned `nil`;
-  a caller that pools its encode buffers therefore wrote whatever it had overwritten them with, and because the leg then reported success the correct replay snapshot was discarded, leaving the two clusters with different data.
-  A write whose arguments hold no bytes to copy allocates nothing extra, and a nil `[]byte` stays nil, so a NULL value is still distinct from an empty one.
+**Reads and iterators**
 
-- A `Scanner` consumer's cluster failures now reach the read strategy, the failover policy and auto-refresh.
-  `Scanner().Err()` previously released the iterator's resources but reported no outcome, so a caller that drained with `Scanner()` and never called `Close()` left a failing cluster with a clean record — the circuit breaker took no input, the cluster was never marked degraded, and reads kept being routed to it.
-  `Err()` now ends the read exactly as `Close` does. It shares the same guard, so the everyday idiom — a `Scanner` loop under a deferred `Close` — still reports once, and a `Close` that follows returns the error the `Scanner` already saw without closing the driver's iterator a second time.
+- `Scan` and `MapScan` send a query carrying a `PageState` token to the cluster that issued it,
+  as `Iter`, `SliceMap` and `SliceScan` already did. A page resumed with `Scan` went wherever
+  the read strategy pointed, so a driver that rejects the foreign cursor charged one read error
+  and one breaker failure per resumed page, and one that accepts it returned rows from the
+  wrong cursor. The paging rule now lives where every entry point resolves its read options.
+- Reads made through an iterator appear on `read_total`, `read_duration_seconds` and
+  `read_errors_total`. `IterContext`, a batch's `IterContext` and both batch CAS entry points
+  counted nothing, so a cluster failing only its iterator reads showed a flat error counter
+  against a `read_total` that never moved. An iterator's duration spans open to close; a
+  bounded first page still observes its own leg and its close adds no second sample.
+- A second `Scanner().Err()` call no longer panics. Both drivers release their iterator inside
+  their own `Err` and dereference it unguarded next time, so logging the error and then
+  returning it crashed the caller's process. `Err` is now idempotent and the read is still
+  reported exactly once.
+- A cluster error reported when an iterator closes moves the read strategy's preference only
+  where a failing `Scan` would have been allowed to fail over — the close path skipped the
+  `ShouldFailover` gate and the drain check. The close still never fails over.
+- A read failover the client refuses no longer moves the read strategy's preference, so
+  `read_preferred` and `read_route_changed` keep describing where reads actually go. The drain
+  gate and the context check now run before `ReadStrategy.OnFailure` is consulted.
+- The context bounding an iterator's first page under `WithClusterReadTimeout` no longer
+  returns an error from `Err` while `Done` is still open — a disagreement `context.Context`
+  forbids, which a driver that polls `Err` would act on.
+- `RoundRobinRead`'s first `Select` returns cluster A; the counter was read after the
+  increment.
 
-- `Scan` and `MapScan` now send a query that carries a `PageState` token to the cluster that issued it,
-  as `Iter`, `SliceMap` and `SliceScan` already did.
-  They were the only read entry points that ignored the routing header in the token,
-  so a page resumed with `Scan` went wherever the read strategy pointed — under default routing, cluster A, even for a token cluster B had produced.
-  A driver that rejects the foreign cursor made the read fail over to B and succeed, so the caller saw nothing,
-  but the rejection was charged to A as a read error and a circuit-breaker failure, one per resumed page;
-  a driver that accepts it returned rows from the wrong cursor.
-  The paging rule now lives in the one place every entry point resolves its read options, so no path can skip it.
+**Sessions**
 
-- The NATS worker under `RetryWhileRetained` now keeps a payload's poison budget when the server refuses the `Term` that would have dropped it, so the redelivery is terminated again and dropped as soon as a `Term` is accepted.
-  The dead-letter count was released whether or not the `Term` went through. A refused `Term` issues no NAK, so the message came back after `AckWait` with a fresh budget, and a poison payload churned for the stream's `MaxAge` — about 2,880 attempts at the default 24h `MaxAge` and 30s `AckWait` — with no `OnDrop` call and no `dead_letter` drop sample.
-  A refused `Term` still issues no NAK and is still counted on `replay_term_failed_total`; only the budget now survives it.
+- `RefreshSession` and `SwapSession` no longer leave a session nobody closes when the client is
+  closed mid-swap. The closed flag is re-checked after the swap, and a swap that finds the
+  client closed retires the holder it installed, closes the session, and returns
+  `types.ErrSessionClosed`.
+- `RefreshSession` no longer charges its own teardown of the old session to the cluster. Reads
+  still in flight on the closed session failed with "session closed" and reached
+  `FailoverPolicy.RecordFailure`, which could open the breaker on a cluster that had just been
+  given a healthy session. A holder is marked retired the moment it is uninstalled: its
+  outcomes still update session stats and read metrics but reach neither the failover policy
+  nor the read strategy, and a probe caught this way settles as `ProbeAbandoned`.
 
-- `RefreshSession` no longer charges its own teardown of the old session to the cluster, and a recovery probe that was running on that session is abandoned rather than reported as failed.
-  Without `WithAutoRefresh` the old session is closed as soon as the new one is installed, so every read still in flight on it failed with the driver's "session closed" error; each of those failures reached `FailoverPolicy.RecordFailure`, and enough of them could open the circuit breaker on the cluster that had just been given a healthy session.
-  A recovery probe caught the same way settled as `ProbeFailed`, which restarted the breaker's reset timeout and logged a probe failure for a cluster that was up.
-  A session holder is now marked retired the moment `RefreshSession` or `SwapSession` uninstalls it, before the old session may be closed.
-  An outcome observed against a retired holder still updates that holder's stats and the read metrics, but reaches neither the failover policy nor the read strategy.
-  A probe that ran on a retired holder settles as `ProbeAbandoned` exactly as one the client cancelled, so the breaker gets its reservation back and nothing is recorded.
+**Replay**
 
-- A write leg that fails while the caller is still waiting is now the cluster's failure even when the caller's context ends before the sibling leg returns.
-  Each leg of a dual write was classified only after both legs had joined, against the caller's context as it stood at that moment —
-  so when one cluster refused the write at once and the other held it until the caller's deadline, the fast failure was reclassified as the caller's along with the slow one.
-  That cluster recorded no write error, no session-liveness failure and nothing for auto-refresh,
-  and `AdaptiveDualWrite` gave it no strike,
-  so a cluster that was down while its sibling was slow never degraded
-  and every such write returned `*types.DualClusterError` instead of falling back to fire-and-forget with replay.
-  Each leg now records whether the caller's context was already done at the moment it returned and is classified by that record;
-  a leg that ended after the caller gave up is still the caller's, as before.
+- `Worker.Stop` — and so `CQLClient.Close` — returns as soon as the worker's remote calls
+  honour cancellation, instead of waiting out the in-flight attempt (30s by default) and the
+  stream lookup behind it. This covers both the NATS and the memory worker; a cancelled
+  attempt is NAK'd for immediate redelivery (NATS) or reported through `WithOnDrop` with reason
+  `shutdown` (memory), and is counted as neither a replay error nor a delivery. An
+  `ExecuteFunc` that ignores its context still holds `Stop` for up to `WithExecuteTimeout`.
+- The NATS worker under `RetryWhileRetained` keeps a payload's poison budget when the server
+  refuses the `Term`. The budget was released either way, and a refused `Term` issues no NAK,
+  so a poison payload came back with a fresh budget and churned for the stream's `MaxAge` —
+  about 2,880 attempts at the default 24h/30s — with no `OnDrop` call.
+- Dead-letter budgets no longer accumulate for the life of the process. A sequence that
+  dead-lettered and then left the stream another way (`MaxAge`, `DiscardOld`, a purge) kept its
+  entry forever. Each eviction-watch poll now drops the budgets of sequences the stream no
+  longer holds, so this rides on `WithEvictionWatch`.
+- `replay_queue_depth` stays current for a cluster whose replay gate is closed. The gated
+  branch slept before the once-a-second depth report, so during a quarantine — exactly the
+  window an operator watches — the depth gauge froze and the age gauge read zero.
 
-- `NewCQLClient` now logs a startup warning when `WithRouteVeto(true)` (or `WithBehaviorProfile(Safe)`) is combined with `WithRecoveryProbeDisabled()`.
-  A vetoed cluster receives no ordinary or fallback read, so its breaker is reopened only by the recovery probe or by a failover leg that lands on it when the *other* cluster fails a read.
-  With the probe disabled, a `LatencyCircuitBreaker` that opened on a slow cluster while its sibling stayed healthy never closed, and reads stayed single-cluster for the life of the process with nothing logged.
-  Routing is unchanged; the warning names both options and how to resolve the combination, and the `WithRouteVeto` and `WithBehaviorProfile` godoc now state who can reopen a vetoed cluster.
+**Metrics and startup warnings**
 
-- A read failover the client refuses no longer moves the read strategy's preference, so the `read_preferred` gauge and `read_route_changed` events keep describing the cluster reads actually go to.
-  The failover gating asked `ReadStrategy.OnFailure` for the alternative before checking whether that alternative was draining or whether the caller's context had already ended,
-  and `StickyRead` and `PrimaryOnlyRead` move their preference as they answer.
-  So while cluster B was draining, a failing read on A moved the preference, the gauge and the event stream to B even though every following read was steered back to A,
-  and the routing dashboard disagreed with the traffic for the whole drain window.
-  The drain gate and the context check now run first,
-  and the strategy is only consulted for a failover the client will take.
-
-- The NATS worker now keeps `replay_queue_depth` current for a cluster whose replay gate is closed.
-  The gated branch of the worker's cluster loop reset the oldest-age gauge to zero and went back to sleep before the once-a-second depth report,
-  so the depth gauge froze at whatever it showed when the gate closed while the age gauge read zero —
-  during a quarantine, exactly the window an operator watches.
-  The depth is read from the stream rather than the consumers,
-  so it is now reported on the same cadence whether or not the gate admits the cluster.
-
-- `Worker.Stop` on a NATS worker — and so `CQLClient.Close` — now returns as soon as the worker's remote calls honour cancellation,
-  instead of waiting out the attempt in flight and the stream lookup behind it.
-  The attempt's context came from `context.Background()` with `WithExecuteTimeout` (30s by default),
-  and each cluster goroutine's depth read from a 5s `context.Background()` context serialised behind a mutex,
-  so a slow-but-alive cluster plus a NATS server that stopped answering could hold `Close` for the sum of those timeouts.
-  Both contexts now descend from one that `Stop` cancels, as the eviction watch's already did;
-  the timeouts themselves are unchanged.
-  A message whose attempt `Stop` cancels is NAK'd for immediate redelivery with the rest of its batch, as a message never reached was,
-  so it is neither counted as a replay error nor charged a delivery,
-  and a fetch `Stop` cuts short is no longer logged as a dequeue failure.
-
-- `Close` no longer hangs after a `Replayer.Enqueue` or auto-refresh `FailureClassifier` panicked while a background write leg (a `DeferredWriteResult`, as `AdaptiveDualWrite` returns for a degraded cluster) reported its failure.
-  The leg's completion callback released its registration with the client only after classifying the result and admitting it for replay;
-  a panic in either that was recovered by whoever ran the callback — the caller's own `Exec` when the leg had already finished before the client registered, or the strategy's completing goroutine — left the leg registered, and `Close` waited for it forever.
-  The registration is now released on every exit from the callback.
-
-- `WithClusterWriteTimeout`'s Godoc described the deadline it puts on a write leg without saying what follows a leg that fails.
-  The failed leg is enqueued for replay on the caller's goroutine, on a context that keeps the caller's values but not its deadline, so the caller's own deadline cannot bound the enqueue;
-  with the bundled `NATSReplayer` the publish waits for the server's acknowledgement for up to `WithPublishTimeout` (5s by default).
-  With one cluster down and the NATS server unreachable, every default-strategy write therefore held the caller for the leg timeout plus the publish timeout and then reported the replay dropped.
-  `WithClusterWriteTimeout`, `WithReplayer`, `replay.WithPublishTimeout` and the replay guide now state the extra bound;
-  the behaviour is unchanged, because a shorter bound would drop admissions that would have succeeded.
-
-- The client now logs a warning when the topology watcher's update channel closes while the client is still open,
-  naming the drain state each cluster is frozen at.
-  Previously the watch loop returned silently,
-  so a cluster left marked as draining
-  — because the caller closed the `topology.Local` or `topology.NATS` watcher, or the NATS watch loop exited —
-  kept having every write skipped and enqueued for replay while the replay gate refused that same cluster,
-  and the backlog grew with no operator signal.
-  The last drain state is still kept, since the cluster may in fact be draining;
-  the warning is the signal to restart the watcher or clear the drain by hand.
-
-- `WithReadStrategy`, `WithWriteStrategy`, `WithFailoverPolicy`, `WithReplayWorker` and `WithTopologyWatcher`'s Godoc described what each instance does without saying that it serves one client.
-  `NewCQLClient` installs its event dispatcher, cluster names, metrics and logger into `StickyRead`, `PrimaryOnlyRead`, `CircuitBreaker`, `LatencyCircuitBreaker`, `AdaptiveDualWrite` and the replay worker as single slots, so a second client sharing an instance redirected the first client's events to its own dispatcher and gave both clients its cluster names.
-  `topology.Local` and `topology.NATS` hand every `Watch` caller the same channel, so two clients on one watcher each saw only some of the drain updates, and the first `Close` cancelled the watch for both.
-  The five options, the two watcher types and the configuration reference now state that an instance serves exactly one client for its lifetime;
-  a `Replayer` carries no client state and may still be shared.
-  No guard was added: the instances are caller-owned and the sharing was never supported.
-
-- `NewCQLClient` now also warns when `WithRouteVeto(true)` is combined with a failover policy that no recovery probe can ever reserve.
-  A reset timeout of zero (`policy.WithResetTimeout(0)` or `policy.WithLatencyResetTimeout(0)`) makes `TryBeginFailoverProbe` refuse every tick, and a custom policy that implements `RouteVeto` without `FailoverProbeReporter` has nothing for the probe to reserve at all.
-  Either one strands a vetoed cluster exactly as `WithRecoveryProbeDisabled()` does: the breaker is left with no closer but a failover leg from the other cluster, so it never closes while that cluster stays healthy.
-  The built-in breakers report their schedule through the new `helix.FailoverProbeScheduleReporter`,
-  so a policy can tell the client whether a probe is scheduled at all.
-  Routing is unchanged.
-
-- A fire-and-forget write leg now contributes its own duration to `write_duration_seconds`, observed when the leg completes, instead of a sample taken while it was still running.
-  The caller records the per-leg write metrics as soon as the write returns, and a degraded cluster's leg has only been dispatched by then, not finished.
-  The sample it recorded was "how long ago the background leg started", which is the healthy cluster's latency wearing the degraded cluster's label — so the histogram for a cluster slow enough to be degraded looked exactly like the histogram for the cluster that was keeping up.
-  Each leg still contributes exactly one sample.
-  A leg that never ran — dropped at the fire-and-forget concurrency limit, or skipped because the cluster is draining — now contributes none, matching what a skipped synchronous leg already did.
-  A custom write strategy that reports `ErrWriteAsync` for a leg it runs itself now observes that leg's duration itself, as `AdaptiveDualWrite` does; `ObserveWriteDuration` says so.
-
-- `AdaptiveDualWrite.ForceDegrade` now logs the operator latch it sets on a cluster that is already degraded, so the call is no longer invisible.
-  The whole method reported only through the healthy-to-degraded transition, and a cluster that had degraded on its own has no transition left to report.
-  So an operator isolating a cluster that had just degraded by itself got no log line at all, while the latch quietly turned off automatic recovery: the recovery probe and fast background writes could no longer restore that cluster.
-  The latch now writes the degrade line at the same level with `alreadyDegraded=true`.
-  The transition event and the transition metrics are unchanged and still fire once per real transition, since the cluster was already counted as degraded.
-  A second `ForceDegrade` on a cluster that is already latched still changes nothing and still reports nothing.
-
-- The context that bounds an iterator's first page under `WithClusterReadTimeout` no longer reports an error before it ends.
-  `Err` fell through to the caller's own context whenever nothing had been latched yet,
-  so between the caller cancelling and that cancellation reaching this context, `Err` returned an error while `Done` was still open —
-  a disagreement `context.Context` forbids and a driver that polls `Err` instead of selecting on `Done` would act on.
-  The same gap existed between the latch releasing its lock and closing the channel.
-  `Err` now reports only the latched error and the latch closes `Done` under the lock `Err` takes,
-  so the two always agree; the error a driver sees once the context ends is unchanged.
-
-- A second `Scanner().Err()` call on the same scanner no longer panics.
-  `Err` forwarded to the driver's scanner on every call, and both drivers release their iterator inside their own `Err` and dereference it unguarded on the next call —
-  so the ordinary habit of logging the error and then returning it crashed the caller's process.
-  `Err` is now idempotent: the first call ends the read and stores the result, and later calls return it without reaching the driver.
-  The read is still reported exactly once, as it already was.
-
-- `SwapSession` no longer leaves behind a session nobody closes when the client is closed while the swap is in progress.
-  The closed flag was read once on entry and the swap itself was unconditional,
-  so a swap that installed its session after `Close` had already closed the one it found reported success and left the new session open for the life of the process,
-  with no holder anyone would ever tear down.
-  The flag is re-checked after the swap — `Close` sets it before it tears anything down — and a swap that finds the client closed retires the holder it just installed, closes the session it was given, and returns `types.ErrSessionClosed`, the same error a swap on an already-closed client returns.
-
-- The NATS worker's dead-letter budgets no longer accumulate for the life of the process.
-  Under `RetryWhileRetained` a payload's poison budget was released only when its `Term` was accepted or its budget ran out,
-  so a sequence that dead-lettered once and then left the stream some other way — `MaxAge` expiry, `DiscardOld` under a limit, a purge — kept its entry forever,
-  and a long-lived worker on a busy stream grew a map it never emptied.
-  Each eviction-watch poll now drops the budgets of the sequences the stream reports it no longer holds.
-  The cleanup rides on `WithEvictionWatch`, which is where the stream state is already read, so a worker that runs `RetryWhileRetained` without the eviction watch is unchanged.
-
-- `AdaptiveDualWrite`'s degrade hysteresis is now measured on a monotonic clock instead of the wall clock.
-  The dwell a degraded cluster serves and the window that decides whether a degrade counts as a re-degrade were compared against `time.Now().UnixNano()`,
-  so a backward clock step — an NTP correction, an operator setting the clock — made the interval since the last recovery negative.
-  A degrade hours later was then classified as a re-degrade: it doubled the dwell, held the cluster in fire-and-forget for longer than configured, and could emit `write_flapping` for a cluster that had not flapped.
-  The clock now reads elapsed monotonic time, which no clock adjustment moves.
-  No exported type or option changes.
-
-- The memory replay worker's `Stop` no longer waits out `WithExecuteTimeout` for the attempt in flight, and neither does the `CQLClient.Close` that waits on it.
-  The memory backend ran every attempt on a context built from `context.Background()`,
-  so a `Stop` issued while the `ExecuteFunc` was blocked on an unresponsive cluster returned only once that attempt gave up — 30 seconds with the default timeout.
-  The attempt now runs on a context the worker ends when it stops, as the NATS worker's attempt already did.
-  The interrupted payload is reported through `WithOnDrop` with the reason `shutdown`, like the payloads still waiting in the queue, because that queue does not survive the process;
-  it is counted neither as a replay error nor as a failed attempt, and `WithOnError` is not called for it.
-  An `ExecuteFunc` that ignores its context still holds `Stop` for up to `WithExecuteTimeout`.
-
-- A cluster error reported when an iterator closes now moves the read strategy's preference only where a failing `Scan` would have been allowed to fail over.
-  The close path called `ReadStrategy.OnFailure` for every cluster error, without the `FailoverPolicy.ShouldFailover` gate and the drain check every other read applies first.
-  So with the default `CircuitBreaker` (threshold 3) one iterator that failed to close moved `StickyRead`'s preference while the same error from a `Scan` moved nothing,
-  and an iterator failing on A moved the preference to B even while B was draining and every read was being steered back to A.
-  The gate is now one helper shared by the failover flow and the close path.
-  What the close reports to the failover policy, to auto-refresh and to the session stats is unchanged.
-  The close still never fails over: an iterator cannot be retried.
-
-- Reads made through an iterator now appear on `read_total`, `read_duration_seconds` and `read_errors_total` like every other read.
-  `IterContext`, a batch's `IterContext` and both batch CAS entry points counted nothing at all,
-  and a cluster error an iterator reported at `Close` was never counted as a read error,
-  so a cluster failing only its iterator reads showed a flat error counter and an error rate computed against a `read_total` that never moved.
-  Only a first page that `WithClusterReadTimeout` bounded was ever counted.
-  Opening an iterator now counts one `read_total` for the cluster it reads from,
-  closing it observes one `read_duration_seconds`,
-  and a cluster error at `Close` or `Scanner.Err` counts one `read_errors_total`.
-  An iterator's duration spans from opening it to closing it, so it covers every page the caller drained;
-  a bounded first page keeps observing its own leg instead, and its close adds no second sample.
-  A first page the leg deadline ended is still counted exactly once, where it always was.
-  `IncReadTotal`, `IncReadError` and `ObserveReadDuration`'s Godoc now state these rules,
-  and the read classification matrix pins them.
-
-- `RefreshSession` no longer leaves behind a session nobody closes when the client is closed while the refresh is in progress.
-  `SwapSession` was given this guard already; the refresh path had the same window and kept it.
-  The closed flag was read once before the swap, so a refresh whose session landed after `Close` had already closed the one it found reported success and left the refresher's session open for the life of the process.
-  A refresh that finds the client closed after the swap now retires the holder it just installed, closes the session the refresher built, and returns `types.ErrSessionClosed`, the same error a refresh on an already-closed client returns.
-  The session it replaced is handed over for closing first, so it is torn down whichever side of `Close` the swap landed on.
-  The auto-refresh detector reports the outcome as a refresh error, as it already did for a client that was closed before the swap.
-
-- `RoundRobinRead` now starts on cluster A:
-  its first `Select` returned cluster B because the counter was read after the increment.
-
-- `WithAdaptiveMinDegradedDwell` on its own now switches on the re-degrade backoff that reports a flapping cluster.
-  The backoff was applied only when `WithAdaptiveRedegradeBackoff` supplied both a window and a cap as well;
-  a caller who set just the minimum dwell got the hold on recovery but no backoff,
-  so `write_flapping_total` and `EventWriteFlapping` could never fire and nothing said so.
-  The window and the cap are now derived as four times the minimum dwell — the two doublings the cap allows —
-  unless `WithAdaptiveRedegradeBackoff` sets them.
-  Either of its arguments may be left at 0 to take the derived value;
-  a cap below the minimum dwell is still a configuration error.
-  Defaults are unchanged: without a minimum dwell there is nothing to double, so the dwell and the backoff both stay off.
+- A fire-and-forget write leg contributes its own duration to `write_duration_seconds`,
+  observed when the leg completes. The old sample was taken while the leg was still running,
+  so a degraded cluster's histogram looked exactly like the healthy cluster's. A leg that never
+  ran — dropped at the concurrency limit, or skipped for a draining cluster — now contributes
+  none.
+- `NewCQLClient` warns when `WithRouteVeto(true)` (or `WithBehaviorProfile(Safe)`) is combined
+  with something that leaves a vetoed cluster's breaker with no closer: `WithRecoveryProbeDisabled()`,
+  a reset timeout of zero, or a custom policy implementing `RouteVeto` without
+  `FailoverProbeReporter`. A vetoed cluster receives no ordinary or fallback read, so reads
+  stayed single-cluster for the life of the process with nothing logged. Routing is unchanged.
+- The client warns when the topology watcher's update channel closes while the client is open,
+  naming the drain state each cluster is frozen at. The watch loop returned silently, so a
+  cluster left marked as draining had every write skipped and enqueued for replay while the
+  replay gate refused that same cluster, and the backlog grew with no operator signal.
 
 ### Changed
 
-- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.7.0-otter`, up from `v2.5.0-otter`.
-  Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork
+  at `v2.7.0-otter`, up from `v2.5.0-otter`. Go ignores `replace` in dependencies, so a module
+  using the v2 adapter must update the line in its own `go.mod`:
 
   ```
   replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.7.0-otter
   ```
 
-  The fork adds no exported symbol and changes no exported signature, but one exported field changes meaning — see the `ReconnectInterval` note below.
+  The fork adds no exported symbol and changes no exported signature, but one exported field
+  changes meaning.
 
-  **The fix that matters most is a panic that used to freeze ring maintenance for the life of a session.**
-  A `system.peers` row the driver could not parse killed the goroutine that maintains the ring, and nothing restarted it, so the session ran on with a topology view frozen at that moment — new nodes never appeared and departed ones never left.
-  Three narrower ring bugs go with it: a node that changed only its port was never reconciled; a single transiently invalid peer row could evict a healthy node with nothing left to rediscover it; and node-event debouncing was unbounded, so a sustained burst of churn could defer topology events for the whole burst.
+  **A `system.peers` row the driver could not parse killed ring maintenance for the life of the
+  session** — new nodes never appeared and departed ones never left. Three narrower ring bugs go
+  with it: a node that changed only its port was never reconciled, a transiently invalid peer
+  row could evict a healthy node with nothing left to rediscover it, and node-event debouncing
+  was unbounded.
 
   **`ReconnectInterval` is now the cap on the retry delay, not the interval between retries.**
-  A host marked DOWN is retried one second after the outage begins, and the delay doubles until it reaches `ReconnectInterval` — at the 60 s default, 1 s, 2 s, 4 s, … 32 s, 60 s, 60 s.
-  The practical effect is that the first readmission attempt for a node that has just recovered arrives in about a second instead of up to a minute, so a client left at the default sees its recovery probes and its circuit breaker close sooner.
-  The backoff is per session rather than per host and resets only once every known host is UP, so a host that fails while another is already down inherits the outage's current delay rather than starting again at one second.
-  A value below one second is unchanged in effect, because the first step is already the cap.
-  `ReconnectInterval = 0` still disables scheduled retries.
+  A host marked DOWN is retried after one second and the delay doubles to the cap — at the 60s
+  default: 1, 2, 4, … 32, 60, 60. A recovered node is therefore readmitted in about a second
+  instead of up to a minute, so recovery probes and circuit breakers close sooner. The backoff
+  is per session and resets only once every known host is UP. A value below one second is
+  unchanged in effect; `ReconnectInterval = 0` still disables scheduled retries.
 
-  Three further changes come with the release, none of them configurable:
+  Three further changes are not configurable:
+  - A full ring refresh runs every five minutes even while every host is UP, regardless of
+    `ReconnectInterval`. Topology logging will show background activity that was not there before.
+  - A session with `ReconnectInterval = 0` carries one extra goroutine for that refresh.
+    `Close` cancels its context but does not wait for it, so **a goroutine-leak assertion taken
+    immediately after `Close` may need a slightly wider tolerance.**
+  - Node-event debouncing is bounded at 4 seconds.
 
-  - A full ring refresh now runs every five minutes even while every host is UP, and it runs regardless of `ReconnectInterval`. It closes the window where a departed node lingers because a peers snapshot held a row that could not be attributed to any host. Topology logging will see it as background activity that was not there before.
-  - A session with `ReconnectInterval = 0` carries one extra goroutine for that refresh. `Close` cancels its context but does not wait for it to return, so a goroutine-leak assertion taken immediately after `Close` may need a slightly wider tolerance.
-  - Node-event debouncing is now bounded at 4 seconds. During sustained churn, topology events land within that window instead of being deferred until the burst ends.
+  **A cancelled read no longer risks losing its connection slot.** Cancelling an in-flight
+  request is how `WithClusterReadTimeout` ends a leg, and a cancelled request whose answer then
+  arrived had roughly a coin-flip chance of never returning its stream to the connection —
+  unlogged, and accumulating precisely in the tail-latency case the option exists to cut, until
+  the connection was rebuilt about 30 seconds later and the cycle began again. Two smaller
+  fixes ride along: a connection that lost a frame boundary is now retired instead of reading
+  the leftover body as the next frame's header (reachable on native protocol v4, which is what
+  ScyllaDB negotiates), and a read's deadline is armed outside the five-attempt retry loop.
 
-  **A cancelled read no longer risks losing its connection slot.**
-  Cancelling an in-flight request is not an edge case in Helix — it is how `WithClusterReadTimeout` ends a leg — and a cancelled request whose answer then arrived had roughly a coin-flip chance of never returning its stream to the connection.
-  Nothing logged it, and the loss only accumulated where the cluster was healthy enough to answer at all, just later than the leg deadline: exactly the tail-latency case the option exists to cut.
-  The effect was a connection whose capacity narrowed until its own heartbeat could not get a stream either, about 30 seconds after which the connection was rebuilt and the cycle began again.
-  Both sides of the handoff now drain, so the slot always comes back once the answer arrives.
+  **A paged read no longer races on the consistency it carries forward.** Each page after the
+  first copied the whole query struct, so a retry policy lowering consistency on one page could
+  be read while the next was assembled. Fields are now carried across explicitly with the
+  consistency read atomically; paging is otherwise unchanged. Two reclamation fixes ride along:
+  a retry that supersedes an iterator closes it first (live for any statement not marked
+  `NonIdempotent`), and a panic out of an observer, host-marking or retry-policy callback closes
+  the iterator it was holding — the panic still reaches the caller unchanged.
 
-  Two smaller fixes ride along.
-  A connection that lost a frame boundary — a body-read failure that was misclassified as non-terminal — kept serving and read the leftover body bytes as the next frame's header; it is now retired instead.
-  That path is reachable on native protocol v4, which is what ScyllaDB negotiates.
-  And a read's deadline was armed inside a five-attempt retry loop, so a connection stuck mid-read took up to five `Timeout`s to be closed rather than one.
-
-  **A paged read no longer races on the consistency it carries forward.**
-  Every query is paged — the driver's default page size is 5000 — and each page after the first was built by copying the whole query struct, so a retry policy lowering consistency on one page could be read while the next page was being assembled.
-  Each field is now carried across explicitly with the consistency read atomically.
-  Nothing about paging changes otherwise: the same fields carry over, the page state is copied, and a pinned page stays on its connection.
-
-  Two smaller reclamation fixes ride along, neither changing a return value.
-  A retry that supersedes an iterator now closes it before going round again, returning its response framer to the pool; this is live for any statement not marked [`NonIdempotent`](https://pkg.go.dev/github.com/arloliu/helix#Query), which is the default.
-  And a panic out of an observer, host-marking or retry-policy callback now closes the iterator it was holding on the way out — the panic itself still reaches the caller unchanged, with the same value and type.
-
-  **A cancelled query now surfaces the cancellation itself.**
-  Once the driver observes that the query's context has ended it consults the retry policy no further and makes no further attempt;
-  the iterator returned in that window carries `context.Canceled` or `context.DeadlineExceeded` rather than the attempt's own error, with its host and warnings intact.
-  Helix already attributed a context error seen after the caller's context ended to the caller, so a leg ended by `WithClusterReadTimeout` classifies as before.
-  Two related changes are inert here: an idempotent query that exhausted its hosts now returns the last attempt's real iterator, so `Iter.Host()` is non-nil there, and Helix never reads it;
-  and speculative execution — never configured by Helix — now waits for its sibling executions before settling on an error.
-
-- `types.ProbeAbandoned` is now the zero value of `types.ProbeOutcome`, ahead of `types.ProbeSucceeded` and `types.ProbeFailed`.
-  The most permissive outcome used to be the one a caller gets for free: a `FailoverProbeReporter` consumer that left the outcome unset closed an open circuit breaker on a probe that had never succeeded.
-  Abandonment only releases the reservation, so an unset outcome now changes nothing about the breaker.
-  All three names are unchanged, and code that reports an outcome by name is unaffected; only a caller that depends on the underlying integers, such as one persisting them, needs to look.
-
-- `WithAdaptiveFireForgetLimit` now bounds the replay admissions that a degraded cluster's background writes are waiting in, not only the writes themselves.
-  `AdaptiveDualWrite` released a leg's slot before reporting the leg's failure, and the client admits that failure for replay on the leg's own goroutine, on a context that is never cancelled;
-  the admission therefore ran outside the limit, and with a replayer whose `Enqueue` blocks, 32 writes under a limit of 4 left 32 goroutines and 32 payloads waiting at once with nothing to bound the count.
-  A leg now holds its slot until the completion callback has returned.
-  A write that finds every slot held is dropped as before — `ErrWriteDropped`, which the client replays — and its payload is admitted on the calling goroutine, so a slow `Enqueue` is felt by the caller instead of accumulating goroutines behind it.
-  A leg that finishes before the client registers its completion callback is still admitted on the caller's goroutine, outside the limit.
-  `Replayer.Enqueue`, `WithReplayer`, `WithAdaptiveFireForgetLimit` and the replay guide describe the bound; a custom `Enqueue` should still return within a bounded time, as both bundled replayers do.
-
-- `WithMaxDeliver` is now checked where the value is used rather than at every `NewNATSReplayer`.
-  It is the delivery budget only under `RetryBounded`;
-  a worker running the default `RetryWhileRetained` overwrites the consumer's `MaxDeliver` with -1,
-  so requiring a positive value at construction rejected a replayer whose active policy never reads the setting.
-  `NewNATSReplayer` now accepts any value,
-  and a worker built with `RetryBounded` over a replayer whose `MaxDeliver` is not positive reports it —
-  from `NewNATSWorkerChecked`, or from `Start` on a worker built with `NewNATSWorker`.
-  A consumer created outside a worker is refused on the same rule,
-  so a non-positive `MaxDeliver` can still never reach JetStream, which would read it as unlimited deliveries.
+  **A cancelled query surfaces the cancellation itself.** Once the driver observes the query's
+  context has ended it makes no further attempt, and the iterator carries `context.Canceled` or
+  `context.DeadlineExceeded` rather than the attempt's own error. Helix already attributed a
+  context error seen after the caller's context ended to the caller, so a leg ended by
+  `WithClusterReadTimeout` classifies as before.
 
 ### Documentation
 
-- The README's CQL examples now use the v2 adapter, which is the recommended path for new code. The Quick Start carries the `go.mod` lines the v2 adapter needs, since Go ignores a `replace` directive that lives in a dependency and the example does not compile without them. The v1 adapter remains supported and needs no `replace` line; the guidance is simply that the fork's fault-tolerance work lands in the v2 driver while v1 follows upstream gocql's pace.
-- `WithClusterReadTimeout` now records the one case where its deadline is not a bound: a token-aware first page can block on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable, so such a leg can overrun `d` and end on the driver's own request timeout instead. The caveat was already in `docs/strategy-policy.md`; it was missing from the godoc a caller sizing timeouts actually reads.
-- `docs/strategy-policy.md` now describes `AdaptiveDualWrite`'s actual recovery gate instead of a stale "recoveryThreshold consecutive fast writes" summary.
-  A background write or probe only credits recovery through the delta test against the sibling's last latency, or under `minFloor` when the sibling has no baseline or is itself degraded.
-  The credited count is then held until `minDegradedDwell` elapses.
-  And `ForceDegrade` latches a cluster so nothing credits recovery until `ForceRecover` or `Reset` clears it.
-  The `LatencyCircuitBreaker` section also now says that with route veto on, a vetoed cluster receives no ordinary or fallback read, so only the recovery probe or a failover leg landing on it can reopen the breaker —
-  fast responses alone no longer close it.
-
-- `docs/mirror.md` no longer claims mirror and replay payload arguments are deep-copied.
-  Only `[]byte` values are deep-copied into a fresh buffer.
-  `[]string`, `map[K]V`, and other nested Cassandra list/set/map column values are copied by reference and share the caller's slice or map header, so a caller must not mutate or reuse one of those values after `Exec` returns until the mirror leg has run.
-
-- `CircuitBreaker`'s Godoc no longer claims a `VetoRoute` method it does not have.
-  Only `LatencyCircuitBreaker` implements route veto; its type doc now says so.
-  `CircuitBreaker`'s concurrency-model comments now attribute `VetoRoute` correctly.
-
-- `Batch.IterContext`'s Godoc, `WithClusterReadTimeout`'s Godoc, and the read-timeout section of `docs/strategy-policy.md` now say that a batch iterator's first page is never bounded by `WithClusterReadTimeout`, unlike a query iterator's.
-  A frozen selected cluster can strand a batch iterator for the caller's whole context budget with no health signal and no failover attempt.
-
-- `Close`'s Godoc now lists a caller-supplied `RecoveryProbe` that ignores its context among the things that can block it.
-  Close cancels the recovery probe loops and waits for them to return,
-  but a probe that does not check the context passed to it keeps running regardless.
-
-- `NATSReplayer.Dequeue` and `Pending`'s Godoc now say they are for driving replay processing without a running `Worker`.
-  `Dequeue` creates a consumer that collides with a `Worker`'s own consumers on the same stream, so the two must not run against the same cluster at once.
-  `Pending` is documented as `Dequeue`'s companion for sizing a manual batch.
-
-- `WithMaxDeliver`'s Godoc now says its value is honoured only under `RetryBounded`.
-  Under the default `RetryWhileRetained` the value is still validated (it must be positive) but is overwritten and never reaches the consumer.
+- The README's CQL examples now use the v2 adapter, and the Quick Start carries the `go.mod`
+  lines it needs. The v1 adapter remains supported and needs no `replace` line; the fork's
+  fault-tolerance work simply lands in v2 while v1 follows upstream gocql's pace.
+- `WithReadStrategy`, `WithWriteStrategy`, `WithFailoverPolicy`, `WithReplayWorker` and
+  `WithTopologyWatcher` now state that **an instance serves exactly one client for its
+  lifetime.** `NewCQLClient` installs its dispatcher, cluster names, metrics and logger into
+  these as single slots, and `topology.Local`/`topology.NATS` hand every `Watch` caller the same
+  channel — so sharing redirected one client's events to the other and let the first `Close`
+  cancel both watches. No guard was added; the sharing was never supported. A `Replayer` carries
+  no client state and may still be shared.
+- `docs/mirror.md` no longer claims mirror and replay payload arguments are deep-copied. **Only
+  `[]byte` values are copied into a fresh buffer**; `[]string`, `map[K]V` and other nested
+  list/set/map values share the caller's header, so a caller must not mutate or reuse one after
+  `Exec` returns until the mirror leg has run.
+- `WithClusterReadTimeout` now records the one case where its deadline is not a bound: a
+  token-aware first page can block on another caller's in-flight routing-metadata load, which
+  neither driver makes cancellable, so such a leg can end on the driver's own request timeout
+  instead.
+- `Batch.IterContext`'s Godoc and the read-timeout section of `docs/strategy-policy.md` now say
+  a batch iterator's first page is never bounded by `WithClusterReadTimeout`, unlike a query
+  iterator's, so a frozen cluster can strand it for the caller's whole context budget.
+- `WithClusterWriteTimeout`, `WithReplayer` and `replay.WithPublishTimeout` now state that a
+  failed leg's replay enqueue runs on the caller's goroutine on a context without the caller's
+  deadline, so with the bundled `NATSReplayer` the caller also waits up to `WithPublishTimeout`
+  (5s by default). Behaviour is unchanged.
+- `docs/strategy-policy.md` now describes `AdaptiveDualWrite`'s actual recovery gate — the
+  delta test against the sibling's last latency, or `minFloor` when the sibling has no baseline
+  or is itself degraded, with the credited count held until `minDegradedDwell` elapses — instead
+  of a stale "recoveryThreshold consecutive fast writes" summary.
+- `CircuitBreaker`'s Godoc no longer claims a `VetoRoute` method it does not have; only
+  `LatencyCircuitBreaker` implements route veto.
+- `Close`'s Godoc lists a caller-supplied `RecoveryProbe` that ignores its context among the
+  things that can block it.
+- `NATSReplayer.Dequeue` and `Pending` are documented as driving replay without a running
+  `Worker`; `Dequeue` creates a consumer that collides with a `Worker`'s own, so the two must
+  not run against the same cluster at once.
+- `WithMaxDeliver`'s Godoc states its value is honoured only under `RetryBounded`.
 
 ## [1.9.0] — 2026-09-06
 
