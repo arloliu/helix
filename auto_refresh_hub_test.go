@@ -273,7 +273,9 @@ func TestRecoveryProbe_RetiredMidProbeIsAbandoned(t *testing.T) {
 	)
 	require.NoError(t, err)
 	t.Cleanup(client.Close)
-	<-old.entered // the probe has loaded the old holder and is blocked inside the session
+	// the probe has loaded the old holder and is blocked inside the session
+	<-old.entered
+	probed := client.holderFor(ClusterA)
 
 	require.NoError(t, client.RefreshSession(t.Context(), ClusterA))
 	select {
@@ -283,6 +285,10 @@ func TestRecoveryProbe_RetiredMidProbeIsAbandoned(t *testing.T) {
 		t.Fatal("the probe never settled")
 	}
 	require.Zero(t, probes.failureA.Load(), "an abandoned probe is not a probe failure")
+
+	client.Close() // joins the probe loop, so every report it makes is in
+	require.Zero(t, probed.stats.consecutiveFailures.Load(),
+		"nor a health observation, exactly as for a probe the client cancelled")
 }
 
 // A refresh whose swap lands after Close has finished installs a session
