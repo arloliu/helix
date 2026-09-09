@@ -67,6 +67,10 @@ type MetricsCollector interface {
 	IncWriteDropped(cluster ClusterID)
 
 	// ObserveWriteDuration records a write operation duration in seconds.
+	// A leg the write strategy runs in the background is not observed by the caller, which sees only that the leg was dispatched;
+	// the strategy observes it when the leg completes, so the sample is that leg's own duration rather than anything the caller waited for.
+	// AdaptiveDualWrite does this for its fire-and-forget legs, and a custom strategy that reports ErrWriteAsync is responsible for its own.
+	// A leg that never ran — dropped at the concurrency limit, or skipped because the cluster is draining — is not observed at all.
 	// Metric: [prefix]_write_duration_seconds{cluster="..."}
 	ObserveWriteDuration(cluster ClusterID, seconds float64)
 

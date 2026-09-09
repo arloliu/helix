@@ -817,6 +817,11 @@ func (a *AdaptiveDualWrite) fireAndForget(
 // observeFireAndForget records the outcome of one background write for
 // health tracking: a failure is surfaced, and a fast success earns the
 // degraded cluster recovery credit.
+//
+// It is also where a background leg contributes its write_duration sample.
+// The foreground caller cannot: it is handed [types.ErrWriteAsync] while this leg is still running,
+// so the only figure it could report is how long ago the leg started.
+// This is the one place that knows how long the leg actually took.
 func (a *AdaptiveDualWrite) observeFireAndForget(
 	cluster types.ClusterID,
 	err error,
@@ -830,6 +835,10 @@ func (a *AdaptiveDualWrite) observeFireAndForget(
 		// neither a failure nor a latency sample.
 		return
 	}
+	// The leg ran, so it has a duration whether it succeeded or failed —
+	// the same rule the synchronous path follows, where only a leg that
+	// never started observes nothing.
+	a.metrics.ObserveWriteDuration(cluster, latency.Seconds())
 	if err != nil {
 		// Surface the background failure: IncWriteError makes it
 		// visible to dashboards, and the Warn log gives operators a
