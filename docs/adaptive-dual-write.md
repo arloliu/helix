@@ -163,8 +163,16 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveRecoveryThreshold` | 5 | Consecutive fast writes to recover |
 | `WithAdaptiveFireForgetTimeout` | 30s | Timeout for fire-and-forget background writes |
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent fire-and-forget goroutines |
-| `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays degraded once it degrades |
-| `WithAdaptiveRedegradeBackoff` | disabled | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
+| `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays degraded once it degrades; setting it also switches the re-degrade backoff on |
+| `WithAdaptiveRedegradeBackoff` | 4× the minimum dwell | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
+
+The dwell and the re-degrade backoff are one subsystem, switched on by `WithAdaptiveMinDegradedDwell`.
+Without a minimum dwell there is no span to hold and nothing for the backoff to double,
+so both are off and `write_flapping` never fires.
+With one, `WithAdaptiveRedegradeBackoff` only tunes the backoff:
+an argument left at 0 takes four times the minimum dwell, which is the two doublings the cap allows.
+A `maxDwell` below the minimum dwell is a configuration error —
+`NewAdaptiveDualWriteChecked` reports it and `NewAdaptiveDualWrite` drops it for the derived value.
 | `WithAdaptiveLogger` | no-op | Structured logger for the fire-and-forget background path |
 | `WithAdaptiveMetrics` | no-op | Metrics collector for background writes; without it a background write's real error never reaches metrics |
 | `WithAdaptiveClusterNames` | A/B | Display names used in the background path's log messages |

@@ -75,6 +75,9 @@ type AdaptiveDualWrite struct {
 	// Hysteresis: a degraded cluster stays degraded for at least the current
 	// dwell, and a degrade that follows a recovery within redegradeWindow
 	// doubles the dwell up to maxDegradedDwell.
+	// The constructors derive redegradeWindow and maxDegradedDwell from
+	// minDegradedDwell when the caller left them unset, and clear all three
+	// when there is no dwell (see deriveAdaptiveDwell).
 	minDegradedDwell time.Duration
 	redegradeWindow  time.Duration
 	maxDegradedDwell time.Duration
@@ -348,13 +351,20 @@ func WithAdaptiveFireForgetLimit(n int) AdaptiveDualWriteOption {
 //
 // Fast writes and successful probes still accumulate recovery credit during
 // the dwell, but the cluster is restored only once the dwell has elapsed
-// as well. This stops a cluster whose probe answers quickly while its
-// writes are still slow from bouncing between the two states.
+// as well.
+// This stops a cluster whose probe answers quickly while its writes are
+// still slow from bouncing between the two states.
 //
-// Default: 0 (recover as soon as the recovery threshold is met)
+// This option alone also turns on the re-degrade backoff: the window and the
+// cap [WithAdaptiveRedegradeBackoff] takes are derived as four times d unless
+// that option sets them, so a cluster that keeps degrading again is reported
+// through [types.EventWriteFlapping] without a second option.
+//
+// Default: 0 (recover as soon as the recovery threshold is met, and no
+// re-degrade backoff)
 //
 // Parameters:
-//   - d: Minimum degraded span; 0 disables the dwell
+//   - d: Minimum degraded span; 0 disables the dwell and the backoff with it
 //
 // Returns:
 //   - AdaptiveDualWriteOption: Configuration option
@@ -369,17 +379,24 @@ func WithAdaptiveMinDegradedDwell(d time.Duration) AdaptiveDualWriteOption {
 //
 // A strike-driven degrade that begins within window of the previous
 // recovery doubles the dwell, starting from [WithAdaptiveMinDegradedDwell]
-// and capped at maxDwell. When the cap is first reached the strategy emits
-// [types.EventWriteFlapping]. A recovery that holds for longer than window,
-// or a manual recovery, resets the backoff.
+// and capped at maxDwell.
+// When the cap is first reached the strategy emits
+// [types.EventWriteFlapping].
+// A recovery that holds for longer than window, or a manual recovery, resets
+// the backoff.
 //
-// Default: disabled
+// The option only tunes the backoff; [WithAdaptiveMinDegradedDwell] is what
+// switches it on.
+// Either argument may be left at 0 to take the derived value, four times the
+// minimum dwell — the two doublings the cap above describes.
+//
+// Default: derived from [WithAdaptiveMinDegradedDwell], and off without one
 //
 // Parameters:
 //   - window: How soon after a recovery a degrade counts as a re-degrade;
-//     0 disables the backoff
-//   - maxDwell: Upper bound for the doubled dwell; must be at least the
-//     minimum dwell
+//     0 derives it from the minimum dwell
+//   - maxDwell: Upper bound for the doubled dwell; 0 derives it from the
+//     minimum dwell, and a positive value must be at least that dwell
 //
 // Returns:
 //   - AdaptiveDualWriteOption: Configuration option
@@ -531,19 +548,24 @@ func adaptiveCountRule(
 }
 
 // adaptiveRedegradeBackoffRule is the interlock between the re-degrade
-// backoff and the dwell it doubles: the backoff needs a window to measure a
-// re-degrade in, a positive dwell to start from, and a cap no smaller than
-// that dwell.
-// A backoff that cannot be applied is dropped rather than half-configured.
+// backoff and the dwell it doubles: the backoff needs a positive dwell to
+// start from, and a cap that is either unset or no smaller than that dwell.
+// An unset window or cap is derived from the dwell by [deriveAdaptiveDwell];
+// a backoff that cannot be applied at all is dropped rather than left half
+// configured.
 func adaptiveRedegradeBackoffRule() adaptiveOptionRule {
 	return adaptiveOptionRule{
 		check: func(a *AdaptiveDualWrite) error {
 			if a.redegradeWindow < 0 || a.maxDegradedDwell < 0 {
 				return optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff")
 			}
-			if a.redegradeWindow > 0 && (a.minDegradedDwell <= 0 || a.maxDegradedDwell < a.minDegradedDwell) {
+			if a.redegradeWindow > 0 && a.minDegradedDwell <= 0 {
 				return newOptionError(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff",
-					"requires a positive WithAdaptiveMinDegradedDwell no larger than maxDwell")
+					"requires a positive WithAdaptiveMinDegradedDwell to double")
+			}
+			if a.maxDegradedDwell > 0 && a.maxDegradedDwell < a.minDegradedDwell {
+				return newOptionError(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff",
+					"maxDwell must be at least the WithAdaptiveMinDegradedDwell it caps")
 			}
 
 			return nil
@@ -552,6 +574,39 @@ func adaptiveRedegradeBackoffRule() adaptiveOptionRule {
 			a.redegradeWindow = 0
 			a.maxDegradedDwell = 0
 		},
+	}
+}
+
+// adaptiveDwellFactor is how far the re-degrade backoff stretches the minimum
+// dwell when the caller left the cap or the window unset.
+// The dwell doubles from the minimum, so a cap of four times it allows the
+// two doublings [WithAdaptiveRedegradeBackoff] describes before the cap is
+// reported; the window matches the cap, so a cluster that degrades again
+// within the longest span it could have dwelled counts as a re-degrade.
+const adaptiveDwellFactor = 4
+
+// deriveAdaptiveDwell completes the dwell configuration, for both
+// constructors.
+// A minimum dwell on its own enables the re-degrade backoff: the cap and the
+// window are derived from it, so [WithAdaptiveMinDegradedDwell] alone is
+// enough for a flapping cluster to be reported.
+// Without a minimum dwell the backoff has nothing to double, so it stays off.
+func deriveAdaptiveDwell(a *AdaptiveDualWrite) {
+	if a.minDegradedDwell <= 0 {
+		a.redegradeWindow = 0
+		a.maxDegradedDwell = 0
+
+		return
+	}
+	derived := time.Duration(math.MaxInt64)
+	if a.minDegradedDwell < derived/adaptiveDwellFactor {
+		derived = adaptiveDwellFactor * a.minDegradedDwell
+	}
+	if a.maxDegradedDwell <= 0 {
+		a.maxDegradedDwell = derived
+	}
+	if a.redegradeWindow <= 0 {
+		a.redegradeWindow = derived
 	}
 }
 
@@ -609,6 +664,7 @@ func normalizeAdaptiveDualWriteForLegacy(a *AdaptiveDualWrite) {
 }
 
 func finalizeAdaptiveDualWrite(a *AdaptiveDualWrite) {
+	deriveAdaptiveDwell(a)
 	if a.metrics == nil {
 		a.metrics = metrics.NewNopMetrics()
 	}

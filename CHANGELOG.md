@@ -210,6 +210,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RoundRobinRead` now starts on cluster A:
   its first `Select` returned cluster B because the counter was read after the increment.
 
+- `WithAdaptiveMinDegradedDwell` on its own now switches on the re-degrade backoff that reports a flapping cluster.
+  The backoff was applied only when `WithAdaptiveRedegradeBackoff` supplied both a window and a cap as well;
+  a caller who set just the minimum dwell got the hold on recovery but no backoff,
+  so `write_flapping_total` and `EventWriteFlapping` could never fire and nothing said so.
+  The window and the cap are now derived as four times the minimum dwell — the two doublings the cap allows —
+  unless `WithAdaptiveRedegradeBackoff` sets them.
+  Either of its arguments may be left at 0 to take the derived value;
+  a cap below the minimum dwell is still a configuration error.
+  Defaults are unchanged: without a minimum dwell there is nothing to double, so the dwell and the backoff both stay off.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.7.0-otter`, up from `v2.5.0-otter`.
