@@ -414,7 +414,9 @@ func (c *CQLClient) Close() {
 //
 // Returns:
 //   - cql.Session: The previous session for the given cluster.
-//   - error: [types.ErrSessionClosed] if the client has been closed,
+//   - error: [types.ErrSessionClosed] if the client has been closed, or if
+//     it closed while the swap was in progress — in which case newSession
+//     is closed before returning and no old session is returned,
 //     [types.ErrNilSession] if newSession is nil,
 //     [types.ErrInvalidCluster] for ClusterB on a single-cluster client
 //     or any unrecognized ClusterID.
@@ -431,7 +433,23 @@ func (c *CQLClient) SwapSession(cluster ClusterID, newSession cql.Session) (cql.
 		return nil, err
 	}
 
-	old := slot.Swap(c.newSessionHolder(newSession))
+	holder := c.newSessionHolder(newSession)
+	old := slot.Swap(holder)
+
+	// Close marks the client closed before it tears anything down, so a
+	// swap that finds the flag set here may have installed its holder
+	// after Close closed the session it found. Nothing would ever close
+	// the new one, so this swap disposes of it: the holder is retired
+	// first, as an uninstalled holder always is, so an outcome an
+	// in-flight operation reports against it reaches neither the failover
+	// policy nor the read strategy.
+	if c.closed.Load() {
+		holder.retired.Store(true)
+		newSession.Close()
+
+		return nil, types.ErrSessionClosed
+	}
+
 	old.retired.Store(true)
 
 	return old.s, nil
