@@ -191,6 +191,10 @@ func WithThreshold(n int) CircuitBreakerOption {
 // failure before the client's recovery probe may test the cluster (see
 // [CircuitBreaker.TryBeginFailoverProbe]).
 //
+// A zero value leaves a client using helix.WithRouteVeto with no way to
+// reopen a vetoed cluster but a failover leg from the other one, and the
+// client warns about the combination at startup.
+//
 // Default: 30s
 //
 // Parameters:
@@ -632,6 +636,18 @@ func (c *CircuitBreaker) TryBeginFailoverProbe(cluster types.ClusterID) (uint64,
 	c.report(state, cluster, transitionHalfOpen, seq)
 
 	return seq, true
+}
+
+// ProbeScheduled reports whether a client's recovery probe can ever reserve
+// this breaker, i.e. whether the reset timeout set by [WithResetTimeout] is
+// positive. A helix client warns at startup when route veto is on and this
+// is false: a vetoed cluster receives no reads, so without a probe only a
+// failover leg landing on it can close its breaker.
+//
+// Returns:
+//   - bool: true when the reset timeout is positive
+func (c *CircuitBreaker) ProbeScheduled() bool {
+	return c.resetTimeout > 0
 }
 
 // CompleteFailoverProbe settles the reservation token from

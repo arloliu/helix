@@ -534,7 +534,11 @@ func WithReplayGate(allow func(cluster ClusterID) bool) Option {
 // A vetoed cluster receives no ordinary or fallback read, so its breaker is
 // reopened only by the recovery probe (see [WithRecoveryProbe]) or by a
 // failover leg landing on it; the client logs a startup Warn when the veto
-// is on and [WithRecoveryProbeDisabled] has removed the probe.
+// is on and nothing can probe the vetoed cluster — because
+// [WithRecoveryProbeDisabled] removed the probe, because the policy does
+// not implement [FailoverProbeReporter], or because it implements
+// [FailoverProbeScheduleReporter] and schedules no probe (a zero
+// policy.WithResetTimeout / policy.WithLatencyResetTimeout).
 //
 // Parameters:
 //   - enabled: true to consult the policy's veto on ordinary reads
