@@ -30,6 +30,8 @@ var (
 	_ helix.FailoverProbeReporter          = (*policy.LatencyCircuitBreaker)(nil)
 	_ helix.FailoverBelowThresholdReporter = (*policy.CircuitBreaker)(nil)
 	_ helix.FailoverBelowThresholdReporter = (*policy.LatencyCircuitBreaker)(nil)
+	_ helix.FailoverProbeScheduleReporter  = (*policy.CircuitBreaker)(nil)
+	_ helix.FailoverProbeScheduleReporter  = (*policy.LatencyCircuitBreaker)(nil)
 
 	_ helix.ProbeReporter        = (*policy.AdaptiveDualWrite)(nil)
 	_ helix.LatchReporter        = (*policy.AdaptiveDualWrite)(nil)

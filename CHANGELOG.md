@@ -128,6 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MemoryReplayer` returns `ErrReplayQueueFull` at once and `NATSReplayer` gives up after `WithPublishTimeout`.
   No bound was added: rejecting an admission loses a write, and no size has been chosen.
 
+- `NewCQLClient` now also warns when `WithRouteVeto(true)` is combined with a failover policy that no recovery probe can ever reserve.
+  A reset timeout of zero (`policy.WithResetTimeout(0)` or `policy.WithLatencyResetTimeout(0)`) makes `TryBeginFailoverProbe` refuse every tick, and a custom policy that implements `RouteVeto` without `FailoverProbeReporter` has nothing for the probe to reserve at all.
+  Either one strands a vetoed cluster exactly as `WithRecoveryProbeDisabled()` does: the breaker is left with no closer but a failover leg from the other cluster, so it never closes while that cluster stays healthy.
+  The built-in breakers report their schedule through the new `helix.FailoverProbeScheduleReporter`,
+  so a policy can tell the client whether a probe is scheduled at all.
+  Routing is unchanged.
+
 ### Changed
 
 - The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.7.0-otter`, up from `v2.5.0-otter`.

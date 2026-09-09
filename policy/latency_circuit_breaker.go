@@ -45,7 +45,7 @@ const defaultLatencyAbsoluteMax = 2 * time.Second
 // depend on the pointer field shape. Because the embed can be nil, every
 // promoted-looking method below (ShouldFailover, RecordFailure,
 // RecordSuccess, Failures, SetClusterNames, MetricsConfigured, SetMetrics,
-// SetEventEmitter, LoggerConfigured, SetLogger) is an explicit wrapper with a nil guard
+// SetEventEmitter, LoggerConfigured, SetLogger, ProbeScheduled) is an explicit wrapper with a nil guard
 // rather than a compiler-promoted method — use one of the constructors
 // (NewLatencyCircuitBreaker / NewLatencyCircuitBreakerChecked) to get a
 // fully configured, functional LatencyCircuitBreaker.
@@ -116,6 +116,10 @@ func WithLatencyFailoverBelowThreshold(enabled bool) LatencyCircuitBreakerOption
 
 // WithLatencyResetTimeout sets how long an open breaker waits after its last
 // failure before the client's recovery probe may test the cluster.
+//
+// A zero value leaves a client using helix.WithRouteVeto with no way to
+// reopen a vetoed cluster but a failover leg from the other one, and the
+// client warns about the combination at startup.
 //
 // Default: 30s
 //
@@ -342,6 +346,20 @@ func (l *LatencyCircuitBreaker) CompleteFailoverProbe(cluster types.ClusterID, t
 	}
 
 	l.CircuitBreaker.CompleteFailoverProbe(cluster, token, outcome)
+}
+
+// ProbeScheduled reports whether a client's recovery probe can ever reserve
+// this breaker. See [CircuitBreaker.ProbeScheduled]. A zero-value
+// LatencyCircuitBreaker (nil embedded *CircuitBreaker) reports false.
+//
+// Returns:
+//   - bool: true when the reset timeout is positive
+func (l *LatencyCircuitBreaker) ProbeScheduled() bool {
+	if l.CircuitBreaker == nil {
+		return false
+	}
+
+	return l.CircuitBreaker.ProbeScheduled()
 }
 
 // AbsoluteMax returns the configured latency threshold.

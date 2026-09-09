@@ -1,6 +1,7 @@
 package helix
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -122,7 +123,80 @@ func TestNewCQLClient_RouteVetoWarnings(t *testing.T) {
 
 		require.NotContains(t, warnings(logger), warnRouteVetoWithoutProbe)
 	})
+	t.Run("option on with a zero latency reset timeout", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithFailoverPolicy(policy.NewLatencyCircuitBreaker(policy.WithLatencyResetTimeout(0))),
+			WithRouteVeto(true),
+		)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		require.Contains(t, warnings(logger), warnRouteVetoWithoutResetTimeout)
+	})
+	t.Run("option on with a zero reset timeout on the embedded breaker", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			// The plain CircuitBreaker has no VetoRoute of its own, so the
+			// veto reaches WithResetTimeout only through a policy that
+			// embeds it and adds one.
+			WithFailoverPolicy(&embeddedBreakerVetoPolicy{CircuitBreaker: policy.NewCircuitBreaker(policy.WithResetTimeout(0))}),
+			WithRouteVeto(true),
+		)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		require.Contains(t, warnings(logger), warnRouteVetoWithoutResetTimeout)
+	})
+	t.Run("option on with the default reset timeouts warns nothing", func(t *testing.T) {
+		for name, p := range map[string]FailoverPolicy{
+			"latency breaker":  policy.NewLatencyCircuitBreaker(),
+			"embedded breaker": &embeddedBreakerVetoPolicy{CircuitBreaker: policy.NewCircuitBreaker()},
+		} {
+			t.Run(name, func(t *testing.T) {
+				logger := &captureLogger{}
+				client, err := NewCQLClient(newMockSession(), newMockSession(),
+					WithLogger(logger),
+					WithFailoverPolicy(p),
+					WithRouteVeto(true),
+				)
+				require.NoError(t, err)
+				t.Cleanup(client.Close)
+
+				for _, w := range warnings(logger) {
+					require.NotContains(t, w, "RouteVeto")
+				}
+			})
+		}
+	})
+	t.Run("option on with a policy the probe cannot reserve", func(t *testing.T) {
+		logger := &captureLogger{}
+		client, err := NewCQLClient(newMockSession(), newMockSession(),
+			WithLogger(logger),
+			WithFailoverPolicy(newVetoPolicy()),
+			WithRouteVeto(true),
+		)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		require.Contains(t, warnings(logger), warnRouteVetoWithoutProbeReporter)
+	})
 }
+
+// embeddedBreakerVetoPolicy is the shape a caller reaches for when they want
+// the plain CircuitBreaker to steer ordinary reads: the breaker supplies the
+// policy and the probe reservation, the wrapper supplies the veto.
+type embeddedBreakerVetoPolicy struct {
+	*policy.CircuitBreaker
+}
+
+func (p *embeddedBreakerVetoPolicy) VetoRoute(cluster ClusterID) bool {
+	return p.ShouldFailover(cluster, errBreakerOpen)
+}
+
+var errBreakerOpen = errors.New("breaker open")
 
 func TestNewCQLClient_NoWarningWhenRecoveryProbeHasAdaptiveStrategy(t *testing.T) {
 	logger := &captureLogger{}
@@ -148,6 +222,16 @@ const (
 		"a vetoed cluster is reopened only by a recovery probe or by a failover leg landing on it, " +
 		"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
 		"drop WithRecoveryProbeDisabled or set WithRouteVeto(false)"
+	warnRouteVetoWithoutProbeReporter = "WithRouteVeto on (also set by WithBehaviorProfile(Safe)) with a failover policy the recovery probe cannot reserve " +
+		"(it does not implement helix.FailoverProbeReporter): " +
+		"a vetoed cluster is reopened only by a recovery probe or by a failover leg landing on it, " +
+		"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
+		"implement FailoverProbeReporter on the policy or set WithRouteVeto(false)"
+	warnRouteVetoWithoutResetTimeout = "WithResetTimeout(0) or WithLatencyResetTimeout(0) with WithRouteVeto on (also set by WithBehaviorProfile(Safe)): " +
+		"the failover policy schedules no recovery probe, and a vetoed cluster is reopened only by a recovery probe " +
+		"or by a failover leg landing on it, " +
+		"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
+		"set a positive reset timeout or set WithRouteVeto(false)"
 	warnNoReadLegDeadline = "dual-cluster mode with no ClusterReadTimeout: " +
 		"a read leg that never answers is bounded only by the caller's context and is never attributed to the cluster; " +
 		"set one with WithClusterReadTimeout"

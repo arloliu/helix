@@ -608,6 +608,19 @@ alternative. The veto never calls `OnFailure`; the strategy's ordinary `OnSucces
 cluster that served the read is unchanged. `helix.WithBehaviorProfile(helix.Safe)` turns the
 veto on together with any future client-owned default that changes in the next major version.
 
+A vetoed cluster receives no ordinary and no fallback read, so only two things reopen it:
+
+- the client's recovery probe, which reserves the breaker once the reset timeout has elapsed;
+- a failover leg landing on it, which only happens when the *other* cluster fails a read.
+
+Nothing can probe the vetoed cluster's breaker — leaving only the failover leg — under any of
+`helix.WithRecoveryProbeDisabled()`, a failover policy that does not implement
+`helix.FailoverProbeReporter` (the probe has no reservation to make against it), or a reset timeout
+of zero (`policy.WithResetTimeout(0)` / `policy.WithLatencyResetTimeout(0)`, which makes
+`TryBeginFailoverProbe` refuse every tick). The client logs a startup warning for each of those
+combined with the veto, because a breaker that opens while the sibling stays healthy then never
+closes and reads stay single-cluster for the life of the process.
+
 **Configuration validation:**
 
 - `NewLatencyCircuitBreaker` is the compatibility constructor. Invalid values fall back to defaults.
