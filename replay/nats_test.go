@@ -26,7 +26,6 @@ func TestNATSReplayerNewInvalidOptionsReturnJoinedErrors(t *testing.T) {
 		replay.WithMaxAckPending(0),
 		replay.WithMaxRequestBatch(0),
 		replay.WithAckWait(0),
-		replay.WithMaxDeliver(0),
 		replay.WithDiscardPolicy(jetstream.DiscardPolicy(99)),
 	)
 	require.Nil(t, replayer)
@@ -43,7 +42,6 @@ func TestNATSReplayerNewInvalidOptionsReturnJoinedErrors(t *testing.T) {
 	require.Contains(t, err.Error(), "WithMaxAckPending")
 	require.Contains(t, err.Error(), "WithMaxRequestBatch")
 	require.Contains(t, err.Error(), "WithAckWait")
-	require.Contains(t, err.Error(), "WithMaxDeliver")
 	require.Contains(t, err.Error(), "WithDiscardPolicy")
 }
 

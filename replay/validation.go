@@ -139,9 +139,9 @@ func validateNATSReplayerConfigForChecked(config NATSReplayerConfig) error {
 	if config.AckWait <= 0 {
 		errList = append(errList, optionErrPositiveDuration(natsReplayerComponent, "WithAckWait"))
 	}
-	if config.MaxDeliver <= 0 {
-		errList = append(errList, optionErrPositiveInt(natsReplayerComponent, "WithMaxDeliver"))
-	}
+	// MaxDeliver is deliberately absent: it is the delivery budget only under
+	// RetryBounded, which the replayer does not know about.
+	// validateNATSRetryBudget checks it where the policy is known.
 	if !isValidDiscardPolicy(config.DiscardPolicy) {
 		errList = append(errList,
 			newOptionError(natsReplayerComponent, "WithDiscardPolicy", "must be DiscardOld or DiscardNew"),
@@ -149,6 +149,19 @@ func validateNATSReplayerConfigForChecked(config NATSReplayerConfig) error {
 	}
 
 	return joinValidationErrors(errList...)
+}
+
+// validateNATSRetryBudget reports the option error a NATS worker's delivery
+// budget produces.
+// Under [RetryBounded] the consumer's MaxDeliver is that budget, so it must
+// be positive; under [RetryWhileRetained] the worker overwrites it with -1
+// (unlimited) before any consumer is created, so any value is accepted.
+func validateNATSRetryBudget(policy ReplayRetryPolicy, replayer *NATSReplayer) error {
+	if policy != RetryBounded || replayer == nil || replayer.config.MaxDeliver > 0 {
+		return nil
+	}
+
+	return optionErrPositiveInt(natsReplayerComponent, "WithMaxDeliver")
 }
 
 func isValidDiscardPolicy(policy jetstream.DiscardPolicy) bool {

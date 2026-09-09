@@ -351,8 +351,11 @@ func WithAckWait(d time.Duration) NATSReplayerOption {
 // the message and the OnDrop callback in WorkerConfig runs.
 // The option has no effect under the default [RetryWhileRetained]: a worker
 // running that policy overwrites the consumer's MaxDeliver with -1
-// (unlimited), so the value configured here is validated (n must be > 0
-// regardless of the active retry policy) but never reaches the consumer.
+// (unlimited), so any value configured here is accepted and never reaches
+// the consumer.
+// Under [RetryBounded] the value is the budget, so it must be positive:
+// [NewNATSWorkerChecked] reports a non-positive one and [NewNATSWorker]
+// returns it from Start.
 //
 // Parameters:
 //   - n: Maximum delivery attempts (default: 5)
@@ -675,6 +678,13 @@ func (n *NATSReplayer) getOrCreateConsumer(
 		// delayed NAKs carry their own delay.
 		consumerConfig.MaxDeliver = -1
 		consumerConfig.BackOff = n.redeliveryBackoff
+	} else if consumerConfig.MaxDeliver <= 0 {
+		// Nothing has taken over the budget, so MaxDeliver is it.
+		// JetStream reads a non-positive MaxDeliver as unlimited, which
+		// would retry a poison message for the stream's whole MaxAge
+		// without ever calling OnDrop, so refuse the consumer instead of
+		// creating that one.
+		return nil, optionErrPositiveInt(natsReplayerComponent, "WithMaxDeliver")
 	}
 
 	consumer, err := n.stream.CreateOrUpdateConsumer(ctx, consumerConfig)

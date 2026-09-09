@@ -288,6 +288,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A leg that finishes before the client registers its completion callback is still admitted on the caller's goroutine, outside the limit.
   `Replayer.Enqueue`, `WithReplayer`, `WithAdaptiveFireForgetLimit` and the replay guide describe the bound; a custom `Enqueue` should still return within a bounded time, as both bundled replayers do.
 
+- `WithMaxDeliver` is now checked where the value is used rather than at every `NewNATSReplayer`.
+  It is the delivery budget only under `RetryBounded`;
+  a worker running the default `RetryWhileRetained` overwrites the consumer's `MaxDeliver` with -1,
+  so requiring a positive value at construction rejected a replayer whose active policy never reads the setting.
+  `NewNATSReplayer` now accepts any value,
+  and a worker built with `RetryBounded` over a replayer whose `MaxDeliver` is not positive reports it —
+  from `NewNATSWorkerChecked`, or from `Start` on a worker built with `NewNATSWorker`.
+  A consumer created outside a worker is refused on the same rule,
+  so a non-positive `MaxDeliver` can still never reach JetStream, which would read it as unlimited deliveries.
+
 ### Documentation
 
 - The README's CQL examples now use the v2 adapter, which is the recommended path for new code. The Quick Start carries the `go.mod` lines the v2 adapter needs, since Go ignores a `replace` directive that lives in a dependency and the example does not compile without them. The v1 adapter remains supported and needs no `replace` line; the guidance is simply that the fork's fault-tolerance work lands in the v2 driver while v1 follows upstream gocql's pace.
