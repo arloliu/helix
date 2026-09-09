@@ -282,6 +282,11 @@ func WithOnError(fn func(types.ReplayPayload, error, int)) WorkerOption {
 // worker counts just after it is reported once and offset in the next
 // interval. The memory worker ignores the option.
 //
+// The same poll releases the dead-letter budgets
+// ([RetryWhileRetained]) of the sequences the stream no longer holds,
+// so a payload the stream removed rather than this worker terminating it
+// does not keep its budget for the process's lifetime.
+//
 // Returns:
 //   - WorkerOption: Configuration option
 func WithEvictionWatch() WorkerOption {
