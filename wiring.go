@@ -65,10 +65,9 @@ func autoInjectMetricsAndLogger(config *ClientConfig) {
 // warnNoEffectOptions logs one warning per option that the rest of the
 // configuration renders inert, one per legacy default that a configured
 // component could improve on (such as a failover policy that can veto
-// routes while WithRouteVeto is off), and one for a route veto that
-// nothing but a failover leg can lift (the recovery probe is disabled), so
-// a misconfiguration is discovered at startup rather than during an
-// incident.
+// routes while WithRouteVeto is off), and one for a route veto that nothing
+// but a failover leg can lift (see warnRouteVeto), so a
+// misconfiguration is discovered at startup rather than during an incident.
 func warnNoEffectOptions(config *ClientConfig) {
 	if config.MirrorReplayer != nil && !config.mirrorTargetSet {
 		config.Logger.Warn("WithMirrorReplayer has no effect without WithMirror; failed mirror writes are only retried in target mode")
@@ -87,7 +86,19 @@ func warnNoEffectOptions(config *ClientConfig) {
 		config.Logger.Warn("replay gating could not be applied or verified for the supplied replay worker: " +
 			"pass replay.WithClusterGate when building it so drain and WithReplayGate hold replay back")
 	}
+	warnRouteVeto(config)
+}
+
+// warnRouteVeto logs the one warning that fits the route veto's
+// configuration: that the veto cannot take effect, that it is available but
+// off, or — the three ways a vetoed cluster is left with no closer but a
+// failover leg from the other cluster — that the recovery probe is disabled,
+// that the failover policy cannot be reserved for a probe, or that it
+// schedules none.
+func warnRouteVeto(config *ClientConfig) {
 	_, canVeto := config.FailoverPolicy.(RouteVeto)
+	_, canProbe := config.FailoverPolicy.(FailoverProbeReporter)
+	schedule, reportsSchedule := config.FailoverPolicy.(FailoverProbeScheduleReporter)
 	switch {
 	case config.RouteVeto && !canVeto:
 		config.Logger.Warn("WithRouteVeto has no effect: the failover policy cannot veto routes")
@@ -102,6 +113,22 @@ func warnNoEffectOptions(config *ClientConfig) {
 			"a vetoed cluster is reopened only by a recovery probe or by a failover leg landing on it, " +
 			"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
 			"drop WithRecoveryProbeDisabled or set WithRouteVeto(false)")
+	case config.RouteVeto && canVeto && !canProbe:
+		// The probe runs, but it has no reservation to make against this
+		// policy, so it can never close the breaker that vetoed.
+		config.Logger.Warn("WithRouteVeto on (also set by WithBehaviorProfile(Safe)) with a failover policy the recovery probe cannot reserve " +
+			"(it does not implement helix.FailoverProbeReporter): " +
+			"a vetoed cluster is reopened only by a recovery probe or by a failover leg landing on it, " +
+			"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
+			"implement FailoverProbeReporter on the policy or set WithRouteVeto(false)")
+	case config.RouteVeto && canVeto && reportsSchedule && !schedule.ProbeScheduled():
+		// A zero reset timeout makes TryBeginFailoverProbe always refuse,
+		// which strands a vetoed cluster exactly as a disabled probe does.
+		config.Logger.Warn("WithResetTimeout(0) or WithLatencyResetTimeout(0) with WithRouteVeto on (also set by WithBehaviorProfile(Safe)): " +
+			"the failover policy schedules no recovery probe, and a vetoed cluster is reopened only by a recovery probe " +
+			"or by a failover leg landing on it, " +
+			"so a breaker that opens while the other cluster stays healthy never closes and reads stay single-cluster; " +
+			"set a positive reset timeout or set WithRouteVeto(false)")
 	}
 }
 

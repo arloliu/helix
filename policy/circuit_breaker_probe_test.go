@@ -107,3 +107,16 @@ func TestLatencyCircuitBreaker_ExternalCompositeLiteral_PointerEmbedShape(t *tes
 			"*CircuitBreaker; a value-embedded CircuitBreaker would fork state "+
 			"on copy instead")
 }
+
+// TestCircuitBreaker_ProbeScheduled reports whether a client's recovery
+// probe can ever reserve the breaker, which is what a zero reset timeout
+// takes away.
+func TestCircuitBreaker_ProbeScheduled(t *testing.T) {
+	assert.True(t, policy.NewCircuitBreaker().ProbeScheduled())
+	assert.False(t, policy.NewCircuitBreaker(policy.WithResetTimeout(0)).ProbeScheduled())
+
+	assert.True(t, policy.NewLatencyCircuitBreaker().ProbeScheduled())
+	assert.False(t, policy.NewLatencyCircuitBreaker(policy.WithLatencyResetTimeout(0)).ProbeScheduled())
+
+	assert.False(t, (&policy.LatencyCircuitBreaker{}).ProbeScheduled(), "a zero value schedules nothing")
+}

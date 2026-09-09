@@ -353,6 +353,17 @@ type FailoverProbeReporter interface {
 	CompleteFailoverProbe(cluster ClusterID, token uint64, outcome types.ProbeOutcome)
 }
 
+// FailoverProbeScheduleReporter is an optional interface for failover
+// policies that own the schedule their [FailoverProbeReporter] reservation
+// follows, such as the built-in breakers' reset timeout. The client logs a
+// startup warning when [WithRouteVeto] is on and the policy reports that no
+// probe is ever scheduled, because the veto then has no closer of its own.
+type FailoverProbeScheduleReporter interface {
+	// ProbeScheduled reports whether a recovery probe can ever reserve
+	// the policy, i.e. whether TryBeginFailoverProbe may return true.
+	ProbeScheduled() bool
+}
+
 // FailoverBelowThresholdReporter is an optional interface for failover
 // policies that own a below-threshold failover setting, such as
 // [policy.WithFailoverBelowThreshold]. The client logs a startup warning
