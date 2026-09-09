@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 
@@ -21,6 +22,7 @@ type readTestMetrics struct {
 	ReadTotal      map[ClusterID]int64
 	ReadErrors     map[ClusterID]int64
 	ReadDivergence map[ClusterID]int64
+	ReadDurations  map[ClusterID][]float64
 }
 
 func newReadTestMetrics() *readTestMetrics {
@@ -28,6 +30,7 @@ func newReadTestMetrics() *readTestMetrics {
 		ReadTotal:      make(map[ClusterID]int64),
 		ReadErrors:     make(map[ClusterID]int64),
 		ReadDivergence: make(map[ClusterID]int64),
+		ReadDurations:  make(map[ClusterID][]float64),
 	}
 }
 
@@ -43,10 +46,22 @@ func (m *readTestMetrics) get(mp map[ClusterID]int64, c ClusterID) int64 {
 	return mp[c]
 }
 
-func (m *readTestMetrics) IncReadTotal(c ClusterID)                     { m.inc(m.ReadTotal, c) }
-func (m *readTestMetrics) IncReadError(c ClusterID)                     { m.inc(m.ReadErrors, c) }
-func (m *readTestMetrics) IncReadDivergence(c ClusterID)                { m.inc(m.ReadDivergence, c) }
-func (m *readTestMetrics) ObserveReadDuration(_ ClusterID, _ float64)   {}
+// durations returns the read durations observed for a cluster, in order.
+func (m *readTestMetrics) durations(c ClusterID) []float64 {
+	m.Lock()
+	defer m.Unlock()
+
+	return slices.Clone(m.ReadDurations[c])
+}
+
+func (m *readTestMetrics) IncReadTotal(c ClusterID)      { m.inc(m.ReadTotal, c) }
+func (m *readTestMetrics) IncReadError(c ClusterID)      { m.inc(m.ReadErrors, c) }
+func (m *readTestMetrics) IncReadDivergence(c ClusterID) { m.inc(m.ReadDivergence, c) }
+func (m *readTestMetrics) ObserveReadDuration(c ClusterID, seconds float64) {
+	m.Lock()
+	defer m.Unlock()
+	m.ReadDurations[c] = append(m.ReadDurations[c], seconds)
+}
 func (m *readTestMetrics) IncWriteTotal(_ ClusterID)                    {}
 func (m *readTestMetrics) IncWriteError(_ ClusterID)                    {}
 func (m *readTestMetrics) IncWriteAsync(_ ClusterID)                    {}

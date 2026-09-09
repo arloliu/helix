@@ -794,7 +794,7 @@ For a dual-cluster client with `WithClusterReadTimeout(d)`, that page is a read 
 | Stage | Context | Reporting |
 |---|---|---|
 | First page, inside `IterContext()` | bounded by `d` | `read_total` and `read_duration` for every leg attempt; a leg that expires also records `read_error`, the session stats and `RecordFailure` |
-| Later pages, drained by the caller | the caller's own context | attributed at `Close()` |
+| Later pages, drained by the caller | the caller's own context | attributed at `Close()`, which adds no second `read_duration` for a leg already observed |
 
 A first page that expires is `ErrClusterTimeout` for its cluster,
 and the read is retried once on the alternative under the same failover gating a `Scan` uses:
@@ -812,7 +812,10 @@ Its first page is still bounded and still counted,
 but an expiry returns `ErrClusterTimeout` rather than replaying a cursor on a cluster that never issued it.
 
 Without `WithClusterReadTimeout`, or in single-cluster mode,
-the first page runs on the caller's context exactly as it always has and reports nothing before `Close()`.
+the first page runs on the caller's context exactly as it always has,
+and the iterator reports nothing before `Close()` beyond the one `read_total` that opening it counts.
+Its `read_duration` then spans from opening the iterator to closing it,
+so the sample covers every page the caller drained.
 
 **Call `Close()`, or `Scanner().Err()` for a `Scanner` consumer.**
 `Close()` reports the read's outcome and releases the leg context the first page ran under.
@@ -820,7 +823,7 @@ the first page runs on the caller's context exactly as it always has and reports
 a Scanner loop under a deferred `Close()` reports the read once.
 An abandoned iterator does neither, the same way it already leaks the driver's own iterator.
 
-A cluster error at `Close()` is always a `RecordFailure` for the failover policy,
+A cluster error at `Close()` is always a `RecordFailure` for the failover policy and one `read_errors_total` for its cluster,
 but it moves the read strategy only where a failing `Scan` would have been allowed to fail over:
 after `ShouldFailover` agrees and unless the alternative cluster is draining.
 A breaker still below its threshold therefore leaves the sticky preference where it is,

@@ -840,7 +840,8 @@ func TestIterFirstPage_TimeoutInactiveKeepsTheCallerContext(t *testing.T) {
 
 		require.True(t, sa.lastQuery(t).legContext() == ctx,
 			"without a leg deadline the driver keeps the caller's own context object")
-		require.Zero(t, h.metrics.get(h.metrics.readTotal, ClusterA), "no leg attempt is counted")
+		require.EqualValues(t, 1, h.metrics.get(h.metrics.readTotal, ClusterA),
+			"the cluster attempt is counted where the iterator was opened, not as a bounded leg")
 	})
 
 	t.Run("single cluster with a leg deadline", func(t *testing.T) {
@@ -853,7 +854,8 @@ func TestIterFirstPage_TimeoutInactiveKeepsTheCallerContext(t *testing.T) {
 
 		require.True(t, sa.lastQuery(t).legContext() == ctx,
 			"a single cluster has no alternative to preserve budget for")
-		require.Zero(t, h.metrics.get(h.metrics.readTotal, ClusterA), "no leg attempt is counted")
+		require.EqualValues(t, 1, h.metrics.get(h.metrics.readTotal, ClusterA),
+			"the cluster attempt is counted where the iterator was opened, not as a bounded leg")
 	})
 }
 

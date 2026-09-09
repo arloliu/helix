@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"sync"
+	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
 )
@@ -19,6 +20,12 @@ type cqlIter struct {
 	ctx            context.Context // the caller's context, for error provenance on Close
 	overrideActive bool            // captured from readTarget at creation, not re-evaluated
 	firstPage      *firstPageCtx   // the leg context the driver keeps; nil when the first page was not bounded
+	// startedAt is when the iterator was opened, so its close can observe
+	// how long the caller held it.
+	// Zero for an iterator whose duration was already observed as a bounded
+	// first-page leg, which measures the leg WithClusterReadTimeout bounds
+	// rather than the caller's scan.
+	startedAt time.Time
 
 	closeOnce sync.Once
 	closeErr  error
@@ -84,11 +91,20 @@ func (i *cqlIter) endFromScanner(err error) {
 	})
 }
 
-// report releases the leg context and records the read's outcome. It never
-// touches the driver iterator, so both the Close path and the Scanner path
-// reach it once the driver has let its own resources go.
+// report releases the leg context, observes how long the read took, and
+// records its outcome.
+// It never touches the driver iterator, so both the Close path and the
+// Scanner path reach it once the driver has let its own resources go.
+//
+// The duration spans the whole read the caller saw — the first page the
+// constructor fetched plus every later page it drained — because that is
+// the interval an iterator occupies a cluster's connection for.
+// A bounded first page has already observed its own leg instead.
 func (i *cqlIter) report(err error) {
 	i.finishFirstPage()
+	if !i.startedAt.IsZero() {
+		i.client.config.Metrics.ObserveReadDuration(i.cluster, time.Since(i.startedAt).Seconds())
+	}
 	i.client.health.iterClosed(i.holder, i.cluster, classifyReadErr(i.ctx, err), err, i.overrideActive)
 }
 
