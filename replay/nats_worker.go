@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,10 @@ type natsBackend struct {
 	// marked dead-letter under RetryWhileRetained. Both cluster goroutines
 	// share it; sequence numbers are unique across the stream. It is not
 	// persisted, so a restart resets the poison budget.
+	// An entry is dropped when its message is terminated, and — under
+	// WithEvictionWatch — when the stream reports it no longer holds the
+	// sequence, so a message the stream removed by MaxAge, DiscardOld or a
+	// purge does not keep its budget for the process's lifetime.
 	dlMu        sync.Mutex
 	deadLetters map[uint64]int
 
@@ -494,6 +499,24 @@ func (b *natsBackend) forgetDeadLetters(seq uint64) {
 	b.dlMu.Lock()
 	delete(b.deadLetters, seq)
 	b.dlMu.Unlock()
+}
+
+// forgetDeadLettersBelow clears the dead-letter counts of every sequence
+// the stream has dropped below firstSeq.
+//
+// A budget is otherwise released only when this worker's Term is accepted,
+// so a payload the stream removed some other way — MaxAge, DiscardOld, a
+// purge — would keep its entry for as long as the process runs. The
+// sequence at firstSeq is still in the stream and is kept; an empty stream
+// reports firstSeq as one past its last sequence, which clears everything.
+//
+// Parameters:
+//   - firstSeq: The oldest sequence the stream still holds
+func (b *natsBackend) forgetDeadLettersBelow(firstSeq uint64) {
+	b.dlMu.Lock()
+	defer b.dlMu.Unlock()
+
+	maps.DeleteFunc(b.deadLetters, func(seq uint64, _ int) bool { return seq < firstSeq })
 }
 
 // recordDrop reports a permanently dropped message; the reason is one of

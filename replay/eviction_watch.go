@@ -56,6 +56,8 @@ func (l *evictionLedger) observe(created time.Time, msgs, lastSeq, settled uint6
 // watchEvictions polls the stream state once per depthRefreshInterval
 // and reports the messages it removed without this process's
 // acknowledgement, until the worker stops.
+// Each poll also releases the dead-letter budgets of the sequences the
+// stream no longer holds.
 // Runs on its own goroutine; the only owner of the ledger.
 func (b *natsBackend) watchEvictions() {
 	defer b.wg.Done()
@@ -80,6 +82,7 @@ func (b *natsBackend) watchEvictions() {
 
 			continue
 		}
+		b.forgetDeadLettersBelow(info.State.FirstSeq)
 		b.reportEvicted(ledger.observe(info.Created, info.State.Msgs, info.State.LastSeq, b.replayer.settled.Swap(0)))
 	}
 }
