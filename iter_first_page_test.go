@@ -572,24 +572,21 @@ func (i *firstPageIter) Columns() []cql.ColumnInfo           { return nil }
 func (i *firstPageIter) Scanner() cql.Scanner                { return &firstPageScanner{iter: i} }
 func (i *firstPageIter) Warnings() []string                  { return nil }
 
-// firstPageScanner mirrors the drivers: Err closes the iterator it came
-// from and releases it, so a second call is the driver's business and not
-// something Helix does on the caller's behalf.
+// firstPageScanner mirrors the drivers exactly: Err releases the iterator
+// it came from and closes it, so a second call dereferences nothing and
+// panics. Helix must never make that second call.
 type firstPageScanner struct {
-	iter   *firstPageIter
-	closed bool
+	iter *firstPageIter
 }
 
 func (s *firstPageScanner) Next() bool          { return s.iter.Scan() }
 func (s *firstPageScanner) Scan(_ ...any) error { return nil }
 
 func (s *firstPageScanner) Err() error {
-	if s.closed {
-		return s.iter.err
-	}
-	s.closed = true
+	iter := s.iter
+	s.iter = nil
 
-	return s.iter.Close()
+	return iter.Close()
 }
 
 // legMetrics records the read-path metrics one leg attempt produces.
@@ -1252,6 +1249,30 @@ func TestIterFirstPage_ScannerErrReportsAClusterFailure(t *testing.T) {
 	closes, _ := sa.counts()
 	require.Equal(t, 1, closes)
 	require.Len(t, h.policy.RecordFailureCalls, 1, "the read is reported exactly once")
+}
+
+func TestIterFirstPage_ScannerErrIsIdempotent(t *testing.T) {
+	sa := newFirstPageSession(iterAnswers)
+	sa.rows = []string{"r1"}
+	sa.closeErr = errors.New("cluster A gave up mid-stream")
+	h := newAnsweringClient(t, sa)
+
+	// A caller that logs the error and then returns it calls Err twice.
+	// Both drivers release their iterator on the first call, so the second
+	// must never reach them.
+	iter := h.query().IterContext(t.Context())
+	scanner := iter.Scanner()
+	for scanner.Next() {
+		require.NoError(t, scanner.Scan())
+	}
+
+	require.ErrorIs(t, scanner.Err(), sa.closeErr)
+	require.ErrorIs(t, scanner.Err(), sa.closeErr,
+		"a second Err returns the error the first one ended the read with")
+
+	closes, _ := sa.counts()
+	require.Equal(t, 1, closes, "the driver's iterator is closed once")
+	require.Len(t, h.policy.RecordFailureCalls, 1, "and the read is reported once")
 }
 
 func TestIterFirstPage_ScannerErrThenCloseReportsOneCleanRead(t *testing.T) {
