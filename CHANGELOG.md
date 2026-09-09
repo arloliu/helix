@@ -176,6 +176,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A degrade hours later was then classified as a re-degrade: it doubled the dwell, held the cluster in fire-and-forget for longer than configured, and could emit `write_flapping` for a cluster that had not flapped.
   The clock now reads elapsed monotonic time, which no clock adjustment moves.
   No exported type or option changes.
+- The memory replay worker's `Stop` no longer waits out `WithExecuteTimeout` for the attempt in flight, and neither does the `CQLClient.Close` that waits on it.
+  The memory backend ran every attempt on a context built from `context.Background()`,
+  so a `Stop` issued while the `ExecuteFunc` was blocked on an unresponsive cluster returned only once that attempt gave up — 30 seconds with the default timeout.
+  The attempt now runs on a context the worker ends when it stops, as the NATS worker's attempt already did.
+  The interrupted payload is reported through `WithOnDrop` with the reason `shutdown`, like the payloads still waiting in the queue, because that queue does not survive the process;
+  it is counted neither as a replay error nor as a failed attempt, and `WithOnError` is not called for it.
+  An `ExecuteFunc` that ignores its context still holds `Stop` for up to `WithExecuteTimeout`.
 
 ### Changed
 

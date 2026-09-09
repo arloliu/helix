@@ -2,6 +2,7 @@ package replay
 
 import (
 	"container/heap"
+	"errors"
 	"sync"
 	"time"
 
@@ -166,6 +167,14 @@ func (b *memoryBackend) park(it *retainedItem) {
 // drop it (poison budget exhausted, window expired, or shutdown) or queue
 // its next attempt after the backoff delay.
 func (b *memoryBackend) settleRetained(it *retainedItem, err error) {
+	if errors.Is(err, errAttemptStopped) {
+		// Stop cut the attempt short, so the error says nothing about the
+		// payload: it is dropped as a shutdown without being classified.
+		b.dropRetained(it, err, types.ReplayDropShutdown)
+
+		return
+	}
+
 	now := time.Now()
 	if b.config.Classifier(err) == DispositionDeadLetter {
 		it.deadLetters++
