@@ -666,6 +666,11 @@ type Batch interface {
 	// This is useful for accessing execution metadata like latency and attempts.
 	// The iterator reads from the selected cluster based on sticky routing.
 	//
+	// Unlike [Query.IterContext], the first page here has no leg-timeout
+	// exception: it always runs on ctx directly, even when the client sets
+	// [WithClusterReadTimeout]. A frozen selected cluster can strand this
+	// call for the caller's whole context budget with no failover attempt.
+	//
 	// Parameters:
 	//   - ctx: Context for cancellation and timeout
 	//

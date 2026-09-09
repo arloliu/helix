@@ -1457,6 +1457,10 @@ func WithClusterWriteTimeout(d time.Duration) Option {
 // bounded and counted like any other, but a paging cursor is only
 // meaningful on the cluster that issued it.
 //
+// [Batch.IterContext] is excluded: its first page is not bounded by d and
+// runs directly on the caller's context, so a frozen selected cluster can
+// strand a batch iterator for the caller's whole context budget.
+//
 // One residual is worth knowing: d bounds the wait for the cluster's
 // answer, not every wait inside the driver. A token-aware first page can
 // block on another caller's in-flight routing-metadata load before its own
