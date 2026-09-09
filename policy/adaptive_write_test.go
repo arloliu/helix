@@ -547,19 +547,25 @@ func TestAdaptiveDualWrite_SetLoggerInjectsWhenUnconfigured(t *testing.T) {
 		"client-injected logger must receive logs when no explicit logger was set")
 }
 
-// recordingLogger is a minimal types.Logger implementation that counts
-// Warn calls. Sufficient for verifying which logger received what.
+// loggedWarn is one Warn call: the message and the key/value pairs that came with it.
+type loggedWarn struct {
+	msg  string
+	args []any
+}
+
+// recordingLogger is a minimal types.Logger implementation that records Warn calls in order.
+// Sufficient for verifying which logger received what, and with which fields.
 type recordingLogger struct {
 	mu    sync.Mutex
-	warns int
+	warns []loggedWarn
 }
 
 func (l *recordingLogger) Debug(_ string, _ ...any) {}
 func (l *recordingLogger) Info(_ string, _ ...any)  {}
-func (l *recordingLogger) Warn(_ string, _ ...any) {
+func (l *recordingLogger) Warn(msg string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.warns++
+	l.warns = append(l.warns, loggedWarn{msg: msg, args: slices.Clone(args)})
 }
 func (l *recordingLogger) Error(_ string, _ ...any) {}
 func (l *recordingLogger) Fatal(_ string, _ ...any) {}
@@ -570,7 +576,15 @@ func (l *recordingLogger) With(_ ...any) types.Logger {
 func (l *recordingLogger) warnCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.warns
+
+	return len(l.warns)
+}
+
+func (l *recordingLogger) warnLog() []loggedWarn {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return slices.Clone(l.warns)
 }
 
 func TestAdaptiveDualWrite_Recovery(t *testing.T) {
@@ -701,6 +715,36 @@ func TestAdaptiveDualWrite_Reset(t *testing.T) {
 	assert.False(t, a.IsDegraded(types.ClusterB))
 	assert.Equal(t, int64(0), a.stateA.lastLatency.Load())
 	assert.Equal(t, int64(0), a.stateB.lastLatency.Load())
+}
+
+// TestAdaptiveDualWrite_ForceDegradeLatchesADegradedClusterVisibly asserts that ForceDegrade leaves an operator-visible trace when the cluster it latches was already degraded.
+// Setting the latch changes what the cluster does — a recovery probe and a fast background write can no longer restore it — so the call cannot pass silently.
+// Nothing about the transition itself is reported twice, and a second ForceDegrade reports nothing at all.
+func TestAdaptiveDualWrite_ForceDegradeLatchesADegradedClusterVisibly(t *testing.T) {
+	log := &recordingLogger{}
+	mc := testutil.NewTestMetricsCollector()
+	em := &recordingEmitter{}
+	a := NewAdaptiveDualWrite(WithAdaptiveLogger(log), WithAdaptiveMetrics(mc))
+	a.SetEventEmitter(em)
+
+	degradeByStrikes(a, types.ClusterA)
+	require.True(t, a.IsDegraded(types.ClusterA))
+	require.False(t, a.IsLatched(types.ClusterA))
+	require.Len(t, log.warnLog(), 1, "the strike-driven degrade reports once")
+
+	a.ForceDegrade(types.ClusterA)
+
+	require.True(t, a.IsLatched(types.ClusterA))
+	warns := log.warnLog()
+	require.Len(t, warns, 2, "latching an already-degraded cluster must leave a trace")
+	require.Equal(t, warns[0].msg, warns[1].msg, "the latch reports through the degrade log line")
+	require.Contains(t, warns[1].args, "alreadyDegraded", "the log line must say the cluster was degraded before the call")
+	require.Equal(t, []types.ClusterEventKind{types.EventWriteDegraded}, em.kinds(), "the transition is not reported twice")
+	require.Equal(t, int64(1), mc.WriteDegraded[types.ClusterA], "the transition counter counts one transition")
+
+	a.ForceDegrade(types.ClusterA)
+
+	require.Len(t, log.warnLog(), 2, "a second ForceDegrade sets nothing and reports nothing")
 }
 
 func TestAdaptiveDualWrite_InvalidClusterNoop(t *testing.T) {
