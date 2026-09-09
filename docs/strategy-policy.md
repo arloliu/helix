@@ -260,10 +260,32 @@ if err != nil {
 │  └─ If semaphore full: returns ErrWriteDropped                      │
 │                                                                     │
 │  Transition DEGRADED → HEALTHY: recoveryThreshold consecutive fast  │
-│  writes observed (including from background goroutines)             │
+│  writes credited (see "Recovery credit gate" below)                 │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Recovery credit gate:** `recoveryThreshold` counts credited fast writes,
+not every fast write,
+and reaching it does not always recover immediately:
+- A synchronous write (both legs succeed) credits the same way it strikes:
+  within `deltaThreshold` of the sibling's latency,
+  or both under `minFloor`.
+- A background (fire-and-forget) write or a recovery probe credits only through the delta test against the sibling's *last recorded* latency:
+  under `absoluteMax`,
+  and within `deltaThreshold` of that sample,
+  or, when the sibling has no baseline yet or is itself degraded,
+  under `minFloor` on its own.
+  This lets two clusters degraded together rebuild a fresh baseline from their own traffic,
+  instead of being judged against each other's stale slow sample.
+- Once `recoveryThreshold` credited writes accumulate,
+  the transition to HEALTHY is held until `minDegradedDwell` has elapsed since the degrade began
+  (`policy.WithAdaptiveMinDegradedDwell`; default 0, no hold).
+  `policy.WithAdaptiveRedegradeBackoff` doubles the dwell, up to `maxDwell`,
+  for a cluster that re-degrades within `window` of its last recovery.
+- `ForceDegrade` latches a cluster:
+  while latched, no write or probe credits recovery, regardless of `fastStrikes`,
+  until `ForceRecover` or `Reset` clears the latch.
 
 **Error semantics:**
 - `ErrWriteAsync` — write accepted for background execution (not a failure)
@@ -275,7 +297,7 @@ if err != nil {
 
 ```go
 strategy.IsDegraded(helix.ClusterA)        // check current state
-strategy.ForceDegrade(helix.ClusterA)      // force DEGRADED for testing
+strategy.ForceDegrade(helix.ClusterA)      // force DEGRADED and latch it (only ForceRecover/Reset clears it)
 strategy.ForceRecover(helix.ClusterA)      // force HEALTHY for testing
 strategy.RecordFastWrite(helix.ClusterA)   // credit a fast write (external health probe)
 strategy.Reset()                           // clear all state, both clusters → HEALTHY
@@ -625,7 +647,13 @@ The client calls `RecordLatency()` automatically after each successful read if t
            Until one of those arrives, A stays OPEN.
 ```
 
-> **Note:** Because every fast successful read calls `RecordSuccess()`, the `resetTimeout` is less significant in `LatencyCircuitBreaker` than in `CircuitBreaker` — successful reads continuously reset the counter, so stale failure accumulation is rare. The dominant closure mechanism is fast responses, not idle timeouts.
+> **Note:** Because every fast successful read calls `RecordSuccess()`,
+> the `resetTimeout` is less significant in `LatencyCircuitBreaker` than in `CircuitBreaker` —
+> successful reads continuously reset the counter, so stale failure accumulation is rare.
+> This timeline assumes ordinary reads still reach A while it is open.
+> With the **Route veto** option above enabled, a vetoed cluster receives no ordinary or fallback read,
+> so fast responses can no longer close it —
+> only the recovery probe or a failover leg that lands on the vetoed cluster can reopen it.
 
 **When to use:** Latency-sensitive production environments where a technically-healthy but slow cluster (e.g., compaction, GC pressure) should be treated as degraded. Combines hard-failure and latency-based degradation in one policy.
 
