@@ -243,6 +243,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The most permissive outcome used to be the one a caller gets for free: a `FailoverProbeReporter` consumer that left the outcome unset closed an open circuit breaker on a probe that had never succeeded.
   Abandonment only releases the reservation, so an unset outcome now changes nothing about the breaker.
   All three names are unchanged, and code that reports an outcome by name is unaffected; only a caller that depends on the underlying integers, such as one persisting them, needs to look.
+- `WithAdaptiveFireForgetLimit` now bounds the replay admissions that a degraded cluster's background writes are waiting in, not only the writes themselves.
+  `AdaptiveDualWrite` released a leg's slot before reporting the leg's failure, and the client admits that failure for replay on the leg's own goroutine, on a context that is never cancelled;
+  the admission therefore ran outside the limit, and with a replayer whose `Enqueue` blocks, 32 writes under a limit of 4 left 32 goroutines and 32 payloads waiting at once with nothing to bound the count.
+  A leg now holds its slot until the completion callback has returned.
+  A write that finds every slot held is dropped as before — `ErrWriteDropped`, which the client replays — and its payload is admitted on the calling goroutine, so a slow `Enqueue` is felt by the caller instead of accumulating goroutines behind it.
+  A leg that finishes before the client registers its completion callback is still admitted on the caller's goroutine, outside the limit.
+  `Replayer.Enqueue`, `WithReplayer`, `WithAdaptiveFireForgetLimit` and the replay guide describe the bound; a custom `Enqueue` should still return within a bounded time, as both bundled replayers do.
 
 ### Documentation
 

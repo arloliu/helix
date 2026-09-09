@@ -1,6 +1,7 @@
 package helix
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -151,4 +152,103 @@ func TestAdaptiveWrite_DeferredFailureWithoutReplayerIsReported(t *testing.T) {
 		t.Fatal("the failed background leg must be reported as a dropped replay")
 	}
 	require.Equal(t, int32(1), mc.dropped[ClusterB].Load())
+}
+
+// blockingReplayer is a Replayer whose Enqueue reports the payload and then
+// waits for the test to release it.
+// It stands in for a queue that is slow to admit, such as a NATS server that
+// has not acknowledged the publish yet.
+type blockingReplayer struct {
+	entered chan types.ReplayPayload
+	release chan struct{}
+}
+
+func (r *blockingReplayer) Enqueue(_ context.Context, p types.ReplayPayload) error {
+	r.entered <- p
+	<-r.release
+
+	return nil
+}
+
+// TestAdaptiveWrite_FireForgetLimitBoundsPendingAdmissions asserts that the
+// fire-and-forget limit bounds the background legs waiting in
+// Replayer.Enqueue, not only the legs whose write is still running.
+// A write that finds every slot held by a pending admission takes the
+// over-limit path instead of starting one more.
+func TestAdaptiveWrite_FireForgetLimitBoundsPendingAdmissions(t *testing.T) {
+	failB := errors.New("cluster B rejected the background write")
+	gate := make(chan struct{})
+	sa, sb := newRecordingSession(nil), newRecordingSession(failB)
+	sb.gate = gate
+
+	adaptive := policy.NewAdaptiveDualWrite(policy.WithAdaptiveFireForgetLimit(2))
+	adaptive.ForceDegrade(ClusterB)
+	replayer := &blockingReplayer{
+		entered: make(chan types.ReplayPayload, 4),
+		release: make(chan struct{}),
+	}
+	mc := &mockMetricsCollector{}
+
+	client, err := NewCQLClient(sa, sb,
+		WithWriteStrategy(adaptive),
+		WithRecoveryProbeDisabled(),
+		WithReplayer(replayer),
+		WithMetrics(mc),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	// Registered after Close so it runs before it: Close waits for the
+	// background legs, which cannot finish while the replayer holds them.
+	release := sync.OnceFunc(func() { close(replayer.release) })
+	t.Cleanup(release)
+
+	// Both writes return as soon as cluster A acknowledges.
+	// Each leaves a background leg holding a slot, parked inside the gated session.
+	const filled = 2
+	for i := range filled {
+		require.NoError(t, client.Query("INSERT INTO t (k, v) VALUES (?, ?)", i, "v").ExecContext(t.Context()))
+	}
+	waitForExecs(t, sb, filled)
+
+	// Releasing the gate fails both legs, so each one moves from its write
+	// into the replay admission that now blocks.
+	close(gate)
+	for range filled {
+		select {
+		case <-replayer.entered:
+		case <-time.After(regressionWaitTimeout):
+			t.Fatal("both failed background legs must reach the replayer")
+		}
+	}
+
+	// The third write finds both slots held by those pending admissions.
+	third := make(chan error, 1)
+	go func() {
+		third <- client.Query("INSERT INTO t (k, v) VALUES (?, ?)", filled, "v").ExecContext(t.Context())
+	}()
+
+	require.Eventually(t, func() bool {
+		mc.Lock()
+		defer mc.Unlock()
+
+		return mc.writeDropped[ClusterB] == 1
+	}, regressionWaitTimeout, time.Millisecond,
+		"a write that cannot get a slot must be dropped, not start a third pending admission")
+	require.Equal(t, int32(filled), sb.execs.Load(), "the dropped write is never attempted on cluster B")
+
+	// The dropped leg is admitted on the caller's goroutine, so the third
+	// write settles only once the replayer lets go of all three payloads.
+	select {
+	case <-replayer.entered:
+	case <-time.After(regressionWaitTimeout):
+		t.Fatal("the dropped leg must be admitted for replay by its caller")
+	}
+	release()
+
+	select {
+	case err := <-third:
+		require.NoError(t, err, "cluster A acknowledged the write")
+	case <-time.After(regressionWaitTimeout):
+		t.Fatal("the third write must return once the replayer releases it")
+	}
 }

@@ -320,9 +320,11 @@ func WithAdaptiveClusterNames(names types.ClusterNames) AdaptiveDualWriteOption 
 // prevents resource exhaustion from too many pending goroutines. If the limit
 // is reached, new fire-and-forget writes are dropped (returning ErrWriteDropped)
 // and the replay system handles reconciliation.
-// The limit covers a leg while its write runs:
-// a leg that fails releases its slot before the client admits it for replay,
-// so the goroutines waiting in the replayer's Enqueue are bounded by how long Enqueue takes, not by n.
+// A leg holds its slot from the moment its write starts until the completion
+// callback the client registered on the deferred result has returned,
+// so the replay admission that a failed leg triggers is bounded by n too.
+// A leg that finishes before the client registers that callback is admitted
+// on the caller's own write goroutine instead, outside the limit.
 //
 // Default: 100
 //
@@ -803,6 +805,13 @@ func (a *AdaptiveDualWrite) fireAndForget(
 
 	result := &deferredWriteError{}
 	go func() {
+		// The slot is held until the completion callback has returned, so
+		// the limit bounds the legs waiting in the client's replay
+		// admission as well as the legs whose write is still running.
+		// The deferred release also covers a panic out of the callback,
+		// which would otherwise strand the slot for good.
+		defer func() { <-a.fireForgetSem }()
+
 		ctx, cancel := context.WithTimeout(context.Background(), a.fireForgetTimeout)
 		defer cancel()
 
@@ -810,9 +819,6 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		err := safeWrite(ctx, write, a.clusterName(cluster))
 		a.observeFireAndForget(cluster, err, time.Since(start), state, siblingState)
 
-		// Release the slot before reporting: the client's completion
-		// callback may enqueue replay, which must not hold a slot.
-		<-a.fireForgetSem
 		result.complete(err)
 	}()
 

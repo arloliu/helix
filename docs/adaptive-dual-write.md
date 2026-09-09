@@ -253,7 +253,8 @@ the query `NonIdempotent()` or `Strict()` so it is never replayed; a
 To prevent resource exhaustion, fire-and-forget writes are bounded by `fireForgetLimit`:
 
 - If limit reached → `ErrWriteDropped` returned
-- Dropped writes are handled by the replay system
+- Dropped writes are handled by the replay system, on the calling goroutine
+- A leg holds its slot until the client's completion callback returns, so the replay admission of a failed leg counts against the limit too; a leg that finishes before the client registers that callback is admitted on the caller's goroutine instead, outside the limit
 - Default: 100 concurrent fire-and-forget goroutines
 
 ## Monitoring Cluster State

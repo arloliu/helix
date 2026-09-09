@@ -846,11 +846,12 @@ func WithAckMode(mode AckMode) Option {
 // (see [WithClusterWriteTimeout]).
 // The bundled NATS replayer bounds each publish by [replay.WithPublishTimeout].
 //
-// The client does not bound the number of pending Enqueue calls:
-// a leg that a strategy completes in the background (see [DeferredWriteResult]) is admitted from that goroutine,
-// which holds the payload until Enqueue returns,
-// so a replayer whose Enqueue blocks accumulates goroutines and payloads without limit.
-// Enqueue must return within a bounded time; both bundled replayers do.
+// A leg that a strategy completes in the background (see [DeferredWriteResult]) is admitted from that goroutine instead,
+// which holds the payload until Enqueue returns.
+// With [policy.AdaptiveDualWrite] such a leg keeps its fire-and-forget slot for the whole admission,
+// so [policy.WithAdaptiveFireForgetLimit] bounds how many of them are pending at once;
+// a write that finds every slot held is dropped and admitted by its own caller.
+// Enqueue must still return within a bounded time — while every slot is held, each new write to the degraded cluster is dropped and admitted by its own caller — and both bundled replayers do.
 //
 // Parameters:
 //   - replayer: The replayer implementation
