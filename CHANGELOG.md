@@ -207,6 +207,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A refresh that finds the client closed after the swap now retires the holder it just installed, closes the session the refresher built, and returns `types.ErrSessionClosed`, the same error a refresh on an already-closed client returns.
   The session it replaced is handed over for closing first, so it is torn down whichever side of `Close` the swap landed on.
   The auto-refresh detector reports the outcome as a refresh error, as it already did for a client that was closed before the swap.
+- `RoundRobinRead` now starts on cluster A:
+  its first `Select` returned cluster B because the counter was read after the increment.
 
 ### Changed
 

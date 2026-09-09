@@ -31,7 +31,7 @@ import (
 type StickyRead struct {
 	preferred        atomic.Value // types.ClusterID
 	initial          types.ClusterID
-	mu               sync.RWMutex // guards lastFailoverTime and every preference transition
+	mu               sync.Mutex // guards lastFailoverTime and every preference transition
 	lastFailoverTime time.Time
 	failoverCooldown time.Duration
 	// knownBad marks a cluster that failed and has not succeeded since;
@@ -586,7 +586,7 @@ func NewRoundRobinRead() *RoundRobinRead {
 	return &RoundRobinRead{}
 }
 
-// Select returns alternating clusters on each call.
+// Select returns alternating clusters on each call, starting at ClusterA.
 //
 // Parameters:
 //   - ctx: Context (unused)
@@ -594,10 +594,13 @@ func NewRoundRobinRead() *RoundRobinRead {
 // Returns:
 //   - types.ClusterID: Alternating between ClusterA and ClusterB
 func (r *RoundRobinRead) Select(_ context.Context) types.ClusterID {
-	count := r.counter.Add(1)
+	// Add returns the post-increment value, so the first caller sees 1;
+	// subtract the increment to give the first read ClusterA.
+	count := r.counter.Add(1) - 1
 	if count%2 == 0 {
 		return types.ClusterA
 	}
+
 	return types.ClusterB
 }
 
