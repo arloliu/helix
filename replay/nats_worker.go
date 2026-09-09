@@ -651,7 +651,10 @@ func NewNATSWorker(replayer *NATSReplayer, execute ExecuteFunc, opts ...WorkerOp
 	finalizeWorkerConfig(&config)
 
 	return newNATSWorkerWithConfig(config, replayer, execute,
-		validateWorkerInputs(replayer != nil, execute))
+		joinValidationErrors(
+			validateWorkerInputs(replayer != nil, execute),
+			validateNATSRetryBudget(config.RetryPolicy, replayer),
+		))
 }
 
 // NewNATSWorkerChecked creates a worker that processes messages from a
@@ -671,6 +674,7 @@ func NewNATSWorkerChecked(replayer *NATSReplayer, execute ExecuteFunc, opts ...W
 	validationErr := joinValidationErrors(
 		validateWorkerInputsForChecked(natsWorkerComponent, replayer != nil, execute),
 		validateWorkerConfigForChecked(config, natsWorkerComponent),
+		validateNATSRetryBudget(config.RetryPolicy, replayer),
 	)
 	if validationErr != nil {
 		return nil, validationErr
