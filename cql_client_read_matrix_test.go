@@ -89,6 +89,7 @@ type readObservation struct {
 	err          errClass
 	served       ClusterID   // cluster that received the primary attempt
 	altContacted bool        // the other cluster received a request
+	readTotal    []ClusterID // IncReadTotal calls, in order
 	readErrors   []ClusterID // IncReadError calls, in order
 	failures     []ClusterID // FailoverPolicy.RecordFailure calls, in order
 	onFailure    []ClusterID // ReadStrategy.OnFailure calls, in order
@@ -390,6 +391,9 @@ func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMo
 	}
 	obs.altContacted = firstA != 0 && firstB != 0
 	for _, c := range []ClusterID{ClusterA, ClusterB} {
+		for range metrics.get(metrics.ReadTotal, c) {
+			obs.readTotal = append(obs.readTotal, c)
+		}
 		for range metrics.get(metrics.ReadErrors, c) {
 			obs.readErrors = append(obs.readErrors, c)
 		}
@@ -397,6 +401,7 @@ func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMo
 			obs.healthFail = append(obs.healthFail, c)
 		}
 	}
+	obs.readTotal = orderFrom(obs.served, obs.readTotal)
 	obs.readErrors = orderFrom(obs.served, obs.readErrors)
 	obs.healthFail = orderFrom(obs.served, obs.healthFail)
 	obs.failures = policy.RecordFailureCalls
@@ -477,9 +482,10 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 			obs.err = errClusterTimeout
 		}
 		obs.failures = []ClusterID{served}
+		obs.readErrors = []ClusterID{served}
 		if isIter && !expires {
-			// Iterator Close reports the failure to the policy and cannot
-			// retry, and emits no read-error metric.
+			// Iterator Close counts the read error and reports the failure to
+			// the policy, but cannot retry.
 			// It moves the strategy only where a failing Scan would be
 			// allowed to fail over, so a draining alternative freezes the
 			// preference here exactly as it does below.
@@ -490,7 +496,6 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 			}
 			break
 		}
-		obs.readErrors = []ClusterID{served}
 		if entry == entrySliceScan {
 			// SliceScan never fails over: the caller's callback already ran.
 			break
@@ -513,8 +518,21 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 			obs.healthFail = append(obs.healthFail, alt)
 		}
 	}
+	obs.readTotal = readTotalFor(obs, alt)
 
 	return obs
+}
+
+// readTotalFor states the read_total rule for one cell: every read that
+// reaches a cluster counts one, whatever that cluster returns and whether
+// the read is a Scan, a slice read or an iterator, so the counter names the
+// clusters the read contacted in contact order.
+func readTotalFor(obs readObservation, alt ClusterID) []ClusterID {
+	if !obs.altContacted {
+		return []ClusterID{obs.served}
+	}
+
+	return []ClusterID{obs.served, alt}
 }
 
 func TestReadClassificationMatrix(t *testing.T) {

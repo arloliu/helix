@@ -116,24 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `Replayer` carries no client state and may still be shared.
   No guard was added: the instances are caller-owned and the sharing was never supported.
 
-- `types.MetricsCollector.IncReadError`'s Godoc did not say when an iterator counts.
-  It now states that an iterator increments `read_errors_total` only when `WithClusterReadTimeout` ends its first page,
-  and that a cluster error surfacing at `Close` or `Scanner.Err` reaches the failover policy and auto-refresh but not the counter.
-  The behaviour is unchanged, and the read classification matrix now pins both cases.
-
-- `Replayer.Enqueue`'s Godoc described the call without saying that the client never bounds how many are pending, and `WithAdaptiveFireForgetLimit`'s claimed its limit prevented too many pending goroutines.
-  A background leg that `AdaptiveDualWrite` runs for a degraded cluster releases its fire-and-forget slot before the client admits its failure for replay, and the admission runs on that leg's goroutine, on a context that is never cancelled, holding the payload until `Enqueue` returns.
-  With a replayer whose `Enqueue` blocks, 32 such writes under a fire-and-forget limit of 4 left 32 goroutines and 32 payloads waiting in `Enqueue` at once, with no write dropped and nothing to bound the count.
-  `Replayer.Enqueue`, `WithReplayer`, `WithAdaptiveFireForgetLimit` and the replay guide now state that `Enqueue` must return within a bounded time, as both bundled replayers do:
-  `MemoryReplayer` returns `ErrReplayQueueFull` at once and `NATSReplayer` gives up after `WithPublishTimeout`.
-  No bound was added: rejecting an admission loses a write, and no size has been chosen.
-
 - `NewCQLClient` now also warns when `WithRouteVeto(true)` is combined with a failover policy that no recovery probe can ever reserve.
   A reset timeout of zero (`policy.WithResetTimeout(0)` or `policy.WithLatencyResetTimeout(0)`) makes `TryBeginFailoverProbe` refuse every tick, and a custom policy that implements `RouteVeto` without `FailoverProbeReporter` has nothing for the probe to reserve at all.
   Either one strands a vetoed cluster exactly as `WithRecoveryProbeDisabled()` does: the breaker is left with no closer but a failover leg from the other cluster, so it never closes while that cluster stays healthy.
   The built-in breakers report their schedule through the new `helix.FailoverProbeScheduleReporter`,
   so a policy can tell the client whether a probe is scheduled at all.
   Routing is unchanged.
+
 - A fire-and-forget write leg now contributes its own duration to `write_duration_seconds`, observed when the leg completes, instead of a sample taken while it was still running.
   The caller records the per-leg write metrics as soon as the write returns, and a degraded cluster's leg has only been dispatched by then, not finished.
   The sample it recorded was "how long ago the background leg started", which is the healthy cluster's latency wearing the degraded cluster's label — so the histogram for a cluster slow enough to be degraded looked exactly like the histogram for the cluster that was keeping up.
@@ -147,6 +136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The latch now writes the degrade line at the same level with `alreadyDegraded=true`.
   The transition event and the transition metrics are unchanged and still fire once per real transition, since the cluster was already counted as degraded.
   A second `ForceDegrade` on a cluster that is already latched still changes nothing and still reports nothing.
+
 - The context that bounds an iterator's first page under `WithClusterReadTimeout` no longer reports an error before it ends.
   `Err` fell through to the caller's own context whenever nothing had been latched yet,
   so between the caller cancelling and that cancellation reaching this context, `Err` returned an error while `Done` was still open —
@@ -154,28 +144,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The same gap existed between the latch releasing its lock and closing the channel.
   `Err` now reports only the latched error and the latch closes `Done` under the lock `Err` takes,
   so the two always agree; the error a driver sees once the context ends is unchanged.
+
 - A second `Scanner().Err()` call on the same scanner no longer panics.
   `Err` forwarded to the driver's scanner on every call, and both drivers release their iterator inside their own `Err` and dereference it unguarded on the next call —
   so the ordinary habit of logging the error and then returning it crashed the caller's process.
   `Err` is now idempotent: the first call ends the read and stores the result, and later calls return it without reaching the driver.
   The read is still reported exactly once, as it already was.
+
 - `SwapSession` no longer leaves behind a session nobody closes when the client is closed while the swap is in progress.
   The closed flag was read once on entry and the swap itself was unconditional,
   so a swap that installed its session after `Close` had already closed the one it found reported success and left the new session open for the life of the process,
   with no holder anyone would ever tear down.
   The flag is re-checked after the swap — `Close` sets it before it tears anything down — and a swap that finds the client closed retires the holder it just installed, closes the session it was given, and returns `types.ErrSessionClosed`, the same error a swap on an already-closed client returns.
+
 - The NATS worker's dead-letter budgets no longer accumulate for the life of the process.
   Under `RetryWhileRetained` a payload's poison budget was released only when its `Term` was accepted or its budget ran out,
   so a sequence that dead-lettered once and then left the stream some other way — `MaxAge` expiry, `DiscardOld` under a limit, a purge — kept its entry forever,
   and a long-lived worker on a busy stream grew a map it never emptied.
   Each eviction-watch poll now drops the budgets of the sequences the stream reports it no longer holds.
   The cleanup rides on `WithEvictionWatch`, which is where the stream state is already read, so a worker that runs `RetryWhileRetained` without the eviction watch is unchanged.
+
 - `AdaptiveDualWrite`'s degrade hysteresis is now measured on a monotonic clock instead of the wall clock.
   The dwell a degraded cluster serves and the window that decides whether a degrade counts as a re-degrade were compared against `time.Now().UnixNano()`,
   so a backward clock step — an NTP correction, an operator setting the clock — made the interval since the last recovery negative.
   A degrade hours later was then classified as a re-degrade: it doubled the dwell, held the cluster in fire-and-forget for longer than configured, and could emit `write_flapping` for a cluster that had not flapped.
   The clock now reads elapsed monotonic time, which no clock adjustment moves.
   No exported type or option changes.
+
 - The memory replay worker's `Stop` no longer waits out `WithExecuteTimeout` for the attempt in flight, and neither does the `CQLClient.Close` that waits on it.
   The memory backend ran every attempt on a context built from `context.Background()`,
   so a `Stop` issued while the `ExecuteFunc` was blocked on an unresponsive cluster returned only once that attempt gave up — 30 seconds with the default timeout.
@@ -183,6 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The interrupted payload is reported through `WithOnDrop` with the reason `shutdown`, like the payloads still waiting in the queue, because that queue does not survive the process;
   it is counted neither as a replay error nor as a failed attempt, and `WithOnError` is not called for it.
   An `ExecuteFunc` that ignores its context still holds `Stop` for up to `WithExecuteTimeout`.
+
 - A cluster error reported when an iterator closes now moves the read strategy's preference only where a failing `Scan` would have been allowed to fail over.
   The close path called `ReadStrategy.OnFailure` for every cluster error, without the `FailoverPolicy.ShouldFailover` gate and the drain check every other read applies first.
   So with the default `CircuitBreaker` (threshold 3) one iterator that failed to close moved `StickyRead`'s preference while the same error from a `Scan` moved nothing,
@@ -190,6 +186,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The gate is now one helper shared by the failover flow and the close path.
   What the close reports to the failover policy, to auto-refresh and to the session stats is unchanged.
   The close still never fails over: an iterator cannot be retried.
+
+- Reads made through an iterator now appear on `read_total`, `read_duration_seconds` and `read_errors_total` like every other read.
+  `IterContext`, a batch's `IterContext` and both batch CAS entry points counted nothing at all,
+  and a cluster error an iterator reported at `Close` was never counted as a read error,
+  so a cluster failing only its iterator reads showed a flat error counter and an error rate computed against a `read_total` that never moved.
+  Only a first page that `WithClusterReadTimeout` bounded was ever counted.
+  Opening an iterator now counts one `read_total` for the cluster it reads from,
+  closing it observes one `read_duration_seconds`,
+  and a cluster error at `Close` or `Scanner.Err` counts one `read_errors_total`.
+  An iterator's duration spans from opening it to closing it, so it covers every page the caller drained;
+  a bounded first page keeps observing its own leg instead, and its close adds no second sample.
+  A first page the leg deadline ended is still counted exactly once, where it always was.
+  `IncReadTotal`, `IncReadError` and `ObserveReadDuration`'s Godoc now state these rules,
+  and the read classification matrix pins them.
 
 ### Changed
 
@@ -250,6 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The most permissive outcome used to be the one a caller gets for free: a `FailoverProbeReporter` consumer that left the outcome unset closed an open circuit breaker on a probe that had never succeeded.
   Abandonment only releases the reservation, so an unset outcome now changes nothing about the breaker.
   All three names are unchanged, and code that reports an outcome by name is unaffected; only a caller that depends on the underlying integers, such as one persisting them, needs to look.
+
 - `WithAdaptiveFireForgetLimit` now bounds the replay admissions that a degraded cluster's background writes are waiting in, not only the writes themselves.
   `AdaptiveDualWrite` released a leg's slot before reporting the leg's failure, and the client admits that failure for replay on the leg's own goroutine, on a context that is never cancelled;
   the admission therefore ran outside the limit, and with a replayer whose `Enqueue` blocks, 32 writes under a limit of 4 left 32 goroutines and 32 payloads waiting at once with nothing to bound the count.
@@ -268,20 +279,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   And `ForceDegrade` latches a cluster so nothing credits recovery until `ForceRecover` or `Reset` clears it.
   The `LatencyCircuitBreaker` section also now says that with route veto on, a vetoed cluster receives no ordinary or fallback read, so only the recovery probe or a failover leg landing on it can reopen the breaker —
   fast responses alone no longer close it.
+
 - `docs/mirror.md` no longer claims mirror and replay payload arguments are deep-copied.
   Only `[]byte` values are deep-copied into a fresh buffer.
   `[]string`, `map[K]V`, and other nested Cassandra list/set/map column values are copied by reference and share the caller's slice or map header, so a caller must not mutate or reuse one of those values after `Exec` returns until the mirror leg has run.
+
 - `CircuitBreaker`'s Godoc no longer claims a `VetoRoute` method it does not have.
   Only `LatencyCircuitBreaker` implements route veto; its type doc now says so.
   `CircuitBreaker`'s concurrency-model comments now attribute `VetoRoute` correctly.
+
 - `Batch.IterContext`'s Godoc, `WithClusterReadTimeout`'s Godoc, and the read-timeout section of `docs/strategy-policy.md` now say that a batch iterator's first page is never bounded by `WithClusterReadTimeout`, unlike a query iterator's.
   A frozen selected cluster can strand a batch iterator for the caller's whole context budget with no health signal and no failover attempt.
+
 - `Close`'s Godoc now lists a caller-supplied `RecoveryProbe` that ignores its context among the things that can block it.
   Close cancels the recovery probe loops and waits for them to return,
   but a probe that does not check the context passed to it keeps running regardless.
+
 - `NATSReplayer.Dequeue` and `Pending`'s Godoc now say they are for driving replay processing without a running `Worker`.
   `Dequeue` creates a consumer that collides with a `Worker`'s own consumers on the same stream, so the two must not run against the same cluster at once.
   `Pending` is documented as `Dequeue`'s companion for sizing a manual batch.
+
 - `WithMaxDeliver`'s Godoc now says its value is honoured only under `RetryBounded`.
   Under the default `RetryWhileRetained` the value is still validated (it must be positive) but is overwritten and never reaches the consumer.
 

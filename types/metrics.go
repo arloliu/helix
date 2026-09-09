@@ -22,16 +22,20 @@ type MetricsCollector interface {
 	// ----------------------
 
 	// IncReadTotal increments the total read operations counter.
+	// Every read that reaches a cluster counts one, so a read that fails over counts on both;
+	// an iterator counts its cluster when it is opened, including one a batch CAS hands back.
 	// Metric: [prefix]_read_total{cluster="..."}
 	IncReadTotal(cluster ClusterID)
 
 	// IncReadError increments the read error counter.
-	// An iterator increments it only when helix.WithClusterReadTimeout ends its first page;
-	// a cluster error surfacing at Close or Scanner.Err reaches the failover policy and auto-refresh, but not this counter.
+	// An iterator increments it once, for the cluster error its Close or its Scanner.Err reports,
+	// or for the first page helix.WithClusterReadTimeout ended before it could be handed over.
 	// Metric: [prefix]_read_errors_total{cluster="..."}
 	IncReadError(cluster ClusterID)
 
 	// ObserveReadDuration records a read operation duration in seconds.
+	// An iterator observes the span from opening it to closing it, so the sample covers every page the caller drained;
+	// a first page bounded by helix.WithClusterReadTimeout observes that leg instead, whichever cluster answered it.
 	// Metric: [prefix]_read_duration_seconds{cluster="..."}
 	ObserveReadDuration(cluster ClusterID, seconds float64)
 
