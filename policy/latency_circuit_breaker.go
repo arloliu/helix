@@ -19,6 +19,10 @@ const defaultLatencyAbsoluteMax = 2 * time.Second
 // Helix client automatically calls RecordLatency() after successful read
 // operations. No manual integration is required.
 //
+// LatencyCircuitBreaker is also the only built-in failover policy that
+// implements the route-veto interface (see [LatencyCircuitBreaker.VetoRoute]
+// and [helix.WithRouteVeto]); the embedded CircuitBreaker does not.
+//
 // Example:
 //
 //	lcb := policy.NewLatencyCircuitBreaker(

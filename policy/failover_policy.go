@@ -86,8 +86,11 @@ func (a *ActiveFailover) RecordSuccess(_ types.ClusterID) {}
 //   - Each cluster's breakerState.mu serializes every compound operation
 //     on that cluster (load, decide, store). Without it the atomic ops form
 //     a TOCTOU sequence that can lose counts or emit duplicate metrics.
-//   - failures and open are atomics so ShouldFailover and VetoRoute read
-//     them lock-free on the hot path; a one-call lag on a transition is fine.
+//   - failures and open are atomics so ShouldFailover reads them lock-free
+//     on the hot path; a one-call lag on a transition is fine. CircuitBreaker
+//     itself has no VetoRoute method — [LatencyCircuitBreaker] embeds
+//     CircuitBreaker and is the one that implements VetoRoute, reading the
+//     same open atomic lock-free.
 //   - seq counts latched transitions per cluster and is incremented under
 //     mu. A call captures the value its own transition produced and, once
 //     the state mutex is released, writes the state gauge and the log line
@@ -146,7 +149,7 @@ type breakerState struct {
 	mu          sync.Mutex    // serializes compound ops
 	tripped     bool          // open or half-open; guarded by mu
 	halfOpen    bool          // a probe reservation is in flight; guarded by mu
-	open        atomic.Bool   // lock-free snapshot of tripped for ShouldFailover and VetoRoute
+	open        atomic.Bool   // lock-free snapshot of tripped for ShouldFailover, and for LatencyCircuitBreaker.VetoRoute
 	failures    atomic.Int32  // lock-free for Failures; written under mu
 	lastFailure atomic.Int64  // Unix nano; written under mu
 	seq         atomic.Uint64 // latched transitions; incremented under mu
