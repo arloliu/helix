@@ -159,6 +159,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the ordinary habit of logging the error and then returning it crashed the caller's process.
   `Err` is now idempotent: the first call ends the read and stores the result, and later calls return it without reaching the driver.
   The read is still reported exactly once, as it already was.
+- `SwapSession` no longer leaves behind a session nobody closes when the client is closed while the swap is in progress.
+  The closed flag was read once on entry and the swap itself was unconditional,
+  so a swap that installed its session after `Close` had already closed the one it found reported success and left the new session open for the life of the process,
+  with no holder anyone would ever tear down.
+  The flag is re-checked after the swap — `Close` sets it before it tears anything down — and a swap that finds the client closed retires the holder it just installed, closes the session it was given, and returns `types.ErrSessionClosed`, the same error a swap on an already-closed client returns.
 
 ### Changed
 
