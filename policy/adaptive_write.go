@@ -26,6 +26,11 @@ const (
 	defaultAdaptiveFireForgetLimit   = int32(100)
 )
 
+// processStart is the base of the hysteresis clock: nowNanos reports the
+// nanoseconds elapsed since it, which time.Since reads from the monotonic
+// clock and no wall-clock adjustment can move.
+var processStart = time.Now()
+
 // AdaptiveDualWrite implements a latency-aware concurrent dual-write strategy.
 //
 // This strategy monitors the relative performance of both clusters and adapts
@@ -73,7 +78,7 @@ type AdaptiveDualWrite struct {
 	minDegradedDwell time.Duration
 	redegradeWindow  time.Duration
 	maxDegradedDwell time.Duration
-	now              func() int64 // Unix nanoseconds; nil means time.Now
+	now              func() int64 // Monotonic nanoseconds; nil means processElapsed
 
 	// Observability for fire-and-forget background writes. The
 	// foreground caller already records metrics for the synchronous
@@ -118,8 +123,8 @@ type clusterWriteState struct {
 	lastLatency atomic.Int64 // Last write latency in nanoseconds; written from goroutines. Cleared on recovery: only a healthy sample is a baseline.
 
 	// Hysteresis bookkeeping, all guarded by mu.
-	degradedAt  int64         // When the current degraded span began (Unix nanoseconds).
-	recoveredAt int64         // When the last strike-driven span ended; 0 after a manual recovery.
+	degradedAt  int64         // When the current degraded span began, on the clock nowNanos reads.
+	recoveredAt int64         // When the last strike-driven span ended, on the same clock; 0 after a manual recovery.
 	dwell       time.Duration // Minimum length of the current degraded span.
 	redegrades  int32         // Consecutive re-degrades inside redegradeWindow.
 
@@ -902,13 +907,20 @@ func (a *AdaptiveDualWrite) creditsRecovery(latency time.Duration, siblingState 
 	return siblingState.isDegraded.Load() && latency < a.minFloor
 }
 
-// nowNanos is time.Now in Unix nanoseconds, or the injected test clock.
+// nowNanos is the monotonic hysteresis clock, or the injected test clock.
+//
+// The dwell and re-degrade comparisons measure intervals, so they read
+// elapsed monotonic time rather than the wall clock. A wall clock stepped
+// backwards — by NTP, or by an operator — would make now-recoveredAt
+// negative and turn a degrade hours after the last recovery into a
+// re-degrade, doubling the dwell and reporting flapping that did not
+// happen.
 func (a *AdaptiveDualWrite) nowNanos() int64 {
 	if a.now != nil {
 		return a.now()
 	}
 
-	return time.Now().UnixNano()
+	return int64(time.Since(processStart))
 }
 
 // markDegradedLocked stamps the start of a degraded span and, for a

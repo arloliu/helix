@@ -26,6 +26,20 @@ func newHysteresisStrategy(clock *manualClock, opts ...AdaptiveDualWriteOption) 
 	return a
 }
 
+func TestAdaptiveDualWrite_HysteresisClockIsMonotonic(t *testing.T) {
+	a := NewAdaptiveDualWrite()
+
+	first := a.nowNanos()
+	second := a.nowNanos()
+
+	require.LessOrEqual(t, first, second, "the hysteresis clock never goes backwards")
+	require.Positive(t, second, "and it is still a usable stamp, distinct from the never-recovered zero")
+	require.Less(t, second, int64(24*time.Hour),
+		"the hysteresis clock must read monotonic elapsed time, not the wall clock: "+
+			"a backward clock step would otherwise make a degrade hours after the last recovery "+
+			"look like a re-degrade, doubling the dwell and reporting flapping that did not happen")
+}
+
 func TestAdaptiveDualWrite_ProbeLatencyCreditsOnlyFastProbes(t *testing.T) {
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveStrikeThreshold(1),

@@ -170,6 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a long-lived worker on a busy stream grew a map it never emptied.
   Each eviction-watch poll now drops the budgets of the sequences the stream reports it no longer holds.
   The cleanup rides on `WithEvictionWatch`, which is where the stream state is already read, so a worker that runs `RetryWhileRetained` without the eviction watch is unchanged.
+- `AdaptiveDualWrite`'s degrade hysteresis is now measured on a monotonic clock instead of the wall clock.
+  The dwell a degraded cluster serves and the window that decides whether a degrade counts as a re-degrade were compared against `time.Now().UnixNano()`,
+  so a backward clock step — an NTP correction, an operator setting the clock — made the interval since the last recovery negative.
+  A degrade hours later was then classified as a re-degrade: it doubled the dwell, held the cluster in fire-and-forget for longer than configured, and could emit `write_flapping` for a cluster that had not flapped.
+  The clock now reads elapsed monotonic time, which no clock adjustment moves.
+  No exported type or option changes.
 
 ### Changed
 
