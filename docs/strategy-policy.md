@@ -200,8 +200,8 @@ strategy := policy.NewAdaptiveDualWrite(
 | `WithAdaptiveRecoveryThreshold` | 5 | Consecutive fast writes to transition DEGRADED → HEALTHY |
 | `WithAdaptiveFireForgetTimeout` | 30s | Timeout applied to each background (fire-and-forget) write |
 | `WithAdaptiveFireForgetLimit` | 100 | Max concurrent background writes; excess returns `ErrWriteDropped` |
-| `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays DEGRADED before recovery credit can restore it |
-| `WithAdaptiveRedegradeBackoff` | disabled | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
+| `WithAdaptiveMinDegradedDwell` | 0 | Minimum time a cluster stays DEGRADED before recovery credit can restore it; setting it also switches the re-degrade backoff on |
+| `WithAdaptiveRedegradeBackoff` | 4× the minimum dwell | `(window, maxDwell)`: a degrade within `window` of a recovery doubles the dwell up to `maxDwell`; reaching the cap emits `write_flapping` |
 | `WithAdaptiveLogger` | no-op | Structured logger for the fire-and-forget background path |
 | `WithAdaptiveMetrics` | no-op | Metrics collector for background writes; without it a background write's real error never reaches metrics |
 | `WithAdaptiveClusterNames` | A/B | Display names used in the background path's log messages |
@@ -281,8 +281,10 @@ and reaching it does not always recover immediately:
 - Once `recoveryThreshold` credited writes accumulate,
   the transition to HEALTHY is held until `minDegradedDwell` has elapsed since the degrade began
   (`policy.WithAdaptiveMinDegradedDwell`; default 0, no hold).
-  `policy.WithAdaptiveRedegradeBackoff` doubles the dwell, up to `maxDwell`,
+  A dwell also switches on the re-degrade backoff, which doubles the dwell, up to `maxDwell`,
   for a cluster that re-degrades within `window` of its last recovery.
+  `policy.WithAdaptiveRedegradeBackoff` tunes that pair;
+  either argument left at 0 takes four times the minimum dwell.
 - `ForceDegrade` latches a cluster:
   while latched, no write or probe credits recovery, regardless of `fastStrikes`,
   until `ForceRecover` or `Reset` clears the latch.
