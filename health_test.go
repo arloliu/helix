@@ -48,10 +48,15 @@ func (s *spyStrategy) OnFailure(cluster ClusterID, _ error) (ClusterID, bool) {
 	return ClusterA, true
 }
 
-// spyPolicy always allows failover and records its health calls.
-type spyPolicy struct{ log *authorityLog }
+// spyPolicy allows failover unless denyFailover is set, and records its
+// health calls. denyFailover stands in for a circuit breaker that has not
+// reached its threshold yet.
+type spyPolicy struct {
+	log          *authorityLog
+	denyFailover bool
+}
 
-func (p *spyPolicy) ShouldFailover(ClusterID, error) bool { return true }
+func (p *spyPolicy) ShouldFailover(ClusterID, error) bool { return !p.denyFailover }
 func (p *spyPolicy) RecordFailure(cluster ClusterID) {
 	p.log.add("policy.RecordFailure(" + string(cluster) + ")")
 }
@@ -106,14 +111,19 @@ type hubFixture struct {
 	log    *authorityLog
 	sa, sb *readProbeSession
 	client *CQLClient
+	// spy is the policy the client holds, so a test can deny failover
+	// before it issues a read.
+	spy *spyPolicy
 }
 
 func newHubFixture(t *testing.T, latency bool, opts ...Option) *hubFixture {
 	t.Helper()
 	log := &authorityLog{}
-	var policy FailoverPolicy = &spyPolicy{log: log}
+	spy := &spyPolicy{log: log}
+	var policy FailoverPolicy = spy
 	if latency {
-		policy = &spyLatencyPolicy{spyPolicy{log: log}}
+		lat := &spyLatencyPolicy{spyPolicy{log: log}}
+		policy, spy = lat, &lat.spyPolicy
 	}
 	sa, sb := newReadProbeSession(), newReadProbeSession()
 	client := newReadProbeClient(t, sa, sb, append([]Option{
@@ -121,7 +131,7 @@ func newHubFixture(t *testing.T, latency bool, opts ...Option) *hubFixture {
 		WithFailoverPolicy(policy),
 	}, opts...)...)
 
-	return &hubFixture{log: log, sa: sa, sb: sb, client: client}
+	return &hubFixture{log: log, sa: sa, sb: sb, client: client, spy: spy}
 }
 
 func (f *hubFixture) stats(cluster ClusterID) (failures int32, lastErr error) {
@@ -220,6 +230,24 @@ func TestHub_IteratorCloseAuthorityOrder(t *testing.T) {
 		failures, lastErr := f.stats(ClusterA)
 		require.Equal(t, int32(1), failures)
 		require.ErrorIs(t, lastErr, errReadProbeCluster)
+	})
+	t.Run("cluster error the policy would not fail over", func(t *testing.T) {
+		f := newHubFixture(t, false)
+		f.spy.denyFailover = true
+		f.sa.setIterCloseErr(errReadProbeCluster)
+		require.ErrorIs(t, f.client.Query("SELECT v FROM t").IterContext(t.Context()).Close(), errReadProbeCluster)
+		require.Equal(t, []string{"policy.RecordFailure(A)"}, f.log.snapshot(),
+			"a breaker below its threshold stops the preference from moving, as it does for a Scan")
+		failures, _ := f.stats(ClusterA)
+		require.Equal(t, int32(1), failures, "the failure is still observed")
+	})
+	t.Run("cluster error while the alternative is draining", func(t *testing.T) {
+		f := newHubFixture(t, false)
+		f.client.drainB.Store(true)
+		f.sa.setIterCloseErr(errReadProbeCluster)
+		require.ErrorIs(t, f.client.Query("SELECT v FROM t").IterContext(t.Context()).Close(), errReadProbeCluster)
+		require.Equal(t, []string{"policy.RecordFailure(A)"}, f.log.snapshot(),
+			"the preference must not move to a cluster the operator is draining")
 	})
 }
 

@@ -416,6 +416,13 @@ func orderFrom(first ClusterID, clusters []ClusterID) []ClusterID {
 	return []ClusterID{clusters[1], clusters[0]}
 }
 
+// iterMovesStrategy reports whether an iterator's close moves the read
+// strategy in mode: an override freezes the strategy, and the failover gate
+// the close now shares with a failing Scan refuses a draining alternative.
+func iterMovesStrategy(mode readMode) bool {
+	return mode != modeOverride && mode != modeDrain
+}
+
 // currentReadBehaviour states, rule by rule, what the read pipeline does
 // today for one cell of the matrix.
 func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) readObservation {
@@ -471,11 +478,14 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 		}
 		obs.failures = []ClusterID{served}
 		if isIter && !expires {
-			// Iterator Close reports the failure to the policy and the
-			// strategy but cannot retry, and emits no read-error metric.
+			// Iterator Close reports the failure to the policy and cannot
+			// retry, and emits no read-error metric.
+			// It moves the strategy only where a failing Scan would be
+			// allowed to fail over, so a draining alternative freezes the
+			// preference here exactly as it does below.
 			// A first page the leg deadline ends never reaches Close:
 			// it is reported and retried like a Scan, so it follows the rules below.
-			if mode != modeOverride {
+			if iterMovesStrategy(mode) {
 				obs.onFailure = []ClusterID{served}
 			}
 			break

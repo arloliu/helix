@@ -183,6 +183,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The interrupted payload is reported through `WithOnDrop` with the reason `shutdown`, like the payloads still waiting in the queue, because that queue does not survive the process;
   it is counted neither as a replay error nor as a failed attempt, and `WithOnError` is not called for it.
   An `ExecuteFunc` that ignores its context still holds `Stop` for up to `WithExecuteTimeout`.
+- A cluster error reported when an iterator closes now moves the read strategy's preference only where a failing `Scan` would have been allowed to fail over.
+  The close path called `ReadStrategy.OnFailure` for every cluster error, without the `FailoverPolicy.ShouldFailover` gate and the drain check every other read applies first.
+  So with the default `CircuitBreaker` (threshold 3) one iterator that failed to close moved `StickyRead`'s preference while the same error from a `Scan` moved nothing,
+  and an iterator failing on A moved the preference to B even while B was draining and every read was being steered back to A.
+  The gate is now one helper shared by the failover flow and the close path.
+  What the close reports to the failover policy, to auto-refresh and to the session stats is unchanged.
+  The close still never fails over: an iterator cannot be retried.
 
 ### Changed
 
