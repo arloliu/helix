@@ -15,9 +15,27 @@ import (
 )
 
 // gateSwitch is a cluster gate a test flips.
-type gateSwitch struct{ open atomic.Bool }
+// checks counts how often the worker consulted it: the worker parks a refused
+// payload for exactly one poll interval, so a rising count is the worker's own
+// clock and stands in for the wall-clock sleeps these tests used to take.
+type gateSwitch struct {
+	open   atomic.Bool
+	checks atomic.Int32
+}
 
-func (g *gateSwitch) allow(types.ClusterID) bool { return g.open.Load() }
+func (g *gateSwitch) allow(types.ClusterID) bool {
+	g.checks.Add(1)
+
+	return g.open.Load()
+}
+
+// awaitChecks blocks until the worker has consulted the gate n more times than
+// it had at from.
+func awaitChecks(t *testing.T, gate *gateSwitch, from int32, n int32, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool { return gate.checks.Load() >= from+n },
+		5*time.Second, time.Millisecond, msg)
+}
 
 func countingExecute(executed *atomic.Int32) replay.ExecuteFunc {
 	return func(context.Context, types.ReplayPayload) error {
@@ -33,10 +51,6 @@ func startWorker(t *testing.T, w *replay.Worker) {
 	t.Cleanup(w.Stop)
 }
 
-// settle waits a few poll intervals so a gated worker had every chance to
-// misbehave before the test asserts it did not.
-func settle() { time.Sleep(30 * time.Millisecond) }
-
 func TestMemoryWorker_RetainedGateParksWithoutSpendingWindow(t *testing.T) {
 	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(8))
 	var executed, dropped atomic.Int32
@@ -50,16 +64,18 @@ func TestMemoryWorker_RetainedGateParksWithoutSpendingWindow(t *testing.T) {
 	enqueueN(t, replayer, 2, types.ClusterA)
 	startWorker(t, worker)
 
-	time.Sleep(80 * time.Millisecond) // longer than the retry window
+	// Each refusal parks a payload for one poll interval, so gate checks measure
+	// the gated stretch: 2 payloads at a 2ms poll means 50 checks put at least
+	// one of them through 24 refusals, well past the 40ms retry window.
+	awaitChecks(t, gate, 0, 50, "the worker must keep parking the payloads past the retry window")
 	require.Zero(t, executed.Load(), "a gated cluster is never executed against")
 	require.Equal(t, 2, replayer.PendingByCluster(types.ClusterA), "parked payloads keep their slots")
 
 	gate.open.Store(true)
-	require.Eventually(t, func() bool { return executed.Load() == 2 }, time.Second, time.Millisecond,
-		"both payloads execute once the gate opens")
-	settle()
+	require.Eventually(t, func() bool { return executed.Load() == 2 && replayer.Len() == 0 },
+		time.Second, time.Millisecond,
+		"both payloads execute once the gate opens, and release their slots")
 	require.Zero(t, dropped.Load(), "time spent gated does not consume the retry window")
-	require.Zero(t, replayer.Len())
 }
 
 func TestMemoryWorker_RetainedGateParksRetries(t *testing.T) {
@@ -89,8 +105,11 @@ func TestMemoryWorker_RetainedGateParksRetries(t *testing.T) {
 	startWorker(t, worker)
 
 	require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
-	gate.open.Store(false)             // close before the retry is due
-	time.Sleep(300 * time.Millisecond) // past the retry delay: the retry is parked behind the gate
+	gate.open.Store(false) // close before the retry is due
+	// Nothing else is queued, so the next gate check can only come from the
+	// retry falling due. Three of them prove the retry delay elapsed and the
+	// closed gate turned the retry away each time.
+	awaitChecks(t, gate, gate.checks.Load(), 3, "the retry must come due and be refused by the closed gate")
 	require.Equal(t, int32(1), executed.Load(), "the retry waits while the gate is closed")
 
 	gate.open.Store(true)
@@ -115,6 +134,9 @@ func TestMemoryWorker_BoundedGateWaitsBetweenAttempts(t *testing.T) {
 
 		return nil
 	}
+	// Buffered with a non-blocking send: a payload that wrongly ran twice must
+	// fail the assertion below, not panic on a second close.
+	succeeded := make(chan struct{}, 1)
 	worker := replay.NewMemoryWorker(replayer, execute,
 		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithMaxAttempts(2),
@@ -122,34 +144,55 @@ func TestMemoryWorker_BoundedGateWaitsBetweenAttempts(t *testing.T) {
 		replay.WithRetryDelay(time.Millisecond),
 		replay.WithClusterGate(gate.allow),
 		replay.WithOnDrop(func(types.ReplayPayload, error) { dropped.Add(1) }),
+		replay.WithOnSuccess(func(types.ReplayPayload) {
+			select {
+			case succeeded <- struct{}{}:
+			default:
+			}
+		}),
 	)
 	enqueueN(t, replayer, 1, types.ClusterA)
 	startWorker(t, worker)
 
 	require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
-	settle()
+	// The retry waits behind the closed gate, one poll interval per refusal, so
+	// three further checks are three intervals of the worker declining to spend
+	// the last attempt.
+	awaitChecks(t, gate, gate.checks.Load(), 3, "the worker must keep re-checking the closed gate")
 	require.Equal(t, int32(1), executed.Load(), "the last attempt is not spent while gated")
 	require.Zero(t, dropped.Load())
 
 	gate.open.Store(true)
 	require.Eventually(t, func() bool { return executed.Load() == 2 }, time.Second, time.Millisecond)
-	settle()
+	<-succeeded // the payload is settled: no drop can follow a successful attempt
 	require.Zero(t, dropped.Load(), "the retry succeeded once the gate opened")
 }
 
 func TestMemoryWorker_GateClosingBetweenDequeueAndExecuteRequeues(t *testing.T) {
 	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(8))
 	var executed atomic.Int32
+	// Buffered with a non-blocking send: a payload that wrongly ran twice must
+	// fail the assertion below, not panic on a second close.
+	succeeded := make(chan struct{}, 1)
 	worker := replay.NewMemoryWorker(replayer, countingExecute(&executed),
 		replay.WithRetryPolicy(replay.RetryBounded),
 		replay.WithPollInterval(2*time.Millisecond),
 		replay.WithClusterGate(closeOnceAtExecute(nil)),
+		replay.WithOnSuccess(func(types.ReplayPayload) {
+			select {
+			case succeeded <- struct{}{}:
+			default:
+			}
+		}),
 	)
 	enqueueN(t, replayer, 1, types.ClusterA)
 	startWorker(t, worker)
 
 	require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
-	settle()
+	// The success settles the payload and the empty queue leaves nothing to
+	// dispatch again, so a second run is ruled out rather than merely late.
+	<-succeeded
+	require.Zero(t, replayer.Len(), "the requeued payload is not still waiting to run")
 	require.Equal(t, int32(1), executed.Load(), "the requeued payload runs exactly once")
 }
 
@@ -250,13 +293,14 @@ func TestMemoryWorker_GatedPayloadKeepsItsSlot(t *testing.T) {
 			startWorker(t, worker)
 
 			require.Eventually(t, func() bool { return executed.Load() == 1 }, time.Second, time.Millisecond)
-			settle()
+			// The released slot is the payload's last act, so everything the
+			// gate callback recorded on the way there has settled by then.
+			require.Eventually(t, func() bool { return replayer.Len() == 0 }, time.Second, time.Millisecond,
+				"the slot is released once the payload has run")
 			require.ErrorIs(t, producerErr, types.ErrReplayQueueFull, "the gated payload still holds the only slot")
 			require.Equal(t, 1, pendingWhileGated, "a requeue holds one slot, not two")
 			require.Equal(t, int32(1), executed.Load())
 			require.Zero(t, dropped.Load(), "a gated payload is never dropped")
-			require.Eventually(t, func() bool { return replayer.Len() == 0 }, time.Second, time.Millisecond,
-				"the slot is released once the payload has run")
 		})
 	}
 }
