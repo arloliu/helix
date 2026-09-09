@@ -757,6 +757,14 @@ type Scanner interface {
 	Scan(dest ...any) error
 
 	// Err returns any error from iteration and releases resources.
+	//
+	// It also ends the read: the outcome reaches the read strategy, the
+	// failover policy and auto-refresh exactly as it does from
+	// [Iter.Close], so a consumer that drains with a Scanner and never
+	// calls Close still reports a failing cluster.
+	//
+	// Err is idempotent. Only the first call ends the read; later calls
+	// return the same error without touching the driver's iterator.
 	Err() error
 }
 

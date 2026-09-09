@@ -211,6 +211,9 @@ func (i *cqlIter) Warnings() []string {
 type cqlScanner struct {
 	scanner cql.Scanner
 	owner   *cqlIter
+
+	errOnce sync.Once
+	err     error
 }
 
 func (s *cqlScanner) Next() bool {
@@ -233,9 +236,16 @@ func (s *cqlScanner) Scan(dest ...any) error {
 //
 // The driver's own Err has already closed the iterator, so this adds no
 // second close.
+//
+// Only the first call reaches the driver; later calls return the same
+// error. Both drivers release their iterator inside Scanner.Err and
+// dereference it unguarded on the next call, so asking twice would panic
+// rather than repeat an answer.
 func (s *cqlScanner) Err() error {
-	err := s.scanner.Err()
-	s.owner.endFromScanner(err)
+	s.errOnce.Do(func() {
+		s.err = s.scanner.Err()
+		s.owner.endFromScanner(s.err)
+	})
 
-	return err
+	return s.err
 }

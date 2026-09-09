@@ -154,6 +154,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The same gap existed between the latch releasing its lock and closing the channel.
   `Err` now reports only the latched error and the latch closes `Done` under the lock `Err` takes,
   so the two always agree; the error a driver sees once the context ends is unchanged.
+- A second `Scanner().Err()` call on the same scanner no longer panics.
+  `Err` forwarded to the driver's scanner on every call, and both drivers release their iterator inside their own `Err` and dereference it unguarded on the next call —
+  so the ordinary habit of logging the error and then returning it crashed the caller's process.
+  `Err` is now idempotent: the first call ends the read and stores the result, and later calls return it without reaching the driver.
+  The read is still reported exactly once, as it already was.
 
 ### Changed
 
