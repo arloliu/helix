@@ -666,6 +666,24 @@ func (c *WorkerConfig) observeDrop(payload types.ReplayPayload, err error, reaso
 	}
 }
 
+// stopContext returns a context that ends when stopCh closes or when the
+// returned cancel runs.
+// A remote call in flight under it cannot hold Worker.Stop for its own timeout.
+// The goroutine that bridges stopCh to the context lives until either
+// happens; call cancel when the goroutine that owns the context returns.
+func stopContext(stopCh <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	return ctx, cancel
+}
+
 // calculateBackoff calculates the backoff delay with exponential increase.
 // Both backends use it to space out retries of a failed payload.
 func calculateBackoff(attempt int, retryDelay, maxRetryDelay time.Duration) time.Duration {
