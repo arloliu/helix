@@ -210,12 +210,21 @@ func WithAdaptiveMinFloor(d time.Duration) AdaptiveDualWriteOption {
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveStrikeThreshold(n int) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
-		if n <= 0 || n > maxInt32 {
-			a.strikeThreshold = 0
-			return
-		}
-		a.strikeThreshold = int32(n)
+		setAdaptiveCount(&a.strikeThreshold, n)
 	}
+}
+
+// setAdaptiveCount stores a count that must be positive and fit in an int32.
+// A value the field cannot hold is stored as 0, which every rule in
+// [adaptiveOptionRules] reads as invalid, so the checked constructor reports
+// it and the unchecked one falls back to the default.
+func setAdaptiveCount(field *int32, n int) {
+	if n <= 0 || n > maxInt32 {
+		*field = 0
+
+		return
+	}
+	*field = int32(n)
 }
 
 // WithAdaptiveRecoveryThreshold sets the consecutive fast writes to recover.
@@ -232,11 +241,7 @@ func WithAdaptiveStrikeThreshold(n int) AdaptiveDualWriteOption {
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveRecoveryThreshold(n int) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
-		if n <= 0 || n > maxInt32 {
-			a.recoveryThreshold = 0
-			return
-		}
-		a.recoveryThreshold = int32(n)
+		setAdaptiveCount(&a.recoveryThreshold, n)
 	}
 }
 
@@ -335,11 +340,7 @@ func WithAdaptiveClusterNames(names types.ClusterNames) AdaptiveDualWriteOption 
 //   - AdaptiveDualWriteOption: Configuration option
 func WithAdaptiveFireForgetLimit(n int) AdaptiveDualWriteOption {
 	return func(a *AdaptiveDualWrite) {
-		if n <= 0 || n > maxInt32 {
-			a.fireForgetLimit = 0
-			return
-		}
-		a.fireForgetLimit = int32(n)
+		setAdaptiveCount(&a.fireForgetLimit, n)
 	}
 }
 
@@ -460,38 +461,131 @@ func applyAdaptiveDualWriteOptions(a *AdaptiveDualWrite, opts ...AdaptiveDualWri
 	}
 }
 
-func validateAdaptiveDualWrite(a *AdaptiveDualWrite) error {
-	errList := make([]error, 0, 8)
+// adaptiveOptionRule is one option's validity rule, written once and read by
+// both constructors: [NewAdaptiveDualWriteChecked] reports the error check
+// returns, and [NewAdaptiveDualWrite] applies repair in its place.
+type adaptiveOptionRule struct {
+	// check reports the option error an unusable value produces, or nil.
+	check func(a *AdaptiveDualWrite) error
+	// repair replaces an unusable value with the one the unchecked
+	// constructor falls back to.
+	// It runs only when check reported an error.
+	repair func(a *AdaptiveDualWrite)
+}
 
-	if a.deltaThreshold <= 0 {
-		errList = append(errList, optionErrPositiveDuration(adaptiveDualWriteComponent, "WithAdaptiveDeltaThreshold"))
+// adaptivePositiveDurationRule builds the rule for a duration option that
+// must be above zero.
+func adaptivePositiveDurationRule(
+	option string,
+	field func(a *AdaptiveDualWrite) *time.Duration,
+	fallback time.Duration,
+) adaptiveOptionRule {
+	return adaptiveOptionRule{
+		check: func(a *AdaptiveDualWrite) error {
+			if *field(a) <= 0 {
+				return optionErrPositiveDuration(adaptiveDualWriteComponent, option)
+			}
+
+			return nil
+		},
+		repair: func(a *AdaptiveDualWrite) { *field(a) = fallback },
 	}
-	if a.absoluteMax <= 0 {
-		errList = append(errList, optionErrPositiveDuration(adaptiveDualWriteComponent, "WithAdaptiveAbsoluteMax"))
+}
+
+// adaptiveNonNegativeDurationRule builds the rule for a duration option that
+// may be zero but not negative.
+func adaptiveNonNegativeDurationRule(
+	option string,
+	field func(a *AdaptiveDualWrite) *time.Duration,
+	fallback time.Duration,
+) adaptiveOptionRule {
+	return adaptiveOptionRule{
+		check: func(a *AdaptiveDualWrite) error {
+			if *field(a) < 0 {
+				return optionErrNonNegativeDuration(adaptiveDualWriteComponent, option)
+			}
+
+			return nil
+		},
+		repair: func(a *AdaptiveDualWrite) { *field(a) = fallback },
 	}
-	if a.minFloor < 0 {
-		errList = append(errList, optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveMinFloor"))
+}
+
+// adaptiveCountRule builds the rule for a count option, which the setters
+// store as 0 when the caller's value is not a positive int32.
+func adaptiveCountRule(
+	option string,
+	field func(a *AdaptiveDualWrite) *int32,
+	fallback int32,
+) adaptiveOptionRule {
+	return adaptiveOptionRule{
+		check: func(a *AdaptiveDualWrite) error {
+			if *field(a) <= 0 {
+				return optionErrInt32Range(adaptiveDualWriteComponent, option)
+			}
+
+			return nil
+		},
+		repair: func(a *AdaptiveDualWrite) { *field(a) = fallback },
 	}
-	if a.strikeThreshold <= 0 {
-		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveStrikeThreshold"))
+}
+
+// adaptiveRedegradeBackoffRule is the interlock between the re-degrade
+// backoff and the dwell it doubles: the backoff needs a window to measure a
+// re-degrade in, a positive dwell to start from, and a cap no smaller than
+// that dwell.
+// A backoff that cannot be applied is dropped rather than half-configured.
+func adaptiveRedegradeBackoffRule() adaptiveOptionRule {
+	return adaptiveOptionRule{
+		check: func(a *AdaptiveDualWrite) error {
+			if a.redegradeWindow < 0 || a.maxDegradedDwell < 0 {
+				return optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff")
+			}
+			if a.redegradeWindow > 0 && (a.minDegradedDwell <= 0 || a.maxDegradedDwell < a.minDegradedDwell) {
+				return newOptionError(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff",
+					"requires a positive WithAdaptiveMinDegradedDwell no larger than maxDwell")
+			}
+
+			return nil
+		},
+		repair: func(a *AdaptiveDualWrite) {
+			a.redegradeWindow = 0
+			a.maxDegradedDwell = 0
+		},
 	}
-	if a.recoveryThreshold <= 0 {
-		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveRecoveryThreshold"))
-	}
-	if a.fireForgetTimeout <= 0 {
-		errList = append(errList, optionErrPositiveDuration(adaptiveDualWriteComponent, "WithAdaptiveFireForgetTimeout"))
-	}
-	if a.fireForgetLimit <= 0 {
-		errList = append(errList, optionErrInt32Range(adaptiveDualWriteComponent, "WithAdaptiveFireForgetLimit"))
-	}
-	if a.minDegradedDwell < 0 {
-		errList = append(errList, optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveMinDegradedDwell"))
-	}
-	if a.redegradeWindow < 0 || a.maxDegradedDwell < 0 {
-		errList = append(errList, optionErrNonNegativeDuration(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff"))
-	} else if a.redegradeWindow > 0 && (a.minDegradedDwell <= 0 || a.maxDegradedDwell < a.minDegradedDwell) {
-		errList = append(errList, newOptionError(adaptiveDualWriteComponent, "WithAdaptiveRedegradeBackoff",
-			"requires a positive WithAdaptiveMinDegradedDwell no larger than maxDwell"))
+}
+
+// adaptiveOptionRules holds one rule per option value, in the order the
+// checked constructor reports them.
+// Cluster names stay outside the table: they carry two different errors and
+// their repair reinstalls a value rather than clamping one.
+var adaptiveOptionRules = []adaptiveOptionRule{
+	adaptivePositiveDurationRule("WithAdaptiveDeltaThreshold",
+		func(a *AdaptiveDualWrite) *time.Duration { return &a.deltaThreshold }, defaultAdaptiveDeltaThreshold),
+	adaptivePositiveDurationRule("WithAdaptiveAbsoluteMax",
+		func(a *AdaptiveDualWrite) *time.Duration { return &a.absoluteMax }, defaultAdaptiveAbsoluteMax),
+	adaptiveNonNegativeDurationRule("WithAdaptiveMinFloor",
+		func(a *AdaptiveDualWrite) *time.Duration { return &a.minFloor }, defaultAdaptiveMinFloor),
+	adaptiveCountRule("WithAdaptiveStrikeThreshold",
+		func(a *AdaptiveDualWrite) *int32 { return &a.strikeThreshold }, defaultAdaptiveStrikeThreshold),
+	adaptiveCountRule("WithAdaptiveRecoveryThreshold",
+		func(a *AdaptiveDualWrite) *int32 { return &a.recoveryThreshold }, defaultAdaptiveRecoveryThreshold),
+	adaptivePositiveDurationRule("WithAdaptiveFireForgetTimeout",
+		func(a *AdaptiveDualWrite) *time.Duration { return &a.fireForgetTimeout }, defaultAdaptiveFireForgetTimeout),
+	adaptiveCountRule("WithAdaptiveFireForgetLimit",
+		func(a *AdaptiveDualWrite) *int32 { return &a.fireForgetLimit }, defaultAdaptiveFireForgetLimit),
+	adaptiveNonNegativeDurationRule("WithAdaptiveMinDegradedDwell",
+		func(a *AdaptiveDualWrite) *time.Duration { return &a.minDegradedDwell }, 0),
+	adaptiveRedegradeBackoffRule(),
+}
+
+func validateAdaptiveDualWrite(a *AdaptiveDualWrite) error {
+	errList := make([]error, 0, len(adaptiveOptionRules)+1)
+
+	for _, rule := range adaptiveOptionRules {
+		if err := rule.check(a); err != nil {
+			errList = append(errList, err)
+		}
 	}
 	if names := a.clusterNames.Load(); names == nil {
 		errList = append(errList, newOptionError(adaptiveDualWriteComponent, "WithAdaptiveClusterNames", "cluster names cannot be nil"))
@@ -503,34 +597,10 @@ func validateAdaptiveDualWrite(a *AdaptiveDualWrite) error {
 }
 
 func normalizeAdaptiveDualWriteForLegacy(a *AdaptiveDualWrite) {
-	if a.deltaThreshold <= 0 {
-		a.deltaThreshold = defaultAdaptiveDeltaThreshold
-	}
-	if a.absoluteMax <= 0 {
-		a.absoluteMax = defaultAdaptiveAbsoluteMax
-	}
-	if a.minFloor < 0 {
-		a.minFloor = defaultAdaptiveMinFloor
-	}
-	if a.strikeThreshold <= 0 {
-		a.strikeThreshold = defaultAdaptiveStrikeThreshold
-	}
-	if a.recoveryThreshold <= 0 {
-		a.recoveryThreshold = defaultAdaptiveRecoveryThreshold
-	}
-	if a.fireForgetTimeout <= 0 {
-		a.fireForgetTimeout = defaultAdaptiveFireForgetTimeout
-	}
-	if a.fireForgetLimit <= 0 {
-		a.fireForgetLimit = defaultAdaptiveFireForgetLimit
-	}
-	if a.minDegradedDwell < 0 {
-		a.minDegradedDwell = 0
-	}
-	if a.redegradeWindow <= 0 || a.minDegradedDwell <= 0 || a.maxDegradedDwell < a.minDegradedDwell {
-		// The backoff needs a dwell to double and a cap to stop at.
-		a.redegradeWindow = 0
-		a.maxDegradedDwell = 0
+	for _, rule := range adaptiveOptionRules {
+		if rule.check(a) != nil {
+			rule.repair(a)
+		}
 	}
 	if names := a.clusterNames.Load(); names == nil || names.Validate() != nil {
 		defaultNames := types.DefaultClusterNames()
