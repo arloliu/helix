@@ -50,10 +50,12 @@ func (i *cqlIter) Scan(dest ...any) bool {
 
 // Close closes the iterator and reports its outcome like any other read:
 // a clean close is a success for the read strategy and the failover
-// policy, a cluster error is a failure for both (the strategy's suggested
-// alternative is ignored because an iterator cannot be retried), and data
-// sentinels or a caller-context error are neither. Auto-refresh accounting
-// sees every outcome except a caller-context error.
+// policy, a cluster error is a failure for the policy and moves the
+// strategy only when the failover gate agrees, and data sentinels or a
+// caller-context error are neither.
+// The strategy's suggested alternative is ignored, because an iterator
+// cannot be retried.
+// Auto-refresh accounting sees every outcome except a caller-context error.
 // Only the first Close reports; later calls return the same error.
 func (i *cqlIter) Close() error {
 	i.closeOnce.Do(func() { i.closeErr = i.closeAndReport() })

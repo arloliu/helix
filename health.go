@@ -30,9 +30,12 @@ import (
 // The metrics still count it, because they count what the client did.
 //
 // Deliberately outside the hub: immediate query CAS (reports no health
-// today), source-side mirror execution (its payloads name a logical sink,
-// not a root cluster), and [ReadStrategy.OnFailure], which is a routing
-// decision taken in the failover flow.
+// today), and source-side mirror execution (its payloads name a logical
+// sink, not a root cluster).
+// Choosing a failover target is a routing decision the failover flow owns,
+// so the hub never names one;
+// the one place it moves the read strategy is an iterator's close, which
+// cannot retry and so has no failover flow of its own to defer to.
 //
 // Single-cluster exception: with no second cluster, a read success or
 // failure updates only the stats, while an iterator's clean close still
@@ -54,6 +57,12 @@ type clusterHealth struct {
 	// countsForRefresh decides whether a failure is a connectivity failure
 	// worth counting toward auto-refresh; see AutoRefreshConfig.FailureClassifier.
 	countsForRefresh func(error) bool
+
+	// failoverAllowed is the client's CQLClient.failoverAllowed gate, bound
+	// once at wiring so an iterator's close applies the same policy and
+	// drain rules a failing Scan does before it moves the read strategy.
+	// Nil until the client installs it.
+	failoverAllowed func(ClusterID, error) bool
 }
 
 // probeKind classifies a recovery probe outcome for the hub.
@@ -134,13 +143,20 @@ func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kin
 // cluster error is a failure for both, and data sentinels or a
 // caller-context error are neither.
 //
-// Order (unchanged from before the hub existed): the holder's stats for
-// every outcome except a caller-context error, then the strategy and the
-// policy. The policy always receives RecordSuccess here, never
-// RecordLatency, because an iterator has no single latency sample.
-// The strategy's suggested alternative on failure is ignored: an iterator
-// cannot be retried. A single-cluster client reports a clean close to the
-// strategy but nothing to the policy, and reports failures to neither.
+// Order: the holder's stats for every outcome except a caller-context
+// error, then the policy, then the strategy.
+// The policy always receives RecordSuccess here, never RecordLatency,
+// because an iterator has no single latency sample.
+//
+// A cluster error moves the read strategy only when failoverAllowed agrees,
+// the same gate a failing Scan passes before the failover flow calls
+// [ReadStrategy.OnFailure]: a breaker still below its threshold, or a
+// draining alternative, leaves the preference where it is.
+// The strategy's suggested alternative is ignored either way, because an
+// iterator cannot be retried — the close reports health, it never fails over.
+//
+// A single-cluster client reports a clean close to the strategy but nothing
+// to the policy, and reports failures to neither.
 // A retired holder reports nothing beyond its stats.
 func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kind readErrKind, err error, overrideActive bool) {
 	switch kind {
@@ -172,11 +188,26 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 		if h.policy != nil {
 			h.policy.RecordFailure(cluster)
 		}
-		if !overrideActive && h.strategy != nil {
+		if !overrideActive && h.strategy != nil && h.failoverGateOpen(cluster, err) {
 			h.strategy.OnFailure(cluster, err)
 		}
 	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
 	}
+}
+
+// failoverGateOpen asks the client's failover gate whether a failure on
+// cluster may move the read strategy.
+// A hub with no gate installed answers yes, so a hub built outside a client
+// keeps the unconditional behaviour it had before the gate existed.
+//
+// Parameters:
+//   - cluster: The cluster the read failed on
+//   - err: The error that cluster returned
+//
+// Returns:
+//   - bool: true when the failure may move the read strategy
+func (h *clusterHealth) failoverGateOpen(cluster ClusterID, err error) bool {
+	return h.failoverAllowed == nil || h.failoverAllowed(cluster, err)
 }
 
 // writeLeg reports one leg of a write on cluster to the holder's stats at

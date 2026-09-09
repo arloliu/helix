@@ -741,6 +741,42 @@ func (c *CQLClient) overrideFailoverTarget(ctx context.Context, rt readTarget, p
 	return rt.snap.fallback, true
 }
 
+// failoverAllowed reports whether a read failure on selectedCluster may be
+// acted on: the FailoverPolicy decides whether the failure may move the
+// read, and a draining alternative is skipped unless the read came from a
+// draining cluster too.
+//
+// It is the request-independent half of the failover gate, so the iterator
+// close path shares it.
+// Both callers run it before [ReadStrategy.OnFailure], which moves the
+// strategy's preference as it answers: a preference that moves for a
+// failover the client would have refused sends the routing gauge and the
+// event stream to a cluster no read follows.
+//
+// The hub has already recorded the failure by the time this runs,
+// so the policy now only decides whether that failure may be acted on.
+// Every bundled FailoverPolicy answers ShouldFailover from state it does
+// not change, so asking it here observes without disturbing the breaker.
+//
+// Parameters:
+//   - selectedCluster: The cluster the read failed on
+//   - primaryErr: The error that cluster returned
+//
+// Returns:
+//   - bool: true when the failure may move the read to the other cluster
+func (c *CQLClient) failoverAllowed(selectedCluster ClusterID, primaryErr error) bool {
+	if c.config.FailoverPolicy != nil && !c.config.FailoverPolicy.ShouldFailover(selectedCluster, primaryErr) {
+		return false
+	}
+
+	// Don't failover to a draining cluster unless we came from a draining cluster too.
+	// With two clusters the alternative is fixed, so the gate needs no answer from the strategy.
+	drainA, drainB := c.getDrainStates()
+
+	return !c.clusterIsDraining(c.alternativeCluster(selectedCluster), drainA, drainB) ||
+		c.clusterIsDraining(selectedCluster, drainA, drainB)
+}
+
 // normalFailoverTarget gates failover with no override active: the
 // FailoverPolicy decides whether this request may retry, a draining
 // alternative is skipped unless the read came from a draining cluster too,
@@ -755,17 +791,7 @@ func (c *CQLClient) normalFailoverTarget(
 	selectedCluster ClusterID,
 	primaryErr error,
 ) (ClusterID, bool) {
-	// The hub has already recorded the failure; the policy now only decides
-	// whether this request may retry on the other cluster.
-	if c.config.FailoverPolicy != nil && !c.config.FailoverPolicy.ShouldFailover(selectedCluster, primaryErr) {
-		return "", false
-	}
-
-	// Don't failover to a draining cluster unless we came from a draining cluster too.
-	// With two clusters the alternative is fixed, so the gate needs no answer from the strategy.
-	drainA, drainB := c.getDrainStates()
-	if c.clusterIsDraining(c.alternativeCluster(selectedCluster), drainA, drainB) &&
-		!c.clusterIsDraining(selectedCluster, drainA, drainB) {
+	if !c.failoverAllowed(selectedCluster, primaryErr) {
 		return "", false
 	}
 

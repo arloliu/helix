@@ -459,6 +459,9 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		client.routeVeto, _ = config.FailoverPolicy.(RouteVeto)
 	}
 	client.health = newClusterHealth(config, sessionB != nil)
+	// The gate reads the client's live drain state, so it can only be bound
+	// once the client exists.
+	client.health.failoverAllowed = client.failoverAllowed
 	client.storeSessionA(sessionA)
 	// Store sessionB even if nil; in single-cluster mode the holder wraps a
 	// nil cql.Session so loadSessionB() returns nil safely without a
