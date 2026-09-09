@@ -130,11 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.6.2-otter`, up from `v2.5.0-otter`.
+- The v2 CQL adapter's `replace` directive now pins the `arloliu/cassandra-gocql-driver` fork at `v2.7.0-otter`, up from `v2.5.0-otter`.
   Go ignores `replace` in dependencies, so a module that uses the v2 adapter must update the line in its own `go.mod` to pick this up (see the README's Requirements):
 
   ```
-  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.6.2-otter
+  replace github.com/apache/cassandra-gocql-driver/v2 => github.com/arloliu/cassandra-gocql-driver/v2 v2.7.0-otter
   ```
 
   The fork adds no exported symbol and changes no exported signature, but one exported field changes meaning — see the `ReconnectInterval` note below.
@@ -175,6 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two smaller reclamation fixes ride along, neither changing a return value.
   A retry that supersedes an iterator now closes it before going round again, returning its response framer to the pool; this is live for any statement not marked [`NonIdempotent`](https://pkg.go.dev/github.com/arloliu/helix#Query), which is the default.
   And a panic out of an observer, host-marking or retry-policy callback now closes the iterator it was holding on the way out — the panic itself still reaches the caller unchanged, with the same value and type.
+
+  **A cancelled query now surfaces the cancellation itself.**
+  Once the driver observes that the query's context has ended it consults the retry policy no further and makes no further attempt;
+  the iterator returned in that window carries `context.Canceled` or `context.DeadlineExceeded` rather than the attempt's own error, with its host and warnings intact.
+  Helix already attributed a context error seen after the caller's context ended to the caller, so a leg ended by `WithClusterReadTimeout` classifies as before.
+  Two related changes are inert here: an idempotent query that exhausted its hosts now returns the last attempt's real iterator, so `Iter.Host()` is non-nil there, and Helix never reads it;
+  and speculative execution — never configured by Helix — now waits for its sibling executions before settling on an error.
 
 ### Documentation
 
