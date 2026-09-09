@@ -79,7 +79,7 @@ func (b *natsBackend) start(cluster types.ClusterID) {
 	// Stop cancels the depth read, the fetch and the attempt in flight, so
 	// a server or a cluster that stops answering cannot hold Worker.Stop
 	// for their timeouts.
-	base, cancelBase := b.stopContext()
+	base, cancelBase := stopContext(b.stopCh)
 	defer cancelBase()
 
 	highProcessed := 0
@@ -370,24 +370,6 @@ func (b *natsBackend) after(d time.Duration) <-chan time.Time {
 	}
 
 	return time.After(d)
-}
-
-// stopContext returns a context that ends when the worker stops or when
-// the returned cancel runs, so a remote call in flight cannot hold
-// Worker.Stop for its own timeout.
-// The goroutine that bridges stopCh to the context lives until either
-// happens; call cancel when the goroutine that owns the context returns.
-func (b *natsBackend) stopContext() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-b.stopCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
-	return ctx, cancel
 }
 
 // nakTail NAKs every message in tail; see processMessages for why a

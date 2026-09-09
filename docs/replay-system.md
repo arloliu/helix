@@ -118,9 +118,12 @@ type ReplayWorker interface {
 ```
 
 `Stop()` blocks until the worker's in-flight batch returns, and `client.Close()` waits for it in turn.
-The NATS worker cancels the context of the attempt in flight, so `Stop()` returns as soon as the
-`ExecuteFunc` honours it, and the interrupted message is NAK'd for redelivery rather than charged a failure;
-the memory worker lets the attempt run to completion, so bound it with `WithExecuteTimeout`.
+Both workers cancel the context of the attempt in flight, so `Stop()` returns as soon as the `ExecuteFunc` honours it,
+and neither counts the interrupted attempt as a replay error.
+The NATS worker NAKs the interrupted message for redelivery, so a restarted worker picks it up again;
+the memory worker reports the interrupted payload through `WithOnDrop` with the reason `shutdown`,
+as it does for the payloads still waiting in its queue, because that queue does not survive the process.
+An `ExecuteFunc` that ignores its context still holds `Stop()` for up to `WithExecuteTimeout`.
 A `WithOnDrop` or `WithOnError` callback must not call `Stop()` or the
 client's `Close()`: both wait for the goroutine that invoked the callback.
 

@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -19,6 +20,12 @@ import (
 // is reached, further failures drop immediately rather than queue up.
 const defaultMemoryRetryConcurrency = 100
 
+// errAttemptStopped wraps the error of an attempt that Stop cut short.
+// Such an attempt is settled as a shutdown drop instead of being counted as
+// an execute failure: the payload was never given a fair try, and the
+// in-memory queue is not durable, so there is nothing to hand back.
+var errAttemptStopped = errors.New("replay attempt interrupted by shutdown")
+
 // memoryBackend implements workerBackend for MemoryReplayer.
 //
 // Retries run in dedicated goroutines, not on the main dequeue loop, so a
@@ -32,6 +39,11 @@ type memoryBackend struct {
 	execute  ExecuteFunc
 	stopCh   <-chan struct{}
 	wg       *sync.WaitGroup
+
+	// stopCtx is the parent of every attempt context.
+	// start owns it and ends it when the worker stops, so an attempt in
+	// flight cannot hold Worker.Stop for ExecuteTimeout.
+	stopCtx context.Context
 
 	retrySem chan struct{} // bounds concurrent retry goroutines
 	retryWG  sync.WaitGroup
@@ -68,6 +80,14 @@ func (b *memoryBackend) backendType() string {
 // dequeue worker.
 func (b *memoryBackend) start(_ types.ClusterID) {
 	defer b.wg.Done()
+
+	// Stop ends the attempt in flight, so an ExecuteFunc that honours its
+	// context cannot hold Worker.Stop for ExecuteTimeout.
+	// Every goroutine that runs an attempt is joined below, before the
+	// deferred cancel runs.
+	base, cancelBase := stopContext(b.stopCh)
+	b.stopCtx = base
+	defer cancelBase()
 
 	if b.retained() {
 		b.schedWG.Add(1)
@@ -158,6 +178,11 @@ func (b *memoryBackend) handleFirstAttempt(payload types.ReplayPayload) {
 	if err == nil {
 		return
 	}
+	if errors.Is(err, errAttemptStopped) {
+		// The slot was released above, so the drop is all that is left.
+		b.dropPayload(payload, err, maxAttempts, types.ReplayDropShutdown)
+		return
+	}
 
 	// No retries configured — drop now.
 	if maxAttempts == 1 {
@@ -213,6 +238,10 @@ func (b *memoryBackend) retryAsync(payload types.ReplayPayload, prevErr error, m
 		if err == nil {
 			return
 		}
+		if errors.Is(err, errAttemptStopped) {
+			b.dropPayload(payload, err, maxAttempts, types.ReplayDropShutdown)
+			return
+		}
 		prevErr = err
 	}
 
@@ -257,6 +286,13 @@ func (b *memoryBackend) runAttempt(payload types.ReplayPayload, attempt, maxAtte
 	start := time.Now()
 	err := b.executeOnce(payload)
 	elapsed := time.Since(start).Seconds()
+
+	if err != nil && b.stopCtx.Err() != nil {
+		// Stop cut the attempt short.
+		// The payload never got a fair try, so it is not charged a failure;
+		// the caller settles it as a shutdown drop.
+		return fmt.Errorf("%w: %w", errAttemptStopped, err)
+	}
 
 	if err == nil {
 		b.config.Metrics.IncReplaySuccess(payload.TargetCluster)
@@ -311,9 +347,10 @@ func (b *memoryBackend) drainAndDrop() {
 	}
 }
 
-// executeOnce executes a single replay attempt with timeout.
+// executeOnce executes a single replay attempt, bounded by ExecuteTimeout
+// and by the worker's stop context.
 func (b *memoryBackend) executeOnce(payload types.ReplayPayload) error {
-	ctx, cancel := context.WithTimeout(context.Background(), b.config.ExecuteTimeout)
+	ctx, cancel := context.WithTimeout(b.stopCtx, b.config.ExecuteTimeout)
 	defer cancel()
 
 	return b.execute(ctx, payload)
@@ -350,10 +387,16 @@ func (b *memoryBackend) clusterName(cluster types.ClusterID) string {
 // On Stop, every pending payload still in the queue is dequeued and the
 // configured OnDrop callback is invoked for each, with reason "shutdown".
 // Any in-flight retry goroutines observe stopCh during their backoff
-// sleep and also exit via OnDrop. High-throughput systems can therefore
-// see a sudden burst of OnDrop callbacks at shutdown proportional to
-// the queue depth + in-flight retry count. Size your OnDrop handler
-// (and any synchronous fallback persistence) accordingly.
+// sleep and also exit via OnDrop.
+// Stop also cancels the context of the attempt in flight, so it returns as
+// soon as the ExecuteFunc honours the cancellation; that payload is settled
+// the same way, through OnDrop with reason "shutdown", and is not counted
+// as a failed attempt.
+// High-throughput systems can therefore see a sudden burst of OnDrop
+// callbacks at shutdown proportional to the queue depth + in-flight retry
+// count.
+// Size your OnDrop handler (and any synchronous fallback persistence)
+// accordingly.
 //
 // Parameters:
 //   - replayer: The memory replayer to consume from
