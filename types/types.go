@@ -180,14 +180,14 @@ const (
 type ProbeOutcome uint8
 
 const (
+	// ProbeAbandoned means the client cancelled the probe, for example on Close; it says nothing about the cluster.
+	// It is the zero value so that an outcome nobody set releases the reservation instead of closing an open breaker.
+	ProbeAbandoned ProbeOutcome = iota
 	// ProbeSucceeded means the probe reached the cluster and completed.
-	ProbeSucceeded ProbeOutcome = iota
+	ProbeSucceeded
 	// ProbeFailed means the cluster returned an error or the probe's own
 	// deadline expired.
 	ProbeFailed
-	// ProbeAbandoned means the client cancelled the probe, for example on
-	// Close; it says nothing about the cluster.
-	ProbeAbandoned
 )
 
 // BatchStatement represents a single statement in a batch for replay.

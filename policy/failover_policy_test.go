@@ -963,3 +963,22 @@ func TestCircuitBreaker_ReentrantTripAfterProbeCloseKeepsOrder(t *testing.T) {
 		"final gauge must agree with the final state: open")
 	require.EqualValues(t, 2, mc.CircuitBreakerTrips[types.ClusterA])
 }
+
+// TestCircuitBreaker_ZeroValueProbeOutcomeReleasesReservation pins the zero value of types.ProbeOutcome to the safe outcome.
+// An external helix.FailoverProbeReporter consumer that leaves the outcome unset reports the zero value,
+// and that must release the reservation rather than close an open breaker on a probe that never succeeded.
+func TestCircuitBreaker_ZeroValueProbeOutcomeReleasesReservation(t *testing.T) {
+	mc := testutil.NewTestMetricsCollector()
+	cb := NewCircuitBreaker(WithThreshold(1), WithResetTimeout(1*time.Hour), WithCircuitBreakerMetrics(mc))
+
+	cb.RecordFailure(types.ClusterA) // trips
+	token := reserveProbe(t, cb, types.ClusterA)
+
+	var unset types.ProbeOutcome
+	cb.CompleteFailoverProbe(types.ClusterA, token, unset)
+
+	require.Equal(t, 2, mc.CircuitBreakerState[types.ClusterA], "a zero-filled outcome must leave the breaker open")
+	require.Equal(t, int64(1), mc.CircuitBreakerProbes[types.ClusterA][types.BreakerProbeAbandoned],
+		"a zero-filled outcome counts as abandoned")
+	require.Zero(t, uint8(types.ProbeAbandoned), "the safe outcome must stay the zero value")
+}
