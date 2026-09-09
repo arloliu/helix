@@ -152,11 +152,12 @@ func TestPrimaryOnlyRead_AutoRecovery_ReturnsToA(t *testing.T) {
 	require.Equal(t, types.ClusterB, alt)
 	require.Equal(t, types.ClusterB, strategy.Select(context.Background()))
 
-	// Wait for recovery timeout to elapse
-	time.Sleep(60 * time.Millisecond)
-
-	// Select should now probe ClusterA
-	require.Equal(t, types.ClusterA, strategy.Select(context.Background()),
+	// Poll Select until the recovery timeout hands out the probe.
+	// Select is the only observer of that deadline, and it hands cluster A to
+	// exactly one caller, so the probe has to be the condition itself.
+	require.Eventually(t, func() bool {
+		return strategy.Select(context.Background()) == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
 		"after recovery timeout, Select should return ClusterA as a probe")
 }
 
@@ -166,7 +167,10 @@ func TestPrimaryOnlyRead_AutoRecovery_SuccessCompletesRecovery(t *testing.T) {
 	strategy := NewPrimaryOnlyRead(WithPrimaryOnlyRecoveryTimeout(50 * time.Millisecond))
 
 	strategy.OnFailure(types.ClusterA, nil)
-	time.Sleep(60 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return strategy.Select(context.Background()) == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
+		"the recovery timeout must hand out a ClusterA probe")
 
 	// Probe succeeds
 	strategy.OnSuccess(types.ClusterA)
@@ -183,10 +187,11 @@ func TestPrimaryOnlyRead_AutoRecovery_FailureResetsTimer(t *testing.T) {
 	strategy := NewPrimaryOnlyRead(WithPrimaryOnlyRecoveryTimeout(50 * time.Millisecond))
 
 	strategy.OnFailure(types.ClusterA, nil)
-	time.Sleep(60 * time.Millisecond)
 
 	// Probe selects A, but read fails again
-	require.Equal(t, types.ClusterA, strategy.Select(context.Background()))
+	require.Eventually(t, func() bool {
+		return strategy.Select(context.Background()) == types.ClusterA
+	}, time.Second, 2*time.Millisecond, "the recovery timeout must hand out a ClusterA probe")
 	strategy.OnFailure(types.ClusterA, nil)
 
 	// Timer reset — should be on B again immediately
@@ -194,8 +199,9 @@ func TestPrimaryOnlyRead_AutoRecovery_FailureResetsTimer(t *testing.T) {
 		"after failed probe, should return to ClusterB immediately")
 
 	// Wait for another recovery window
-	time.Sleep(60 * time.Millisecond)
-	require.Equal(t, types.ClusterA, strategy.Select(context.Background()),
+	require.Eventually(t, func() bool {
+		return strategy.Select(context.Background()) == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
 		"after second recovery timeout, should probe ClusterA again")
 }
 
@@ -223,11 +229,11 @@ func TestPrimaryOnlyRead_RecoveryTimeout_BFailure_PreservesTimer(t *testing.T) {
 	// Immediately after, Select should return B (recovery timeout not yet elapsed)
 	require.Equal(t, types.ClusterB, strategy.Select(t.Context()))
 
-	// Wait for recovery timeout to elapse from the refreshed timestamp
-	time.Sleep(60 * time.Millisecond)
-
-	// Now Select should probe A again via the recovery-timeout path
-	require.Equal(t, types.ClusterA, strategy.Select(t.Context()),
+	// Wait for recovery timeout to elapse from the refreshed timestamp,
+	// then Select should probe A again via the recovery-timeout path
+	require.Eventually(t, func() bool {
+		return strategy.Select(t.Context()) == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
 		"after recovery timeout, should probe ClusterA again")
 
 	// If the probe succeeds, recovery completes
@@ -242,7 +248,17 @@ func TestPrimaryOnlyRead_NoRecoveryTimeout_StaysOnB(t *testing.T) {
 	strategy := NewPrimaryOnlyRead() // no timeout
 
 	strategy.OnFailure(types.ClusterA, nil)
-	time.Sleep(20 * time.Millisecond)
+
+	// Anchor the "no recovery" claim to a strategy that does recover.
+	// The sibling failed over no earlier than this one and hands out its probe
+	// once its recovery timeout elapses, which is the positive event that a
+	// bare sleep only guessed at.
+	sibling := NewPrimaryOnlyRead(WithPrimaryOnlyRecoveryTimeout(10 * time.Millisecond))
+	sibling.OnFailure(types.ClusterA, nil)
+	require.Eventually(t, func() bool {
+		return sibling.Select(context.Background()) == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
+		"a sibling with a recovery timeout must probe ClusterA")
 
 	// Should remain on B regardless of time elapsed
 	require.Equal(t, types.ClusterB, strategy.Select(context.Background()))
@@ -359,13 +375,16 @@ func TestStickyRead_CooldownExpired_SwitchesPreferred(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, types.ClusterB, strategy.Preferred())
 
-	// Wait for cooldown to expire
-	time.Sleep(15 * time.Millisecond)
+	// B fails after cooldown — should switch preferred back to A.
+	// Within the cooldown OnFailure(B) hands A back for this request alone and
+	// leaves preferred where it is, so retrying it is harmless and the move
+	// itself is the event to wait for.
+	require.Eventually(t, func() bool {
+		alt, ok := strategy.OnFailure(types.ClusterB, nil)
 
-	// B fails after cooldown — should switch preferred back to A
-	alt, ok := strategy.OnFailure(types.ClusterB, nil)
-	require.True(t, ok)
-	require.Equal(t, types.ClusterA, alt)
+		return ok && alt == types.ClusterA && strategy.Preferred() == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
+		"preferred should switch to ClusterA after cooldown expires")
 	require.Equal(t, types.ClusterA, strategy.Preferred(),
 		"preferred should switch to ClusterA after cooldown expires")
 }
@@ -384,7 +403,21 @@ func TestStickyRead_CooldownExpiry_DoesNotProbePassively(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, types.ClusterB, strategy.Preferred())
 
-	time.Sleep(15 * time.Millisecond)
+	// Anchor the "nothing moved" claim to a strategy whose cooldown demonstrably
+	// expired: the sibling failed over no earlier than this one, so once a
+	// failure on its preferred cluster moves it, this one's cooldown is over too.
+	sibling := NewStickyRead(
+		WithPreferredCluster(types.ClusterA),
+		WithStickyReadCooldown(10*time.Millisecond),
+	)
+	_, ok = sibling.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Eventually(t, func() bool {
+		sibling.OnFailure(types.ClusterB, nil)
+
+		return sibling.Preferred() == types.ClusterA
+	}, time.Second, 2*time.Millisecond,
+		"a sibling's cooldown must expire and let a failure move its preference")
 
 	require.Equal(t, types.ClusterB, strategy.Select(t.Context()),
 		"cooldown expiry alone must not change preferred cluster")
