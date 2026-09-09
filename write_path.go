@@ -134,9 +134,15 @@ func (k writeLegErrKind) failed() bool {
 // recordWriteLegMetrics emits the per-leg write metrics for one cluster.
 // startNano is 0 when the leg never started (skipped or draining), in which
 // case no duration is observed.
+//
+// A legAsync leg observes nothing here either.
+// It is still running: the strategy handed back [types.ErrWriteAsync] the moment it dispatched the leg,
+// so the only duration available at this point is "how long ago the background leg started",
+// which is the sibling leg's latency wearing the degraded cluster's label.
+// The strategy observes that leg's real duration when it completes.
 func (c *CQLClient) recordWriteLegMetrics(cluster ClusterID, leg writeLegErrKind, startNano, nowNano int64) {
 	c.config.Metrics.IncWriteTotal(cluster)
-	if startNano > 0 {
+	if startNano > 0 && leg != legAsync {
 		c.config.Metrics.ObserveWriteDuration(cluster, float64(nowNano-startNano)/float64(time.Second))
 	}
 	switch leg {

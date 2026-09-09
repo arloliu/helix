@@ -35,6 +35,11 @@ type recordingSession struct {
 	execs  atomic.Int32
 	closed atomic.Bool
 	execCh chan string
+
+	// gate, when non-nil, holds every write inside the session until it is closed.
+	// held then reports how long the last released write was held for, which is a lower bound on that leg's own run time.
+	gate chan struct{}
+	held atomic.Int64
 }
 
 type recordingQuery struct {
@@ -133,8 +138,18 @@ func (s *recordingSession) exec(stmt string) error {
 	case s.execCh <- stmt:
 	default:
 	}
+	if s.gate != nil {
+		start := time.Now()
+		<-s.gate
+		s.held.Store(int64(time.Since(start)))
+	}
 
 	return s.err
+}
+
+// heldFor reports how long the last gated write was held inside the session.
+func (s *recordingSession) heldFor() time.Duration {
+	return time.Duration(s.held.Load())
 }
 
 func (q *recordingQuery) Consistency(cql.Consistency) cql.Query       { return q }

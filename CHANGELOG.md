@@ -134,6 +134,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The built-in breakers report their schedule through the new `helix.FailoverProbeScheduleReporter`,
   so a policy can tell the client whether a probe is scheduled at all.
   Routing is unchanged.
+- A fire-and-forget write leg now contributes its own duration to `write_duration_seconds`, observed when the leg completes, instead of a sample taken while it was still running.
+  The caller records the per-leg write metrics as soon as the write returns, and a degraded cluster's leg has only been dispatched by then, not finished.
+  The sample it recorded was "how long ago the background leg started", which is the healthy cluster's latency wearing the degraded cluster's label — so the histogram for a cluster slow enough to be degraded looked exactly like the histogram for the cluster that was keeping up.
+  Each leg still contributes exactly one sample.
+  A leg that never ran — dropped at the fire-and-forget concurrency limit, or skipped because the cluster is draining — now contributes none, matching what a skipped synchronous leg already did.
+  A custom write strategy that reports `ErrWriteAsync` for a leg it runs itself now observes that leg's duration itself, as `AdaptiveDualWrite` does; `ObserveWriteDuration` says so.
+
 - `AdaptiveDualWrite.ForceDegrade` now logs the operator latch it sets on a cluster that is already degraded, so the call is no longer invisible.
   The whole method reported only through the healthy-to-degraded transition, and a cluster that had degraded on its own has no transition left to report.
   So an operator isolating a cluster that had just degraded by itself got no log line at all, while the latch quietly turned off automatic recovery: the recovery probe and fast background writes could no longer restore that cluster.
