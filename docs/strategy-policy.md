@@ -820,6 +820,14 @@ the first page runs on the caller's context exactly as it always has and reports
 a Scanner loop under a deferred `Close()` reports the read once.
 An abandoned iterator does neither, the same way it already leaks the driver's own iterator.
 
+A cluster error at `Close()` is always a `RecordFailure` for the failover policy,
+but it moves the read strategy only where a failing `Scan` would have been allowed to fail over:
+after `ShouldFailover` agrees and unless the alternative cluster is draining.
+A breaker still below its threshold therefore leaves the sticky preference where it is,
+so one iterator that fails to close no longer moves routing when the same error from a `Scan` would not.
+The strategy's suggested alternative is discarded either way — an iterator cannot be retried,
+so its close reports health and never fails over.
+
 One residual is worth knowing:
 a token-aware first page can wait on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable.
 
