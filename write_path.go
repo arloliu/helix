@@ -430,9 +430,16 @@ func (c *CQLClient) executeDualWrite(
 	return &types.NoSynchronousAckError{ResultA: errA, ResultB: errB, Replay: replayErr}
 }
 
-// replayLeg arranges replay for one leg. A leg whose strategy reports its
-// result later (see [DeferredWriteResult]) is replayed only if that result
-// is a failure; every other unacknowledged leg is enqueued now.
+// replayLeg arranges replay for one leg.
+// A leg whose strategy reports its result later (see [DeferredWriteResult])
+// is replayed only if that result is a failure; every other unacknowledged
+// leg is enqueued now.
+//
+// Registering the background leg with c.deferred always succeeds here:
+// executeDualWrite is the only caller and it holds its own registration for
+// the whole call, so the counter is never zero while this runs and
+// deferredLegs.add refuses a holder only once the count has reached zero
+// under Close.
 func (c *CQLClient) replayLeg(
 	ctx context.Context,
 	wc writeContext,
@@ -455,11 +462,7 @@ func (c *CQLClient) replayLeg(
 	// but not its deadline, as an immediate enqueue does.
 	payload := c.replayPayload(wc, cluster)
 	bg := context.WithoutCancel(ctx)
-	if !c.deferred.add() {
-		// Close has begun and will not wait for this leg, so enqueue now:
-		// a failure reported after the worker stopped would otherwise be lost.
-		return c.enqueueReplayPayload(bg, payload, err, kind)
-	}
+	c.deferred.add()
 	// A leg that has already completed runs the callback inline, on this
 	// goroutine, before OnComplete returns; its admission result is then a
 	// synchronous outcome the caller must see.
