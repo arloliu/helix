@@ -113,11 +113,38 @@ func TestNATSReplayer_PendingByClusterCountsInFlightAndDelayed(t *testing.T) {
 	}
 	<-entered
 	assert.Equal(t, 1, pending(), "in flight, not yet acknowledged")
-	release <- fmt.Errorf("%w: pool empty", types.ErrClusterUnreachable)
-	time.Sleep(50 * time.Millisecond) // inside the delayed NAK window
-	assert.Equal(t, 1, pending(), "waiting for redelivery")
 
-	<-entered
+	nakedAt := time.Now()
+	release <- fmt.Errorf("%w: pool empty", types.ErrClusterUnreachable)
+
+	// The failed attempt is NAK'd with the retry delay, so the redelivery is
+	// the anchor for the whole delayed window. Its arrival no sooner than that
+	// delay is what tells a delayed NAK from a plain one; the pending count
+	// cannot, because it reads 1 for an unacknowledged message either way.
+	redelivered := make(chan struct{})
+	go func() {
+		<-entered
+		close(redelivered)
+	}()
+
+	var samples int
+	deadline := time.After(30 * time.Second)
+	for waiting := true; waiting; {
+		select {
+		case <-redelivered:
+			waiting = false
+		case <-deadline:
+			require.FailNow(t, "the NAK'd message was never redelivered")
+		case <-time.After(20 * time.Millisecond):
+			assert.Equal(t, 1, pending(), "waiting for redelivery")
+			samples++
+		}
+	}
+	assert.Positive(t, samples, "the delayed NAK must hold the message across at least one sample")
+	assert.GreaterOrEqual(t, time.Since(nakedAt), 200*time.Millisecond,
+		"redelivery must wait out the NAK's retry delay")
+	assert.Equal(t, 1, pending(), "redelivered, still not acknowledged")
+
 	release <- nil
 	require.Eventually(t, func() bool { return pending() == 0 }, 5*time.Second, 20*time.Millisecond,
 		"acknowledged")
