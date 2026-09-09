@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/types"
@@ -336,6 +337,11 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 	}
 	batch = batch.WithTimestamp(ts)
 
+	// One read_total for the cluster attempt, as attemptRead counts one for
+	// a Scan; Close observes the duration this starts.
+	b.client.config.Metrics.IncReadTotal(rt.cluster)
+	startedAt := time.Now()
+
 	return &cqlIter{
 		iter:           batch.IterContext(ctx),
 		client:         b.client,
@@ -343,6 +349,7 @@ func (b *cqlBatch) IterContext(ctx context.Context) Iter {
 		holder:         holder,
 		ctx:            ctx,
 		overrideActive: rt.snap.active,
+		startedAt:      startedAt,
 	}
 }
 
@@ -376,17 +383,24 @@ func (b *cqlBatch) ExecCASContext(ctx context.Context, dest ...any) (applied boo
 	}
 	batch = batch.WithTimestamp(ts)
 
+	startedAt := time.Now()
 	applied, cqlItr, err := batch.ExecCASContext(ctx, dest...)
 	if cqlItr == nil {
 		return applied, nil, err
 	}
 
+	// A CAS that hands back an iterator made a read attempt on this cluster:
+	// the iterator's Close reports through the read path, so it counts one
+	// read_total and the duration Close observes starts before the CAS ran.
+	b.client.config.Metrics.IncReadTotal(selectedCluster)
+
 	return applied, &cqlIter{
-		iter:    cqlItr,
-		client:  b.client,
-		cluster: selectedCluster,
-		holder:  holder,
-		ctx:     ctx,
+		iter:      cqlItr,
+		client:    b.client,
+		cluster:   selectedCluster,
+		holder:    holder,
+		ctx:       ctx,
+		startedAt: startedAt,
 	}, err
 }
 
@@ -420,16 +434,23 @@ func (b *cqlBatch) MapExecCASContext(ctx context.Context, dest map[string]any) (
 	}
 	batch = batch.WithTimestamp(ts)
 
+	startedAt := time.Now()
 	applied, cqlItr, err := batch.MapExecCASContext(ctx, dest)
 	if cqlItr == nil {
 		return applied, nil, err
 	}
 
+	// A CAS that hands back an iterator made a read attempt on this cluster:
+	// the iterator's Close reports through the read path, so it counts one
+	// read_total and the duration Close observes starts before the CAS ran.
+	b.client.config.Metrics.IncReadTotal(selectedCluster)
+
 	return applied, &cqlIter{
-		iter:    cqlItr,
-		client:  b.client,
-		cluster: selectedCluster,
-		holder:  holder,
-		ctx:     ctx,
+		iter:      cqlItr,
+		client:    b.client,
+		cluster:   selectedCluster,
+		holder:    holder,
+		ctx:       ctx,
+		startedAt: startedAt,
 	}, err
 }

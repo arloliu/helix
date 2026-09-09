@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
 	"github.com/arloliu/helix/types"
@@ -325,6 +326,11 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 	query := holder.s.Query(q.statement, q.values...)
 	query = q.applyConfig(query)
 
+	// One read_total for the cluster attempt, as attemptRead counts one for
+	// a Scan; Close observes the duration this starts.
+	q.client.config.Metrics.IncReadTotal(rt.cluster)
+	startedAt := time.Now()
+
 	return &cqlIter{
 		iter:           query.IterContext(ctx),
 		client:         q.client,
@@ -332,6 +338,7 @@ func (q *cqlQuery) IterContext(ctx context.Context) Iter {
 		holder:         holder,
 		ctx:            ctx,
 		overrideActive: rt.snap.active,
+		startedAt:      startedAt,
 	}
 }
 

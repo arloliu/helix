@@ -143,8 +143,11 @@ func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kin
 // cluster error is a failure for both, and data sentinels or a
 // caller-context error are neither.
 //
-// Order: the holder's stats for every outcome except a caller-context
-// error, then the policy, then the strategy.
+// Order: the read error metric and the holder's stats for every outcome
+// except a caller-context error, then the policy, then the strategy.
+// The metric closes the read's own accounting — its cluster attempt was
+// counted where the iterator was opened — so an iterator that fails is as
+// visible on read_errors_total as a failing Scan.
 // The policy always receives RecordSuccess here, never RecordLatency,
 // because an iterator has no single latency sample.
 //
@@ -163,6 +166,9 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 	case readOK:
 		holder.stats.succeeded(h.now())
 	case readClusterErr:
+		// Counted here, beside the stats, so a retired holder's failure
+		// still reaches the metrics: they count what the client did.
+		h.metrics.IncReadError(cluster)
 		h.failedNow(holder, err)
 	case readCtxErr:
 		h.readCallerExpired(cluster)
