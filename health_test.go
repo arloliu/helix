@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/internal/metrics"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/require"
 )
@@ -388,6 +390,51 @@ func TestHub_RetiredSessionOutcomeIsWithheld(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, charged, "exactly the installed session's failure is recorded")
+}
+
+// readErrorCounter counts the read errors the hub reports, per cluster.
+type readErrorCounter struct {
+	metrics.NopMetrics
+	a, b atomic.Int64
+}
+
+func (m *readErrorCounter) IncReadError(cluster types.ClusterID) {
+	if cluster == ClusterA {
+		m.a.Add(1)
+	} else {
+		m.b.Add(1)
+	}
+}
+
+// An iterator holds the session it was opened on until the caller closes
+// it, so a refresh in between leaves its close reporting against a holder
+// that is no longer installed. The close still counts the read error and
+// still advances that holder's stats — the metrics count what the client
+// did — but the failover policy and the read strategy hear nothing, so the
+// old session's error cannot open the breaker on the cluster that has just
+// been given a healthy one.
+func TestHub_RetiredHolderIterCloseIsWithheld(t *testing.T) {
+	errCount := &readErrorCounter{}
+	refresher := func(context.Context, ClusterID, error) (cql.Session, error) { return newReadProbeSession(), nil }
+	// No WithAutoRefresh: RefreshSession closes the old session at once.
+	f := newHubFixture(t, false, WithSessionRefresher(refresher), WithMetrics(errCount))
+	f.sa.setIterCloseErr(errUnreachableForTest)
+
+	iter := f.client.Query("SELECT v FROM t").IterContext(t.Context())
+	opened := f.client.holderFor(ClusterA) // the holder the iterator reads from
+	f.log.calls = nil
+
+	require.NoError(t, f.client.RefreshSession(t.Context(), ClusterA))
+	require.ErrorIs(t, iter.Close(), errUnreachableForTest)
+
+	require.Equal(t, int32(1), opened.stats.consecutiveFailures.Load(),
+		"the failure lands on the holder the iterator read from")
+	require.Equal(t, int64(1), errCount.a.Load(),
+		"a retired holder's cluster error is still a read error: the metrics count what the client did")
+	require.Empty(t, f.log.snapshot(),
+		"neither the failover policy nor the read strategy hears about a session that is no longer installed")
+	require.Zero(t, f.client.statsForCluster(ClusterA).consecutiveFailures.Load(),
+		"the installed holder keeps its own clean record")
 }
 
 var _ cql.Session = (*blockingSession)(nil)
