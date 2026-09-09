@@ -1118,6 +1118,23 @@ func (a *AdaptiveDualWrite) logWriteDegraded(cluster types.ClusterID, reason str
 	)
 }
 
+// logWriteLatched logs a [AdaptiveDualWrite.ForceDegrade] that set the operator latch on a cluster that was already degraded.
+// It reports through the degrade line, at the same level, because that is the line an operator watches for a cluster leaving synchronous writes.
+// The alreadyDegraded field is what separates it from a transition: no state changed except that the cluster can no longer recover on its own.
+// See [AdaptiveDualWrite.logWriteDegraded] for the calling requirements.
+func (a *AdaptiveDualWrite) logWriteLatched(cluster types.ClusterID, strikes int) {
+	if a.logger == nil {
+		return
+	}
+
+	a.logger.Warn("cluster degraded to fire-and-forget writes",
+		"cluster", a.clusterName(cluster),
+		"reason", "manual",
+		"slowStrikes", strikes,
+		"alreadyDegraded", true,
+	)
+}
+
 // logWriteRecovered logs a degraded-to-healthy transition. See
 // [AdaptiveDualWrite.logWriteDegraded] for the calling requirements.
 func (a *AdaptiveDualWrite) logWriteRecovered(cluster types.ClusterID, reason string) {
@@ -1375,8 +1392,14 @@ func (a *AdaptiveDualWrite) Reset() {
 // Emits [types.EventWriteDegraded] with Reason "manual" and Count set to the
 // cluster's current slow-strike count when this call performs the transition.
 // A manual degrade does not clear slowStrikes, so Count reports whatever had
-// accumulated before the call rather than always being zero. Calling it on an
-// already-degraded cluster still clears fastStrikes but emits nothing.
+// accumulated before the call rather than always being zero.
+//
+// Calling it on a cluster that is already degraded sets the latch without a transition,
+// so it emits no event and moves no counter — the cluster was already counted as degraded.
+// It does clear fastStrikes,
+// and it logs the degrade line with alreadyDegraded=true,
+// because the latch changes what the cluster does: automatic recovery is now off.
+// Calling it on a cluster that is already latched changes nothing and reports nothing.
 //
 // Parameters:
 //   - cluster: The cluster to degrade
@@ -1388,6 +1411,7 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 
 	state.mu.Lock()
 	wasDegraded := state.isDegraded.Load()
+	wasLatched := state.latched.Load()
 	state.fastStrikes = 0
 	state.isDegraded.Store(true)
 	state.latched.Store(true)
@@ -1407,13 +1431,21 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 	}
 	state.mu.Unlock()
 
-	if !wasDegraded {
+	switch {
+	case !wasDegraded:
 		// A manual degrade clears fastStrikes but leaves slowStrikes
 		// intact, so the log line reports the live counter rather than
 		// asserting it is zero.
 		a.recordTransitionMetrics(state, cluster, true, seq)
 		a.logWriteDegraded(cluster, "manual", strikes)
 		a.events.drain()
+	case !wasLatched:
+		// No transition to report: the cluster was already degraded,
+		// so the event and both transition metrics would double-count a degrade that already happened.
+		// The latch itself is still news — it is what stops a recovery probe or a fast background write from restoring the cluster.
+		// So it goes to the log an operator reads for the degrade,
+		// with the field that separates it from the transition line.
+		a.logWriteLatched(cluster, strikes)
 	}
 }
 
