@@ -553,6 +553,13 @@ func (n *NATSReplayer) Enqueue(ctx context.Context, payload types.ReplayPayload)
 // subsequent fetches. The returned messages must be acknowledged after
 // successful processing using the Ack method on each message.
 //
+// Dequeue is for driving replay processing directly, without a [Worker].
+// It creates a consumer named "helix-worker-<cluster>", which collides with
+// the "helix-worker-{high,low}-<cluster>" consumers a running [Worker]
+// creates via DequeueByPriority on the same stream: JetStream rejects the
+// second consumer on a WorkQueuePolicy stream, so do not call Dequeue
+// alongside a [Worker] processing the same cluster.
+//
 // Parameters:
 //   - ctx: Context for cancellation
 //   - cluster: Target cluster to get messages for (ClusterA or ClusterB)
@@ -1224,6 +1231,12 @@ func (m *ReplayMessage) Term() error {
 }
 
 // Pending returns the number of pending messages in the stream.
+//
+// Pending is for driving replay processing directly, without a [Worker].
+// Pair it with [NATSReplayer.Dequeue] to size a manual batch.
+// It reports a whole-stream count and creates no consumer of its own, so it
+// has no consumer-name collision to worry about — see [NATSReplayer.Dequeue]
+// for the collision that method has with a running [Worker].
 //
 // Parameters:
 //   - ctx: Context for cancellation
