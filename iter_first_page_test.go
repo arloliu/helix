@@ -58,48 +58,55 @@ func TestFirstPageCtx_DelegatesToTheCaller(t *testing.T) {
 	require.False(t, ok, "a caller without a deadline is reported as having none")
 }
 
-// lockProbeParent reports whether the leg context still held its lock
-// when it asked the caller for an error.
-type lockProbeParent struct {
-	ctx    context.Context
-	fp     *firstPageCtx
-	probed bool
-	held   bool
-}
-
-func (p *lockProbeParent) Deadline() (time.Time, bool) { return p.ctx.Deadline() }
-func (p *lockProbeParent) Done() <-chan struct{}       { return p.ctx.Done() }
-func (p *lockProbeParent) Value(key any) any           { return p.ctx.Value(key) }
-
-func (p *lockProbeParent) Err() error {
-	if p.fp != nil && !p.probed {
-		p.probed = true
-		if p.fp.mu.TryLock() {
-			p.fp.mu.Unlock()
-		} else {
-			p.held = true
-		}
-	}
-
-	return p.ctx.Err()
-}
-
-func TestFirstPageCtx_ErrReadsTheCallerUnderOneLock(t *testing.T) {
-	inner, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	parent := &lockProbeParent{ctx: inner}
+func TestFirstPageCtx_ErrStaysSilentUntilDoneCloses(t *testing.T) {
+	// manualParent reports the caller's error without closing its own Done
+	// and without firing the registration, so the test occupies the window
+	// between the caller's cancellation and callerEnded running.
+	parent := newManualParent()
 	fp := newFirstPageCtx(parent, legTimeoutForTest)
-	// Cleanups run last-in-first-out, so finish detaches the registration
-	// before the parent is cancelled and callerEnded never runs: the probe
-	// below is the only concurrent-free reader.
 	t.Cleanup(fp.finish)
-	parent.fp = fp
 
-	require.NoError(t, fp.Err(), "an armed context follows a live caller")
-	require.True(t, parent.probed, "Err consulted the caller")
-	require.True(t, parent.held,
-		"the latched error and the caller's must be read under one critical section: "+
-			"a latch landing between them would let one reader report the caller's error and the next the leg's")
+	parent.end()
+	requireOpen(t, fp, "nothing has latched yet")
+	require.NoError(t, fp.Err(),
+		"context.Context requires Err to stay nil while Done is open: a driver that polls Err "+
+			"would otherwise see the caller's cancellation before this context ends")
+
+	fp.callerEnded()
+	requireClosed(t, fp, "the caller's end latches through")
+	require.ErrorIs(t, fp.Err(), context.Canceled, "and Err reports it once Done is closed")
+}
+
+func TestFirstPageCtx_ErrIsNeverNonNilBeforeDone(t *testing.T) {
+	// A reader spinning on Err while a latch lands must never catch the
+	// error before the channel: latch closes Done under the same lock Err
+	// takes, so there is no window between the two.
+	for range 200 {
+		fp := newFirstPageCtx(t.Context(), legTimeoutForTest)
+		early := make(chan struct{})
+		observed := make(chan bool, 1)
+		go func() {
+			seen := false
+			close(early)
+			for {
+				err := fp.Err()
+				select {
+				case <-fp.Done():
+					observed <- seen
+
+					return
+				default:
+				}
+				if err != nil {
+					seen = true
+				}
+			}
+		}()
+		<-early
+		fp.legExpired()
+		require.False(t, <-observed, "Err reported the latched error while Done was still open")
+		fp.finish()
+	}
 }
 
 func TestFirstPageCtx_LegTimerBeatsDisarm(t *testing.T) {
@@ -155,7 +162,6 @@ func TestFirstPageCtx_LegTimerNeverOverridesTheCallersError(t *testing.T) {
 	// The schedule the drivers can produce: the caller ends, the leg timer
 	// fires before the parent registration runs.
 	cancel()
-	require.ErrorIs(t, fp.Err(), context.Canceled, "an unlatched context reports the caller's error")
 
 	fp.legExpired()
 	require.ErrorIs(t, fp.Err(), context.Canceled, "a latch taken under a dead caller copies its error")

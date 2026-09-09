@@ -24,7 +24,7 @@ import (
 // either sees exactly what it sees today; Done closes when the leg timer
 // expires while armed, when the caller's context ends, or when the
 // iterator is finished with; and Err reports the one latched terminal
-// error, or the caller's while none is latched.
+// error, which is the caller's own whenever the caller ended first.
 type firstPageCtx struct {
 	parent     context.Context
 	done       chan struct{}
@@ -78,24 +78,21 @@ func (fp *firstPageCtx) Done() <-chan struct{} {
 	return fp.done
 }
 
-// Err returns the latched terminal error when there is one, and otherwise
-// the caller's own error, so a driver waking on Done sees a context error
-// with the provenance Helix intends.
+// Err returns the one latched terminal error, and nil until there is one,
+// so a driver waking on Done sees a context error with the provenance
+// Helix intends.
 //
-// Both reads happen under one critical section.
-// Releasing the lock between them would let a latch land in the gap: a
-// reader that found no error yet would go on to report the caller's error
-// while the next reader reports the leg's, and [context.Context] requires
-// Err to keep the one error it first returned.
+// It deliberately does not fall through to the caller's own error: latch
+// is the only writer of both finalErr and Done and it holds mu across the
+// two, so Err reports exactly the state Done reflects. Reading the
+// caller's error here instead would report a cancellation in the interval
+// before callerEnded latches it, and [context.Context] requires Err to
+// stay nil for as long as Done is open.
 func (fp *firstPageCtx) Err() error {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
 
-	if fp.finalErr != nil {
-		return fp.finalErr
-	}
-
-	return fp.parent.Err()
+	return fp.finalErr
 }
 
 // Value delegates to the caller's context.
@@ -108,6 +105,8 @@ func (fp *firstPageCtx) Value(key any) any {
 // It is the only writer of finalErr, expired and done, and it decides
 // under mu, so the single caller that finds no error latched yet is the
 // one that closes the channel.
+// The channel is closed under mu as well, so Err — which takes the same
+// lock — can never report the error before Done is closed.
 // A caller whose own context already ended keeps that error rather than
 // being handed a leg timeout, which is what stops a cancellation from
 // being reported as a cluster failure.
@@ -118,17 +117,22 @@ func (fp *firstPageCtx) Value(key any) any {
 //     the context is disarmed
 func (fp *firstPageCtx) latch(err error, fromTimer bool) {
 	fp.mu.Lock()
+	defer fp.mu.Unlock()
+
 	if fp.finalErr != nil || (fromTimer && !fp.armed) {
-		fp.mu.Unlock()
 		return
 	}
 	if perr := fp.parent.Err(); perr != nil { // the caller got there first
 		err, fromTimer = perr, false
 	}
+	if err == nil {
+		// A parent that ends without reporting an error would otherwise
+		// close Done with a nil Err, which is the disagreement this type
+		// exists to avoid.
+		err, fromTimer = context.Canceled, false
+	}
 	fp.finalErr, fp.expired, fp.armed = err, fromTimer, false
 	fp.timer.Stop() // a terminal context must not be held alive by a pending callback
-	fp.mu.Unlock()
-
 	close(fp.done)
 }
 
