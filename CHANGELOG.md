@@ -147,6 +147,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The latch now writes the degrade line at the same level with `alreadyDegraded=true`.
   The transition event and the transition metrics are unchanged and still fire once per real transition, since the cluster was already counted as degraded.
   A second `ForceDegrade` on a cluster that is already latched still changes nothing and still reports nothing.
+- The context that bounds an iterator's first page under `WithClusterReadTimeout` no longer reports an error before it ends.
+  `Err` fell through to the caller's own context whenever nothing had been latched yet,
+  so between the caller cancelling and that cancellation reaching this context, `Err` returned an error while `Done` was still open —
+  a disagreement `context.Context` forbids and a driver that polls `Err` instead of selecting on `Done` would act on.
+  The same gap existed between the latch releasing its lock and closing the channel.
+  `Err` now reports only the latched error and the latch closes `Done` under the lock `Err` takes,
+  so the two always agree; the error a driver sees once the context ends is unchanged.
 
 ### Changed
 
