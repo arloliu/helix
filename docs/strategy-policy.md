@@ -810,6 +810,11 @@ An abandoned iterator does neither, the same way it already leaks the driver's o
 One residual is worth knowing:
 a token-aware first page can wait on another caller's in-flight routing-metadata load before its own context is consulted, because neither driver makes that cache cancellable.
 
+This whole mechanism applies to `Query.IterContext` only.
+`Batch.IterContext` never routes through it: its first page always runs on the caller's own context,
+even when `WithClusterReadTimeout` is set, so a frozen selected cluster can strand a batch iterator
+for the caller's whole context budget with no bounded leg and no failover attempt.
+
 ### Operator Workflow
 
 ```
