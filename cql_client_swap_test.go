@@ -87,6 +87,46 @@ func TestSwapSession_CloseAfterSwapClosesNewSession(t *testing.T) {
 	assert.True(t, mockB.closed.Load(), "B closed as usual")
 }
 
+func TestSwapSession_ClientClosedDuringTheSwapDisposesOfTheNewSession(t *testing.T) {
+	mockA, mockB := newAlwaysOKMock(), newAlwaysOKMock()
+	client := newDualClusterTestClient(t, mockA, mockB)
+
+	// SwapSession asks the client's NowProvider for the stamp of the
+	// holder it is about to install, which happens after the closed check
+	// and before the swap. Parking the provider there puts the swap in
+	// exactly the window a concurrent Close has to lose.
+	var armed atomic.Bool
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	helix.SetClientNowFuncForTest(client, func() int64 {
+		if armed.CompareAndSwap(true, false) {
+			close(entered)
+			<-release
+		}
+
+		return 0
+	})
+
+	newMockA := newAlwaysOKMock()
+	swapped := make(chan error, 1)
+	armed.Store(true)
+	go func() {
+		_, err := client.SwapSession(helix.ClusterA, newMockA)
+		swapped <- err
+	}()
+
+	<-entered
+	client.Close()
+	close(release)
+
+	assert.ErrorIs(t, <-swapped, types.ErrSessionClosed,
+		"a swap the client outlived reports the client as closed, like one that starts closed")
+	assert.True(t, newMockA.closed.Load(),
+		"a session installed after Close finished must be closed by the swap that installed it")
+	assert.True(t, mockA.closed.Load(), "Close still closed the session it found installed")
+	assert.True(t, mockB.closed.Load(), "B closed as usual")
+}
+
 func TestSwapSession_RejectsNilSession(t *testing.T) {
 	client := newDualClusterTestClient(t, newAlwaysOKMock(), newAlwaysOKMock())
 	_, err := client.SwapSession(helix.ClusterA, nil)
