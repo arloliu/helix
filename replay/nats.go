@@ -348,8 +348,11 @@ func WithAckWait(d time.Duration) NATSReplayerOption {
 // under [RetryBounded].
 //
 // After this many failed delivery attempts (Nak's), NATS stops redelivering
-// the message and the OnDrop callback in WorkerConfig runs. The option has
-// no effect under the default [RetryWhileRetained].
+// the message and the OnDrop callback in WorkerConfig runs.
+// The option has no effect under the default [RetryWhileRetained]: a worker
+// running that policy overwrites the consumer's MaxDeliver with -1
+// (unlimited), so the value configured here is validated (n must be > 0
+// regardless of the active retry policy) but never reaches the consumer.
 //
 // Parameters:
 //   - n: Maximum delivery attempts (default: 5)
