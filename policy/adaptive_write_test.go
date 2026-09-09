@@ -40,6 +40,41 @@ func BenchmarkAdaptiveDualWrite_ExecuteStrict_BothHealthy(b *testing.B) {
 	}
 }
 
+// deferredCompleter is the shape a fire-and-forget leg's result reports completion through.
+// Matching the shape rather than the concrete type keeps these tests working
+// if the strategy renames its internal result type.
+type deferredCompleter interface {
+	OnComplete(fn func(err error))
+}
+
+// awaitWriteLeg waits for the fire-and-forget leg behind err and reports the leg's final error.
+// The completion callback runs after the strategy has observed the leg's outcome,
+// so every latency sample, strike and recovery credit the leg contributes is visible once this returns
+// — which is what a sleep after Execute was guessing at.
+//
+// A result that carries no leg (a synchronous nil, or a dropped leg) has
+// nothing to wait for and reports ok == false.
+func awaitWriteLeg(t *testing.T, err error) (ok bool, legErr error) {
+	t.Helper()
+
+	var deferred deferredCompleter
+	if !errors.As(err, &deferred) {
+		return false, nil
+	}
+
+	done := make(chan error, 1)
+	deferred.OnComplete(func(e error) { done <- e })
+
+	select {
+	case e := <-done:
+		return true, e
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "fire-and-forget leg did not complete")
+
+		return false, nil
+	}
+}
+
 // degradeByStrikes degrades cluster through the strike path, so the cluster
 // can still recover on fast writes: ForceDegrade would latch it instead.
 func degradeByStrikes(a *AdaptiveDualWrite, cluster types.ClusterID) {
@@ -443,7 +478,8 @@ func TestAdaptiveDualWrite_FireAndForget(t *testing.T) {
 	assert.Equal(t, int32(1), callsB.Load())
 
 	// Wait for fire-and-forget to complete
-	time.Sleep(50 * time.Millisecond)
+	ok, _ := awaitWriteLeg(t, errA)
+	require.True(t, ok, "a degraded cluster's write must be handed to a fire-and-forget leg")
 	assert.True(t, fireForgetCompleted.Load())
 	assert.Equal(t, int32(1), callsA.Load())
 }
@@ -892,8 +928,11 @@ func TestAdaptiveDualWrite_AutomaticRecoveryViaDegradedWrites(t *testing.T) {
 
 		assert.NoError(t, errB)
 
-		// Give fire-and-forget goroutines time to complete
-		time.Sleep(20 * time.Millisecond)
+		// Wait for the fire-and-forget leg to report: its recovery credit is
+		// only visible to the next round once the callback has run.
+		if ok, legErr := awaitWriteLeg(t, errA); ok {
+			require.NoError(t, legErr)
+		}
 	}
 
 	// Step 3: Verify cluster A has recovered
@@ -918,19 +957,18 @@ func TestAdaptiveDualWrite_FireForgetLimit(t *testing.T) {
 	a.ForceDegrade(types.ClusterA)
 	require.True(t, a.IsDegraded(types.ClusterA))
 
-	var asyncCount, droppedCount atomic.Int32
-	var writesStarted sync.WaitGroup
-	writesStarted.Add(3) // We'll try 3 concurrent writes
-
 	// Block all writes so they hold the semaphore
 	blockCh := make(chan struct{})
 
 	// Execute 3 concurrent writes - only 2 should be accepted (limit=2)
+	results := make(chan error, 3)
+	var attempts sync.WaitGroup
+	attempts.Add(3)
 	for range 3 {
 		go func() {
+			defer attempts.Done()
 			errA, _ := a.Execute(ctx,
 				func(ctx context.Context) error {
-					writesStarted.Done()
 					<-blockCh // Block until released
 					return nil
 				},
@@ -938,28 +976,41 @@ func TestAdaptiveDualWrite_FireForgetLimit(t *testing.T) {
 					return nil
 				},
 			)
-
-			if errors.Is(errA, types.ErrWriteAsync) {
-				asyncCount.Add(1)
-			} else if errors.Is(errA, types.ErrWriteDropped) {
-				droppedCount.Add(1)
-			}
+			results <- errA
 		}()
 	}
 
-	// Wait for all writes to start (or be dropped)
-	// Give time for goroutines to attempt semaphore acquisition
-	time.Sleep(50 * time.Millisecond)
+	// Execute decides accepted-or-dropped without waiting for the write itself,
+	// so all three calls returning is the event that fixes the outcome
+	// — no leg can release its semaphore slot before then, because every leg is parked on blockCh.
+	attempts.Wait()
+	close(results)
 
 	// Release blocked writes
 	close(blockCh)
 
-	// Wait for completion
-	time.Sleep(100 * time.Millisecond)
+	var asyncCount, droppedCount int
+	var legs []error
+	for errA := range results {
+		switch {
+		case errors.Is(errA, types.ErrWriteAsync):
+			asyncCount++
+			legs = append(legs, errA)
+		case errors.Is(errA, types.ErrWriteDropped):
+			droppedCount++
+		}
+	}
 
 	// Verify: 2 accepted (async), 1 dropped
-	assert.Equal(t, int32(2), asyncCount.Load(), "Should have 2 async writes (semaphore limit)")
-	assert.Equal(t, int32(1), droppedCount.Load(), "Should have 1 dropped write (limit exceeded)")
+	assert.Equal(t, 2, asyncCount, "Should have 2 async writes (semaphore limit)")
+	assert.Equal(t, 1, droppedCount, "Should have 1 dropped write (limit exceeded)")
+
+	// Drain the accepted legs so the test does not outlive them.
+	for _, leg := range legs {
+		ok, legErr := awaitWriteLeg(t, leg)
+		require.True(t, ok)
+		require.NoError(t, legErr)
+	}
 }
 
 func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
@@ -1005,7 +1056,9 @@ func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
 		require.True(t, errors.Is(errA, types.ErrWriteAsync) || errors.Is(errA, types.ErrWriteDropped))
 
 		// Wait for fire-and-forget to complete
-		time.Sleep(600 * time.Millisecond)
+		if ok, legErr := awaitWriteLeg(t, errA); ok {
+			require.NoError(t, legErr)
+		}
 	}
 
 	// Cluster A should still be degraded because delta is too large
@@ -1024,10 +1077,10 @@ func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
 				return nil
 			},
 		)
-		_ = errA
-
 		// Wait for fire-and-forget to complete
-		time.Sleep(100 * time.Millisecond)
+		if ok, legErr := awaitWriteLeg(t, errA); ok {
+			require.NoError(t, legErr)
+		}
 	}
 
 	// Cluster A should now have recovered
@@ -1065,7 +1118,7 @@ func TestAdaptiveDualWrite_RecoveryWhenBothDegraded(t *testing.T) {
 	// Since both are degraded, lastLatency will be 0 for both
 	// Recovery should use absoluteMax-only check
 	for range 4 {
-		_, _ = a.Execute(ctx,
+		errA, errB := a.Execute(ctx,
 			func(ctx context.Context) error {
 				time.Sleep(20 * time.Millisecond) // Fast (< 100ms absoluteMax)
 				return nil
@@ -1077,7 +1130,11 @@ func TestAdaptiveDualWrite_RecoveryWhenBothDegraded(t *testing.T) {
 		)
 
 		// Wait for fire-and-forget to complete
-		time.Sleep(50 * time.Millisecond)
+		for _, err := range []error{errA, errB} {
+			if ok, legErr := awaitWriteLeg(t, err); ok {
+				require.NoError(t, legErr)
+			}
+		}
 	}
 
 	// Both clusters should have recovered (using absoluteMax-only check)
@@ -1328,14 +1385,11 @@ func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
 		"precondition: stateA.lastLatency must be 0 before fire-and-forget")
 
 	ctx := t.Context()
-	var writeDone sync.WaitGroup
-	writeDone.Add(1)
 
 	errA, _ := a.Execute(ctx,
 		func(context.Context) error {
 			// Simulate a fast write (~1ms) — well within absoluteMax and delta.
 			time.Sleep(1 * time.Millisecond)
-			writeDone.Done()
 			return nil
 		},
 		func(context.Context) error { return nil },
@@ -1345,10 +1399,11 @@ func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
 	require.ErrorIs(t, errA, types.ErrWriteAsync,
 		"cluster A (degraded) must return ErrWriteAsync")
 
-	// Wait for the goroutine to complete before checking lastLatency.
-	writeDone.Wait()
-	// Give the goroutine a brief moment to store latency after writeDone.Done().
-	time.Sleep(5 * time.Millisecond)
+	// The leg stores its latency before it reports completion,
+	// so the callback is the point at which lastLatency is guaranteed to be readable.
+	ok, legErr := awaitWriteLeg(t, errA)
+	require.True(t, ok, "a degraded cluster's write must be handed to a fire-and-forget leg")
+	require.NoError(t, legErr)
 
 	latency := a.stateA.lastLatency.Load()
 	assert.Greater(t, latency, int64(0),
@@ -1485,8 +1540,20 @@ func TestAdaptiveDualWrite_ExecuteStrict_NoFireAndForget(t *testing.T) {
 	require.ErrorIs(t, errA, types.ErrClusterDegraded)
 	require.NoError(t, errB)
 
-	// Wait longer than the fire-and-forget timeout to confirm no goroutine ran
-	time.Sleep(150 * time.Millisecond)
+	// Anchor the negative claim to a leg that does run.
+	// Execute hands the same degraded cluster to a fire-and-forget leg,
+	// and a leg ExecuteStrict had spawned would have been started before this one,
+	// so by the time this one reports, the strict write would already have been counted.
+	var anchor int32
+	anchorErr, _ := a.Execute(ctx,
+		func(_ context.Context) error { atomic.AddInt32(&anchor, 1); return nil },
+		func(_ context.Context) error { return nil },
+	)
+	ok, legErr := awaitWriteLeg(t, anchorErr)
+	require.True(t, ok, "Execute must hand the degraded cluster to a fire-and-forget leg")
+	require.NoError(t, legErr)
+	require.Equal(t, int32(1), atomic.LoadInt32(&anchor), "the anchor leg must have run")
+
 	assert.Equal(t, int32(0), atomic.LoadInt32(&calledA), "write must not be called via fire-and-forget")
 }
 
