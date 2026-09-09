@@ -190,6 +190,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two related changes are inert here: an idempotent query that exhausted its hosts now returns the last attempt's real iterator, so `Iter.Host()` is non-nil there, and Helix never reads it;
   and speculative execution — never configured by Helix — now waits for its sibling executions before settling on an error.
 
+- `types.ProbeAbandoned` is now the zero value of `types.ProbeOutcome`, ahead of `types.ProbeSucceeded` and `types.ProbeFailed`.
+  The most permissive outcome used to be the one a caller gets for free: a `FailoverProbeReporter` consumer that left the outcome unset closed an open circuit breaker on a probe that had never succeeded.
+  Abandonment only releases the reservation, so an unset outcome now changes nothing about the breaker.
+  All three names are unchanged, and code that reports an outcome by name is unaffected; only a caller that depends on the underlying integers, such as one persisting them, needs to look.
+
 ### Documentation
 
 - The README's CQL examples now use the v2 adapter, which is the recommended path for new code. The Quick Start carries the `go.mod` lines the v2 adapter needs, since Go ignores a `replace` directive that lives in a dependency and the example does not compile without them. The v1 adapter remains supported and needs no `replace` line; the guidance is simply that the fork's fault-tolerance work lands in the v2 driver while v1 follows upstream gocql's pace.
