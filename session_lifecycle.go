@@ -289,6 +289,14 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // Bound that batch's wall time via the worker's own timeouts if you need
 // a hard upper bound on Close latency.
 //
+// Close also cancels the recovery probe loops and waits for both to return.
+// A loop in the middle of a probe call is not interrupted by that
+// cancellation on its own: [RecoveryProbe.Probe] is invoked with a context
+// derived from it, but the probe itself must honor cancellation for the
+// call to return promptly.
+// A custom [RecoveryProbe.Probe] that ignores its context blocks Close for
+// as long as that call takes.
+//
 // Close also drains the mirror engine synchronously, which on a full
 // queue can take minutes. mirror.WithDrainTimeout bounds only how long
 // queued captures keep starting; Close still waits for the executions and
