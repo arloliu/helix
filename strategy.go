@@ -41,12 +41,14 @@ type AllowedClustersFunc func() []ClusterID
 type Replayer interface {
 	// Enqueue adds a failed write to the replay queue.
 	//
-	// The client calls Enqueue once per failed leg on a context that carries the caller's values but is never cancelled,
-	// and it does not bound how many calls are pending at once:
-	// a leg that a strategy completes in the background (see [DeferredWriteResult]) is admitted from that goroutine,
-	// which holds the payload until Enqueue returns, and nothing limits their number.
-	// Enqueue must therefore return within a bounded time — by rejecting when the queue is full or by timing out —
-	// rather than block until space appears.
+	// The client calls Enqueue once per failed leg on a context that carries the caller's values but is never cancelled.
+	// Most admissions run on the caller's own write goroutine, so a slow Enqueue holds the caller;
+	// a leg that a strategy completes in the background (see [DeferredWriteResult]) is admitted from that goroutine instead,
+	// and with [policy.AdaptiveDualWrite] such a leg holds its fire-and-forget slot until the admission returns,
+	// so [policy.WithAdaptiveFireForgetLimit] bounds how many run at once.
+	// Enqueue must return within a bounded time — by rejecting when the queue is full or by timing out — rather than block until space appears:
+	// once every fire-and-forget slot is held by an admission that has not returned, the strategy accepts no further background write,
+	// so each new write is dropped and admitted by its own caller, and a replayer that never returns blocks every caller writing to the degraded cluster.
 	// The bundled replayers do: [replay.MemoryReplayer] returns [types.ErrReplayQueueFull] at once,
 	// and [replay.NATSReplayer] gives up after its publish timeout.
 	//
