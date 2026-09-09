@@ -60,6 +60,63 @@ func degradeClusterA(t *testing.T, adaptive *policy.AdaptiveDualWrite) {
 	require.False(t, adaptive.IsLatched(ClusterA))
 }
 
+// degradeClusterB is degradeClusterA for the other cluster, so a test can keep
+// one cluster healthy while the other's probe loop keeps ticking.
+func degradeClusterB(t *testing.T, adaptive *policy.AdaptiveDualWrite) {
+	t.Helper()
+	fail := func(context.Context) error { return errors.New("simulated cluster failure") }
+	ok := func(context.Context) error { return nil }
+	for range 10 {
+		if adaptive.IsDegraded(ClusterB) {
+			break
+		}
+		_, _ = adaptive.Execute(t.Context(), ok, fail)
+	}
+	require.True(t, adaptive.IsDegraded(ClusterB), "strikes must degrade the cluster")
+	require.False(t, adaptive.IsLatched(ClusterB))
+}
+
+// awaitProbeTicks starts a second client whose recovery probe does run and
+// blocks until it has fired ticks times.
+// It anchors a "no probe ran" claim to a positive event on the same path:
+// the anchor's loop starts no earlier than the client under test and ticks on
+// the same interval, so a loop that had started would have fired by then.
+// ticks stays under the strategy's recovery threshold, so the anchor cluster
+// is still degraded — and still probed — for every tick counted.
+func awaitProbeTicks(t *testing.T, interval time.Duration, ticks int) {
+	t.Helper()
+
+	adaptive := policy.NewAdaptiveDualWrite()
+	degradeClusterA(t, adaptive)
+
+	fired := make(chan struct{}, ticks)
+	anchor, err := NewCQLClient(newMockSession(), newMockSession(),
+		WithWriteStrategy(adaptive),
+		WithRecoveryProbe(RecoveryProbe{
+			Probe: func(context.Context, cql.Session) error {
+				select {
+				case fired <- struct{}{}:
+				default:
+				}
+
+				return nil
+			},
+			Interval: interval,
+			Timeout:  time.Second,
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { anchor.Close() })
+
+	for range ticks {
+		select {
+		case <-fired:
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "the anchor recovery probe did not tick")
+		}
+	}
+}
+
 // TestRecoveryProbe_StartsForAdaptiveDualWrite verifies that a recovery probe
 // goroutine starts automatically when WriteStrategy is AdaptiveDualWrite.
 func TestRecoveryProbe_StartsForAdaptiveDualWrite(t *testing.T) {
@@ -119,7 +176,7 @@ func TestRecoveryProbe_NoStartWithoutAdaptive(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
-	time.Sleep(50 * time.Millisecond)
+	awaitProbeTicks(t, customProbe.Interval, 3)
 	assert.False(t, probeFired.Load(), "probe must not fire for non-Adaptive strategy")
 }
 
@@ -148,7 +205,7 @@ func TestRecoveryProbe_DisabledOption(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
-	time.Sleep(50 * time.Millisecond)
+	awaitProbeTicks(t, customProbe.Interval, 3)
 	assert.False(t, probeFired.Load(), "probe must not fire when disabled")
 }
 
@@ -157,14 +214,14 @@ func TestRecoveryProbe_DisabledOption(t *testing.T) {
 func TestRecoveryProbe_SkipsHealthyCluster(t *testing.T) {
 	sa, sb := newMockSession(), newMockSession()
 	adaptive := policy.NewAdaptiveDualWrite()
-	// Neither cluster is degraded.
+	// Cluster A stays healthy.
+	// Cluster B is degraded so its own loop keeps probing, which is what the
+	// healthy cluster's silence is measured against.
+	degradeClusterB(t, adaptive)
 
-	probeFired := atomic.Bool{}
+	probes := &probeCounters{}
 	customProbe := RecoveryProbe{
-		Probe: func(_ context.Context, _ cql.Session) error {
-			probeFired.Store(true)
-			return nil
-		},
+		Probe:    func(_ context.Context, _ cql.Session) error { return nil },
 		Interval: 5 * time.Millisecond,
 		Timeout:  20 * time.Millisecond,
 	}
@@ -172,12 +229,17 @@ func TestRecoveryProbe_SkipsHealthyCluster(t *testing.T) {
 	client, err := NewCQLClient(sa, sb,
 		WithWriteStrategy(adaptive),
 		WithRecoveryProbe(customProbe),
+		WithMetrics(probes),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
-	time.Sleep(50 * time.Millisecond)
-	assert.False(t, probeFired.Load(), "probe must not execute against a healthy cluster")
+	// Both loops start together and tick on the same interval, so B's probes
+	// are the anchor: once three of them have run, A's loop has had three ticks
+	// of its own to misbehave in.
+	require.Eventually(t, func() bool { return probes.successB.Load() >= 3 },
+		5*time.Second, 2*time.Millisecond, "the degraded cluster must be probed")
+	assert.Zero(t, probes.successA.Load(), "probe must not execute against a healthy cluster")
 }
 
 // TestRecoveryProbe_AdvancesRecovery verifies that successful probes credit
@@ -294,8 +356,16 @@ func TestRecoveryProbe_CloseWaitsForGoroutines(t *testing.T) {
 	adaptive := policy.NewAdaptiveDualWrite()
 	degradeClusterA(t, adaptive)
 
+	probeFired := make(chan struct{}, 1)
 	customProbe := RecoveryProbe{
-		Probe:    func(_ context.Context, _ cql.Session) error { return nil },
+		Probe: func(_ context.Context, _ cql.Session) error {
+			select {
+			case probeFired <- struct{}{}:
+			default:
+			}
+
+			return nil
+		},
 		Interval: 10 * time.Millisecond,
 		Timeout:  50 * time.Millisecond,
 	}
@@ -306,8 +376,13 @@ func TestRecoveryProbe_CloseWaitsForGoroutines(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Give goroutines time to start ticking.
-	time.Sleep(30 * time.Millisecond)
+	// The first probe is proof the loops are up and ticking, which is all the
+	// sleep here was standing in for.
+	select {
+	case <-probeFired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery probe did not fire before Close")
+	}
 
 	done := make(chan struct{})
 	go func() { client.Close(); close(done) }()
