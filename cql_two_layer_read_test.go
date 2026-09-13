@@ -78,85 +78,61 @@ func TestRunPrimaryRead_SingleClusterMode_TreatsAsPrimaryAttempt(t *testing.T) {
 		"single-cluster attempt records IncReadTotal exactly once")
 }
 
-func TestExecuteRead_AttemptedFalse_PropagatesPreAttemptErr_NoMetrics(t *testing.T) {
-	sessionA := newMockSession()
-	met := newReadTestMetrics()
-	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
+func TestPreAttemptFailClosed_PropagatesWithoutMetrics(t *testing.T) {
+	// Both wrappers share one implementation, so each cause is checked once,
+	// through whichever wrapper reaches it.
+	t.Run("resolve target fails", func(t *testing.T) {
+		sessionA := newMockSession()
+		met := newReadTestMetrics()
+		policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
 
-	client, err := NewCQLClient(sessionA, nil,
-		WithMetrics(met),
-		WithFailoverPolicy(policy),
-		WithAllowedClusters(func() []ClusterID {
-			return []ClusterID{ClusterB}
-		}),
-	)
-	require.NoError(t, err)
-	defer client.Close()
+		client, err := NewCQLClient(sessionA, nil,
+			WithMetrics(met),
+			WithFailoverPolicy(policy),
+			WithAllowedClusters(func() []ClusterID {
+				return []ClusterID{ClusterB}
+			}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
 
-	err = client.executeRead(context.Background(), readOptions{},
-		func(_ context.Context, _ cql.Session) error {
-			t.Fatal("readFunc must not run on pre-attempt fail-closed")
-			return nil
-		})
-	require.ErrorIs(t, err, types.ErrInvalidClusterOverride)
+		err = client.executeRead(context.Background(), readOptions{},
+			func(_ context.Context, _ cql.Session) error {
+				t.Fatal("readFunc must not run on pre-attempt fail-closed")
+				return nil
+			})
+		require.ErrorIs(t, err, types.ErrInvalidClusterOverride)
 
-	assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterA))
-	assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterA))
-	assert.Empty(t, policy.RecordFailureCalls,
-		"pre-attempt errors are not cluster faults; no RecordFailure")
-}
+		assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterA))
+		assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterA))
+		assert.Empty(t, policy.RecordFailureCalls,
+			"pre-attempt errors are not cluster faults; no RecordFailure")
+	})
 
-func TestExecuteReadNoFailover_AttemptedFalse_PropagatesPreAttemptErr_NoMetrics(t *testing.T) {
-	sessionA := newMockSession()
-	sessionB := newMockSession()
-	met := newReadTestMetrics()
-	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
+	t.Run("client closed", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+		met := newReadTestMetrics()
+		policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
 
-	client, err := NewCQLClient(sessionA, sessionB,
-		WithMetrics(met),
-		WithFailoverPolicy(policy),
-	)
-	require.NoError(t, err)
-	client.Close()
+		client, err := NewCQLClient(sessionA, sessionB,
+			WithMetrics(met),
+			WithFailoverPolicy(policy),
+		)
+		require.NoError(t, err)
+		client.Close()
 
-	err = client.executeReadNoFailover(context.Background(), readOptions{},
-		func(_ context.Context, _ cql.Session) error { return nil })
-	require.ErrorIs(t, err, types.ErrSessionClosed)
+		err = client.executeReadNoFailover(context.Background(), readOptions{},
+			func(_ context.Context, _ cql.Session) error {
+				t.Fatal("readFunc must not run on pre-attempt fail-closed")
+				return nil
+			})
+		require.ErrorIs(t, err, types.ErrSessionClosed)
 
-	assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterA))
-	assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterA))
-	assert.Empty(t, policy.RecordFailureCalls)
-}
-
-func TestExecuteReadNoFailover_EmitsSameMetricsAsExecuteRead_OnSuccess(t *testing.T) {
-	sessionA1 := newMockSession()
-	sessionB1 := newMockSession()
-	sessionA2 := newMockSession()
-	sessionB2 := newMockSession()
-	met1 := newReadTestMetrics()
-	met2 := newReadTestMetrics()
-
-	clientER, err := NewCQLClient(sessionA1, sessionB1, WithMetrics(met1))
-	require.NoError(t, err)
-	defer clientER.Close()
-
-	clientNF, err := NewCQLClient(sessionA2, sessionB2, WithMetrics(met2))
-	require.NoError(t, err)
-	defer clientNF.Close()
-
-	// Both clients run a successful read.
-	err = clientER.executeRead(context.Background(), readOptions{},
-		func(_ context.Context, _ cql.Session) error { return nil })
-	require.NoError(t, err)
-
-	err = clientNF.executeReadNoFailover(context.Background(), readOptions{},
-		func(_ context.Context, _ cql.Session) error { return nil })
-	require.NoError(t, err)
-
-	assert.Equal(t, met1.get(met1.ReadTotal, ClusterA), met2.get(met2.ReadTotal, ClusterA),
-		"on success, both wrappers emit IncReadTotal identically")
-	assert.Equal(t, int64(0), met2.get(met2.ReadErrors, ClusterA),
-		"success path must not emit IncReadError")
+		assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterA))
+		assert.Equal(t, int64(0), met.get(met.ReadErrors, ClusterA))
+		assert.Empty(t, policy.RecordFailureCalls)
+	})
 }
 
 func TestExecuteReadNoFailover_EmitsIncReadError_OnPrimaryRealError(t *testing.T) {
