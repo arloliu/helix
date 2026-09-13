@@ -704,8 +704,13 @@ func (a *AdaptiveDualWrite) SetMetrics(m types.MetricsCollector) {
 }
 
 // LoggerConfigured reports whether the logger was explicitly set via
-// WithAdaptiveLogger. Mirrors MetricsConfigured so the helix client
-// can use the same auto-injection guard for both knobs.
+// WithAdaptiveLogger.
+//
+// It mirrors MetricsConfigured in shape only. helix.NewCQLClient asks
+// MetricsConfigured before injecting its own collector, but asks nothing
+// before injecting its logger: SetLogger applies the "explicit wins" rule
+// itself, so the guard lives there rather than in the caller. This is for
+// code wiring a strategy up on its own.
 func (a *AdaptiveDualWrite) LoggerConfigured() bool {
 	return a.loggerExplicit
 }

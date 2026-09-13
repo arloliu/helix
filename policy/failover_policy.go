@@ -297,9 +297,13 @@ func (c *CircuitBreaker) SetMetrics(m types.MetricsCollector) {
 }
 
 // LoggerConfigured reports whether the logger was explicitly set via
-// [WithCircuitBreakerLogger] / [WithLatencyLogger]. Mirrors
-// MetricsConfigured so the helix client can use the same auto-injection
-// guard for both knobs.
+// [WithCircuitBreakerLogger] / [WithLatencyLogger].
+//
+// It mirrors MetricsConfigured in shape only. helix.NewCQLClient asks
+// MetricsConfigured before injecting its own collector, but asks nothing
+// before injecting its logger: SetLogger applies the "explicit wins" rule
+// itself, so the guard lives there rather than in the caller. This is for
+// code wiring a breaker up on its own.
 func (c *CircuitBreaker) LoggerConfigured() bool {
 	return c.loggerExplicit
 }
