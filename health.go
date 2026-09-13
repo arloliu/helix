@@ -40,8 +40,9 @@ import (
 // Single-cluster exception: with no second cluster, a read success or
 // failure updates only the stats, while an iterator's clean close still
 // reaches the read strategy (as it always has) and nothing reaches the
-// failover policy. The three entry points keep these historical rules
-// rather than one uniform gate.
+// failover policy. These three read entry points keep the historical
+// rules rather than one uniform gate; writeLeg is stats-only in both
+// modes and so needs no exception.
 //
 // The entry points do not share one clock, and the differences are the
 // point rather than drift:
