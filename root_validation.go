@@ -55,8 +55,9 @@ func validateRootAckMode(config *ClientConfig) error {
 }
 
 // validateRootTimestampProvider samples the timestamp provider once and
-// rejects one that returns zero, which the drivers would replace with the
-// server's current time on every replay.
+// rejects one that returns zero, which the drivers would replace with
+// their own process clock as the frame is written -- giving every replay
+// the time it was replayed rather than the time it was first issued.
 func validateRootTimestampProvider(config *ClientConfig) error {
 	if config.TimestampProvider == nil || config.TimestampProvider() != 0 {
 		return nil

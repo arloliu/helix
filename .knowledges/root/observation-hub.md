@@ -32,11 +32,13 @@ Every read attempt (`runPrimaryRead`, the failover retry in `tryFallbackCluster`
 
 A failure reaches the stats only if the auto-refresh failure classifier (`AutoRefreshConfig.FailureClassifier`, default `DefaultAutoRefreshFailureClassifier`) counts it as a connectivity failure.
 A schema or query error proves the session reachable, so it leaves the stats untouched.
-Every entry point that records a failure passes it through, and it gates the stats alone: a read's `IncReadError` and `FailoverPolicy.RecordFailure` have already happened by then.
+Every entry point that records a failure passes it through, and it gates the stats alone.
+A failing read runs the metric first, then the classifier and stats, then `FailoverPolicy.RecordFailure` — so the policy hears about a failure the classifier kept out of the stats.
 
 The entry points deliberately do not share one clock, and the differences are load-bearing rather than drift.
 Reads, an iterator's close, and a probe sample the configured `NowProvider` as they report, because reporting is when the outcome is known.
-`writeLeg` is given the clock its caller captured when the leg returned, so a leg whose result is aggregated later keeps the time it actually ended.
+`writeLeg` is given the clock its caller captured once the strategy returned, shared by both legs, so the hub cannot re-sample it after the caller has aggregated the results.
+A leg that finished early is reported at that shared time rather than its own; what is fixed at leg return is the caller-cancelled provenance, not the timestamp.
 `deferredWriteLeg` takes the process clock, because it runs while `Close` waits on the leg's deferred registration and so must not call a user-supplied `NowProvider` that `Close` could be blocking.
 
 A holder is optional only for `writeLeg`, whose leg may never have reached a session.
