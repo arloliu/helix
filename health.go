@@ -51,8 +51,15 @@ import (
 //     returned, shared by both legs of the write, so the hub cannot
 //     re-sample it after the caller has already aggregated the results.
 //     A leg that finished early is reported at that shared time, not at
-//     its own; what is fixed at leg return is the caller-cancelled
-//     provenance, not the timestamp.
+//     its own; what is fixed at the return of a leg that ran is the
+//     caller-cancelled provenance, not the timestamp. A leg whose write
+//     panics never reaches that record, because the panic-to-error
+//     recovery sits in the caller (safeCQLWrite, or the strategy's own
+//     safeWrite) outside the closure; such a leg carries the zero
+//     provenance and is classified as the cluster's failure.
+//     The single-cluster fast paths reach writeLeg directly instead and
+//     sample NowProvider as they report, having no sibling leg to share
+//     a time with.
 //   - deferredWriteLeg takes the process clock, because it runs while Close
 //     waits on the leg's deferred registration and must not call into
 //     user-supplied code that Close could be blocking.
