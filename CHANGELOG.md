@@ -20,7 +20,8 @@ paths so the two can no longer drift apart.
 
   *Reported timings move by the cost of classifying both legs.* One timestamp serves both
   legs, so that cost now lands in `ObserveWriteDuration` for each of them — including a leg
-  that succeeded — and in the success and failure times the auto-refresh detector reads.
+  that succeeded — and in the stored success and failure timestamps, of which the
+  last-success one is an input to the auto-refresh detector.
   Classification is `errors.Is` over the leg's error, so this is normally bookkeeping-sized;
   an error whose `Is` or `Unwrap` chain is expensive makes it larger. Ordinary writes reach
   this, not just exotic ones.
@@ -83,7 +84,8 @@ paths so the two can no longer drift apart.
   them.** The list had drifted: `FailoverBelowThreshold`, `TryBeginFailoverProbe` and
   `CompleteFailoverProbe` forward like the rest and were never added to it. The doc now also
   states why such a wrapper cannot simply be deleted: the embedded `*CircuitBreaker` may be
-  nil, so method promotion would panic where the wrapper returns the zero value.
+  nil, so method promotion would panic where the wrapper returns a zero value or
+  safely does nothing.
 
 ## [1.10.0] — 2026-09-09
 

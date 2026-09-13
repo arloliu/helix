@@ -47,9 +47,12 @@ import (
 // point rather than drift:
 //   - Reads, an iterator's close, and a probe sample [ClientConfig.NowProvider]
 //     as they report, because reporting is the moment the outcome is known.
-//   - writeLeg is given the clock its caller captured when the leg returned,
-//     so a leg whose result is aggregated later is still attributed to when
-//     it actually ended.
+//   - writeLeg is given the clock its caller captured once the strategy
+//     returned, shared by both legs of the write, so the hub cannot
+//     re-sample it after the caller has already aggregated the results.
+//     A leg that finished early is reported at that shared time, not at
+//     its own; what is fixed at leg return is the caller-cancelled
+//     provenance, not the timestamp.
 //   - deferredWriteLeg takes the process clock, because it runs while Close
 //     waits on the leg's deferred registration and must not call into
 //     user-supplied code that Close could be blocking.
