@@ -2,6 +2,7 @@ package helix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -71,11 +72,10 @@ func TestRunPrimaryRead_SingleClusterMode_TreatsAsPrimaryAttempt(t *testing.T) {
 	res := client.runPrimaryRead(context.Background(), readOptions{},
 		func(_ context.Context, _ cql.Session) error { return nil })
 	require.True(t, res.done, "a successful read is finished")
-	require.Equal(t, ClusterA, res.selected, "single-cluster mode attempts ClusterA")
 	require.NoError(t, res.err)
 
 	assert.Equal(t, int64(1), met.get(met.ReadTotal, ClusterA),
-		"single-cluster attempt records IncReadTotal exactly once")
+		"single-cluster mode attempts ClusterA, and records IncReadTotal exactly once")
 }
 
 func TestPreAttemptFailClosed_PropagatesWithoutMetrics(t *testing.T) {
@@ -380,4 +380,64 @@ func TestSingleClusterSuccess_DoesNotCallStrategyOnSuccess_NorPolicyRecordSucces
 		"single-cluster successful reads must not invoke FailoverPolicy.RecordSuccess")
 	assert.Empty(t, policy.RecordFailureCalls,
 		"successful reads must not invoke FailoverPolicy.RecordFailure")
+}
+
+// TestExecuteRead_SuccessfulFailover_ReportsOverrideState pins the one
+// observable difference between the two failover routes: the override state
+// [CQLClient.tryFallbackCluster] passes on to the hub. An active override
+// freezes the ReadStrategy, so the alternative's success is not reported to
+// it; without an override the same success moves the preference.
+//
+// It is the only place a wrong override flag would change behaviour
+// silently — a failing alternative never reaches [clusterHealth.readSucceeded].
+func TestExecuteRead_SuccessfulFailover_ReportsOverrideState(t *testing.T) {
+	t.Run("override active freezes the strategy", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+		// The override lists B first, so B is the primary and A the alternative.
+		sessionB.scanErr = errors.New("cluster B down")
+
+		strategy := &trackingReadStrategy{preferred: ClusterA}
+		client, err := NewCQLClient(sessionA, sessionB,
+			WithReadStrategy(strategy),
+			WithFailoverPolicy(newMockFailoverPolicy(true)),
+			WithAllowedClusters(func() []ClusterID {
+				return []ClusterID{ClusterB, ClusterA}
+			}),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		var result string
+		require.NoError(t, client.Query("SELECT name FROM users").Scan(&result))
+
+		assert.Equal(t, 1, len(sessionB.queries), "the override's first cluster is the primary")
+		assert.Equal(t, 1, len(sessionA.queries), "the override's second cluster serves the failover")
+		assert.Empty(t, strategy.OnSuccessCalls,
+			"an override freezes the strategy: a successful failover must not report success")
+		assert.Empty(t, strategy.OnFailureCalls,
+			"an override freezes the strategy: the failing primary must not move the preference")
+	})
+
+	t.Run("no override moves the strategy", func(t *testing.T) {
+		sessionA := newMockSession()
+		sessionB := newMockSession()
+		sessionA.scanErr = errors.New("cluster A down")
+
+		strategy := &trackingReadStrategy{preferred: ClusterA}
+		client, err := NewCQLClient(sessionA, sessionB,
+			WithReadStrategy(strategy),
+			WithFailoverPolicy(newMockFailoverPolicy(true)),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		var result string
+		require.NoError(t, client.Query("SELECT name FROM users").Scan(&result))
+
+		assert.Equal(t, []ClusterID{ClusterA}, strategy.OnFailureCalls,
+			"the strategy names the alternative for the failing primary")
+		assert.Equal(t, []ClusterID{ClusterB}, strategy.OnSuccessCalls,
+			"without an override the alternative's success moves the preference")
+	})
 }
