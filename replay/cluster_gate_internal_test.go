@@ -105,8 +105,16 @@ func TestNATSBackend_HoldsFetchedBatchWhileGated(t *testing.T) {
 	require.Zero(t, executed.Load())
 	require.Zero(t, naks.Load(), "a gated message is never NAK'd, so its last delivery is not spent")
 
+	// The worker re-reads the gate right after each tick it consumes, so
+	// opening it here may already have released the batch — and a worker
+	// running the batch out never reads another tick. Offer the tick the
+	// still-held worker needs, but take the finished batch instead when it
+	// won the race, or this send would block until the test timed out.
 	open.Store(true)
-	ticks <- time.Time{}
+	select {
+	case ticks <- time.Time{}:
+	case <-done:
+	}
 	select {
 	case <-done:
 	case <-time.After(time.Second):
