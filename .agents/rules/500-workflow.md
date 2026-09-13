@@ -9,7 +9,7 @@
 
 ## Git Conventions
 - **Branches:** `feat/`, `fix/`, `docs/`, `chore/`, `test/`.
-- **Commits:** Conventional format. Present tense. First line < 50 chars.
+- **Commits:** Conventional format, present tense, first line <= 72 chars (aim for 50).
     - `feat: add adaptive dual-write strategy`
     - `fix: handle nil replayer on partial write failure`
 - **Merging a PR:** rebase and merge, so `main` stays linear.
