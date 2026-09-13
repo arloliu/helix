@@ -558,6 +558,13 @@ func TestWatchTopology_ChannelClosedWhileDrainingWarnsAndKeepsState(t *testing.T
 	watcher.updates <- TopologyUpdate{Cluster: ClusterA, Available: false, DrainMode: true}
 	close(watcher.updates)
 
+	// The update channel is buffered, so the send above does not wait for
+	// the goroutine: wait for the update to land first. Checking only that
+	// the goroutine is gone would be satisfied by one that has not started.
+	require.Eventually(t, func() bool {
+		return client.IsDraining(ClusterA)
+	}, time.Second, 5*time.Millisecond, "the final update must be applied before the channel close is observed")
+
 	// The warning is written before watchTopology returns,
 	// so the goroutine's exit proves the log call has happened.
 	require.Eventually(t, func() bool {
