@@ -57,7 +57,7 @@ For all other writes (ordinary column overwrites), the default behaviour — rep
 | One cluster fails or times out             | `*PartialWriteError{Acknowledged, Unacknowledged, Cause}` — no replay                                          |
 | One cluster degraded (`AdaptiveDualWrite`) | `*PartialWriteError{Cause: ErrClusterDegraded}` — degraded cluster skipped, healthy cluster written, no replay |
 | One cluster draining (topology)            | `*PartialWriteError{Cause: ErrClusterDraining}` — draining cluster skipped, healthy cluster written, no replay |
-| Both clusters fail / degraded / draining   | `*DualClusterError` — no replay                                                                                |
+| Neither cluster acknowledges — any mix of failed / degraded / draining | `*DualClusterError` — no replay, and the two causes need not match |
 | Cluster slow but not flagged               | Bounded by caller's context deadline; on timeout → `*PartialWriteError`                                        |
 | Single-cluster mode                        | No-op — the single write returns its error directly                                                            |
 | CAS / LWT (`ScanCAS`, `ExecCAS`)           | No-op — CAS is always single-cluster internally                                                                |
@@ -172,6 +172,10 @@ if errors.As(err, &dce) {
 
 Both `ErrorA` and `ErrorB` may be `ErrClusterDegraded` or `ErrClusterDraining` if both clusters
 were in a skipped state.
+They need not be the same kind:
+one cluster may be skipped while the other genuinely fails, and that mix is a `*DualClusterError` too.
+Without `Strict()` the same pair is a partial write that replay can reconcile,
+so the replaying path returns `*NoSynchronousAckError` — or `nil` under `AckOnReplayAdmission`.
 
 ---
 

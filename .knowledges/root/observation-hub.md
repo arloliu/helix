@@ -38,4 +38,5 @@ Classification (`classifyReadErr`, `classifyWriteLeg`) runs at the call site whi
 
 - `health.go` → `clusterHealth`, `clusterStats.succeeded`, `clusterStats.failed`
 - `cql_client.go` → `sessionHolder`, `holderFor`, `statsForCluster`
-- `write_path.go` → `writeLegState`, `writeLeg`
+- `write_path.go` → `writeLegState`, `writeLeg`, `reportWriteLegs`
+- `read_path.go` → `runPrimaryRead`, `primaryReadOutcome`, `attemptRead`
