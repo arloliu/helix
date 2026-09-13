@@ -349,6 +349,54 @@ func TestStrict_BothDrainingReturnsDualClusterError(t *testing.T) {
 	require.Empty(t, sb.queries)
 }
 
+// TestStrict_DrainingPlusRealFailureReturnsDualClusterError covers the mixed case:
+// one cluster draining while the other genuinely fails.
+// Neither the both-draining guard nor the PartialWriteError paths apply, so Strict() reports both causes.
+//
+// The same leg results without Strict() are a partial write the replaying path can reconcile,
+// and it returns NoSynchronousAckError or nil.
+// Strict promises no replay, so an unacknowledged leg is an error here however it came to be unacknowledged.
+func TestStrict_DrainingPlusRealFailureReturnsDualClusterError(t *testing.T) {
+	sa, sb := newMockSession(), newMockSession()
+	watcher := newMockTopologyWatcher()
+
+	// Subscribed before the drain is triggered, so the transition cannot be missed.
+	entered := make(chan types.ClusterID, 1)
+	client := newDualClient(t, sa, sb,
+		WithTopologyWatcher(watcher),
+		WithWriteStrategy(policy.NewConcurrentDualWrite()),
+		WithOnClusterEvent(func(event types.ClusterEvent) {
+			if event.Kind == types.EventDrainEntered {
+				select {
+				case entered <- event.Cluster:
+				default:
+				}
+			}
+		}),
+	)
+
+	sb.execErr = errors.New("cluster B unavailable")
+	watcher.SetDrain(ClusterA, true)
+
+	select {
+	case cluster := <-entered:
+		require.Equal(t, ClusterA, cluster, "only cluster A was drained")
+	case <-time.After(2 * time.Second):
+		t.Fatal("cluster A never entered drain")
+	}
+
+	err := client.Query("INSERT INTO t (k) VALUES (?)", "x").Strict().ExecContext(t.Context())
+
+	var dce *types.DualClusterError
+	require.True(t, errors.As(err, &dce), "expected DualClusterError, got %T: %v", err, err)
+	assert.ErrorIs(t, dce.ErrorA, types.ErrClusterDraining)
+	assert.ErrorIs(t, dce.ErrorB, sb.execErr)
+
+	// The draining cluster is skipped before its session is touched; the other one is attempted.
+	require.Empty(t, sa.queries)
+	require.Len(t, sb.queries, 1)
+}
+
 // TestStrict_AdaptiveDegraded verifies that when AdaptiveDualWrite has one cluster
 // degraded, Strict() returns *PartialWriteError{Cause: ErrClusterDegraded} instead
 // of firing a background goroutine.
