@@ -8,10 +8,12 @@
 5. Verify docs are updated if API changed.
 
 ## Git Conventions
-- **Branches:** `feat/`, `fix/`, `docs/`, `chore/`, `test/`.
+- **Branches:** `feat/`, `fix/`, `docs/`, `refactor/`, `chore/`, `test/`.
+  Match the prefix to the commit type the branch carries.
 - **Commits:** Conventional format, present tense, first line <= 72 chars (aim for 50).
     - `feat: add adaptive dual-write strategy`
     - `fix: handle nil replayer on partial write failure`
+    - `refactor: report both write legs from one place`
 - **Merging a PR:** rebase and merge, so `main` stays linear.
 
     ```bash
