@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRunPrimaryRead_ClientClosed_ReturnsAttemptedFalse_NoMetrics(t *testing.T) {
+func TestRunPrimaryRead_ClientClosed_NoAttempt_NoMetrics(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
 	met := newReadTestMetrics()
@@ -26,7 +26,7 @@ func TestRunPrimaryRead_ClientClosed_ReturnsAttemptedFalse_NoMetrics(t *testing.
 
 	res := client.runPrimaryRead(context.Background(), readOptions{},
 		func(_ context.Context, _ cql.Session) error { return nil })
-	require.False(t, res.attempted, "client-closed must yield attempted=false")
+	require.True(t, res.done, "client-closed finishes the read")
 	require.ErrorIs(t, res.err, types.ErrSessionClosed)
 
 	assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterA))
@@ -34,7 +34,7 @@ func TestRunPrimaryRead_ClientClosed_ReturnsAttemptedFalse_NoMetrics(t *testing.
 	assert.Empty(t, policy.RecordFailureCalls)
 }
 
-func TestRunPrimaryRead_ResolveReadTargetFails_ReturnsAttemptedFalse_NoMetrics(t *testing.T) {
+func TestRunPrimaryRead_ResolveReadTargetFails_NoAttempt_NoMetrics(t *testing.T) {
 	sessionA := newMockSession()
 	met := newReadTestMetrics()
 
@@ -51,7 +51,7 @@ func TestRunPrimaryRead_ResolveReadTargetFails_ReturnsAttemptedFalse_NoMetrics(t
 
 	res := client.runPrimaryRead(context.Background(), readOptions{},
 		func(_ context.Context, _ cql.Session) error { return nil })
-	require.False(t, res.attempted)
+	require.True(t, res.done)
 	require.ErrorIs(t, res.err, types.ErrInvalidClusterOverride)
 
 	assert.Equal(t, int64(0), met.get(met.ReadTotal, ClusterA),
@@ -70,8 +70,8 @@ func TestRunPrimaryRead_SingleClusterMode_TreatsAsPrimaryAttempt(t *testing.T) {
 
 	res := client.runPrimaryRead(context.Background(), readOptions{},
 		func(_ context.Context, _ cql.Session) error { return nil })
-	require.True(t, res.attempted, "single-cluster mode is a real attempt")
-	require.Equal(t, ClusterA, res.selected)
+	require.True(t, res.done, "a successful read is finished")
+	require.Equal(t, ClusterA, res.selected, "single-cluster mode attempts ClusterA")
 	require.NoError(t, res.err)
 
 	assert.Equal(t, int64(1), met.get(met.ReadTotal, ClusterA),

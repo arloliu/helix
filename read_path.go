@@ -437,66 +437,84 @@ func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOpt
 	return opts
 }
 
-// primaryAttemptResult captures the outcome of one primary-cluster read
-// attempt. It carries enough state for either the failover-enabled or the
-// no-failover wrapper to record terminal signals correctly without each
-// reimplementing the resolve-and-attempt sequence.
+// primaryReadOutcome is what a primary read leaves for its caller once the read has been reported to the observation hub.
 //
-// attempted=false means no read was sent to any cluster (client closed,
-// resolveReadTarget failed, etc.); err carries the pre-attempt error and
-// wrappers MUST NOT emit cluster metrics or call cluster-health functions.
-// attempted=true means a read was sent and runPrimaryRead recorded
-// IncReadTotal + ObserveReadDuration; err is nil on success or the
-// cluster's error.
-type primaryAttemptResult struct {
-	attempted bool
-	target    readTarget
-	selected  ClusterID
-	holder    *sessionHolder // the session the attempt used
-	elapsed   float64
-	err       error
+// done means the read is finished and err is the caller's result:
+// a pre-attempt failure, a success, a data sentinel, a caller-context error, or whatever the FallbackRead probe returned.
+// done=false means the primary failed with a health signal that runPrimaryRead already reported, and err is that failure;
+// target and selected are the routing state a caller needs to retry the request on the alternative.
+//
+// selected is the cluster the primary attempt targeted, not necessarily the one that produced err:
+// a FallbackRead probe answers from the alternative and reports its own outcome against that cluster.
+type primaryReadOutcome struct {
+	done     bool
+	err      error
+	target   readTarget
+	selected ClusterID
 }
 
-// runPrimaryRead executes the single-attempt portion of a read: pre-
-// attempt fail-closed checks, cluster selection through resolveReadTarget,
-// and the once-per-attempt IncReadTotal / ObserveReadDuration metrics.
+// runPrimaryRead takes a read as far as it can go without deciding routing:
+// pre-attempt fail-closed checks,
+// cluster selection through resolveReadTarget,
+// the once-per-attempt IncReadTotal / ObserveReadDuration metrics,
+// the terminal signal for a success or a health-signalling failure,
+// and the FallbackRead probe a not-found may trigger.
 //
-// runPrimaryRead intentionally reports nothing to the observation hub.
-// Those terminal signals are caller-owned so each fires exactly once per
-// attempt.
+// Each fires exactly once per primary attempt, because this is the only place the primary's outcome is written.
+// The alternative's own outcome is reported by tryFallbackCluster and executeFallbackRead, against that cluster.
+//
+// Failover is deliberately not here:
+// a FallbackRead probe resolves the same read on the alternative, while failover retries the request,
+// and only the latter is the caller's decision.
 func (c *CQLClient) runPrimaryRead(
 	ctx context.Context,
 	opts readOptions,
 	readFunc func(context.Context, cql.Session) error,
-) primaryAttemptResult {
+) primaryReadOutcome {
 	if c.closed.Load() {
-		return primaryAttemptResult{err: types.ErrSessionClosed}
+		return primaryReadOutcome{done: true, err: types.ErrSessionClosed}
 	}
 
 	rt := c.resolveReadTarget(ctx, opts)
 	if rt.err != nil {
-		return primaryAttemptResult{err: rt.err, target: rt}
+		return primaryReadOutcome{done: true, err: rt.err, target: rt}
 	}
 
-	// Single-cluster mode applies whether AllowedClusters is nil, returns
-	// nil/empty, or returns [ClusterA]: resolveReadTarget returns ClusterA
-	// and holderFor maps every cluster to the only session. Otherwise
-	// resolveReadTarget already moved the selection away from an
-	// ineligible cluster where the options allow it.
+	// Single-cluster mode applies whether AllowedClusters is nil, returns nil/empty, or returns [ClusterA]:
+	// resolveReadTarget returns ClusterA and holderFor maps every cluster to the only session.
+	// Otherwise resolveReadTarget already moved the selection away from an ineligible cluster where the options allow it.
 	selected := rt.cluster
 	if c.IsSingleCluster() {
 		selected = ClusterA
 	}
 	holder, elapsed, err := c.attemptRead(ctx, selected, readFunc)
 
-	return primaryAttemptResult{
-		attempted: true,
-		target:    rt,
-		selected:  selected,
-		holder:    holder,
-		elapsed:   elapsed,
-		err:       err,
+	if err == nil {
+		c.health.readSucceeded(holder, selected, rt.snap.active, elapsed)
+
+		return primaryReadOutcome{done: true, target: rt, selected: selected}
 	}
+
+	kind := classifyReadErr(ctx, err)
+	// Data sentinels and caller-context errors are not health signals —
+	// the cluster responded correctly, or the caller gave up.
+	// That includes a not-found the caller's own scan callback returned,
+	// which SliceScanContext unwraps at the public boundary.
+	// Only a genuine not-found triggers the FallbackRead probe,
+	// and only in dual-cluster mode (single-cluster has no alternative session).
+	if !kind.isHealthSignal() {
+		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
+			err = c.executeFallbackRead(ctx, rt.snap, selected, readFunc, opts.fallbackOpts)
+		}
+
+		return primaryReadOutcome{done: true, err: err, target: rt, selected: selected}
+	}
+
+	// Real error: the hub records the metric, the stats, and the policy failure once.
+	// What happens next is routing, and that is the caller's.
+	c.health.readFailed(holder, selected, kind, err)
+
+	return primaryReadOutcome{err: err, target: rt, selected: selected}
 }
 
 // readLegContext bounds one read leg by [ClientConfig.ClusterReadTimeout].
@@ -582,90 +600,38 @@ func (c *CQLClient) executeRead(
 	opts readOptions,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	res := c.runPrimaryRead(ctx, opts, readFunc)
-	if !res.attempted {
-		return res.err
+	out := c.runPrimaryRead(ctx, opts, readFunc)
+	if out.done {
+		return out.err
 	}
 
-	if res.err == nil {
-		c.health.readSucceeded(res.holder, res.selected, res.target.snap.active, res.elapsed)
-		return nil
-	}
-
-	kind := classifyReadErr(ctx, res.err)
-	// Data sentinels and caller-context errors are not health signals —
-	// the cluster responded correctly, or the caller gave up. Only
-	// not-found triggers the FallbackRead probe, and only in dual-cluster
-	// mode (single-cluster has no alternative session).
-	if !kind.isHealthSignal() {
-		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
-			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
-		}
-		return res.err
-	}
-
-	// Real error path: the hub records the metric, the stats, and the
-	// policy failure once; the failover branch below only decides routing.
-	c.health.readFailed(res.holder, res.selected, kind, res.err)
-
-	// Single-cluster real-error has no failover target.
+	// A real primary error, already reported.
+	// All that is left is routing, and single-cluster mode has no failover target.
 	if c.IsSingleCluster() {
-		return res.err
+		return out.err
 	}
 
-	if res.target.snap.active {
-		return c.executeOverrideFailover(ctx, res.target, res.err, readFunc)
+	if out.target.snap.active {
+		return c.executeOverrideFailover(ctx, out.target, out.err, readFunc)
 	}
 
-	return c.executeNormalFailover(ctx, res.selected, res.err, readFunc)
+	return c.executeNormalFailover(ctx, out.selected, out.err, readFunc)
 }
 
-// executeReadNoFailover wraps runPrimaryRead with full terminal-signal
-// recording but never enters standard failover. Used by paged slice reads
-// where re-running the readFunc on the alternative would leak an opaque
-// PageState cursor or (for SliceScan) re-invoke the caller's scanFn after
-// partial accumulator mutation.
+// executeReadNoFailover runs a primary read and never enters standard failover.
+// Used by paged slice reads where re-running the readFunc on the alternative would leak an opaque PageState cursor,
+// or (for SliceScan) re-invoke the caller's scanFn after partial accumulator mutation.
 //
-// On a real primary error, executeReadNoFailover reports the failure to
-// the observation hub exactly as executeRead does, so per-cluster health
-// stays consistent with the failover path. The returned error is the
-// primary's error verbatim.
-//
-// opts.fallbackRead is honored; single-cluster mode skips the fallback
-// invocation and returns the primary error directly.
+// Terminal signalling and the FallbackRead probe are inherited unchanged from [CQLClient.runPrimaryRead],
+// so per-cluster health stays consistent with the failover path.
 func (c *CQLClient) executeReadNoFailover(
 	ctx context.Context,
 	opts readOptions,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	res := c.runPrimaryRead(ctx, opts, readFunc)
-	if !res.attempted {
-		return res.err
-	}
-
-	if res.err == nil {
-		c.health.readSucceeded(res.holder, res.selected, res.target.snap.active, res.elapsed)
-		return nil
-	}
-
-	kind := classifyReadErr(ctx, res.err)
-	// Data sentinels, a not-found returned by the caller's own scan
-	// callback, and caller-context errors terminate the read without a
-	// health signal. Only a genuine not-found triggers the FallbackRead
-	// probe; SliceScanContext unwraps the caller's not-found at the public
-	// boundary.
-	if !kind.isHealthSignal() {
-		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
-			return c.executeFallbackRead(ctx, res.target.snap, res.selected, readFunc, opts.fallbackOpts)
-		}
-		return res.err
-	}
-
-	// Real error path: there is no failover branch, so the hub is the one
-	// place every terminal signal is recorded.
-	c.health.readFailed(res.holder, res.selected, kind, res.err)
-
-	return res.err
+	// A reported primary failure and a finished read are the same answer here:
+	// with no failover to decide, the outcome's error is the caller's result either way.
+	return c.runPrimaryRead(ctx, opts, readFunc).err
 }
 
 // executeOverrideFailover handles failover when an AllowedClusters override is active.
