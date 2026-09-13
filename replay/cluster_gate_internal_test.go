@@ -124,6 +124,71 @@ func TestNATSBackend_HoldsFetchedBatchWhileGated(t *testing.T) {
 	require.Zero(t, naks.Load())
 }
 
+// TestNATSBackend_OpenGateReleasesWholeBatchWithoutPolling proves that a
+// gate found open releases every remaining message straight away: only the
+// held message waits on a poll, and the rest of the batch is not made to
+// sit through another hold interval each.
+//
+// The gate call itself is the synchronisation point, because the worker
+// makes it the moment it wakes from a poll. Holding the worker inside that
+// call lets the gate open underneath it, which is the ordering a loaded
+// runner produces on its own — and the one that leaves nobody reading the
+// tick channel.
+func TestNATSBackend_OpenGateReleasesWholeBatchWithoutPolling(t *testing.T) {
+	var mu sync.Mutex
+	progress := make([]int, 3)
+	var naks, executed atomic.Int32
+	msgs := gatedNATSMessages(3, &progress, &naks, &mu)
+
+	var open atomic.Bool
+	var gateCalls atomic.Int32
+	held := make(chan struct{})
+	release := make(chan struct{})
+
+	cfg := newTestNATSBackendConfig()
+	cfg.PollInterval = time.Millisecond
+	WithClusterGate(func(types.ClusterID) bool {
+		// The second call is the one the first tick wakes.
+		if gateCalls.Add(1) == 2 {
+			close(held)
+			<-release
+		}
+
+		return open.Load()
+	})(&cfg)
+
+	ticks := make(chan time.Time)
+	b := &natsBackend{
+		replayer: &NATSReplayer{config: NATSReplayerConfig{AckWait: 30 * time.Second}},
+		config:   &cfg,
+		execute: func(context.Context, types.ReplayPayload) error {
+			executed.Add(1)
+
+			return nil
+		},
+		stopCh:      make(chan struct{}),
+		backoffWait: func(time.Duration) <-chan time.Time { return ticks },
+	}
+
+	done := make(chan struct{})
+	go func() { b.processMessages(t.Context(), msgs, false); close(done) }()
+
+	ticks <- time.Time{}
+	<-held
+	open.Store(true)
+	close(release)
+
+	// No further tick is offered: the batch must finish on the gate alone.
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the batch did not finish once the gate opened under the worker")
+	}
+	require.Equal(t, int32(3), executed.Load(),
+		"a gate found open releases the whole batch, not one message per poll")
+	require.Zero(t, naks.Load())
+}
+
 // TestNATSBackend_HoldPollsWithinAckWait proves a gated batch is refreshed
 // at a fraction of AckWait even when PollInterval is longer than AckWait.
 func TestNATSBackend_HoldPollsWithinAckWait(t *testing.T) {
