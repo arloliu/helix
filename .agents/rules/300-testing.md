@@ -22,6 +22,29 @@
     2. Collect all state transitions.
     3. Assert on complete history.
 
+**Reference implementation:** `gatedStateCollector` in `policy/failover_policy_test.go`.
+It closes a channel from inside the metrics call it wraps,
+so the test learns of a transition at the earliest point that transition exists
+instead of sampling for it afterwards.
+
+**The one exception: state observed outside the process.**
+When what the test waits on lives outside the process and offers nothing to subscribe to —
+a row landing in Cassandra/ScyllaDB, a container's state —
+polling is the only mechanism there is.
+Use `require.Eventually` for it, never `assert.Eventually`:
+a soft-failing wait lets the rest of the test run against state it has just failed to establish.
+
+The exception is about the absence of a subscribe point, not about polling being easier to write.
+Where a hook exists — a callback, a metrics collector, a logger the code already calls —
+`require.Eventually` on a counter breaks all three rules above:
+it samples a final state, so `counter == 1` passes the instant the counter reaches 1
+and never observes a second increment the assertion claims cannot happen.
+
+Do not add a subscribe point to production code to satisfy this rule.
+A channel that exists only for a test is a seam the code under test can leave before the send,
+which hangs the test to the package timeout rather than failing it;
+if one is unavoidable, guard every send with a `select` on a done channel.
+
 ## Test Patterns
 **Table-Driven** — Use ONLY for multiple cases:
 ```go
