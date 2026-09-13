@@ -293,6 +293,48 @@ func (c *CQLClient) writeLeg(
 	}
 }
 
+// reportWriteLegs classifies both legs, records their metrics, and reports each to the observation hub.
+// It runs once the strategy has returned, and is the only place a synchronous dual-write leg is reported,
+// so the replaying and strict paths cannot drift in what they count or what the hub hears.
+//
+// The returned kinds are the callers' input to their own aggregation:
+// replay eligibility on one path, PartialWriteError construction on the other.
+func (c *CQLClient) reportWriteLegs(
+	ctx context.Context,
+	legStateA, legStateB *writeLegState,
+	errA, errB error,
+) (legA, legB writeLegErrKind) {
+	// Classify results: distinguish operational sentinel states from real errors.
+	// ErrWriteAsync     — write is in flight via fire-and-forget (not a cluster error).
+	// ErrWriteDropped   — write was not attempted due to concurrency limit (not a cluster error).
+	// ErrClusterDraining — leg skipped because the cluster is draining (not a cluster error).
+	// A failure after the caller's context ended is the caller's, not the cluster's;
+	// each leg recorded which it was when it returned.
+	//
+	// Classification runs before the clock is read, so a leg the strategy never dispatched —
+	// the one case classify judges against ctx as it stands now rather than against what the leg
+	// recorded — is judged as close as possible to when the strategy returned.
+	// The strict path previously read the clock first; the difference is one time.Now call,
+	// and it can only move such a leg between legFailed and legCanceled.
+	legA = legStateA.classify(ctx, errA)
+	legB = legStateB.classify(ctx, errB)
+
+	// One instant for both legs, so their durations and liveness stamps agree.
+	// Start times are read through atomics because a fire-and-forget leg publishes its own.
+	nowNano := time.Now().UnixNano()
+
+	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
+	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
+
+	// Session liveness — reported PER leg so a partial success (A=ok, B=err) advances A's lastSuccess
+	// while accumulating failures on B.
+	// The hub ignores async, dropped, skipped, and caller-cancelled legs.
+	c.health.writeLeg(legStateA.holder.Load(), ClusterA, legA, errA, nowNano)
+	c.health.writeLeg(legStateB.holder.Load(), ClusterB, legB, errB, nowNano)
+
+	return legA, legB
+}
+
 // legContext bounds one write leg by [ClientConfig.ClusterWriteTimeout].
 // The leg's own deadline expiring leaves the caller's context live, so
 // the failure is attributed to the cluster.
@@ -365,28 +407,7 @@ func (c *CQLClient) executeDualWrite(
 		wg.Wait()
 	}
 
-	// Classify results: distinguish operational sentinel states from real errors.
-	// ErrWriteAsync     — write is in flight via fire-and-forget (not a cluster error).
-	// ErrWriteDropped   — write was not attempted due to concurrency limit (not a cluster error).
-	// ErrClusterDraining — leg skipped because the cluster is draining (not a cluster error).
-	// A failure after the caller's context ended is the caller's, not the
-	// cluster's; each leg recorded which it was when it returned.
-	legA := legStateA.classify(ctx, errA)
-	legB := legStateB.classify(ctx, errB)
-
-	// Record metrics for both clusters.
-	// Use atomic loads to safely read start times that may have been set by fire-and-forget goroutines.
-	now := time.Now()
-	nowNano := now.UnixNano()
-
-	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
-	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
-
-	// Session liveness — reported PER leg so a partial success (A=ok,
-	// B=err) advances A's lastSuccess while accumulating failures on B.
-	// The hub ignores async, dropped, skipped, and caller-cancelled legs.
-	c.health.writeLeg(legStateA.holder.Load(), ClusterA, legA, errA, nowNano)
-	c.health.writeLeg(legStateB.holder.Load(), ClusterB, legB, errB, nowNano)
+	legA, legB := c.reportWriteLegs(ctx, &legStateA, &legStateB, errA, errB)
 
 	// Both succeeded definitively.
 	if errA == nil && errB == nil {
@@ -703,20 +724,13 @@ func (c *CQLClient) executeStrictDualWrite(
 		wg.Wait()
 	}
 
-	now := time.Now()
-	nowNano := now.UnixNano()
-
-	legA := legStateA.classify(ctx, errA)
-	legB := legStateB.classify(ctx, errB)
-	c.recordWriteLegMetrics(ClusterA, legA, legStateA.start.Load(), nowNano)
-	c.recordWriteLegMetrics(ClusterB, legB, legStateB.start.Load(), nowNano)
-
-	c.health.writeLeg(legStateA.holder.Load(), ClusterA, legA, errA, nowNano)
-	c.health.writeLeg(legStateB.holder.Load(), ClusterB, legB, errB, nowNano)
+	c.reportWriteLegs(ctx, &legStateA, &legStateB, errA, errB)
 
 	if errA == nil && errB == nil {
 		return nil
 	}
+	// Strict aggregates on the raw results, not the classified kinds:
+	// with no replay to carry an unacknowledged leg, any non-nil result leaves that cluster unwritten.
 	if errA != nil && errB != nil {
 		return &types.DualClusterError{ErrorA: errA, ErrorB: errB}
 	}
