@@ -42,6 +42,21 @@ import (
 // reaches the read strategy (as it always has) and nothing reaches the
 // failover policy. The three entry points keep these historical rules
 // rather than one uniform gate.
+//
+// The entry points do not share one clock, and the differences are the
+// point rather than drift:
+//   - Reads, an iterator's close, and a probe sample [ClientConfig.NowProvider]
+//     as they report, because reporting is the moment the outcome is known.
+//   - writeLeg is given the clock its caller captured when the leg returned,
+//     so a leg whose result is aggregated later is still attributed to when
+//     it actually ended.
+//   - deferredWriteLeg takes the process clock, because it runs while Close
+//     waits on the leg's deferred registration and must not call into
+//     user-supplied code that Close could be blocking.
+//
+// A holder is likewise optional only for writeLeg, whose leg may never have
+// reached a session; every other entry point is reached with the holder its
+// attempt used.
 type clusterHealth struct {
 	strategy ReadStrategy
 	policy   FailoverPolicy
