@@ -34,8 +34,8 @@ See [Replay System](replay-system.md).
 
 | Option | Default | Description | Validation |
 |--------|---------|-------------|------------|
-| `WithReplayer(replayer)` | `nil` — partial write failures are lost | Durable store for writes that failed on one cluster | — |
-| `WithReplayWorker(worker)` | `nil` | Worker that drains the replayer; started with the client and stopped on `Close` | — |
+| `WithReplayer(replayer)` | `nil` — partial write failures are lost | Durable store for writes that failed on one cluster | Cannot be combined with `WithAutoMemoryWorker` |
+| `WithReplayWorker(worker)` | `nil` | Worker that drains the replayer; started with the client and stopped on `Close` | Cannot be combined with `WithAutoMemoryWorker` |
 | `WithAutoMemoryWorker(queueCapacity, workerOpts...)` | off; `queueCapacity` 0 uses 10000 | Builds and runs an in-process `MemoryReplayer` plus worker for development and simple deployments | Cannot be combined with `WithReplayer`; cannot be combined with `WithReplayWorker` |
 | `WithReplayGate(allow)` | `nil` — every cluster permitted | Operator predicate that holds replay back for a cluster while it returns false | — |
 
