@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.1] — 2026-09-13
+
+A maintenance release. `gorelease` reports it as a patch: no exported API changes. There is
+one narrow behavior change in strict-write leg accounting; the rest is documentation the
+public options were missing, plus internal consolidation of the read and write reporting
+paths so the two can no longer drift apart.
+
+### Behavior change
+
+- **A strict write now classifies its legs before it reads the clock**, where it previously
+  read the clock first. Both write paths report through one helper, which had to pick an
+  order. Two consequences, neither of which changes the error a caller receives:
+
+  *Reported timings move by the cost of classifying both legs.* One timestamp serves both
+  legs, so that cost now lands in `ObserveWriteDuration` for each of them — including a leg
+  that succeeded — and in the success and failure times the auto-refresh detector reads.
+  Classification is `errors.Is` over the leg's error, so this is normally bookkeeping-sized;
+  an error whose `Is` or `Unwrap` chain is expensive makes it larger. Ordinary writes reach
+  this, not just exotic ones.
+
+  *A leg the strategy never dispatched can change classification.* Such a leg is judged
+  against the context as it stands when classification runs, so one that fails without a
+  Helix sentinel can move between the failed and caller-cancelled kinds, which decides
+  whether `IncWriteError` fires for it. A dispatched leg keeps the cancellation provenance
+  recorded when it returned, and the bundled strategies' own skips (`SyncDualWrite` after
+  cancellation, `AdaptiveDualWrite` for a degraded cluster) classify stably, so reaching
+  this one needs a custom `StrictWriter`.
+
+### Changed
+
+- **Both write paths report through one helper.** `executeDualWrite` and
+  `executeStrictDualWrite` each classified both legs, recorded their metrics and reported
+  them to the observation hub in eight near-identical lines that differed only in where the
+  clock was captured. Each path keeps its own aggregation, which genuinely differs — the
+  replaying path tests the classified kinds because replay can carry an unacknowledged leg,
+  while strict tests the raw results because nothing will. See **Behavior change** for what
+  unifying the reporting moved.
+
+- **Every read failover passes through one gate.** `executeRead` now calls the same
+  failover-target helper the iterator's first page already used, so the override and
+  strategy gatings cannot diverge.
+
+- **The observation hub's failover gate is a constructor argument.** It was a field left nil
+  and patched by wiring on the next line, which made its nil branch unreachable.
+
+### Fixed
+
+- Two latent races in the test suite. A gated replay batch test sent on a channel its worker
+  might already have stopped reading, which hangs until the package timeout — this is what
+  failed in CI. A topology-watcher test's only synchronisation point was equally satisfied by
+  a goroutine that had not started yet, so it asserted against a warning nothing had written;
+  its wait was bounded, so it failed rather than hung. No production code was involved.
+
+### Documentation
+
+- **Every option `NewCQLClient` can reject now says so in its own Godoc.** Eleven did not:
+  `WithAckMode`, `WithBehaviorProfile`, `WithTimestampProvider`, `WithClusterNames`,
+  `WithReplayer`, `WithReplayWorker`, and the five `WithAutoRefresh*` overrides. The wording
+  matches the `Validation` column of `docs/configuration.md`. `WithTimestampProvider` is the
+  one worth reading: a provider returning zero is refused because both drivers treat a zero
+  value as unset and substitute their own process clock as the frame is written, so a
+  replayed write would carry the time it was replayed rather than the time it was first
+  issued — which is what decides last-write-wins between the clusters.
+
+- **`WithReplayer` and `WithReplayWorker` state that they cannot be combined with
+  `WithAutoMemoryWorker`.** The exclusion binds all three but was recorded only on
+  `WithAutoMemoryWorker`, both in Godoc and in the configuration table.
+
+- **`LoggerConfigured` no longer claims a role it does not have.** Its Godoc on
+  `CircuitBreaker` and `AdaptiveDualWrite` said it exists so the client can apply the same
+  auto-injection guard it uses for metrics. The client asks `MetricsConfigured` through
+  `Instrumentable` before injecting a collector, but asks nothing before injecting a logger:
+  `SetLogger` lets an explicit choice win by itself. The method is unchanged.
+
+- **`LatencyCircuitBreaker`'s type doc describes its nil-guarded wrappers rather than listing
+  them.** The list had drifted: `FailoverBelowThreshold`, `TryBeginFailoverProbe` and
+  `CompleteFailoverProbe` forward like the rest and were never added to it. The doc now also
+  states why such a wrapper cannot simply be deleted: the embedded `*CircuitBreaker` may be
+  nil, so method promotion would panic where the wrapper returns the zero value.
+
 ## [1.10.0] — 2026-09-09
 
 A correctness release. The themes are dual-write data integrity (a background leg could

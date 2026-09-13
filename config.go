@@ -1065,9 +1065,10 @@ func WithAutoMemoryWorker(queueCapacity int, workerOpts ...replay.WorkerOption) 
 // WithTimestampProvider sets the timestamp generator.
 //
 // [NewCQLClient] samples fn once and rejects one that returns zero with an
-// option error: the drivers treat a zero timestamp as unset and substitute
-// the server's own clock, which would defeat the point of replaying a write
-// at its original time.
+// option error: both drivers treat a zero value as unset and substitute
+// their own process clock at the moment the frame is written, so a replayed
+// write would carry the time it was replayed rather than the time it was
+// first issued — which is what decides last-write-wins between the clusters.
 //
 // Parameters:
 //   - fn: Function that returns current timestamp in microseconds. Must not
