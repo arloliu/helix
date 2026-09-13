@@ -451,7 +451,8 @@ func WithFailoverPolicy(policy FailoverPolicy) Option {
 // only a failover leg can reopen it (see [WithRouteVeto]).
 //
 // Parameters:
-//   - profile: [Legacy] (the default) or [Safe]
+//   - profile: [Legacy] (the default) or [Safe]. Any other value is rejected
+//     with an option error from [NewCQLClient].
 //
 // Returns:
 //   - Option: Configuration option
@@ -821,7 +822,9 @@ func WithMirrorReplayer(replayer Replayer, workerOpts ...replay.WorkerOption) Op
 // queue or in that background attempt.
 //
 // Parameters:
-//   - mode: The acknowledgement mode
+//   - mode: [RequireSynchronousAck] (the default) or [AckOnReplayAdmission].
+//     Any other value is rejected with an option error from [NewCQLClient],
+//     because the write path would otherwise treat it as the default.
 //
 // Returns:
 //   - Option: Configuration option
@@ -853,6 +856,10 @@ func WithAckMode(mode AckMode) Option {
 // a write that finds every slot held is dropped and admitted by its own caller.
 // Enqueue must still return within a bounded time — while every slot is held, each new write to the degraded cluster is dropped and admitted by its own caller — and both bundled replayers do.
 //
+// Cannot be combined with [WithAutoMemoryWorker], which builds a replayer
+// and worker of its own: [NewCQLClient] rejects the pair with an option
+// error rather than silently replacing the replayer set here.
+//
 // Parameters:
 //   - replayer: The replayer implementation
 //
@@ -870,6 +877,10 @@ func WithReplayer(replayer Replayer) Option {
 // and stopped when the client is closed.
 // A worker instance therefore serves exactly one [CQLClient] for that client's lifetime;
 // build a new worker for another client.
+//
+// Cannot be combined with [WithAutoMemoryWorker], which builds a replayer
+// and worker of its own: [NewCQLClient] rejects the pair with an option
+// error rather than silently replacing the worker set here.
 //
 // Parameters:
 //   - worker: The replay worker implementation (e.g., MemoryWorker, NATSWorker)
@@ -1053,8 +1064,14 @@ func WithAutoMemoryWorker(queueCapacity int, workerOpts ...replay.WorkerOption) 
 
 // WithTimestampProvider sets the timestamp generator.
 //
+// [NewCQLClient] samples fn once and rejects one that returns zero with an
+// option error: the drivers treat a zero timestamp as unset and substitute
+// the server's own clock, which would defeat the point of replaying a write
+// at its original time.
+//
 // Parameters:
-//   - fn: Function that returns current timestamp in microseconds
+//   - fn: Function that returns current timestamp in microseconds. Must not
+//     return zero.
 //
 // Returns:
 //   - Option: Configuration option
@@ -1151,7 +1168,8 @@ func WithLogger(logger types.Logger) Option {
 //
 // These names are used in metrics labels and log messages instead of the
 // default "A" and "B". Names must be Prometheus-compatible (alphanumeric
-// with underscores, starting with letter or underscore, max 32 chars).
+// with underscores, starting with letter or underscore, max 32 chars);
+// a name that is not is rejected with an option error from [NewCQLClient].
 //
 // If not set, defaults to "A" and "B".
 //
@@ -1662,16 +1680,25 @@ func WithAutoRefresh(opts ...AutoRefreshOption) Option {
 }
 
 // WithAutoRefreshFailureThreshold overrides AutoRefreshConfig.FailureThreshold.
+//
+// Must be > 0 once auto-refresh is enabled; a zero or negative value is
+// rejected with an option error from [NewCQLClient].
 func WithAutoRefreshFailureThreshold(n int) AutoRefreshOption {
 	return func(c *AutoRefreshConfig) { c.FailureThreshold = n }
 }
 
 // WithAutoRefreshSustainedFailureWindow overrides AutoRefreshConfig.SustainedFailureWindow.
+//
+// Must be > 0 once auto-refresh is enabled; a zero or negative duration is
+// rejected with an option error from [NewCQLClient].
 func WithAutoRefreshSustainedFailureWindow(d time.Duration) AutoRefreshOption {
 	return func(c *AutoRefreshConfig) { c.SustainedFailureWindow = d }
 }
 
 // WithAutoRefreshMinRetryInterval overrides AutoRefreshConfig.MinRetryInterval.
+//
+// Must be > 0 once auto-refresh is enabled; a zero or negative duration is
+// rejected with an option error from [NewCQLClient].
 func WithAutoRefreshMinRetryInterval(d time.Duration) AutoRefreshOption {
 	return func(c *AutoRefreshConfig) { c.MinRetryInterval = d }
 }
@@ -1687,11 +1714,17 @@ func WithAutoRefreshFailureClassifier(fn func(error) bool) AutoRefreshOption {
 }
 
 // WithAutoRefreshCheckInterval overrides AutoRefreshConfig.CheckInterval.
+//
+// Must be > 0 once auto-refresh is enabled; a zero or negative duration is
+// rejected with an option error from [NewCQLClient].
 func WithAutoRefreshCheckInterval(d time.Duration) AutoRefreshOption {
 	return func(c *AutoRefreshConfig) { c.CheckInterval = d }
 }
 
 // WithAutoRefreshRefreshTimeout overrides AutoRefreshConfig.RefreshTimeout.
+//
+// Must be > 0 once auto-refresh is enabled; a zero or negative duration is
+// rejected with an option error from [NewCQLClient].
 func WithAutoRefreshRefreshTimeout(d time.Duration) AutoRefreshOption {
 	return func(c *AutoRefreshConfig) { c.RefreshTimeout = d }
 }
