@@ -58,10 +58,11 @@ type clusterHealth struct {
 	// worth counting toward auto-refresh; see AutoRefreshConfig.FailureClassifier.
 	countsForRefresh func(error) bool
 
-	// failoverAllowed is the client's CQLClient.failoverAllowed gate, bound
-	// once at wiring so an iterator's close applies the same policy and
-	// drain rules a failing Scan does before it moves the read strategy.
-	// Nil until the client installs it.
+	// failoverAllowed is the client's CQLClient.failoverAllowed gate,
+	// answering whether a failure on a cluster may move the read strategy.
+	// It is taken at construction so an iterator's close applies the same
+	// policy and drain rules a failing Scan does before it moves the
+	// strategy, and so a hub cannot exist without one.
 	failoverAllowed func(ClusterID, error) bool
 }
 
@@ -75,7 +76,9 @@ const (
 )
 
 // newClusterHealth resolves the authorities once at construction.
-func newClusterHealth(config *ClientConfig, dual bool) clusterHealth {
+// failoverAllowed is the client's own gate; it reads live drain state, so
+// the client must already exist to supply it.
+func newClusterHealth(config *ClientConfig, dual bool, failoverAllowed func(ClusterID, error) bool) clusterHealth {
 	h := clusterHealth{
 		strategy:         config.ReadStrategy,
 		policy:           config.FailoverPolicy,
@@ -83,6 +86,7 @@ func newClusterHealth(config *ClientConfig, dual bool) clusterHealth {
 		dual:             dual,
 		now:              config.NowProvider,
 		countsForRefresh: config.AutoRefresh.FailureClassifier,
+		failoverAllowed:  failoverAllowed,
 	}
 	if h.countsForRefresh == nil {
 		h.countsForRefresh = DefaultAutoRefreshFailureClassifier
@@ -194,26 +198,11 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 		if h.policy != nil {
 			h.policy.RecordFailure(cluster)
 		}
-		if !overrideActive && h.strategy != nil && h.failoverGateOpen(cluster, err) {
+		if !overrideActive && h.strategy != nil && h.failoverAllowed(cluster, err) {
 			h.strategy.OnFailure(cluster, err)
 		}
 	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
 	}
-}
-
-// failoverGateOpen asks the client's failover gate whether a failure on
-// cluster may move the read strategy.
-// A hub with no gate installed answers yes, so a hub built outside a client
-// keeps the unconditional behaviour it had before the gate existed.
-//
-// Parameters:
-//   - cluster: The cluster the read failed on
-//   - err: The error that cluster returned
-//
-// Returns:
-//   - bool: true when the failure may move the read strategy
-func (h *clusterHealth) failoverGateOpen(cluster ClusterID, err error) bool {
-	return h.failoverAllowed == nil || h.failoverAllowed(cluster, err)
 }
 
 // writeLeg reports one leg of a write on cluster to the holder's stats at
