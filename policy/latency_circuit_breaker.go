@@ -43,10 +43,13 @@ const defaultLatencyAbsoluteMax = 2 * time.Second
 // copying it, even before first use, would otherwise trip `go vet`
 // copylocks and break existing external composite literals/selectors that
 // depend on the pointer field shape. Because the embed can be nil, every
-// promoted-looking method below (ShouldFailover, RecordFailure,
-// RecordSuccess, Failures, SetClusterNames, MetricsConfigured, SetMetrics,
-// SetEventEmitter, LoggerConfigured, SetLogger, ProbeScheduled) is an explicit wrapper with a nil guard
-// rather than a compiler-promoted method — use one of the constructors
+// method that forwards to the embedded breaker is an explicit wrapper with
+// a nil guard rather than a compiler-promoted method: promotion would
+// dereference the nil embed and panic, so the guard is what the zero value
+// is safe by. Each such method says so in its own godoc.
+//
+// Removing a wrapper to "let promotion supply it" therefore changes
+// behaviour rather than saving a line. Use one of the constructors
 // (NewLatencyCircuitBreaker / NewLatencyCircuitBreakerChecked) to get a
 // fully configured, functional LatencyCircuitBreaker.
 type LatencyCircuitBreaker struct {
