@@ -442,15 +442,14 @@ func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOpt
 // done means the read is finished and err is the caller's result:
 // a pre-attempt failure, a success, a data sentinel, a caller-context error, or whatever the FallbackRead probe returned.
 // done=false means the primary failed with a health signal that runPrimaryRead already reported, and err is that failure;
-// target and selected are the routing state a caller needs to retry the request on the alternative.
+// target is the routing state a caller needs to retry the request on the alternative.
 //
-// selected is the cluster the primary attempt targeted, not necessarily the one that produced err:
+// The cluster the attempt targeted is target.cluster, which is not necessarily the one that produced err:
 // a FallbackRead probe answers from the alternative and reports its own outcome against that cluster.
 type primaryReadOutcome struct {
-	done     bool
-	err      error
-	target   readTarget
-	selected ClusterID
+	done   bool
+	err    error
+	target readTarget
 }
 
 // runPrimaryRead takes a read as far as it can go without deciding routing:
@@ -492,7 +491,7 @@ func (c *CQLClient) runPrimaryRead(
 	if err == nil {
 		c.health.readSucceeded(holder, selected, rt.snap.active, elapsed)
 
-		return primaryReadOutcome{done: true, target: rt, selected: selected}
+		return primaryReadOutcome{done: true, target: rt}
 	}
 
 	kind := classifyReadErr(ctx, err)
@@ -507,14 +506,14 @@ func (c *CQLClient) runPrimaryRead(
 			err = c.executeFallbackRead(ctx, rt.snap, selected, readFunc, opts.fallbackOpts)
 		}
 
-		return primaryReadOutcome{done: true, err: err, target: rt, selected: selected}
+		return primaryReadOutcome{done: true, err: err, target: rt}
 	}
 
 	// Real error: the hub records the metric, the stats, and the policy failure once.
 	// What happens next is routing, and that is the caller's.
 	c.health.readFailed(holder, selected, kind, err)
 
-	return primaryReadOutcome{err: err, target: rt, selected: selected}
+	return primaryReadOutcome{err: err, target: rt}
 }
 
 // readLegContext bounds one read leg by [ClientConfig.ClusterReadTimeout].
@@ -611,11 +610,12 @@ func (c *CQLClient) executeRead(
 		return out.err
 	}
 
-	if out.target.snap.active {
-		return c.executeOverrideFailover(ctx, out.target, out.err, readFunc)
+	fallback, ok := c.failoverTarget(ctx, out.target, out.err)
+	if !ok {
+		return out.err
 	}
 
-	return c.executeNormalFailover(ctx, out.selected, out.err, readFunc)
+	return c.tryFallbackCluster(ctx, out.target, fallback, out.err, readFunc)
 }
 
 // executeReadNoFailover runs a primary read and never enters standard failover.
@@ -634,41 +634,12 @@ func (c *CQLClient) executeReadNoFailover(
 	return c.runPrimaryRead(ctx, opts, readFunc).err
 }
 
-// executeOverrideFailover handles failover when an AllowedClusters override is active.
-// The ReadStrategy is NOT consulted — failover target comes from the override snapshot.
-func (c *CQLClient) executeOverrideFailover(
-	ctx context.Context,
-	rt readTarget,
-	primaryErr error,
-	readFunc func(context.Context, cql.Session) error,
-) error {
-	fallback, ok := c.overrideFailoverTarget(ctx, rt, primaryErr)
-	if !ok {
-		return primaryErr
-	}
-
-	return c.tryFallbackCluster(ctx, rt.cluster, fallback, primaryErr, true, readFunc)
-}
-
-// executeNormalFailover handles failover using the ReadStrategy (no override active).
-func (c *CQLClient) executeNormalFailover(
-	ctx context.Context,
-	selectedCluster ClusterID,
-	primaryErr error,
-	readFunc func(context.Context, cql.Session) error,
-) error {
-	fallback, ok := c.normalFailoverTarget(ctx, selectedCluster, primaryErr)
-	if !ok {
-		return primaryErr
-	}
-
-	return c.tryFallbackCluster(ctx, selectedCluster, fallback, primaryErr, false, readFunc)
-}
-
 // failoverTarget returns the cluster a read that failed on rt.cluster may
 // retry on, and whether it may retry at all.
-// It picks the gating an active AllowedClusters override needs over the
-// ReadStrategy's, exactly as executeRead does.
+// An active AllowedClusters override names the alternative from its own
+// snapshot and leaves the ReadStrategy frozen; without one the strategy
+// names it. Every read that fails over passes through here, so the two
+// gatings cannot drift apart.
 //
 // Returns:
 //   - ClusterID: The cluster to retry on; empty when the read may not retry
@@ -781,20 +752,24 @@ func (c *CQLClient) normalFailoverTarget(
 
 // tryFallbackCluster executes a read on the fallback cluster after the primary
 // cluster failed. It records metrics, handles not-found, and returns a
-// DualClusterError when both clusters fail. Used by both override and normal
-// failover paths.
+// DualClusterError when both clusters fail.
+//
+// rt is the primary's resolved target, carrying both the cluster the read
+// failed on and the override state that named fallback: an override freezes
+// the ReadStrategy, so a success here is reported to the hub but not to the
+// strategy. Taking the pair as resolved keeps them from disagreeing.
 func (c *CQLClient) tryFallbackCluster(
 	ctx context.Context,
-	selected, fallback ClusterID,
+	rt readTarget,
+	fallback ClusterID,
 	primaryErr error,
-	overrideActive bool,
 	readFunc func(context.Context, cql.Session) error,
 ) error {
-	c.announceFailover(selected, fallback, primaryErr)
+	c.announceFailover(rt.cluster, fallback, primaryErr)
 
 	holder, elapsed, err := c.attemptRead(ctx, fallback, readFunc)
 	if err == nil {
-		c.health.readSucceeded(holder, fallback, overrideActive, elapsed)
+		c.health.readSucceeded(holder, fallback, rt.snap.active, elapsed)
 		return nil
 	}
 
@@ -811,7 +786,7 @@ func (c *CQLClient) tryFallbackCluster(
 
 	c.health.readFailed(holder, fallback, kind, err)
 
-	return dualReadError(selected, primaryErr, err)
+	return dualReadError(rt.cluster, primaryErr, err)
 }
 
 // announceFailover publishes the decision to retry a failed read on
