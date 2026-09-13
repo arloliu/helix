@@ -38,7 +38,12 @@ A failing read runs the metric first, then the classifier and stats, then `Failo
 The entry points deliberately do not share one clock, and the differences are load-bearing rather than drift.
 Reads, an iterator's close, and a probe sample the configured `NowProvider` as they report, because reporting is when the outcome is known.
 `writeLeg` is given the clock its caller captured once the strategy returned, shared by both legs, so the hub cannot re-sample it after the caller has aggregated the results.
-A leg that finished early is reported at that shared time rather than its own; what is fixed at leg return is the caller-cancelled provenance, not the timestamp.
+A leg that finished early is reported at that shared time rather than its own; what is fixed at the return of a leg that ran is the caller-cancelled provenance, not the timestamp.
+A leg whose write panics never reaches that record, because the panic-to-error recovery sits in the caller
+(`safeCQLWrite`, or the strategy's own `safeWrite`) outside the closure;
+such a leg carries the zero provenance and is classified as the cluster's failure.
+The single-cluster fast paths in `query.go` and `batch.go` call `writeLeg` directly and pass `NowProvider` as they report,
+having no sibling leg to share a time with.
 `deferredWriteLeg` takes the process clock, because it runs while `Close` waits on the leg's deferred registration and so must not call a user-supplied `NowProvider` that `Close` could be blocking.
 
 A holder is optional only for `writeLeg`, whose leg may never have reached a session.

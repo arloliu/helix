@@ -297,8 +297,10 @@ func (c *CQLClient) writeLeg(
 // It runs once the strategy has returned, and is the only place a synchronous dual-write leg is reported,
 // so the replaying and strict paths cannot drift in what they count or what the hub hears.
 //
-// The returned kinds are the callers' input to their own aggregation:
-// replay eligibility on one path, PartialWriteError construction on the other.
+// The returned kinds are the replaying path's input to its own aggregation:
+// per-leg replay eligibility, and whether either leg acknowledged the write.
+// The strict path calls this for the metrics and the hub alone and discards
+// the kinds, aggregating on the raw results instead.
 func (c *CQLClient) reportWriteLegs(
 	ctx context.Context,
 	legStateA, legStateB *writeLegState,

@@ -175,7 +175,8 @@ were in a skipped state.
 They need not be the same kind:
 one cluster may be skipped while the other genuinely fails, and that mix is a `*DualClusterError` too.
 Without `Strict()` the same pair is a partial write that replay can reconcile,
-so the replaying path returns `*NoSynchronousAckError` — or `nil` under `AckOnReplayAdmission`.
+so the replaying path returns `*NoSynchronousAckError`
+— or `nil` under `AckOnReplayAdmission`, once every leg that needed replay was enqueued.
 
 ---
 
