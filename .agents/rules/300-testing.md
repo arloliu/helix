@@ -57,6 +57,18 @@ A channel that exists only for a test is a seam the code under test can leave be
 which hangs the test to the package timeout rather than failing it;
 if one is unavoidable, guard every send with a `select` on a done channel.
 
+### What the `time.Sleep` ban does and does not cover
+
+It bans sleeping *to wait for state*. Two shapes are not that:
+
+- **Fixture latency.** `time.Sleep` inside a fake write function so the code under test
+  has a real duration to measure (`policy/adaptive_write_test.go`) is producing the input,
+  not waiting for an outcome.
+- **Asserting nothing happened.** There is no event to wait for when the claim is an absence,
+  so a bounded wait followed by the assertion is the only shape available
+  (`replay_gate_test.go` waits, then requires the replay count is still zero).
+  Keep the wait as short as the claim allows.
+
 ## Test Patterns
 **Table-Driven** — Use ONLY for multiple cases:
 ```go
