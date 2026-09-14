@@ -6,10 +6,11 @@ what is actually uncovered,
 where the covered parts are covered weakly,
 and what no coverage number can see.
 
-Nothing here is a request to change production code.
+Nothing here was a request to change production code.
 Where a finding names a production bug or a missing seam,
 it is recorded as a finding,
-and the decision to act on it is separate.
+and the decision to act on it is taken separately —
+as it was for S7, which is closed by a one-line fix decided after the fact.
 
 ## What was measured
 
@@ -266,13 +267,15 @@ but the `types` functions they forward to are at 100%,
 so they belong in the out-of-scope list below,
 not here.
 
-### S7 — `UnwrapSession(nil)` panics in v1, returns nil in v2
+### S7 — `UnwrapSession(nil)` panicked in v1, returned nil in v2 — CLOSED
 
 Found while writing the S1 tests, not by coverage.
 
-`adapter/cql/v2/helpers.go` guards the nil receiver
-and documents the parameter as "may be nil".
-`adapter/cql/v1/helpers.go:121` does not:
+Both adapters shipped `UnwrapSession` unguarded.
+`ac831a4` added the nil guard and the "may be nil" wording to v2,
+along with v2's `TestUnwrapSessionNil`,
+and did not touch v1 —
+so v1 kept dereferencing the pointer it was handed:
 
 ```go
 func UnwrapSession(s *Session) *gocql.Session {
@@ -280,17 +283,27 @@ func UnwrapSession(s *Session) *gocql.Session {
 }
 ```
 
-`v1.UnwrapSession(nil)` is a nil-pointer dereference.
-The v2 package has `TestUnwrapSessionNil` asserting the guarded behaviour;
-v1 has no equivalent, which is why the asymmetry survived.
+`v1.UnwrapSession(nil)` was a nil-pointer dereference.
+v1 had no equivalent of v2's test,
+which is why the asymmetry survived.
 
-Recorded, not fixed —
-this is a production change and the call is the maintainer's.
-Adding the guard makes the two adapters agree
-and costs one branch;
-leaving it means the v1 doc comment should stop implying the v2 contract.
-No test was added for either behaviour,
-because pinning the panic would cement it.
+**Closed** by adding the guard to v1 so the two adapters agree,
+with `TestUnwrapSessionNil` in `adapter/cql/v1/adapter_test.go`
+mirroring v2's test of the same name.
+The v1 doc comment, which promised a session unconditionally,
+now carries v2's "may be nil" wording.
+A sweep of both `helpers.go` files found no other guard v2 has and v1 lacks.
+
+Verified against the defect it fixes —
+the test was written first and failed with a nil-pointer dereference
+in the unguarded `return s.session`;
+adding the guard passes.
+
+`gorelease`'s criterion makes this patch-level:
+no exported signature moved,
+and the behaviour lands on the contract v2 already documents.
+The CHANGELOG gained an `[Unreleased]` section with a Fixed entry.
+Releasing stays the maintainer's call.
 
 ## Explicitly out of scope — not gaps
 
@@ -337,16 +350,10 @@ None warrant their own suite.
 
 ## Status and suggested order
 
-S1, S2 and S6 are closed.
+S1, S2, S6 and S7 are closed.
 Remaining, in the order they are worth doing:
 
-**S2** — the only finding that would catch a regression nobody is currently able to see.
-Needs a decision on `goleak` versus the dependency-free diff first.
-
 **S3**, then **S4** — mechanical, no decisions needed.
-
-**S7** — a one-line production change or a doc correction;
-the choice is the maintainer's.
 
 **S5** — a design question to answer before it is a test task.
 
