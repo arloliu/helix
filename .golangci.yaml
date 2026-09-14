@@ -18,6 +18,7 @@ linters:
     - errorlint
     - exhaustive
     - fatcontext
+    - forbidigo
     - gocheckcompilerdirectives
     - gocritic
     - gocyclo
@@ -72,6 +73,13 @@ linters:
         - ^github.com/spf13/cobra.CompletionOptions$
         - ^github.com/stretchr/testify/mock.Mock$
         - ^gopkg.in/yaml.v3.Node$
+    forbidigo:
+      forbid:
+        # A soft-failing wait lets the assertions after it run against state
+        # it has just reported it could not establish. See the async section
+        # of .agents/rules/300-testing.md.
+        - pattern: assert\.Eventually(WithT)?\b
+          msg: use require.Eventually, or wait on the hook the value is written from
     gocritic:
       settings:
         captLocal:
