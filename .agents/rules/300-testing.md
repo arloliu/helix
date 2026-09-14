@@ -30,17 +30,27 @@ It closes a channel from inside the metrics call it wraps,
 so the test learns of a transition at the earliest point that transition exists
 instead of sampling for it afterwards.
 
-**The one exception: state observed outside the process.**
-When what the test waits on lives outside the process and offers nothing to subscribe to —
-a row landing in Cassandra/ScyllaDB, a container's state —
-polling is the only mechanism there is.
-Use `require.Eventually` for it.
+### The one exception: no subscribe point exists
 
-The exception is about the absence of a subscribe point, not about polling being easier to write.
-Where a hook exists — a callback, a metrics collector, a logger the code already calls —
+Some state has nothing to subscribe to at all.
+Not "no hook is wired yet" — nothing anywhere fires when it changes.
+Three shapes recur:
+
+- **State held outside the process.** A row landing in Cassandra/ScyllaDB, a container's state.
+- **A deadline whose only observer is the condition.** A recovery timeout or cooldown
+  where `Select()` or `TryBeginFailoverProbe()` is the thing that notices the clock has passed;
+  nothing fires when it does.
+- **A goroutine's existence**, read out of `runtime.Stack`.
+
+Poll with `require.Eventually` there.
+
+The exception is the absence of a subscribe point, not the convenience of polling.
+Where a hook exists — a callback, a metrics collector, a logger, an event handler the code already calls —
 `require.Eventually` on a counter breaks all three rules above:
 it samples a final state, so `counter == 1` passes the instant the counter reaches 1
 and never observes a second increment the assertion claims cannot happen.
+If an exactness claim must stay on a polled counter,
+pair the wait with `require.Never` on the over-count (`replay/eviction_nats_test.go` does this).
 
 Do not add a subscribe point to production code to satisfy this rule.
 A channel that exists only for a test is a seam the code under test can leave before the send,
