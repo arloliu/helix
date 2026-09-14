@@ -5,6 +5,7 @@ import (
 	"errors"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -665,18 +666,23 @@ func TestMemoryReplayerDequeueBlockingArms(t *testing.T) {
 	}
 }
 
-// TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake pins the actual,
-// current contract for close-while-blocked: Close only stores a flag
-// and does not close the underlying channels, so a Dequeue
-// already parked in the blocking select does NOT wake on Close alone.
-// It stays blocked until a payload arrives or its context is cancelled.
+// TestMemoryReplayerDequeueCloseWhileBlockedWakes closes S8: a Dequeue
+// already parked in the blocking select must wake once Close runs, not
+// only when a payload arrives or its own context is cancelled.
 //
-// This is narrower than the Dequeue doc comment, which promises "Returns
-// false if the context is cancelled or the replayer is closed and empty" —
-// that promise holds for a Dequeue call that starts after Close, but not
-// for one already parked when Close runs.
+// The Dequeue doc comment promises "Returns false if the context is
+// cancelled or the replayer is closed and empty" for every caller, not
+// only one that starts after Close — a caller already parked when Close
+// runs used to hang until its context expired.
 // See the reported finding.
-func TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake(t *testing.T) {
+//
+// Drop the done arm and this test times out its one-second wait: with a
+// flag-only Close, nothing touches the blocking select and the parked
+// goroutine cannot wake at all.
+// A `case <-m.done:` arm that unconditionally returns false would pass
+// this test — TestMemoryReplayerDequeueClosePayloadRacePrefersPayload is
+// what catches that shape instead.
+func TestMemoryReplayerDequeueCloseWhileBlockedWakes(t *testing.T) {
 	replayer := NewMemoryReplayer()
 
 	requireNoDequeueParked(t)
@@ -684,32 +690,160 @@ func TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
-	resultCh := make(chan bool, 1)
+	type dequeueResult struct {
+		payload types.ReplayPayload
+		ok      bool
+	}
+	resultCh := make(chan dequeueResult, 1)
 	go func() {
-		_, ok := replayer.Dequeue(ctx)
-		resultCh <- ok
+		payload, ok := replayer.Dequeue(ctx)
+		resultCh <- dequeueResult{payload, ok}
 	}()
 
 	waitDequeueParked(t)
 
 	replayer.Close()
 
-	// Asserting an absence has no event to subscribe to, so a bounded wait
-	// followed by the assertion is the sanctioned shape (rule 300-testing).
 	select {
-	case <-resultCh:
-		t.Fatal("Dequeue returned on Close alone while parked; the blocking-path contract changed")
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	// Unblock via cancellation so the goroutine exits before the test ends
-	// (replay/leak_main_test.go fails the package on a surviving goroutine).
-	cancel()
-
-	select {
-	case ok := <-resultCh:
-		require.False(t, ok)
+	case got := <-resultCh:
+		require.False(t, got.ok)
+		require.Equal(t, types.ReplayPayload{}, got.payload)
 	case <-time.After(time.Second):
-		t.Fatal("Dequeue did not exit after ctx cancellation")
+		// Unblock the parked goroutine before failing so it cannot outlive
+		// this test (replay/leak_main_test.go fails the package on a
+		// surviving goroutine); Dequeue returns on ctx cancellation and the
+		// buffered resultCh send cannot then block.
+		cancel()
+		t.Fatal("Dequeue did not wake within one second of Close")
 	}
+}
+
+// TestMemoryReplayerDequeueClosePayloadRacePrefersPayload is S8's trap
+// test: once the done arm exists, it must not treat "done is closed" as
+// "nothing is left". requeue can land a payload after Close (it does not
+// check the closed flag), and Go's select picks a ready arm at random, so
+// a bare `case <-m.done: return false` loses an already-waiting payload
+// roughly half the time it fires.
+//
+// m.mu is what turns the race deterministic instead of a coin flip: the
+// done arm's own try path (tryDequeueWithPriority) must take mu before
+// scanning the queues, and nothing else reachable from here does.
+// Holding mu across Close (which commits the parked select to the done
+// arm, since the payload channels are still empty at that instant) and
+// then requeue (which therefore buffers instead of handing off directly,
+// because the done arm's receiver already claimed the wake) guarantees
+// the payload is sitting in the channel by the time the done arm's try
+// path is allowed to run.
+// A correct implementation returns the payload on every run; a bare
+// `return false` fails on every run — no repeat-loop is needed to catch
+// it, and one would misrepresent this as probabilistic when it isn't.
+func TestMemoryReplayerDequeueClosePayloadRacePrefersPayload(t *testing.T) {
+	replayer := NewMemoryReplayer()
+	require.NotNil(t, replayer.done, "the constructor must build the done channel Close closes")
+
+	requireNoDequeueParked(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	type dequeueResult struct {
+		payload types.ReplayPayload
+		ok      bool
+	}
+	resultCh := make(chan dequeueResult, 1)
+	go func() {
+		payload, ok := replayer.Dequeue(ctx)
+		resultCh <- dequeueResult{payload, ok}
+	}()
+
+	waitDequeueParked(t)
+
+	payload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "RACE", Priority: types.PriorityHigh, Timestamp: 1}
+
+	replayer.mu.Lock()
+	replayer.Close()                      // closes done; the parked select commits to the done arm here, while it is the only ready case
+	requeued := replayer.requeue(payload) // buffers: the done arm's receiver already claimed the wake, so this cannot hand off directly
+	replayer.mu.Unlock()                  // release the done arm's try path to look for the buffered payload
+
+	// Assert after the unlock, never inside it: require fails through
+	// runtime.Goexit, which runs deferred calls only, so an assertion here
+	// would strand mu locked and leave the consumer blocked on it forever.
+	// It would be parked on the mutex rather than the select, so cancelling
+	// the context could not free it either, and the package would report a
+	// goroutine leak instead of the real cause.
+	require.True(t, requeued, "requeue must buffer the payload for the done arm to find")
+
+	var got dequeueResult
+	select {
+	case got = <-resultCh:
+	case <-time.After(time.Second):
+		t.Fatal("Dequeue did not return after Close while a payload was held for it under mu")
+	}
+
+	require.True(t, got.ok, "a payload was buffered before the done arm's try path ran; it must not report drained")
+	require.Equal(t, payload, got.payload)
+}
+
+// TestMemoryReplayerCloseIdempotent covers Close's doc promise that it is
+// safe to call multiple times, including on a replayer that was never
+// built through a constructor (done is nil).
+//
+// Sequential double-Close alone would pass even against a naive
+// `if !m.closed.Load() { m.closed.Store(true); close(m.done) }`: nothing
+// forces a second call to interleave inside the Load-then-Store window.
+// The concurrent subtest is what actually exercises the CompareAndSwap
+// the design calls for, so run this test with -race.
+func TestMemoryReplayerCloseIdempotent(t *testing.T) {
+	t.Run("sequential on a constructed replayer", func(t *testing.T) {
+		replayer := NewMemoryReplayer()
+		require.NotPanics(t, func() {
+			replayer.Close()
+			replayer.Close()
+			replayer.Close()
+		})
+	})
+
+	t.Run("zero value never constructed", func(t *testing.T) {
+		replayer := &MemoryReplayer{}
+		require.NotPanics(t, func() {
+			replayer.Close()
+			replayer.Close()
+		})
+	})
+
+	t.Run("concurrent close races do not panic", func(t *testing.T) {
+		// Each round gets a fresh replayer whose closers are released
+		// together, so they land inside each other's Load-then-Store
+		// window instead of arriving staggered enough that the first is
+		// already done.
+		// One round is not enough either: that window is a few
+		// instructions wide, so a naive guard survives a single round
+		// almost every time.
+		// A double close panics on the goroutine that loses, taking the
+		// binary down, so the failure is loud rather than an assertion.
+		const (
+			rounds  = 500
+			closers = 8
+		)
+
+		for range rounds {
+			// Capacity 1 keeps each round's four channels small enough
+			// that 500 of them cost nothing.
+			replayer := NewMemoryReplayer(WithQueueCapacity(1))
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(closers)
+			for range closers {
+				go func() {
+					defer wg.Done()
+					<-start
+					replayer.Close()
+				}()
+			}
+
+			close(start)
+			wg.Wait()
+		}
+	})
 }

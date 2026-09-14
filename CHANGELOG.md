@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unwraps nil and uses the result still panics, now at the first use of the returned
   `*gocql.Session` rather than at the unwrap.
 
+- **`MemoryReplayer.Close` now releases callers blocked in `Dequeue`.** `Close` stored a flag
+  and left the payload channels open, deliberately, so that a concurrent `Enqueue` could not
+  panic on a closed channel. The side effect was that a caller already parked in `Dequeue`'s
+  blocking select never woke: it stayed there until its context was cancelled or a payload
+  arrived, even though `Dequeue` documents returning false once the replayer is closed and
+  empty. A consumer loop driven by `context.Background()` hung for good. `Close` now also
+  closes a separate `done` channel, once, and `Dequeue` waits on it — draining whatever is
+  still queued before it reports completion, since a closed replayer is not necessarily a
+  drained one. The payload channels are still left open, so the `Enqueue` safety that
+  motivated the original design is unchanged. Helix's own replay worker never took this path,
+  so this reaches callers using `MemoryReplayer` directly.
+
 ## [1.10.1] — 2026-09-13
 
 A maintenance release. `gorelease` reports it as a patch: no exported API changes. There is

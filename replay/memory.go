@@ -59,13 +59,19 @@ const (
 // # Thread Safety
 //
 // All methods are safe for concurrent use. The Close method marks the replayer
-// as closed but does not close the underlying channel, preventing panics from
+// as closed and closes a separate done channel to release blocked Dequeue
+// callers, but leaves the payload channels open, preventing panics from
 // concurrent Enqueue calls during shutdown.
 type MemoryReplayer struct {
 	queues   [2]clusterQueues // indexed by clusterIndex
 	closed   atomic.Bool
 	capacity int
 	pending  atomic.Int64 // slots held across both clusters
+
+	// done is closed exactly once, by Close, to release callers parked in
+	// Dequeue's blocking select. The payload channels stay open, so this
+	// is the only signal a blocked caller can wait on.
+	done chan struct{}
 
 	// Dequeue scheduling state: cluster rotation and priority ratio.
 	mu                sync.Mutex
@@ -219,6 +225,7 @@ func initializeMemoryReplayerQueues(m *MemoryReplayer) {
 		m.queues[i].high = make(chan types.ReplayPayload, m.capacity)
 		m.queues[i].low = make(chan types.ReplayPayload, m.capacity)
 	}
+	m.done = make(chan struct{})
 }
 
 // clusterOrder maps queue indexes to clusters; clusterIndex and clusterAt
@@ -294,8 +301,11 @@ func (m *MemoryReplayer) Enqueue(ctx context.Context, payload types.ReplayPayloa
 // High-priority messages are preferred, but low-priority messages are guaranteed
 // to be processed based on the ratio (e.g., 10:1 means 1 low per 10 high).
 //
-// Blocks until a payload is available or the context is cancelled.
+// Blocks until a payload is available, the context is cancelled, or the
+// replayer is closed.
 // Returns false if the context is cancelled or the replayer is closed and empty.
+// Closing releases a caller that is already blocked here, which is why a
+// consumer loop does not need a cancellable context to end.
 //
 // Parameters:
 //   - ctx: Context for cancellation
@@ -335,6 +345,21 @@ func (m *MemoryReplayer) Dequeue(ctx context.Context) (types.ReplayPayload, bool
 	var high bool
 	select {
 	case <-ctx.Done():
+		return types.ReplayPayload{}, false
+	case <-m.done:
+		// Close fired. A closed replayer is not necessarily an empty one:
+		// select picks at random among ready arms, and requeue can land a
+		// payload after Close. Sweep the queues before reporting
+		// completion, or a caller is told they are empty while a payload
+		// sits in one.
+		// The sweep is a snapshot, not a barrier: an Enqueue that passed
+		// its closed check before Close can still land after it, and
+		// DrainAll remains the way to recover such a payload.
+		if payload, ok := m.tryDequeueWithPriority(nil); ok {
+			m.releaseSlot(payload.TargetCluster)
+			return payload, true
+		}
+
 		return types.ReplayPayload{}, false
 	case payload = <-m.queues[0].high:
 		idx, high = 0, true
@@ -599,12 +624,27 @@ func (m *MemoryReplayer) Cap() int {
 // Close marks the replay queue as closed.
 //
 // After Close is called, Enqueue will return ErrSessionClosed.
-// The underlying channel is NOT closed to prevent panics from concurrent
+// The payload channels are NOT closed, to prevent panics from concurrent
 // Enqueue calls. Use DrainAll to retrieve remaining items after Close.
+//
+// Close releases callers parked in Dequeue: each drains whatever is left
+// and then reports completion, so a consumer loop ends without needing a
+// cancellable context.
 //
 // Close is safe to call multiple times.
 func (m *MemoryReplayer) Close() {
-	m.closed.Store(true)
+	// The compare-and-swap is what keeps repeated and concurrent calls
+	// safe: only the call that flips the flag closes the channel.
+	if !m.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	// A replayer built outside the constructors has no done channel.
+	// Dequeue's initialized guard turns such a caller away before the
+	// select, so there is nobody to release.
+	if m.done != nil {
+		close(m.done)
+	}
 }
 
 // IsClosed returns whether the replayer has been closed.
