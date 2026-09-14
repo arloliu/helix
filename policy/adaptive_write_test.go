@@ -543,17 +543,20 @@ func TestAdaptiveDualWrite_ExplicitLoggerWinsOverInjection(t *testing.T) {
 	bgErr := errors.New("background failure")
 	a.ForceDegrade(types.ClusterA)
 
-	_, _ = a.Execute(t.Context(),
+	errA, _ := a.Execute(t.Context(),
 		func(_ context.Context) error { return bgErr },
 		func(_ context.Context) error { return nil },
 	)
 
-	// Wait for the background goroutine to log.
-	require.Eventually(t, func() bool {
-		return explicit.warnCount() >= 1
-	}, time.Second, 10*time.Millisecond,
-		"explicit logger must receive the background-write Warn")
+	// The leg logs before it completes, so waiting on the completion callback
+	// makes both counts below final.
+	ok, _ := awaitWriteLeg(t, errA)
+	require.True(t, ok, "a degraded cluster's write must be handed to a fire-and-forget leg")
 
+	warns := explicit.warnLog()
+	require.Len(t, warns, 2, "the degrade and the failed background leg each warn once")
+	assert.Equal(t, "adaptive: fire-and-forget write failed on degraded cluster", warns[1].msg,
+		"explicit logger must receive the background-write Warn")
 	assert.Zero(t, clientLogger.warnCount(),
 		"client-injected logger must not receive logs once an explicit logger is configured")
 }

@@ -765,6 +765,8 @@ func TestNATSWatchFailure_ReturnsToWatchMode(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return kv.watchCalls() >= 4
 	}, 2*time.Second, 5*time.Millisecond, "Watch must be retried after falling back to polling")
+	// The fake fails the first three Watch calls and no more, so two warns is
+	// the whole run, not a count read before a fourth failure could arrive.
 	require.Equal(t, 2, logger.warnCount(), "failures one and two warn; the third is a debug line")
 
 	// A watch delivers the change immediately, well inside one poll interval

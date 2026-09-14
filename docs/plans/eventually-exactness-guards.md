@@ -50,26 +50,31 @@ no quiescence point, but 26 for 26 had one.
 Prefer quiescence: it costs no wall clock, where a `Never` costs its whole window
 on the passing path. The replay package's runtime did not move.
 
-## Still open: the adjacent six
+## The adjacent six, also closed
 
-The wait itself uses `>=` and makes no exactness claim,
-but a line or two later the test asserts an exact value on a counter that is still live.
-These were left alone deliberately — the fix above is a large enough change to review on its own,
-and four of the six need the same quiescence reasoning applied to a different counter.
+The wait itself used `>=` and made no exactness claim,
+but a line or two later the test asserted an exact value on a counter that was still live.
+The unsoundness had moved down a line rather than being absent.
 
-In four of the six the later assertion reads the very counter that was awaited.
-In the two `cql_client_recovery_probe_test.go` entries it reads the *other* cluster's counter
-(await `successB >= 3`, then assert `successA` is zero),
-which is a weaker version of the same problem: nothing bounds when the zero is read.
+Four took the same quiescence treatment as the 26.
+`CQLClient.Close()` cancels the recovery-probe loops and waits for them, which is what
+makes "no probe ever ran against the healthy cluster" a claim about the whole run
+rather than about the instant the line was read:
+`cql_client_recovery_probe_test.go` (two sites) and `failover_probe_test.go`.
+`policy/adaptive_write_test.go` moved to `awaitWriteLeg`, and now asserts on the warn
+it means rather than on a count — the explicit logger receives two warns, the degrade
+and the failed leg, and only the second one is what the test is about.
 
-`cql_client_recovery_probe_test.go:240` (→ `:242`),
-`cql_client_recovery_probe_test.go:300` (→ `:305`, `:307`),
-`replay/retained_memory_test.go:78` (→ `:79`, `:80`),
-`topology/nats_test.go:765` (→ `:768`),
-`policy/adaptive_write_test.go:552` (→ `:557`),
-`failover_probe_test.go:167` (→ `:169`).
+`topology/nats_test.go` needed no mechanism. The fake fails the first three `Watch`
+calls and no more, so two warns is the whole run; the fix is a comment naming that cap.
 
-Line numbers are as of the commit that closed the 26 and will drift.
+`replay/retained_memory_test.go` was the one that could not take a quiescence point:
+its assertion is *about* mid-flight state, the backlog held during an outage, so
+stopping the worker would destroy the thing being checked.
+It was also a latent flake — the outage was a 300ms deadline, and the assertion was
+only valid while that deadline had not passed, racing 150 retries against the clock.
+The outage now ends on a flag the test sets, so the backlog is intact by construction
+rather than by winning a race, and the test no longer spends the 300ms.
 
 ## Out of scope
 

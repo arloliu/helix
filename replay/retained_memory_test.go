@@ -32,6 +32,21 @@ func unreachableFor(d time.Duration, attempts, successes *atomic.Int32) replay.E
 	}
 }
 
+// unreachableUntil returns an ExecuteFunc that reports the cluster as
+// unreachable until the test sets back, so the outage ends on an event the
+// test controls rather than on a deadline it has to outrun.
+func unreachableUntil(back *atomic.Bool, attempts, successes *atomic.Int32) replay.ExecuteFunc {
+	return func(_ context.Context, _ types.ReplayPayload) error {
+		attempts.Add(1)
+		if !back.Load() {
+			return fmt.Errorf("%w: pool empty", types.ErrClusterUnreachable)
+		}
+		successes.Add(1)
+
+		return nil
+	}
+}
+
 // enqueuer is the enqueue half of both replayers.
 type enqueuer interface {
 	Enqueue(ctx context.Context, payload types.ReplayPayload) error
@@ -60,8 +75,9 @@ func TestMemoryWorker_RetainedPolicySurvivesOutage(t *testing.T) {
 	mc := testutil.NewTestMetricsCollector()
 
 	var attempts, successes, dropped atomic.Int32
+	var back atomic.Bool
 	worker := replay.NewMemoryWorker(replayer,
-		unreachableFor(300*time.Millisecond, &attempts, &successes),
+		unreachableUntil(&back, &attempts, &successes),
 		replay.WithRetryPolicy(replay.RetryWhileRetained),
 		replay.WithPollInterval(5*time.Millisecond),
 		replay.WithRetryDelay(5*time.Millisecond),
@@ -75,10 +91,15 @@ func TestMemoryWorker_RetainedPolicySurvivesOutage(t *testing.T) {
 	require.NoError(t, worker.Start())
 
 	// While the cluster is down the backlog stays visible: slots are held.
+	// The outage ends only when this test says so, so nothing can succeed and
+	// release a slot between the wait and the two counts below — they are
+	// exact because the cluster is still down, not because they were read fast
+	// enough.
 	require.Eventually(t, func() bool { return attempts.Load() >= payloads }, 2*time.Second, 5*time.Millisecond)
 	assert.Equal(t, payloads, replayer.PendingByCluster(types.ClusterB), "waiting payloads must keep their slots")
 	assert.Equal(t, payloads, mc.GetReplayQueueDepth(types.ClusterB), "queue depth gauge must count waiting payloads")
 
+	back.Store(true) // the cluster returns
 	require.Eventually(t, func() bool { return successes.Load() >= payloads }, 5*time.Second, 10*time.Millisecond)
 	worker.Stop()
 
