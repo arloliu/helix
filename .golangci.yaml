@@ -78,7 +78,7 @@ linters:
         # A soft-failing wait lets the assertions after it run against state
         # it has just reported it could not establish. See the async section
         # of .agents/rules/300-testing.md.
-        - pattern: assert\.Eventually(WithT)?\b
+        - pattern: assert\.Eventually(f|WithT|WithTf)?\b
           msg: use require.Eventually, or wait on the hook the value is written from
     gocritic:
       settings:
