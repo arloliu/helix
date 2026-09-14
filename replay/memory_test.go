@@ -3,6 +3,8 @@ package replay
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -387,4 +389,327 @@ func TestMemoryReplayerClusterFIFOWithinPriority(t *testing.T) {
 		}
 	}
 	require.Equal(t, []int64{1, 2, 3}, timestamps)
+}
+
+// TestMemoryReplayerDequeueTryPathSucceeds covers Dequeue's own non-blocking
+// try-path success branch (memory.go:320-323): a payload already waiting is
+// returned without ever reaching the blocking select.
+// This is not one of S3's six buckets — every other test that dequeues a
+// ready payload calls TryDequeue directly — but it is the last uncovered
+// branch inside Dequeue itself, so it is closed alongside them.
+func TestMemoryReplayerDequeueTryPathSucceeds(t *testing.T) {
+	replayer := NewMemoryReplayer()
+	defer replayer.Close()
+
+	payload := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 1", Priority: types.PriorityHigh}
+	require.NoError(t, replayer.Enqueue(context.Background(), payload))
+
+	dequeued, ok := replayer.Dequeue(context.Background())
+	require.True(t, ok)
+	require.Equal(t, payload, dequeued)
+	require.Equal(t, 0, replayer.Len())
+}
+
+// dequeueOrFail runs Dequeue on its own goroutine and returns its result,
+// failing the test if the call does not return promptly.
+//
+// Running it off the test goroutine is what keeps a regression legible:
+// the guards below exist so that Dequeue returns early instead of parking,
+// and a direct call that parked anyway would hang the whole package to its
+// timeout rather than failing here.
+// A bounded context would not do — Dequeue returns false off the blocking
+// select's own ctx.Done() arm, so the assertions would pass with the guard
+// gone.
+func dequeueOrFail(t *testing.T, replayer *MemoryReplayer) (types.ReplayPayload, bool) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	type dequeueResult struct {
+		payload types.ReplayPayload
+		ok      bool
+	}
+	resultCh := make(chan dequeueResult, 1)
+	go func() {
+		payload, ok := replayer.Dequeue(ctx)
+		resultCh <- dequeueResult{payload, ok}
+	}()
+
+	select {
+	case got := <-resultCh:
+		return got.payload, got.ok
+	case <-time.After(time.Second):
+		t.Fatal("Dequeue parked where it should have returned early")
+
+		return types.ReplayPayload{}, false
+	}
+}
+
+// TestMemoryReplayerDequeueUninitialized closes S3's uninitialized guard:
+// a zero-value MemoryReplayer (never built via NewMemoryReplayer) must
+// return false rather than nil-deref on its unset channels.
+func TestMemoryReplayerDequeueUninitialized(t *testing.T) {
+	replayer := &MemoryReplayer{}
+
+	payload, ok := dequeueOrFail(t, replayer)
+	require.False(t, ok)
+	require.Equal(t, types.ReplayPayload{}, payload)
+}
+
+// TestMemoryReplayerDequeueContextAlreadyCancelled closes S3's pre-check
+// select: a context cancelled before Dequeue is ever called must be caught
+// before any dequeue attempt, not just by the later blocking select.
+//
+// A payload is enqueued first so the two guards are distinguishable: an
+// already-cancelled context whose queue is empty would also be caught by
+// the blocking select's own ctx.Done() arm, so that alone would not prove
+// the pre-check runs.
+// With a payload waiting, only the pre-check honours cancellation ahead of
+// a successful dequeue — without it, the try-path below would return the
+// payload instead.
+func TestMemoryReplayerDequeueContextAlreadyCancelled(t *testing.T) {
+	replayer := NewMemoryReplayer()
+	defer replayer.Close()
+
+	waiting := types.ReplayPayload{TargetCluster: types.ClusterA, Query: "SELECT 1", Priority: types.PriorityHigh}
+	require.NoError(t, replayer.Enqueue(context.Background(), waiting))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	payload, ok := replayer.Dequeue(ctx)
+	require.False(t, ok)
+	require.Equal(t, types.ReplayPayload{}, payload)
+	require.Equal(t, 1, replayer.Len(), "the pre-check must not consume the waiting payload")
+}
+
+// TestMemoryReplayerDequeueClosedAndDrained closes S3's closed-and-drained
+// exit: once Close has been called and nothing is pending, Dequeue must
+// return immediately rather than parking in the blocking select forever.
+func TestMemoryReplayerDequeueClosedAndDrained(t *testing.T) {
+	replayer := NewMemoryReplayer()
+	replayer.Close()
+
+	payload, ok := dequeueOrFail(t, replayer)
+	require.False(t, ok)
+	require.Equal(t, types.ReplayPayload{}, payload)
+}
+
+// dequeueParkedFrame is the frame runtime.Stack prints for a goroutine
+// inside Dequeue.
+const dequeueParkedFrame = "(*MemoryReplayer).Dequeue("
+
+// dequeueParkedState is the state runtime.Stack prints in a goroutine's
+// header when it is parked on a select.
+// It is matched as a prefix because the runtime appends how long the
+// goroutine has been waiting once that passes a minute ("[select, 2
+// minutes]").
+const dequeueParkedState = "[select"
+
+// goroutineDump returns a complete dump of every goroutine's stack.
+// The buffer doubles until the dump fits, the way test/testutil/leak does
+// it: a truncated dump could drop the very block being looked for.
+func goroutineDump() string {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return string(buf[:n])
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// dequeueParked reports whether the dump holds a goroutine parked on a
+// select inside Dequeue.
+//
+// Matching the state and the frame together, rather than "Dequeue"
+// anywhere in the dump, is what proves the goroutine reached the blocking
+// select.
+// Dequeue's other select carries a default case, so it never parks; a
+// goroutine still in the non-blocking prologue, or one that has already
+// returned, cannot satisfy both halves.
+// Pinning the pair instead of a file:line also survives edits to memory.go
+// above the select.
+//
+// A stack dump cannot identify which goroutine is which, so this answers
+// "some goroutine is parked there", not "the caller's is".
+// requireNoDequeueParked closes that gap from the other side.
+func dequeueParked(dump string) bool {
+	for g := range strings.SplitSeq(dump, "\n\n") {
+		header, body, ok := strings.Cut(g, "\n")
+		if !ok {
+			continue
+		}
+		if strings.Contains(header, dequeueParkedState) && strings.Contains(body, dequeueParkedFrame) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// requireNoDequeueParked fails unless no goroutine is parked in Dequeue
+// right now.
+//
+// Call it before starting the goroutine a test intends to park.
+// Without it, a Dequeue left parked by an earlier failing test would
+// satisfy waitDequeueParked instantly, the test's own goroutine would take
+// the non-blocking try-path, and the arm subtests would pass while
+// exercising nothing — the one way they can go inert without saying so.
+func requireNoDequeueParked(t *testing.T) {
+	t.Helper()
+
+	require.False(t, dequeueParked(goroutineDump()),
+		"a Dequeue from an earlier test is still parked, so waitDequeueParked cannot tell it from this test's own")
+}
+
+// waitDequeueParked polls until a goroutine is parked in Dequeue's blocking
+// select.
+// A goroutine's existence (here, its parked state) has nothing to
+// subscribe to, which is the documented exception in rule 300-testing for
+// using require.Eventually instead of an event-driven collector.
+func waitDequeueParked(t *testing.T) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		return dequeueParked(goroutineDump())
+	}, time.Second, 5*time.Millisecond,
+		"no goroutine parked in Dequeue's blocking select")
+}
+
+// TestMemoryReplayerDequeueBlockingArms closes S3's four payload arms of
+// the blocking select: one subtest per (cluster, priority) pair.
+//
+// Each subtest starts Dequeue against an empty replayer, confirms via
+// runtime.Stack that the goroutine actually reached the blocking select
+// (not the earlier non-blocking try-path — see dequeueParked), then
+// enqueues exactly one payload into exactly one (cluster, priority) slot.
+// Enqueuing into only one slot matters: Go's select picks randomly among
+// ready arms, so a second ready channel would destroy attribution of which
+// arm actually fired.
+//
+// Each subtest asserts both the returned payload and the bookkeeping that
+// arm performs (noteDequeuedLocked): nextQueue rotates to the other
+// cluster, and the served cluster's highProcessed counter increments (high)
+// or resets to zero (low).
+func TestMemoryReplayerDequeueBlockingArms(t *testing.T) {
+	tests := []struct {
+		name     string
+		cluster  types.ClusterID
+		priority types.PriorityLevel
+		wantIdx  int
+		wantHigh bool
+	}{
+		{name: "cluster A high", cluster: types.ClusterA, priority: types.PriorityHigh, wantIdx: 0, wantHigh: true},
+		{name: "cluster A low", cluster: types.ClusterA, priority: types.PriorityLow, wantIdx: 0, wantHigh: false},
+		{name: "cluster B high", cluster: types.ClusterB, priority: types.PriorityHigh, wantIdx: 1, wantHigh: true},
+		{name: "cluster B low", cluster: types.ClusterB, priority: types.PriorityLow, wantIdx: 1, wantHigh: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			replayer := NewMemoryReplayer()
+			t.Cleanup(replayer.Close)
+
+			// Seed a non-zero, non-one counter before the goroutine starts,
+			// so the assertion below can tell "incremented" from "untouched"
+			// and "reset to zero" from "was already zero" — asserting 0/1
+			// against a fresh replayer would pass whether or not the arm
+			// touched the counter at all.
+			// Safe without synchronization: the write happens-before the
+			// goroutine below, which is the only other access, and it
+			// takes m.mu before reading the field.
+			const seededHighProcessed = 3
+			replayer.queues[tt.wantIdx].highProcessed = seededHighProcessed
+
+			requireNoDequeueParked(t)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+
+			type dequeueResult struct {
+				payload types.ReplayPayload
+				ok      bool
+			}
+			resultCh := make(chan dequeueResult, 1)
+			go func() {
+				payload, ok := replayer.Dequeue(ctx)
+				resultCh <- dequeueResult{payload, ok}
+			}()
+
+			waitDequeueParked(t)
+
+			payload := types.ReplayPayload{TargetCluster: tt.cluster, Query: tt.name, Priority: tt.priority, Timestamp: 1}
+			require.NoError(t, replayer.Enqueue(context.Background(), payload))
+
+			var got dequeueResult
+			select {
+			case got = <-resultCh:
+			case <-time.After(time.Second):
+				t.Fatal("Dequeue did not return after the matching payload was enqueued")
+			}
+
+			require.True(t, got.ok)
+			require.Equal(t, payload, got.payload)
+
+			// Bookkeeping the blocking arm performs, per noteDequeuedLocked.
+			require.Equal(t, 1-tt.wantIdx, replayer.nextQueue, "nextQueue should rotate away from the served cluster")
+			if tt.wantHigh {
+				require.Equal(t, seededHighProcessed+1, replayer.queues[tt.wantIdx].highProcessed, "high arm should increment highProcessed")
+			} else {
+				require.Equal(t, 0, replayer.queues[tt.wantIdx].highProcessed, "low arm should reset highProcessed to zero")
+			}
+		})
+	}
+}
+
+// TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake pins the actual,
+// current contract for close-while-blocked: Close only stores a flag
+// and does not close the underlying channels, so a Dequeue
+// already parked in the blocking select does NOT wake on Close alone.
+// It stays blocked until a payload arrives or its context is cancelled.
+//
+// This is narrower than the Dequeue doc comment, which promises "Returns
+// false if the context is cancelled or the replayer is closed and empty" —
+// that promise holds for a Dequeue call that starts after Close, but not
+// for one already parked when Close runs.
+// See the reported finding.
+func TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake(t *testing.T) {
+	replayer := NewMemoryReplayer()
+
+	requireNoDequeueParked(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	resultCh := make(chan bool, 1)
+	go func() {
+		_, ok := replayer.Dequeue(ctx)
+		resultCh <- ok
+	}()
+
+	waitDequeueParked(t)
+
+	replayer.Close()
+
+	// Asserting an absence has no event to subscribe to, so a bounded wait
+	// followed by the assertion is the sanctioned shape (rule 300-testing).
+	select {
+	case <-resultCh:
+		t.Fatal("Dequeue returned on Close alone while parked; the blocking-path contract changed")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Unblock via cancellation so the goroutine exits before the test ends
+	// (replay/leak_main_test.go fails the package on a surviving goroutine).
+	cancel()
+
+	select {
+	case ok := <-resultCh:
+		require.False(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("Dequeue did not exit after ctx cancellation")
+	}
 }

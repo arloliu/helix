@@ -175,7 +175,7 @@ so the binary hangs to its timeout rather than reaching the leak check.
 That is the drain test doing its job,
 and it is worth knowing that the two guards overlap there.
 
-### S3 — `MemoryReplayer.Dequeue` blocking path is untested
+### S3 — `MemoryReplayer.Dequeue` blocking path was untested — CLOSED
 
 `replay/memory.go:306 Dequeue` sits at **39.1%**.
 Uncovered: the uninitialized guard, the pre-check `ctx.Done()`,
@@ -183,8 +183,10 @@ the closed-and-drained exit,
 and **all four arms of the blocking select** —
 the path a caller takes when the queue is empty and it waits for work.
 
-The worker does not use it; it goes through
-`dequeueWithPriority` / `dequeueStrict` instead.
+The worker does not use it;
+`memoryBackend.dequeueLoop` polls `tryDequeueRetained` instead
+(`dequeueWithPriority` and `dequeueStrict` belong to the NATS backend
+and never touch `MemoryReplayer`).
 That is exactly why it rots:
 `Dequeue` is exported API a user calling `MemoryReplayer` directly will reach,
 and the library itself never walks it.
@@ -194,9 +196,42 @@ Neighbouring numbers in the same file tell the same story:
 `normalizeMemoryReplayerForLegacy` 50.0%,
 `memory_worker.go:270 requeueGated` 40.0%.
 
-**Closes when** each of the four blocking arms is driven
-(payload arriving on high and low, on each cluster),
-plus cancel-while-blocked and close-while-blocked.
+**Closed** by the `TestMemoryReplayerDequeue*` tests in `replay/memory_test.go`,
+which take `Dequeue` from 39.1% to 100%.
+One test per non-blocking bucket —
+the uninitialized guard, an already-cancelled context,
+and the closed-and-drained exit —
+plus a subtest per blocking arm and the two blocked-caller cases.
+Cancel-while-blocked was already covered
+by the existing `TestMemoryReplayerDequeueBlocking`.
+
+The arm subtests turn on one hazard worth recording.
+`tryDequeueWithPriority` runs before the blocking select and returns the same
+`(payload, true)`, so a test that enqueues and then calls `Dequeue`
+passes through the try-path and never touches the arm it claims to cover.
+Each subtest therefore starts `Dequeue` on an empty replayer,
+waits until a goroutine is actually parked on a select inside `Dequeue`
+— read out of `runtime.Stack`, matching the parked state and the frame together,
+which `Dequeue`'s other select cannot satisfy because it carries a `default` —
+and only then enqueues one payload into one (cluster, priority) slot.
+Any second ready channel would destroy attribution,
+since `select` picks at random among ready arms.
+Each subtest asserts the arm's `noteDequeuedLocked` bookkeeping,
+not just the payload.
+
+Verified against injected defects, one per bucket and one per arm.
+Mis-assigning `idx` inside a single arm fails that arm's subtest and no other;
+flipping only `high`, leaving `idx` correct,
+fails on the `highProcessed` assertion,
+which is what proves that assertion is load-bearing rather than dead.
+Inverting the uninitialized guard or the closed-and-drained guard
+parks the caller forever and the subtest dies at the package timeout.
+Restoring each passes.
+
+`replay` unit coverage moved 82.6% to 83.3%.
+The measurement is unit-only;
+`replay` is the one package where unit and merged coverage sit within 0.3%,
+so the table was left as measured rather than re-running the Docker tier.
 
 ### S4 — `contrib/metrics/vm` at 59.1%, unmoved by any tier
 
@@ -305,6 +340,51 @@ and the behaviour lands on the contract v2 already documents.
 The CHANGELOG gained an `[Unreleased]` section with a Fixed entry.
 Releasing stays the maintainer's call.
 
+### S8 — a `Dequeue` parked when `Close` runs is never released
+
+Found while closing S3, not by coverage.
+
+`Close` (`replay/memory.go`) stores an atomic flag and deliberately leaves the
+channels open, so concurrent `Enqueue` calls cannot panic on a closed channel.
+The consequence is that a caller already parked in `Dequeue`'s blocking select
+does not wake when the replayer closes.
+It stays parked until a payload arrives or its own context is cancelled.
+
+The `Dequeue` doc comment promises more than that:
+
+> Returns false if the context is cancelled or the replayer is closed and empty.
+
+That holds for a call entering `Dequeue` after `Close` —
+the closed-and-drained check near the top returns immediately —
+but not for one already blocked.
+A caller that dequeues with `context.Background()` and relies on `Close`
+to end its loop hangs for good.
+The library's own worker does not take this path —
+`memoryBackend.dequeueLoop` polls `tryDequeueRetained` on its own interval
+and never blocks in `Dequeue` —
+which is why the gap survived.
+
+The current behaviour is pinned by
+`TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake`,
+with a comment saying it is the contract as it stands, not as it should be.
+
+Recorded, not fixed.
+Both routes are production changes and the call is the maintainer's:
+release blocked callers on `Close`,
+or narrow the doc comment to say that `Close` does not release a blocked caller
+and that a cancellable context is the only way out.
+
+Releasing them is more than one new select arm.
+The broadcast itself is easy — a `done` channel closed once by `Close`,
+since closing the payload channels would reintroduce
+the concurrent-`Enqueue` panic `Close` exists to avoid.
+But a `done` arm alone would break the promise it is meant to keep:
+`select` picks at random among ready arms,
+so a closed-but-not-yet-drained replayer would return `false`
+with payloads still queued.
+Waking on `done` has to re-run the try-path
+and return `false` only once the queues are genuinely empty.
+
 ## Explicitly out of scope — not gaps
 
 Recorded so the percentages are not mistaken for debt later:
@@ -350,10 +430,12 @@ None warrant their own suite.
 
 ## Status and suggested order
 
-S1, S2, S6 and S7 are closed.
+S1, S2, S3, S6 and S7 are closed.
 Remaining, in the order they are worth doing:
 
-**S3**, then **S4** — mechanical, no decisions needed.
+**S4** — mechanical, no decisions needed.
+
+**S8** — a production change or a doc correction; the choice is the maintainer's.
 
 **S5** — a design question to answer before it is a test task.
 
