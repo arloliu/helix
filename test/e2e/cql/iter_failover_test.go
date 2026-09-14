@@ -4,6 +4,7 @@ package cql_test
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -21,22 +22,69 @@ import (
 // iterEventKinds collects the kinds of cluster events a scenario produced.
 // The client delivers them on its own dispatcher goroutine, so reads and
 // writes are guarded.
+//
+// A scenario registers the kinds it expects through expect before the
+// action that produces them, and the handler closes each registration as
+// the event is delivered. The test therefore learns of an event at the
+// moment it happens rather than sampling for it afterwards.
 type iterEventKinds struct {
-	mu    sync.Mutex
-	kinds []htypes.ClusterEventKind
+	mu       sync.Mutex
+	kinds    []htypes.ClusterEventKind
+	expected map[htypes.ClusterEventKind]chan struct{}
+}
+
+func newIterEventKinds() *iterEventKinds {
+	return &iterEventKinds{expected: make(map[htypes.ClusterEventKind]chan struct{})}
+}
+
+// expect registers interest in kind and returns a channel closed when the
+// first event of that kind arrives. A kind already delivered returns an
+// already-closed channel, so registering late is safe rather than silently
+// waiting forever.
+func (e *iterEventKinds) expect(kind htypes.ClusterEventKind) <-chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if ch, ok := e.expected[kind]; ok {
+		return ch
+	}
+
+	ch := make(chan struct{})
+	if slices.Contains(e.kinds, kind) {
+		close(ch)
+	}
+	e.expected[kind] = ch
+
+	return ch
 }
 
 func (e *iterEventKinds) handler(ev htypes.ClusterEvent) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	e.kinds = append(e.kinds, ev.Kind)
+	// A kind can arrive more than once; only the first delivery closes.
+	if ch, ok := e.expected[ev.Kind]; ok {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
 }
 
-func (e *iterEventKinds) has(kind htypes.ClusterEventKind) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+// awaitEvent waits for a registration made by expect.
+// It reports a soft failure rather than stopping the subtest, so an e2e run
+// that misses one event still reports the breaker state, the preference and
+// the latency bounds the assertions after it cover.
+func awaitEvent(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg string, args ...any) {
+	t.Helper()
 
-	return slices.Contains(e.kinds, kind)
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		assert.Fail(t, fmt.Sprintf(msg, args...))
+	}
 }
 
 // TestS_PauseA_IterFirstPageMovesToTheOtherCluster is the iterator half of
@@ -95,7 +143,7 @@ func TestS_PauseA_IterFirstPageMovesToTheOtherCluster(t *testing.T) {
 				policy.WithLatencyResetTimeout(30*time.Second),
 			)
 			rs := policy.NewStickyRead(policy.WithPreferredCluster(htypes.ClusterA))
-			events := &iterEventKinds{}
+			events := newIterEventKinds()
 			mc := testutil.NewTestMetricsCollector()
 
 			client, err := helix.NewCQLClient(d.wrap(a), d.wrap(b),
@@ -108,6 +156,10 @@ func TestS_PauseA_IterFirstPageMovesToTheOtherCluster(t *testing.T) {
 			)
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
+
+			// Registered before the pause that produces them.
+			breakerOpened := events.expect(htypes.EventCircuitBreakerOpen)
+			routeChanged := events.expect(htypes.EventReadRouteChanged)
 
 			ctx := context.Background()
 			require.NoError(t, a.Pause(ctx))
@@ -148,13 +200,9 @@ func TestS_PauseA_IterFirstPageMovesToTheOtherCluster(t *testing.T) {
 			require.Equal(t, "v", served,
 				"[%s] an iterator's first page must leave the frozen cluster", d.name)
 
-			assert.Eventually(t, func() bool {
-				return events.has(htypes.EventCircuitBreakerOpen)
-			}, 5*time.Second, 50*time.Millisecond,
+			awaitEvent(t, breakerOpened, 5*time.Second,
 				"[%s] the leg expiries must trip the breaker", d.name)
-			assert.Eventually(t, func() bool {
-				return events.has(htypes.EventReadRouteChanged)
-			}, 5*time.Second, 50*time.Millisecond,
+			awaitEvent(t, routeChanged, 5*time.Second,
 				"[%s] the strategy must move its preference off the frozen cluster", d.name)
 
 			assert.Less(t, slowest, 3*legTimeout,
