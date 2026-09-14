@@ -50,6 +50,16 @@ func TestWrapSessionNilPanics(t *testing.T) {
 	})
 }
 
+// TestUnwrapSessionNil verifies that UnwrapSession returns nil for a nil
+// *Session instead of panicking.
+func TestUnwrapSessionNil(t *testing.T) {
+	var s *v1.Session
+
+	require.NotPanics(t, func() {
+		require.Nil(t, v1.UnwrapSession(s))
+	})
+}
+
 // The following tests require a real gocql.Session and are run as integration tests.
 // See test/integration/cql_v1_adapter_test.go for those tests.
 

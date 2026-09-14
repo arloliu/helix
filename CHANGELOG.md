@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`v1.UnwrapSession(nil)` no longer panics.** Both adapters shipped this helper
+  dereferencing the pointer it was handed. v2 gained a nil guard, and the "may be nil"
+  wording for the parameter, in v1.5.3; v1 was missed and kept panicking. v1 now agrees
+  and returns nil, and its doc comment, which promised a session unconditionally, was
+  corrected to match. Note that the panic does not disappear so much as move: a caller who
+  unwraps nil and uses the result still panics, now at the first use of the returned
+  `*gocql.Session` rather than at the unwrap.
+
 ## [1.10.1] — 2026-09-13
 
 A maintenance release. `gorelease` reports it as a patch: no exported API changes. There is
