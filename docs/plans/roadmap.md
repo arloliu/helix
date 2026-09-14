@@ -347,7 +347,7 @@ Five items deviate from the table:
 
 ---
 
-## Phase 6 — Performance (`v1.9.0`)
+## Phase 6 — Performance (no release assigned)
 
 | Item | Finding | Work |
 |---|---|---|
@@ -362,6 +362,10 @@ Five items deviate from the table:
 
 **Verification:** benchmark numbers before and after each item in the PR description.
 
+**Status (2026-09-14):** not started.
+None of 6.1 to 6.8 has been attempted — `WithReplayConcurrency` and `WithAsyncPublish` do not exist.
+Nothing here should begin without the before-and-after benchmark the verification line asks for.
+
 ---
 
 ## Release Mapping
@@ -371,7 +375,17 @@ Five items deviate from the table:
 | `v1.6.1` | 0, 1 | Opt-in outage-surviving replay; arg cloning; queue depth and age observable; corrected docs |
 | `v1.7.0` | 2, 3 | Root restructured; zero-ack writes return an error; ctx errors no longer poison health; retry defaults survive outages; replay envelope versioned |
 | `v1.8.0` | 4, 5 | Observation hub; sticky `ForceDegrade`; per-cluster replay gating; breaker and sticky-read fixes; route changes observable |
-| `v1.9.0` | 6 | Replay throughput, async publish, contention fixes |
+| unassigned | 6 | Replay throughput, async publish, contention fixes |
+
+Phases 0 to 5 are released.
+Phase 6 is the only one left and carries no release number:
+the `v1.9.0` this table once gave it was taken by work from outside this roadmap.
+
+Four releases since `v1.8.0` came from elsewhere and closed no phase of this plan —
+`v1.8.1` (a driver-fork pin bump), `v1.9.0` (`RowScanner`, the `contrib/log/slog` adapter,
+`CallerContextMetrics`, iterator first-page context handling), and `v1.10.0` / `v1.10.1`
+(risk-review fixes and Godoc accuracy).
+They are recorded in `CHANGELOG.md`; this table stays a map of the phases above, not of every release.
 
 ## Working Conventions
 
