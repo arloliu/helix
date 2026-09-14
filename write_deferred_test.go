@@ -65,11 +65,16 @@ func TestAdaptiveWrite_DeferredFailureIsReplayed(t *testing.T) {
 		replayer.Lock()
 		defer replayer.Unlock()
 
-		return len(replayer.payloads) == writes
-	}, regressionWaitTimeout, time.Millisecond, "each failed background leg must be enqueued for replay once")
+		return len(replayer.payloads) >= writes
+	}, regressionWaitTimeout, time.Millisecond, "each failed background leg must be enqueued for replay")
+
+	// Close waits for the background legs, so nothing can be enqueued after
+	// it returns.
+	client.Close()
 
 	replayer.Lock()
 	defer replayer.Unlock()
+	require.Len(t, replayer.payloads, writes, "each failed background leg is enqueued once")
 	for _, p := range replayer.payloads {
 		require.Equal(t, ClusterB, p.TargetCluster)
 		require.Equal(t, "INSERT INTO t (k, v) VALUES (?, ?)", p.Query)
@@ -108,8 +113,13 @@ func TestAdaptiveWrite_BackgroundLegObservesItsOwnDuration(t *testing.T) {
 	releaseOnce()
 
 	require.Eventually(t, func() bool {
-		return len(spy.samplesFor(ClusterB)) == 1
-	}, regressionWaitTimeout, time.Millisecond, "the background leg must observe its duration once, when it completes")
+		return len(spy.samplesFor(ClusterB)) >= 1
+	}, regressionWaitTimeout, time.Millisecond, "the background leg must observe its duration when it completes")
+
+	// The gate is already released, so Close returns once the background leg
+	// has finished and the sample counts below are final.
+	client.Close()
+	require.Len(t, spy.samplesFor(ClusterB), 1, "the background leg observes its duration once")
 
 	held := sb.heldFor()
 	require.Positive(t, held, "the leg must have been held long enough to measure")
@@ -231,7 +241,7 @@ func TestAdaptiveWrite_FireForgetLimitBoundsPendingAdmissions(t *testing.T) {
 		mc.Lock()
 		defer mc.Unlock()
 
-		return mc.writeDropped[ClusterB] == 1
+		return mc.writeDropped[ClusterB] >= 1
 	}, regressionWaitTimeout, time.Millisecond,
 		"a write that cannot get a slot must be dropped, not start a third pending admission")
 	require.Equal(t, int32(filled), sb.execs.Load(), "the dropped write is never attempted on cluster B")
@@ -251,4 +261,11 @@ func TestAdaptiveWrite_FireForgetLimitBoundsPendingAdmissions(t *testing.T) {
 	case <-time.After(regressionWaitTimeout):
 		t.Fatal("the third write must return once the replayer releases it")
 	}
+
+	// Close waits for every background leg, so no further write can be
+	// dropped after it returns.
+	client.Close()
+	mc.Lock()
+	defer mc.Unlock()
+	require.EqualValues(t, 1, mc.writeDropped[ClusterB], "exactly one write is dropped over the limit")
 }

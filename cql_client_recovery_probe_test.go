@@ -527,8 +527,12 @@ func TestRecoveryProbe_FailureLogging(t *testing.T) {
 	t.Cleanup(func() { client.Close() })
 
 	require.Eventually(t, func() bool {
-		return probes.failureA.Load() == failingProbes && calls.Load() > failingProbes
+		return probes.failureA.Load() >= failingProbes && calls.Load() > failingProbes
 	}, time.Second, 5*time.Millisecond, "the probe must fail five times and then block")
+	// The probe loop is sequential and the sixth call is parked on release,
+	// so no seventh call — and therefore no sixth failure — can start. That
+	// block, not the wait, is what makes the count below exact.
+	require.EqualValues(t, failingProbes, probes.failureA.Load(), "the probe fails exactly five times")
 
 	logger.Lock()
 	warns := 0

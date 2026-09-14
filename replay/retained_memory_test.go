@@ -79,9 +79,10 @@ func TestMemoryWorker_RetainedPolicySurvivesOutage(t *testing.T) {
 	assert.Equal(t, payloads, replayer.PendingByCluster(types.ClusterB), "waiting payloads must keep their slots")
 	assert.Equal(t, payloads, mc.GetReplayQueueDepth(types.ClusterB), "queue depth gauge must count waiting payloads")
 
-	require.Eventually(t, func() bool { return successes.Load() == payloads }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return successes.Load() >= payloads }, 5*time.Second, 10*time.Millisecond)
 	worker.Stop()
 
+	assert.Equal(t, int32(payloads), successes.Load(), "each payload succeeds once")
 	assert.Equal(t, int32(0), dropped.Load(), "no payload may be dropped during an outage")
 	assert.Equal(t, 0, replayer.Len(), "slots must be released after success")
 	assert.Equal(t, int64(0), mc.GetReplayDropped(types.ClusterB))
@@ -202,10 +203,11 @@ func TestMemoryWorker_RetainedPolicyShutdownDropsWaiting(t *testing.T) {
 	)
 	enqueueN(t, replayer, payloads, types.ClusterA)
 	require.NoError(t, worker.Start())
-	require.Eventually(t, func() bool { return attempts.Load() == payloads }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return attempts.Load() >= payloads }, 2*time.Second, 5*time.Millisecond)
 
 	worker.Stop()
 
+	assert.Equal(t, int32(payloads), attempts.Load(), "each payload is attempted once before it parks")
 	assert.Equal(t, int32(payloads), dropped.Load())
 	assert.Equal(t, int64(payloads), mc.GetReplayWorkerDropped(types.ClusterA, types.ReplayDropShutdown))
 	assert.Equal(t, 0, replayer.Len(), "every slot must be released on shutdown")

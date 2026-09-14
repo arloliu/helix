@@ -511,12 +511,14 @@ func TestAdaptiveDualWrite_FireAndForgetSurfacesError(t *testing.T) {
 		"foreground sees ErrWriteAsync regardless of background outcome")
 	require.NoError(t, errB)
 
-	// Background goroutine has its own context — give it time to finish.
-	require.Eventually(t, func() bool {
-		return m.GetWriteErrors(types.ClusterA) == 1
-	}, time.Second, 10*time.Millisecond,
-		"IncWriteError must be emitted for the degraded cluster's background failure")
+	// The leg records IncWriteError before it completes, so waiting on the
+	// completion callback makes the counts below final.
+	ok, legErr := awaitWriteLeg(t, errA)
+	require.True(t, ok, "a degraded cluster's write must be handed to a fire-and-forget leg")
+	require.ErrorIs(t, legErr, bgErr)
 
+	assert.Equal(t, int64(1), m.GetWriteErrors(types.ClusterA),
+		"IncWriteError must be emitted once for the degraded cluster's background failure")
 	assert.Equal(t, int64(0), m.GetWriteErrors(types.ClusterB),
 		"healthy cluster must not see IncWriteError")
 }

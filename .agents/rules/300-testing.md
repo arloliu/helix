@@ -49,8 +49,20 @@ Where a hook exists — a callback, a metrics collector, a logger, an event hand
 `require.Eventually` on a counter breaks all three rules above:
 it samples a final state, so `counter == 1` passes the instant the counter reaches 1
 and never observes a second increment the assertion claims cannot happen.
-If an exactness claim must stay on a polled counter,
-pair the wait with `require.Never` on the over-count (`replay/eviction_nats_test.go` does this).
+An exactness claim therefore does not belong in the wait at all.
+Wait for `>=`, then assert the exact value at a point where the counter can no
+longer move: `Worker.Stop()` joins the worker goroutines, `CQLClient.Close()`
+waits for the background legs, a settled payload leaves an empty queue with
+nothing to dispatch twice. Quiescence costs no wall clock.
+Read any backlog *before* stopping a worker — `Stop` drains the queue and drops
+what is left, which would take the parked payloads with it.
+Where the file already has a completion seam — an `OnSuccess` channel, an
+`OnComplete` callback — subscribe to that instead: it is cheaper than a
+lifecycle join and it is the event-driven shape this rule asks for.
+Only where no such point exists, pair the wait with `require.Never` on the
+over-count (`replay/eviction_nats_test.go` does this), sized against the retry
+or backoff a spurious increment would arrive on. It costs its whole window on
+the passing path, so it is the last resort, not the first.
 
 Do not add a subscribe point to production code to satisfy this rule.
 A channel that exists only for a test is a seam the code under test can leave before the send,
