@@ -340,7 +340,7 @@ and the behaviour lands on the contract v2 already documents.
 The CHANGELOG gained an `[Unreleased]` section with a Fixed entry.
 Releasing stays the maintainer's call.
 
-### S8 — a `Dequeue` parked when `Close` runs is never released
+### S8 — a `Dequeue` parked when `Close` ran was never released — CLOSED
 
 Found while closing S3, not by coverage.
 
@@ -364,26 +364,60 @@ The library's own worker does not take this path —
 and never blocks in `Dequeue` —
 which is why the gap survived.
 
-The current behaviour is pinned by
-`TestMemoryReplayerDequeueCloseWhileBlockedDoesNotWake`,
-with a comment saying it is the contract as it stands, not as it should be.
+**Closed** by making the behaviour match the doc rather than the other way round.
+`MemoryReplayer` gained a `done` channel, built by `initializeMemoryReplayerQueues`,
+which both constructors share.
+`Close` closes it exactly once and `Dequeue`'s blocking select waits on it.
+The payload channels are still left open,
+so the concurrent-`Enqueue` safety that motivated the original design is untouched.
 
-Recorded, not fixed.
-Both routes are production changes and the call is the maintainer's:
-release blocked callers on `Close`,
-or narrow the doc comment to say that `Close` does not release a blocked caller
-and that a cancellable context is the only way out.
+Two things make this more than one new select arm.
 
-Releasing them is more than one new select arm.
-The broadcast itself is easy — a `done` channel closed once by `Close`,
-since closing the payload channels would reintroduce
-the concurrent-`Enqueue` panic `Close` exists to avoid.
-But a `done` arm alone would break the promise it is meant to keep:
 `select` picks at random among ready arms,
-so a closed-but-not-yet-drained replayer would return `false`
-with payloads still queued.
-Waking on `done` has to re-run the try-path
-and return `false` only once the queues are genuinely empty.
+so `done` firing does not mean the queues are empty —
+and `requeue` does not check the closed flag,
+so a payload can land after `Close`.
+The arm therefore re-runs the try-path
+and reports completion only once that sweep comes back empty.
+A bare `case <-m.done: return false` would tell a caller the queue is empty
+while a payload sits in it.
+The sweep is a snapshot rather than a barrier —
+an `Enqueue` that passed its closed check before `Close` can still land after it,
+the same window the `closed && Len() == 0` early return has always had —
+so the arm narrows the race without closing it,
+and `DrainAll` stays the way to recover a payload that lands late.
+
+`Close` documents itself as safe to call multiple times,
+which a flag store satisfied for free and a channel close does not.
+It now flips the flag with `CompareAndSwap`,
+so only the caller that wins closes the channel,
+and it skips the close on a replayer built outside the constructors,
+where `done` is nil.
+
+Verified against four injected defects:
+
+- a `done` arm returning `false` without draining —
+  fails the payload-race test on every run;
+- `Close` guarded by `Load` then `Store` instead of `CompareAndSwap` —
+  panics with "close of closed channel";
+- no `done` arm at all — the blocked caller never wakes, failing at its bounded wait;
+- no nil guard in `Close` — the zero-value subtest panics.
+
+Restoring each passes.
+
+The race test is deterministic rather than probabilistic:
+it holds `m.mu` so the `done` arm's try-path cannot run,
+requeues a payload into that window, then releases the lock.
+The naive construction of parking, requeuing and then closing proves nothing —
+a parked `select` commits to its case at send time,
+so the payload is handed straight to the receiver whether the arm is right or wrong.
+The concurrent-`Close` test needed the same treatment:
+50 unsynchronised goroutines missed the `Load`-then-`Store` window on every run,
+so it now releases eight closers together across 500 rounds,
+which catches it every time.
+
+`.knowledges/replay/index.md` holds only a pointer to `NewMemoryReplayer`,
+no description of this mechanic, so no bundle sync was owed.
 
 ## Explicitly out of scope — not gaps
 
@@ -430,12 +464,10 @@ None warrant their own suite.
 
 ## Status and suggested order
 
-S1, S2, S3, S6 and S7 are closed.
+S1, S2, S3, S6, S7 and S8 are closed.
 Remaining, in the order they are worth doing:
 
 **S4** — mechanical, no decisions needed.
-
-**S8** — a production change or a doc correction; the choice is the maintainer's.
 
 **S5** — a design question to answer before it is a test task.
 
