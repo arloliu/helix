@@ -19,14 +19,17 @@ import (
 	htypes "github.com/arloliu/helix/types"
 )
 
-// iterEventKinds collects the kinds of cluster events a scenario produced.
-// The client delivers them on its own dispatcher goroutine, so reads and
-// writes are guarded.
+// iterEventKinds turns the client's cluster events into per-kind
+// registrations a scenario can wait on. The client delivers events on its
+// own dispatcher goroutine, so both fields are guarded.
 //
 // A scenario registers the kinds it expects through expect before the
 // action that produces them, and the handler closes each registration as
 // the event is delivered. The test therefore learns of an event at the
 // moment it happens rather than sampling for it afterwards.
+//
+// kinds is the delivery record. Nothing asserts on it today; it exists so
+// expect can answer for an event that arrived before it was called.
 type iterEventKinds struct {
 	mu       sync.Mutex
 	kinds    []htypes.ClusterEventKind
