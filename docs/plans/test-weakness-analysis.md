@@ -95,7 +95,7 @@ Verified against an injected defect —
 adding `+ 1` to each cast fails 14 subtests per adapter;
 restoring passes.
 
-### S2 — No goroutine-leak guard anywhere
+### S2 — No goroutine-leak guard anywhere — CLOSED
 
 The library's product is background goroutines:
 the event dispatcher (`events.go:229`),
@@ -113,31 +113,66 @@ Shutdown correctness is asserted indirectly —
 but nothing asserts the goroutines actually *exited*.
 `go.uber.org/goleak` does not appear in `go.mod` or `go.sum`.
 
-A throwaway probe answered the immediate question:
+A probe answered the immediate question:
 a `TestMain` taking a goroutine-stack snapshot before `m.Run()`
 and diffing after, with a settle-retry,
 found **zero leaked goroutines** across root, `replay`, `mirror`, `topology` and `policy`.
-The probe was verified to be capable of failing —
-injecting a single `go func() { time.Sleep(2*time.Hour) }()` into the `mirror` package
-produced `ZZLEAK: 1 leaked goroutine(s)`
-and a red build.
 
-So this is not an open bug.
-It is an unguarded invariant:
+So this was never an open bug.
+It was an unguarded invariant:
 the shutdown paths are correct today
-and nothing would notice if a future change broke them.
+and nothing would have noticed if a future change broke them.
 
-**Closes when** the probe becomes permanent.
-Two options, and they are not equally gated.
-Adding `go.uber.org/goleak` as a test-only dependency needs the maintainer's approval first
-(rule 100-overview §3 requires asking before adding deps).
-Keeping the dependency-free `runtime.Stack` diff
-as a shared `TEST_DIRS`-resident helper needs no approval at all:
+**Closed** by `test/testutil/leak`,
+wired into the five packages that own goroutines.
+No new dependency:
 rule 300-testing already names a goroutine's existence,
 read out of `runtime.Stack`,
-as a case where `require.Eventually` is the correct tool.
-The dependency-free version got the full result here,
-so the dependency buys convenience, not capability.
+as a case where polling is the correct tool,
+so the dependency-free route needed no approval —
+whereas `go.uber.org/goleak` would have needed one
+under rule 100-overview §3.
+The helper got the full result on its own,
+so the dependency would have bought convenience, not capability.
+
+The package sits under `test/testutil/` rather than in `testutil` itself
+because `testutil` imports helix,
+which would make it unimportable from helix's own in-package tests.
+
+Two entry points.
+`leak.TestMain(m)` guards a whole package
+and is what the five `leak_main_test.go` files call.
+`leak.Check(t)` guards one test,
+for a lifecycle case where naming the test matters more
+than naming the binary;
+nothing calls it yet.
+
+Both settle before reporting:
+a goroutine released by `Close` still has to be scheduled before it returns,
+so an instantaneous snapshot would call every clean shutdown a leak.
+The wait is bounded at 5s and costs wall clock only on the failing path.
+
+Verified against three injected defects,
+one per bucket:
+
+- a bare `go func() { time.Sleep(time.Hour) }()` —
+  caught, and the report names the test that started it;
+- a test that calls `Engine.Start()` and forgets `Stop()` —
+  caught, both workers reported, stacks naming `(*Engine).worker`;
+- the same forgotten `Stop` under `leak.Check(t)` —
+  caught, attributed to the test rather than the binary.
+
+Restoring each passes.
+`test/testutil/leak` also carries its own tests
+for the settle, ignore and reporting logic.
+
+One thing the probe cannot do:
+removing `wg.Wait()` from `Engine.Stop` was tried as a fourth, more realistic
+defect and had to be abandoned —
+an existing drain test blocks forever without the join,
+so the binary hangs to its timeout rather than reaching the leak check.
+That is the drain test doing its job,
+and it is worth knowing that the two guards overlap there.
 
 ### S3 — `MemoryReplayer.Dequeue` blocking path is untested
 
@@ -302,7 +337,7 @@ None warrant their own suite.
 
 ## Status and suggested order
 
-S1 and S6 are closed.
+S1, S2 and S6 are closed.
 Remaining, in the order they are worth doing:
 
 **S2** — the only finding that would catch a regression nobody is currently able to see.
