@@ -43,7 +43,7 @@ func TestNATSWorker_CorruptMessageIsCountedAndTerminated(t *testing.T) {
 	require.NoError(t, worker.Start())
 	defer worker.Stop()
 
-	require.Eventually(t, func() bool { return mc.GetReplayCorrupt(types.ClusterA) == 1 },
+	require.Eventually(t, func() bool { return mc.GetReplayCorrupt(types.ClusterA) >= 1 },
 		5*time.Second, 20*time.Millisecond, "the decode failure is counted")
 	require.Eventually(t, func() bool { return callbackErr.Load() != nil }, time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool {
@@ -51,6 +51,10 @@ func TestNATSWorker_CorruptMessageIsCountedAndTerminated(t *testing.T) {
 
 		return err == nil && pending == 0
 	}, 5*time.Second, 20*time.Millisecond, "the terminated message leaves the stream")
+	// The message is gone from the stream and the worker is joined, so a
+	// redelivery cannot count the same decode failure twice.
+	worker.Stop()
+	assert.EqualValues(t, 1, mc.GetReplayCorrupt(types.ClusterA), "the decode failure is counted once")
 	assert.Zero(t, executed.Load())
 	assert.Zero(t, mc.GetReplayTermFailed(types.ClusterA), "the server accepted the Term")
 }

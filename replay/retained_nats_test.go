@@ -176,7 +176,7 @@ func TestNATSWorker_RetainedPolicySurvivesOutage(t *testing.T) {
 	require.NoError(t, worker.Start())
 	defer worker.Stop()
 
-	require.Eventually(t, func() bool { return successes.Load() == payloads }, 10*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool { return successes.Load() >= payloads }, 10*time.Second, 20*time.Millisecond)
 	assert.Greater(t, attempts.Load(), int32(payloads*2), "attempts must exceed a bounded budget of 2")
 	assert.Equal(t, int32(0), dropped.Load())
 
@@ -185,6 +185,11 @@ func TestNATSWorker_RetainedPolicySurvivesOutage(t *testing.T) {
 
 		return err == nil && pending == 0
 	}, 5*time.Second, 20*time.Millisecond, "every message must be acknowledged")
+
+	// Every message is acknowledged and the worker is joined, so no
+	// redelivery can add a success behind the wait above.
+	worker.Stop()
+	assert.Equal(t, int32(payloads), successes.Load(), "each payload succeeds once")
 
 	info, err := js.Consumer(t.Context(), replayer.StreamName(), "helix-worker-high-A")
 	require.NoError(t, err)

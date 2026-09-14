@@ -212,10 +212,11 @@ func TestMemoryWorkerProcessesMessages(t *testing.T) {
 
 	// Wait for messages to be processed
 	require.Eventually(t, func() bool {
-		return processedCount.Load() == 5
+		return processedCount.Load() >= 5
 	}, 2*time.Second, 10*time.Millisecond)
 
 	worker.Stop()
+	assert.Equal(t, int32(5), processedCount.Load(), "each payload is executed once")
 }
 
 func TestMemoryWorkerOnSuccessCallback(t *testing.T) {
@@ -247,10 +248,11 @@ func TestMemoryWorkerOnSuccessCallback(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		return successCount.Load() == 1
+		return successCount.Load() >= 1
 	}, 2*time.Second, 10*time.Millisecond)
 
 	worker.Stop()
+	assert.Equal(t, int32(1), successCount.Load(), "OnSuccess fires once per payload")
 }
 
 func TestMemoryWorkerOnErrorCallback(t *testing.T) {
@@ -420,10 +422,12 @@ func TestNATSWorkerProcessesMessages(t *testing.T) {
 
 	// Wait for all messages to be processed
 	require.Eventually(t, func() bool {
-		return processedA.Load() == 3 && processedB.Load() == 2
+		return processedA.Load() >= 3 && processedB.Load() >= 2
 	}, 5*time.Second, 50*time.Millisecond)
 
 	worker.Stop()
+	assert.Equal(t, int32(3), processedA.Load(), "cluster A's messages are each executed once")
+	assert.Equal(t, int32(2), processedB.Load(), "cluster B's messages are each executed once")
 }
 
 func TestNATSWorkerParallelProcessing(t *testing.T) {
@@ -477,12 +481,12 @@ func TestNATSWorkerParallelProcessing(t *testing.T) {
 
 	// Wait for all messages to be processed
 	require.Eventually(t, func() bool {
-		return processedA.Load() == 3 && processedB.Load() == 3
+		return processedA.Load() >= 3 && processedB.Load() >= 3
 	}, 5*time.Second, 50*time.Millisecond)
 
 	worker.Stop()
 
-	// Both clusters should have processed messages
+	// Both clusters should have processed messages.
 	assert.Equal(t, int32(3), processedA.Load())
 	assert.Equal(t, int32(3), processedB.Load())
 }
@@ -680,15 +684,17 @@ func TestMemoryWorker_MaxAttemptsBoundsRetries(t *testing.T) {
 	require.NoError(t, worker.Start())
 
 	require.Eventually(t, func() bool {
-		return dropped.Load() == 1
-	}, time.Second, 5*time.Millisecond, "OnDrop must fire exactly once after MaxAttempts")
+		return dropped.Load() >= 1
+	}, time.Second, 5*time.Millisecond, "OnDrop must fire after MaxAttempts")
 
-	// Give the worker a moment to demonstrate it does NOT re-enqueue.
-	time.Sleep(50 * time.Millisecond)
+	// Stop joins the worker goroutines and drains whatever is still queued
+	// through OnDrop, so a payload this test claims was never re-enqueued
+	// would show up here as a second drop rather than as a count sampled
+	// before it arrived.
+	worker.Stop()
+	assert.Equal(t, int32(1), dropped.Load(), "OnDrop must fire exactly once after MaxAttempts")
 	assert.Equal(t, int32(3), attempts.Load(), "exactly MaxAttempts attempts, no re-enqueue")
 	assert.Equal(t, 0, replayer.Len(), "queue must remain empty after drop")
-
-	worker.Stop()
 }
 
 // TestMemoryWorker_FailingPayloadDoesNotBlockHealthy is the head-of-line
@@ -744,9 +750,16 @@ func TestMemoryWorker_FailingPayloadDoesNotBlockHealthy(t *testing.T) {
 	// Healthy payload must be processed within ~150ms — well under the
 	// 2s backoff that would block it under inline-retry semantics.
 	require.Eventually(t, func() bool {
-		return processedHealthy.Load() == 1
+		return processedHealthy.Load() >= 1
 	}, 500*time.Millisecond, 5*time.Millisecond,
 		"healthy payload must not be blocked behind a failing payload's retry backoff")
+
+	// The healthy payload succeeded and released its slot, so there is
+	// nothing left for the worker to dispatch a second time. The failing
+	// payload is still retrying, which is why the worker cannot be stopped
+	// here: the assertion below is a claim about what has happened by now.
+	require.Zero(t, replayer.PendingByCluster(types.ClusterB), "the healthy payload is settled")
+	assert.Equal(t, int32(1), processedHealthy.Load(), "the healthy payload runs once")
 
 	// Sanity: the failing payload's first attempt has run, but its
 	// retry attempts (which would take 2+ seconds with the backoff
@@ -874,11 +887,12 @@ func TestMemoryWorker_RecoveryBeforeMaxAttempts(t *testing.T) {
 	require.NoError(t, worker.Start())
 
 	require.Eventually(t, func() bool {
-		return success.Load() == 1
+		return success.Load() >= 1
 	}, time.Second, 5*time.Millisecond, "transient failure must recover within MaxAttempts")
 
 	worker.Stop()
 
+	assert.Equal(t, int32(1), success.Load(), "a recovered payload succeeds once")
 	assert.Equal(t, int32(3), attempts.Load(), "should stop attempting after first success")
 	assert.Equal(t, int32(0), dropped.Load(), "OnDrop must not fire when payload eventually succeeds")
 }

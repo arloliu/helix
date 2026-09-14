@@ -69,10 +69,19 @@ func TestClusterWriteTimeout_DegradedBackgroundLegIsReplayed(t *testing.T) {
 		replayer.Lock()
 		defer replayer.Unlock()
 
-		return len(replayer.payloads) == 1 && replayer.payloads[0].TargetCluster == ClusterA
+		return len(replayer.payloads) >= 1 && replayer.payloads[0].TargetCluster == ClusterA
 	}, time.Second, time.Millisecond, "the expired background leg is replayed")
-	require.Eventually(t, func() bool { return client.statsForCluster(ClusterA).consecutiveFailures.Load() == 1 },
+	require.Eventually(t, func() bool { return client.statsForCluster(ClusterA).consecutiveFailures.Load() >= 1 },
 		time.Second, time.Millisecond, "the background leg's deadline is a health signal")
+
+	// Close waits for the background legs, so neither count can move after it
+	// returns.
+	client.Close()
+	replayer.Lock()
+	defer replayer.Unlock()
+	require.Len(t, replayer.payloads, 1, "the expired leg is replayed once")
+	require.EqualValues(t, 1, client.statsForCluster(ClusterA).consecutiveFailures.Load(),
+		"the expired leg is one failure, not one per retry")
 }
 
 func TestClusterWriteTimeout_CallerDeadlineStillWins(t *testing.T) {

@@ -1,100 +1,79 @@
 # Exactness claims on polled counters
 
-26 async waits assert that something happened *exactly* N times
+26 async waits asserted that something happened *exactly* N times
 while waiting for a monotonic counter to *reach* N.
 `require.Eventually` returns the moment the condition first holds,
 so the wait cannot observe an increment past N —
-the assertion passes whether the count ends at N or at N+3,
-which is the opposite of what its message claims.
+the assertion passed whether the count ended at N or at N+3,
+which is the opposite of what its message claimed.
 
-This is a correctness gap in the tests, not a style one:
-each of these sites is currently unable to fail for the thing it is there to check.
+All 26 are fixed. This file records what the fix turned out to be,
+because it was not what this file originally prescribed,
+and what is still open.
 
-## The fix
+## What the fix turned out to be
 
-`replay/eviction_nats_test.go` already solves it and is the template.
-It pairs the wait at `:71` with a `require.Never` on the over-count at `:84`
-(the twelve lines between them assert on other state):
+Every wait now asks `>=`, which is all a wait can honestly claim,
+and the exact value is asserted at a point where the counter can no longer move.
+Three such points exist, and between them they covered all 26 sites:
 
-```go
-require.Eventually(t, func() bool { return em.evicted() == 3 }, ...)
-require.Never(t, func() bool { return em.evicted() != 3 }, 2500*time.Millisecond, 100*time.Millisecond)
-```
+**`Worker.Stop()`** closes `stopCh` and then `wg.Wait()`s,
+so every worker goroutine has returned before it does.
+A count read after it is final, not sampled. 14 sites.
 
-Prefer converting to a channel wait on the hook the counter is written from
-where that is mechanical — see the async section of
-[`.agents/rules/300-testing.md`](../../.agents/rules/300-testing.md)
-and `gatedStateCollector` in `policy/failover_policy_test.go`.
-Where the wait must stay, add the `require.Never` guard.
+Two orderings matter around it.
+Stop drains the queue and drops what is left through `OnDrop`,
+so a backlog a test means to assert on must be read *before* Stop
+(`TestMemoryWorker_GateIsPerCluster` was written the other way round and failed).
+That same drain is what makes the guard strong:
+a payload wrongly re-enqueued shows up as an extra drop instead of going unseen.
 
-Pick the `Never` window against what the test is bounding,
-not a fixed number: it has to outlast the retry or backoff that a spurious extra
-increment would arrive on.
+**`CQLClient.Close()`** calls `deferred.wait()`,
+which waits for the background legs whose failure would be enqueued for replay. 5 sites.
+Close is idempotent, so an explicit call before the `t.Cleanup(client.Close)` is safe.
 
-## Sites
+**A structural bound the test already had.** 6 sites.
+An empty queue after a settled payload leaves nothing to dispatch twice;
+a probe loop parked on a channel cannot start the call that would increment again.
+These sites were never actually broken — the bound was there,
+it just sat a line below a wait that claimed to be doing the work.
+For them the fix is only the `>=` relaxation and a comment naming the real bound.
 
-All 26 have a hook already wired (bucket A) unless noted.
+The remaining site, `policy/adaptive_write_test.go`, was converted to the
+completion seam `awaitWriteLeg` that the file already uses:
+the leg records `IncWriteError` before it completes, so waiting on completion
+makes the count final.
 
-### Root package and `policy/` (7)
+**No `require.Never` was needed anywhere.**
+The template in `replay/eviction_nats_test.go` remains correct for a site with
+no quiescence point, but 26 for 26 had one.
+Prefer quiescence: it costs no wall clock, where a `Never` costs its whole window
+on the passing path. The replay package's runtime did not move.
 
-| Site | Claim |
-|---|---|
-| `write_deferred_test.go:64` | `len(replayer.payloads) == 2` — "each failed background leg must be enqueued for replay once" |
-| `write_deferred_test.go:110` | `len(spy.samplesFor(ClusterB)) == 1` — "must observe its duration once, when it completes" |
-| `write_deferred_test.go:230` | `mc.writeDropped[ClusterB] == 1` — "must be dropped, not start a third pending admission" |
-| `write_cluster_timeout_test.go:68` | `len(replayer.payloads) == 1` |
-| `write_cluster_timeout_test.go:74` | `consecutiveFailures == 1` — no seam wired; `recovery_probe.go` offers `IncRecoveryProbeFailure` and `logProbeFailure` |
-| `cql_client_recovery_probe_test.go:529` | `probes.failureA == 5 && calls > 5` — "must fail five times and then block" |
-| `policy/adaptive_write_test.go:515` | `m.GetWriteErrors(A) == 1` |
-
-### `replay/` (19)
-
-| Site | Claim |
-|---|---|
-| `worker_test.go:682` | `dropped == 1` — "OnDrop must fire exactly once after MaxAttempts". The strongest case: the test already follows it with a 50ms sleep to "give the worker a moment to demonstrate it does NOT re-enqueue", which is the `require.Never` guard written by hand and without a real bound |
-| `worker_test.go:214` | `processedCount == 5` |
-| `worker_test.go:249` | `successCount == 1` |
-| `worker_test.go:422` | `processedA == 3 && processedB == 2` |
-| `worker_test.go:479` | `processedA == 3 && processedB == 3` |
-| `worker_test.go:746` | `processedHealthy == 1` |
-| `worker_test.go:876` | `success == 1` |
-| `cluster_gate_test.go:191` | `executed == 1` — "the requeued payload runs exactly once" |
-| `cluster_gate_test.go:75` | `executed == 2 && replayer.Len() == 0` |
-| `cluster_gate_test.go:107` | `executed == 1` |
-| `cluster_gate_test.go:116` | `executed == 2` |
-| `cluster_gate_test.go:157` | `executed == 1` |
-| `cluster_gate_test.go:166` | `executed == 2` |
-| `cluster_gate_test.go:295` | `executed == 1` |
-| `cluster_gate_test.go:326` | `executedB == 2` |
-| `retained_memory_test.go:82` | `successes == payloads` |
-| `retained_memory_test.go:205` | `attempts == payloads` |
-| `retained_nats_test.go:179` | `successes == payloads` |
-| `corrupt_nats_test.go:46` | `mc.GetReplayCorrupt(A) == 1` |
-
-## Adjacent, decide when you get there
+## Still open: the adjacent six
 
 The wait itself uses `>=` and makes no exactness claim,
 but a line or two later the test asserts an exact value on a counter that is still live.
-The unsoundness moved down a line rather than being absent.
+These were left alone deliberately — the fix above is a large enough change to review on its own,
+and four of the six need the same quiescence reasoning applied to a different counter.
 
 In four of the six the later assertion reads the very counter that was awaited.
 In the two `cql_client_recovery_probe_test.go` entries it reads the *other* cluster's counter
 (await `successB >= 3`, then assert `successA` is zero),
 which is a weaker version of the same problem: nothing bounds when the zero is read.
 
-These six sit in the 17 sound-looking `>=` sites counted as out of scope below.
-Whether they belong there is the decision this section defers.
-
 `cql_client_recovery_probe_test.go:240` (→ `:242`),
 `cql_client_recovery_probe_test.go:300` (→ `:305`, `:307`),
 `replay/retained_memory_test.go:78` (→ `:79`, `:80`),
 `topology/nats_test.go:765` (→ `:768`),
-`policy/adaptive_write_test.go:550` (→ `:555`),
+`policy/adaptive_write_test.go:552` (→ `:557`),
 `failover_probe_test.go:167` (→ `:169`).
+
+Line numbers are as of the commit that closed the 26 and will drift.
 
 ## Out of scope
 
-The other 65 of the 91 in-process waits:
+The other 65 of the 91 in-process waits, as classified when this list was drawn up:
 
 - 17 have a wired hook but a `>=` condition and no exactness claim in the wait itself
   — sound as waits, just not idiomatic. Six of them carry the adjacent problem above.
@@ -112,5 +91,3 @@ except to note that 8 of them wait on an in-process hook rather than on the cont
 A classification of all 128 `Eventually` call sites as of `main` at `45b88da`
 (91 in-process + 37 container-backed; two of the e2e ones were converted away in the same PR),
 run while deciding what the async rule's polling exception should cover.
-The rule now names the `require.Never` guard;
-this file is the list of places that need it.
