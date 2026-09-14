@@ -411,6 +411,14 @@ requeues a payload into that window, then releases the lock.
 The naive construction of parking, requeuing and then closing proves nothing —
 a parked `select` commits to its case at send time,
 so the payload is handed straight to the receiver whether the arm is right or wrong.
+
+The converse is worth knowing before anyone reuses the construction.
+It leans on `close(done)` winning that commit ahead of the `requeue` send,
+which is a runtime-implementation detail and not a language guarantee.
+If the select ever committed to the payload arm instead,
+the test would still pass while exercising nothing —
+inert rather than flaky,
+the same failure mode the S3 arm subtests were built to avoid.
 The concurrent-`Close` test needed the same treatment:
 50 unsynchronised goroutines missed the `Load`-then-`Store` window on every run,
 so it now releases eight closers together across 500 rounds,
