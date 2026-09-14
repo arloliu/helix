@@ -17,6 +17,9 @@
 
 ## Async Testing (CRITICAL)
 - ❌ **NEVER** use `time.Sleep()` to wait for state.
+- ❌ **NEVER** use `assert.Eventually` anywhere.
+  A soft-failing wait lets the rest of the test run against state it has just failed to establish.
+  `forbidigo` enforces this; there is no case for it, inside the exception below or out.
 - ✅ **ALWAYS** use event-driven collectors that:
     1. Subscribe BEFORE triggering action.
     2. Collect all state transitions.
@@ -31,8 +34,7 @@ instead of sampling for it afterwards.
 When what the test waits on lives outside the process and offers nothing to subscribe to —
 a row landing in Cassandra/ScyllaDB, a container's state —
 polling is the only mechanism there is.
-Use `require.Eventually` for it, never `assert.Eventually`:
-a soft-failing wait lets the rest of the test run against state it has just failed to establish.
+Use `require.Eventually` for it.
 
 The exception is about the absence of a subscribe point, not about polling being easier to write.
 Where a hook exists — a callback, a metrics collector, a logger the code already calls —
