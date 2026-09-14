@@ -166,6 +166,10 @@ func TestFailoverProbe_OneProbeServesBothAuthorities(t *testing.T) {
 	close(gate)
 	require.Eventually(t, func() bool { return !both.ShouldFailover(ClusterA, nil) },
 		time.Second, time.Millisecond, "the probe closes the breaker")
+
+	// Close joins the probe loops. Without it a second probe could credit the
+	// write strategy again after the count below was read.
+	client.Close()
 	require.Equal(t, int32(1), both.writeCredits.Load(), "the same probe credited the write strategy exactly once")
 }
 

@@ -239,6 +239,11 @@ func TestRecoveryProbe_SkipsHealthyCluster(t *testing.T) {
 	// of its own to misbehave in.
 	require.Eventually(t, func() bool { return probes.successB.Load() >= 3 },
 		5*time.Second, 2*time.Millisecond, "the degraded cluster must be probed")
+
+	// Close cancels both probe loops and waits for them, so A's count is
+	// final: the claim is that no probe ever ran against the healthy cluster,
+	// not that none had run by the time the line was read.
+	client.Close()
 	assert.Zero(t, probes.successA.Load(), "probe must not execute against a healthy cluster")
 }
 
@@ -301,6 +306,9 @@ func TestRecoveryProbe_FailingProbeDoesNotRecover(t *testing.T) {
 		return probes.failureA.Load() >= 3
 	}, 500*time.Millisecond, 5*time.Millisecond, "IncRecoveryProbeFailure must reach 3 recorded failures")
 
+	// Close joins the probe loops, so the success count below is the whole
+	// run rather than a sample taken while the loop was still ticking.
+	client.Close()
 	assert.True(t, adaptive.IsDegraded(ClusterA), "cluster A must remain degraded")
 	assert.GreaterOrEqual(t, probes.failureA.Load(), int32(3),
 		"IncRecoveryProbeFailure must be incremented for each failing probe")
