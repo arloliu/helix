@@ -12,8 +12,9 @@ each of these sites is currently unable to fail for the thing it is there to che
 
 ## The fix
 
-`replay/eviction_nats_test.go:71-85` already solves it and is the template.
-It pairs the wait with a `require.Never` on the over-count:
+`replay/eviction_nats_test.go` already solves it and is the template.
+It pairs the wait at `:71` with a `require.Never` on the over-count at `:84`
+(the twelve lines between them assert on other state):
 
 ```go
 require.Eventually(t, func() bool { return em.evicted() == 3 }, ...)
@@ -72,9 +73,17 @@ All 26 have a hook already wired (bucket A) unless noted.
 
 ## Adjacent, decide when you get there
 
-The wait itself uses `>=`, but the next line reads the same live counter with
-`Equal`/`Zero`.
+The wait itself uses `>=` and makes no exactness claim,
+but a line or two later the test asserts an exact value on a counter that is still live.
 The unsoundness moved down a line rather than being absent.
+
+In four of the six the later assertion reads the very counter that was awaited.
+In the two `cql_client_recovery_probe_test.go` entries it reads the *other* cluster's counter
+(await `successB >= 3`, then assert `successA` is zero),
+which is a weaker version of the same problem: nothing bounds when the zero is read.
+
+These six sit in the 17 sound-looking `>=` sites counted as out of scope below.
+Whether they belong there is the decision this section defers.
 
 `cql_client_recovery_probe_test.go:240` (→ `:242`),
 `cql_client_recovery_probe_test.go:300` (→ `:305`, `:307`),
@@ -87,19 +96,21 @@ The unsoundness moved down a line rather than being absent.
 
 The other 65 of the 91 in-process waits:
 
-- 17 have a wired hook but a `>=` condition and no exactness claim — sound, just not idiomatic.
+- 17 have a wired hook but a `>=` condition and no exactness claim in the wait itself
+  — sound as waits, just not idiomatic. Six of them carry the adjacent problem above.
 - 19 have a seam the test does not install.
 - 28 have no subscribe point at all and fall under the rule's exception.
 - 1 is `replay/eviction_nats_test.go:71`, which makes an exactness claim and is already guarded.
 
-The 39 container-backed waits in `test/e2e/cql/` and `test/integration/` were not classified,
+The 37 container-backed waits in `test/e2e/cql/` (24) and `test/integration/` (13) were not classified,
 except to note that 8 of them wait on an in-process hook rather than on the container
 (`nats_batch_integration_test.go:233`, `:315`, `:391`;
 `topology_integration_test.go:340`, `:401`, `:594`, `:675`, `:690`).
 
 ## Where this came from
 
-A classification of all 130 `Eventually` sites,
+A classification of all 128 `Eventually` call sites as of `main` at `45b88da`
+(91 in-process + 37 container-backed; two of the e2e ones were converted away in the same PR),
 run while deciding what the async rule's polling exception should cover.
 The rule now names the `require.Never` guard;
 this file is the list of places that need it.
