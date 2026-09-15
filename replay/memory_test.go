@@ -509,7 +509,7 @@ const dequeueParkedFrame = "(*MemoryReplayer).Dequeue("
 const dequeueParkedState = "[select"
 
 // goroutineDump returns a complete dump of every goroutine's stack.
-// The buffer doubles until the dump fits, the way test/testutil/leak does
+// The buffer doubles until the dump fits, the way internal/leak does
 // it: a truncated dump could drop the very block being looked for.
 func goroutineDump() string {
 	buf := make([]byte, 1<<16)

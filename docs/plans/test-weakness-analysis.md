@@ -134,7 +134,7 @@ It was an unguarded invariant:
 the shutdown paths are correct today
 and nothing would have noticed if a future change broke them.
 
-**Closed** by `test/testutil/leak`,
+**Closed** by `internal/leak`,
 wired into the five packages that own goroutines.
 No new dependency:
 rule 300-testing already names a goroutine's existence,
@@ -146,9 +146,13 @@ under rule 100-overview §3.
 The helper got the full result on its own,
 so the dependency would have bought convenience, not capability.
 
-The package sits under `test/testutil/` rather than in `testutil` itself
+The package sits under `internal/` rather than in `testutil` itself
 because `testutil` imports helix,
-which would make it unimportable from helix's own in-package tests.
+which would make it unimportable from helix's own in-package tests —
+and `internal/` additionally keeps a test-only helper
+out of the module's public surface,
+where `gorelease` would read the added package as a minor bump
+and it would carry a compatibility obligation it does not want.
 
 Two entry points.
 `leak.TestMain(m)` guards a whole package
@@ -174,7 +178,7 @@ one per bucket:
   caught, attributed to the test rather than the binary.
 
 Restoring each passes.
-`test/testutil/leak` also carries its own tests
+`internal/leak` also carries its own tests
 for the settle, ignore and reporting logic.
 
 One thing the probe cannot do:

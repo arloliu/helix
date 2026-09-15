@@ -13,9 +13,11 @@
 // where polling is the correct tool.
 // This package polls [runtime.Stack].
 //
-// It lives outside the testutil package proper because that package
-// imports helix, which would make it unimportable from helix's own
-// in-package tests.
+// It lives under internal rather than in the testutil package proper:
+// testutil imports helix, which would make it unimportable from helix's
+// own in-package tests, and internal keeps a test-only helper out of the
+// module's public surface, where it would otherwise carry a compatibility
+// obligation.
 package leak
 
 import (
@@ -57,7 +59,15 @@ var ignoredFrames = []string{
 	"os/signal.signal_recv",
 	"os/signal.loop",
 	"runtime.ensureSigM",
-	"test/testutil/leak.stacks",
+
+	// This package's own reader. Unreachable through today's two entry
+	// points: the only goroutine whose stack can carry this frame is the
+	// one calling stacks, and that goroutine is already in the before
+	// snapshot, so diff skips it before ignored is consulted. It is kept
+	// for a Check registered from a goroutine spawned after the snapshot,
+	// where the frame would otherwise be reported as a leak.
+	// The path is part of the match, so it moves when the package does.
+	"internal/leak.stacks",
 }
 
 // TestMain runs a package's tests and then fails the binary if any
