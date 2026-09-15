@@ -11,19 +11,9 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
-// Compile-time assertions that *Collector implements the optional
-// types.AdaptiveWriteMetrics, types.MirrorReplayMetrics,
-// types.ClusterEventMetrics, types.RecoveryProbeMetrics,
-// types.StrictMetrics, and types.CallerContextMetrics interfaces. Placed in
-// a _test.go file per the public-package assertion convention.
-var (
-	_ types.AdaptiveWriteMetrics = (*Collector)(nil)
-	_ types.MirrorReplayMetrics  = (*Collector)(nil)
-	_ types.ClusterEventMetrics  = (*Collector)(nil)
-	_ types.RecoveryProbeMetrics = (*Collector)(nil)
-	_ types.StrictMetrics        = (*Collector)(nil)
-	_ types.CallerContextMetrics = (*Collector)(nil)
-)
+// The compile-time interface assertions for *Collector live in
+// vm_recorders_test.go, in one block covering the base
+// types.MetricsCollector interface plus every optional interface.
 
 func TestCollector_DurationHistogramsUsePrometheusBuckets(t *testing.T) {
 	c := New(WithMetricsSet(metrics.NewSet()))
