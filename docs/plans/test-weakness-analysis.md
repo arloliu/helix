@@ -9,8 +9,10 @@ and what no coverage number can see.
 Nothing here was a request to change production code.
 Where a finding names a production bug or a missing seam,
 it is recorded as a finding,
-and the decision to act on it is taken separately —
-as it was for S7, which is closed by a one-line fix decided after the fact.
+and the decision to act on it is taken separately.
+Three were acted on that way: S7, S8 and S5,
+each decided after the finding was written,
+and S8 changes a documented `MemoryReplayer` contract.
 
 ## What was measured
 
@@ -114,7 +116,7 @@ the memory backend's retained-retry spawns
 (`replay/memory_retained.go:240`, `replay/memory_worker.go:94`, `:206`),
 the mirror engine's worker pool (`mirror/engine.go:278`),
 both topology watchers (`topology/local.go:67`, `topology/nats.go:128`),
-and the adaptive-write background leg (`policy/adaptive_write.go:938`).
+and the adaptive-write background leg (`fireAndForget` in `policy/adaptive_write.go`).
 
 Shutdown correctness is asserted indirectly —
 26 quiescence assertions now hang off `Stop()`/`Close()`
@@ -185,7 +187,7 @@ and it is worth knowing that the two guards overlap there.
 
 ### S3 — `MemoryReplayer.Dequeue` blocking path was untested — CLOSED
 
-`replay/memory.go:306 Dequeue` sits at **39.1%**.
+`MemoryReplayer.Dequeue` in `replay/memory.go` sat at **39.1%**.
 Uncovered: the uninitialized guard, the pre-check `ctx.Done()`,
 the closed-and-drained exit,
 and **all four arms of the blocking select** —
