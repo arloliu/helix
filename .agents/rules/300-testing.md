@@ -74,8 +74,12 @@ if one is unavoidable, guard every send with a `select` on a done channel.
 It bans sleeping *to wait for state*. Two shapes are not that:
 
 - **Fixture latency.** `time.Sleep` inside a fake write function so the code under test
-  has a real duration to measure (`policy/adaptive_write_test.go`) is producing the input,
-  not waiting for an outcome.
+  has a real duration to measure is producing the input, not waiting for an outcome.
+  Prefer a clock seam where one exists: `AdaptiveDualWrite` takes `latencyNow`, and
+  `policy/adaptive_latency_clock_test.go` steps it instead of sleeping. The one surviving
+  sleep of this shape, in `TestAdaptiveDualWrite_RelativeDeltaDegradation`, is kept on
+  purpose, as the only test whose assertion depends on the seam's real-clock fallback
+  measuring real elapsed time.
 - **Asserting nothing happened.** There is no event to wait for when the claim is an absence,
   so a bounded wait followed by the assertion is the only shape available
   (`replay_gate_test.go` waits, then requires the replay count is still zero).
