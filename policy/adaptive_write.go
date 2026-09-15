@@ -81,7 +81,8 @@ type AdaptiveDualWrite struct {
 	minDegradedDwell time.Duration
 	redegradeWindow  time.Duration
 	maxDegradedDwell time.Duration
-	now              func() int64 // Monotonic nanoseconds; nil means processElapsed
+	now              func() int64                // Monotonic nanoseconds; nil means processElapsed
+	latencyNow       func(types.ClusterID) int64 // Clock latency sampling reads, per leg; nil means processElapsed
 
 	// Observability for fire-and-forget background writes. The
 	// foreground caller already records metrics for the synchronous
@@ -795,23 +796,23 @@ func (a *AdaptiveDualWrite) Execute(
 		// on the calling goroutine instead of spawning two goroutines for
 		// this common case. Both writes still execute concurrently.
 		wg.Go(func() {
-			start := time.Now()
+			start := a.latencyNanos(types.ClusterB)
 			errB = safeWrite(ctx, writeB, "B")
-			latencyB = time.Since(start)
+			latencyB = time.Duration(a.latencyNanos(types.ClusterB) - start)
 			callerDoneB = ctx.Err() != nil
 		})
 
-		start := time.Now()
+		start := a.latencyNanos(types.ClusterA)
 		errA = safeWrite(ctx, writeA, "A")
-		latencyA = time.Since(start)
+		latencyA = time.Duration(a.latencyNanos(types.ClusterA) - start)
 		callerDoneA = ctx.Err() != nil
 	} else {
 		// Cluster A
 		if !degradedA {
 			wg.Go(func() {
-				start := time.Now()
+				start := a.latencyNanos(types.ClusterA)
 				errA = safeWrite(ctx, writeA, "A")
-				latencyA = time.Since(start)
+				latencyA = time.Duration(a.latencyNanos(types.ClusterA) - start)
 				callerDoneA = ctx.Err() != nil
 			})
 		} else {
@@ -821,9 +822,9 @@ func (a *AdaptiveDualWrite) Execute(
 		// Cluster B
 		if !degradedB {
 			wg.Go(func() {
-				start := time.Now()
+				start := a.latencyNanos(types.ClusterB)
 				errB = safeWrite(ctx, writeB, "B")
-				latencyB = time.Since(start)
+				latencyB = time.Duration(a.latencyNanos(types.ClusterB) - start)
 				callerDoneB = ctx.Err() != nil
 			})
 		} else {
@@ -946,9 +947,9 @@ func (a *AdaptiveDualWrite) fireAndForget(
 		ctx, cancel := context.WithTimeout(context.Background(), a.fireForgetTimeout)
 		defer cancel()
 
-		start := time.Now()
+		start := a.latencyNanos(cluster)
 		err := safeWrite(ctx, write, a.clusterName(cluster))
-		a.observeFireAndForget(cluster, err, time.Since(start), state, siblingState)
+		a.observeFireAndForget(cluster, err, time.Duration(a.latencyNanos(cluster)-start), state, siblingState)
 
 		result.complete(err)
 	}()
@@ -1055,6 +1056,30 @@ func (a *AdaptiveDualWrite) creditsRecovery(latency time.Duration, siblingState 
 func (a *AdaptiveDualWrite) nowNanos() int64 {
 	if a.now != nil {
 		return a.now()
+	}
+
+	return int64(time.Since(processStart))
+}
+
+// latencyNanos is the clock latency sampling reads, for one cluster's leg.
+//
+// It is deliberately a separate seam from nowNanos. nowNanos answers how
+// long the process has been running, which the dwell and re-degrade
+// comparisons need; this one is only ever read in pairs, to measure one
+// write's duration. Keeping them apart lets a test drive simulated
+// latency without also moving the hysteresis clock, and leaves each
+// seam's documentation about one thing.
+//
+// The cluster is a parameter because the two legs run concurrently. A
+// single shared counter could not attribute a duration to one of them:
+// the other leg's advance would land between this leg's two reads. An
+// injected clock therefore keeps one counter per cluster.
+//
+// Both seams default to the same monotonic source, so a caller who
+// injects neither sees no difference.
+func (a *AdaptiveDualWrite) latencyNanos(cluster types.ClusterID) int64 {
+	if a.latencyNow != nil {
+		return a.latencyNow(cluster)
 	}
 
 	return int64(time.Since(processStart))
@@ -1686,22 +1711,22 @@ func (a *AdaptiveDualWrite) ExecuteStrict(
 		// on the calling goroutine instead of spawning two goroutines for
 		// this common case. Both writes still execute concurrently.
 		wg.Go(func() {
-			start := time.Now()
+			start := a.latencyNanos(types.ClusterB)
 			errB = safeWrite(ctx, writeB, "B")
-			latencyB = time.Since(start)
+			latencyB = time.Duration(a.latencyNanos(types.ClusterB) - start)
 			callerDoneB = ctx.Err() != nil
 		})
 
-		start := time.Now()
+		start := a.latencyNanos(types.ClusterA)
 		errA = safeWrite(ctx, writeA, "A")
-		latencyA = time.Since(start)
+		latencyA = time.Duration(a.latencyNanos(types.ClusterA) - start)
 		callerDoneA = ctx.Err() != nil
 	} else {
 		if !degradedA {
 			wg.Go(func() {
-				start := time.Now()
+				start := a.latencyNanos(types.ClusterA)
 				errA = safeWrite(ctx, writeA, "A")
-				latencyA = time.Since(start)
+				latencyA = time.Duration(a.latencyNanos(types.ClusterA) - start)
 				callerDoneA = ctx.Err() != nil
 			})
 		} else {
@@ -1710,9 +1735,9 @@ func (a *AdaptiveDualWrite) ExecuteStrict(
 
 		if !degradedB {
 			wg.Go(func() {
-				start := time.Now()
+				start := a.latencyNanos(types.ClusterB)
 				errB = safeWrite(ctx, writeB, "B")
-				latencyB = time.Since(start)
+				latencyB = time.Duration(a.latencyNanos(types.ClusterB) - start)
 				callerDoneB = ctx.Err() != nil
 			})
 		} else {
