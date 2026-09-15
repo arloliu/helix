@@ -40,6 +40,26 @@ const settleTimeout = 5 * time.Second
 // settleInterval is how often the survivors are re-counted while waiting.
 const settleInterval = 50 * time.Millisecond
 
+// ignoredFrames are stack frames belonging to the runtime or the testing
+// package rather than to code under test.
+// A goroutine parked in one of them is scaffolding:
+// the signal handler, the test runner's own bookkeeping,
+// or this package reading the stacks.
+//
+// Each entry must be matchable against a single goroutine's stack as
+// stacks splits them, on a blank line.
+// An entry spanning that boundary can never match, and would claim a
+// coverage this list does not have.
+var ignoredFrames = []string{
+	"testing.(*M).Run",
+	"testing.runTests",
+	"testing.tRunner",
+	"os/signal.signal_recv",
+	"os/signal.loop",
+	"runtime.ensureSigM",
+	"test/testutil/leak.stacks",
+}
+
 // TestMain runs a package's tests and then fails the binary if any
 // goroutine started during the run is still alive.
 //
@@ -188,22 +208,6 @@ func diff(before map[uint64]struct{}, after map[uint64]string) []string {
 	}
 
 	return leaked
-}
-
-// ignoredFrames are stack frames belonging to the runtime or the testing
-// package rather than to code under test.
-// A goroutine parked in one of them is scaffolding:
-// the signal handler, the test runner's own bookkeeping,
-// or this package reading the stacks.
-var ignoredFrames = []string{
-	"testing.(*M).Run",
-	"testing.runTests",
-	"testing.tRunner",
-	"os/signal.signal_recv",
-	"os/signal.loop",
-	"runtime.ensureSigM",
-	"runtime.goexit\n\ncreated by runtime",
-	"test/testutil/leak.stacks",
 }
 
 // ignored reports whether a stack belongs to scaffolding rather than to
