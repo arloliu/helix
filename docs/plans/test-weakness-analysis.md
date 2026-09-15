@@ -41,6 +41,14 @@ The first two columns are the measurement this analysis was built on.
 The third re-runs the merge after the tests added for S1 and S6 below,
 so the two are comparable.
 
+**The whole table is the state before S2 through S5 and S7 and S8 were closed,
+and it was not re-measured after.**
+Each finding records what it moved:
+`contrib/metrics/vm` went to 100% (S4),
+`replay` to 83.3% unit with `Dequeue` at 100% (S3),
+and `types` was already at 100% merged here.
+Read a row as the reason the finding exists, not as where the package stands now.
+
 Two of the alarming unit-only numbers dissolve on merge:
 `types` at 70.3% and `adapter/cql/v1` at 33.7% are instrumentation artifacts,
 not gaps.
