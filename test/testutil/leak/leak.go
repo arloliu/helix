@@ -109,13 +109,35 @@ func TestMain(m *testing.M) {
 func Check(t *testing.T) {
 	t.Helper()
 
+	registerCheck(t, settleTimeout)
+}
+
+// checkT is the part of *testing.T that registerCheck uses.
+//
+// The seam exists so the failure path can be observed. A test
+// that let Check fail it for real would report as a failure itself,
+// which leaves the guard unverifiable by the rule that every guard must
+// be shown to fail. The timeout is a parameter for the same reason:
+// waiting out the real one would cost the suite five seconds per case.
+type checkT interface {
+	Helper()
+	Cleanup(func())
+	Failed() bool
+	Error(args ...any)
+}
+
+// registerCheck registers the leak check on t, waiting up to timeout for
+// goroutines to settle.
+func registerCheck(t checkT, timeout time.Duration) {
+	t.Helper()
+
 	before := snapshot()
 	t.Cleanup(func() {
 		if t.Failed() {
 			return
 		}
 
-		if leaked := settle(before, settleTimeout); len(leaked) > 0 {
+		if leaked := settle(before, timeout); len(leaked) > 0 {
 			var b strings.Builder
 			report(&b, leaked)
 			t.Error(b.String())
