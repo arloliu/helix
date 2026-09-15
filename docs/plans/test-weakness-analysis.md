@@ -233,7 +233,7 @@ The measurement is unit-only;
 `replay` is the one package where unit and merged coverage sit within 0.3%,
 so the table was left as measured rather than re-running the Docker tier.
 
-### S4 — `contrib/metrics/vm` at 59.1%, unmoved by any tier
+### S4 — `contrib/metrics/vm` sat at 59.1%, unmoved by any tier — CLOSED
 
 254 statements, the largest untested block outside `replay`.
 Unit and merged coverage are identical,
@@ -245,9 +245,66 @@ a wrong or missing one is invisible in production except as a metric that never 
 Individual recorders sit at 0%:
 `AddMirrorDrainDropped`, `AddReplayEvicted`, `AddClusterEventsDropped`.
 
-**Closes when** each optional interface assertion is pinned
-(`var _ helix.XxxMetrics = (*Metrics)(nil)`)
-and each recorder is called once with the emitted series name asserted.
+**Closed** by `contrib/metrics/vm/vm_recorders_test.go`,
+which takes the package from 59.1% to **100%**.
+Fourteen optional interfaces, not the thirteen this entry first counted:
+`MirrorShutdownMetrics` was added after it was written.
+
+Calling each recorder and asserting its own series would not have been enough.
+Roughly fifty recorders share one shape —
+`if cluster == types.ClusterA { c.fooA.Inc() } else { c.fooB.Inc() }` —
+so the live defect is a recorder wired to the wrong field
+or the wrong cluster's branch,
+which the compiler cannot see
+and which "my counter moved" cannot distinguish.
+Each case therefore scrapes the whole exposition into a `series -> value` map
+before and after the call,
+and asserts that **only** the named series moved.
+A recorder that also nudges a second field,
+or two recorders sharing one field,
+fail on the victim's series rather than their own.
+
+Verified against five injected defects:
+
+- swapping one recorder's `ClusterA` and `ClusterB` branches —
+  fails both of that recorder's rows;
+- cross-wiring one recorder to another's field —
+  caught by the whole-scrape check, not by the recorder's own assertion;
+- `AddReplayEvicted` adding 1 instead of `n` — fails its delta assertion;
+- renaming a method that satisfies an optional interface —
+  fails to compile at the `var _` assertion;
+- hardcoding `"helix"` in place of `c.prefix` in a lazily-named recorder —
+  fails the prefix test.
+
+That last one is worth keeping.
+The prefix test iterates over *emitted* series,
+and seven recorders build their own name string
+instead of inheriting it from `initMetrics`,
+so until those seven were called the test passed over them vacuously:
+two hardcoded prefixes survived a green run.
+A test that iterates over what was emitted
+only covers what something emitted.
+
+Two guards keep the file from rotting.
+A reflective test lists `*Collector`'s `Inc*`/`Set*`/`Add*`/`Observe*` methods
+and fails by name for any that no table exercises,
+so recorder fifty-one cannot land at 0% silently —
+verified by deleting a row and watching it name the orphan.
+A routing comment at the top of the file
+maps a recorder's signature shape to the table it belongs in.
+
+The pre-existing tests in `vm_test.go` were deliberately kept.
+They overlap the new tables on recorder coverage
+but are the only place asserting the pre-created-at-0 contract,
+which the tables drop.
+Only their `var _` block went, as a strict subset of the new one.
+
+`New`'s global-registration branch is covered too,
+using `metrics.UnregisterSet` in a cleanup.
+It is the path every real user takes —
+`WithMetricsSet` exists for test isolation —
+and nothing had asserted a default-built collector was reachable
+from a global scrape.
 
 ### S5 — Adaptive-write latency sampling has no clock seam
 
@@ -472,12 +529,10 @@ None warrant their own suite.
 
 ## Status and suggested order
 
-S1, S2, S3, S6, S7 and S8 are closed.
-Remaining, in the order they are worth doing:
+S1, S2, S3, S4, S6, S7 and S8 are closed.
 
-**S4** — mechanical, no decisions needed.
-
-**S5** — a design question to answer before it is a test task.
+**S5** is the only finding left,
+and it is a design question to answer before it is a test task.
 
 Per the standing rule, each new guard must be shown to fail against an injected defect before it counts as closing anything.
 Green and inert look identical.
