@@ -282,8 +282,13 @@ func TestAdaptiveDualWrite_ZeroValueForceDegradeFallsBackToSynchronous(t *testin
 	assert.NoError(t, errB)
 }
 
+// Injects only latencyNow: no dwell option is set, so a.now (the
+// hysteresis clock) stays on the real monotonic source and this assertion
+// does not depend on it either way.
 func TestAdaptiveDualWrite_BothHealthy(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite()
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	var callsA, callsB atomic.Int32
@@ -291,12 +296,12 @@ func TestAdaptiveDualWrite_BothHealthy(t *testing.T) {
 	errA, errB := a.Execute(ctx,
 		func(ctx context.Context) error {
 			callsA.Add(1)
-			time.Sleep(10 * time.Millisecond)
+			clock.advance(types.ClusterA, 10*time.Millisecond)
 			return nil
 		},
 		func(ctx context.Context) error {
 			callsB.Add(1)
-			time.Sleep(10 * time.Millisecond)
+			clock.advance(types.ClusterB, 10*time.Millisecond)
 			return nil
 		},
 	)
@@ -366,23 +371,19 @@ func TestAdaptiveDualWrite_Execute_BothHealthyRunConcurrently(t *testing.T) {
 }
 
 func TestAdaptiveDualWrite_AbsoluteCapDegradation(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(50*time.Millisecond),
 		WithAdaptiveStrikeThreshold(2),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Simulate slow cluster A (exceeds absolute max)
 	for range 2 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(60 * time.Millisecond) // Exceeds 50ms
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Fast
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 60*time.Millisecond), // Exceeds 50ms
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond), // Fast
 		)
 	}
 
@@ -390,6 +391,13 @@ func TestAdaptiveDualWrite_AbsoluteCapDegradation(t *testing.T) {
 	assert.False(t, a.IsDegraded(types.ClusterB))
 }
 
+// Deliberately left on real sleeps: of the delta-threshold tests this is
+// the cleanest genuine concurrent dual write with two different real
+// durations (30ms vs 100ms) racing through Execute's goroutine + inline
+// path together, so it stands in as the end-to-end guard that the
+// latencyNow seam itself has not regressed.
+// Every other threshold test in this file drives the same comparison
+// through the injected clock.
 func TestAdaptiveDualWrite_RelativeDeltaDegradation(t *testing.T) {
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveDeltaThreshold(50*time.Millisecond),
@@ -418,24 +426,20 @@ func TestAdaptiveDualWrite_RelativeDeltaDegradation(t *testing.T) {
 }
 
 func TestAdaptiveDualWrite_MinFloorIgnoresDelta(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveDeltaThreshold(10*time.Millisecond),
 		WithAdaptiveMinFloor(50*time.Millisecond),
 		WithAdaptiveStrikeThreshold(2),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Both are fast (< minFloor), even though delta > threshold
 	for range 5 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(5 * time.Millisecond)
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(30 * time.Millisecond) // 25ms difference
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 5*time.Millisecond),
+			latencyStep(clock, types.ClusterB, 30*time.Millisecond), // 25ms difference
 		)
 	}
 
@@ -444,10 +448,17 @@ func TestAdaptiveDualWrite_MinFloorIgnoresDelta(t *testing.T) {
 	assert.False(t, a.IsDegraded(types.ClusterB))
 }
 
+// Injects only latencyNow. The completion signal this test cares about
+// (fireForgetCompleted) is ordered by awaitWriteLeg's callback wait, not
+// by wall-clock duration, so the sleep here was only ever standing in for
+// "the write takes some time" — the clock step preserves that without
+// costing real time.
 func TestAdaptiveDualWrite_FireAndForget(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveFireForgetTimeout(100 * time.Millisecond),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Force degrade cluster A
@@ -460,7 +471,7 @@ func TestAdaptiveDualWrite_FireAndForget(t *testing.T) {
 	errA, errB := a.Execute(ctx,
 		func(ctx context.Context) error {
 			callsA.Add(1)
-			time.Sleep(10 * time.Millisecond)
+			clock.advance(types.ClusterA, 10*time.Millisecond)
 			fireForgetCompleted.Store(true)
 			return nil
 		},
@@ -649,25 +660,21 @@ func TestAdaptiveDualWrite_Recovery(t *testing.T) {
 }
 
 func TestAdaptiveDualWrite_RecoveryViaFastWrites(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveMinFloor(20*time.Millisecond),
 		WithAdaptiveDeltaThreshold(50*time.Millisecond), // A-B delta must exceed this
 		WithAdaptiveRecoveryThreshold(2),
 		WithAdaptiveStrikeThreshold(2),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// First degrade cluster A via slow writes (150ms vs 10ms = 140ms delta > 50ms threshold)
 	for range 2 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(150 * time.Millisecond) // Slow
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Fast
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 150*time.Millisecond), // Slow
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),  // Fast
 		)
 	}
 	require.True(t, a.IsDegraded(types.ClusterA))
@@ -679,14 +686,8 @@ func TestAdaptiveDualWrite_RecoveryViaFastWrites(t *testing.T) {
 	// Now execute fast writes - both clusters healthy, both fast
 	for range 2 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Fast
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Fast
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 10*time.Millisecond), // Fast
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond), // Fast
 		)
 	}
 
@@ -884,25 +885,21 @@ func TestAdaptiveDualWrite_ImplementsWriteStrategy(t *testing.T) {
 // This tests the fix for the recovery limitation where degraded clusters
 // previously couldn't recover because fire-and-forget writes didn't track latency.
 func TestAdaptiveDualWrite_AutomaticRecoveryViaDegradedWrites(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(100*time.Millisecond),
 		WithAdaptiveStrikeThreshold(2),
 		WithAdaptiveRecoveryThreshold(3), // Need 3 fast writes to recover
 		WithAdaptiveFireForgetTimeout(5*time.Second),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Step 1: Degrade cluster A via slow writes
 	for range 2 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(150 * time.Millisecond) // Exceeds 100ms absoluteMax
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Fast
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 150*time.Millisecond), // Exceeds 100ms absoluteMax
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),  // Fast
 		)
 	}
 	require.True(t, a.IsDegraded(types.ClusterA), "Cluster A should be degraded after slow writes")
@@ -915,14 +912,8 @@ func TestAdaptiveDualWrite_AutomaticRecoveryViaDegradedWrites(t *testing.T) {
 
 	for range 10 { // Execute several writes
 		errA, errB := a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Fast - should trigger recovery
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond)
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 10*time.Millisecond), // Fast - should trigger recovery
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 		)
 
 		if errors.Is(errA, types.ErrWriteAsync) {
@@ -1019,24 +1010,20 @@ func TestAdaptiveDualWrite_FireForgetLimit(t *testing.T) {
 }
 
 func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(2*time.Second),
 		WithAdaptiveDeltaThreshold(100*time.Millisecond),
 		WithAdaptiveRecoveryThreshold(3),
 		WithAdaptiveFireForgetTimeout(5*time.Second),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Step 1: Establish healthy baseline for cluster B (10ms latency)
 	_, errB := a.Execute(ctx,
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		},
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		},
+		latencyStep(clock, types.ClusterA, 10*time.Millisecond),
+		latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 	)
 	require.NoError(t, errB)
 
@@ -1049,14 +1036,8 @@ func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
 	// These should NOT trigger recovery because 500ms - 10ms = 490ms > 100ms threshold
 	for range 5 {
 		errA, _ := a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(500 * time.Millisecond) // Fast enough (< 2s) but delta too large
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond) // Keep cluster B baseline fresh
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 500*time.Millisecond), // Fast enough (< 2s) but delta too large
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),  // Keep cluster B baseline fresh
 		)
 		require.True(t, errors.Is(errA, types.ErrWriteAsync) || errors.Is(errA, types.ErrWriteDropped))
 
@@ -1073,14 +1054,8 @@ func TestAdaptiveDualWrite_RecoveryRequiresDelta(t *testing.T) {
 	// Step 4: Now execute writes that are both fast AND within delta of sibling
 	for range 5 {
 		errA, _ := a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(50 * time.Millisecond) // Fast and delta = 40ms < 100ms threshold
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond)
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 50*time.Millisecond), // Fast and delta = 40ms < 100ms threshold
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 		)
 		// Wait for fire-and-forget to complete
 		if ok, legErr := awaitWriteLeg(t, errA); ok {
@@ -1105,12 +1080,14 @@ func TestAdaptiveDualWrite_FireForgetLimitOption(t *testing.T) {
 func TestAdaptiveDualWrite_RecoveryWhenBothDegraded(t *testing.T) {
 	// When both clusters are degraded, recovery should fall back to absoluteMax-only check
 	// because there's no healthy sibling baseline to compare against
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(100*time.Millisecond),
 		WithAdaptiveDeltaThreshold(50*time.Millisecond),
 		WithAdaptiveRecoveryThreshold(2),
 		WithAdaptiveFireForgetTimeout(5*time.Second),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Force degrade both clusters
@@ -1124,14 +1101,8 @@ func TestAdaptiveDualWrite_RecoveryWhenBothDegraded(t *testing.T) {
 	// Recovery should use absoluteMax-only check
 	for range 4 {
 		errA, errB := a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(20 * time.Millisecond) // Fast (< 100ms absoluteMax)
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(20 * time.Millisecond) // Fast (< 100ms absoluteMax)
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 20*time.Millisecond), // Fast (< 100ms absoluteMax)
+			latencyStep(clock, types.ClusterB, 20*time.Millisecond), // Fast (< 100ms absoluteMax)
 		)
 
 		// Wait for fire-and-forget to complete
@@ -1157,26 +1128,22 @@ func TestAdaptiveDualWrite_NoDoubleStrike(t *testing.T) {
 	// Without the fix, a single execution with cap+delta violation gives 2 strikes,
 	// degrading the cluster after just 1 round (2 >= 2).
 	// With the fix, it takes 2 rounds (1 strike each).
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(50*time.Millisecond),    // cap threshold
 		WithAdaptiveDeltaThreshold(30*time.Millisecond), // delta threshold
 		WithAdaptiveMinFloor(10*time.Millisecond),
 		WithAdaptiveStrikeThreshold(2),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Single execution: A takes 80ms (>50ms cap), B takes 10ms.
 	// Delta = 70ms > 30ms threshold → both conditions fire for A.
 	// With the fix: A gets exactly 1 strike, NOT 2.
 	_, _ = a.Execute(ctx,
-		func(ctx context.Context) error {
-			time.Sleep(80 * time.Millisecond) // exceeds absoluteMax AND deltaThreshold
-			return nil
-		},
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond) // fast
-			return nil
-		},
+		latencyStep(clock, types.ClusterA, 80*time.Millisecond), // exceeds absoluteMax AND deltaThreshold
+		latencyStep(clock, types.ClusterB, 10*time.Millisecond), // fast
 	)
 
 	// After 1 execution, A must NOT be degraded yet (strikeThreshold=2).
@@ -1186,14 +1153,8 @@ func TestAdaptiveDualWrite_NoDoubleStrike(t *testing.T) {
 
 	// Second execution with same pattern → 2nd strike → now degraded.
 	_, _ = a.Execute(ctx,
-		func(ctx context.Context) error {
-			time.Sleep(80 * time.Millisecond)
-			return nil
-		},
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		},
+		latencyStep(clock, types.ClusterA, 80*time.Millisecond),
+		latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 	)
 
 	assert.True(t, a.IsDegraded(types.ClusterA),
@@ -1368,6 +1329,7 @@ func TestAdaptiveDualWrite_Concurrent_StrikeAndRecover(t *testing.T) {
 // so the sibling's delta check would always compare against the old latency snapshot
 // taken when the cluster was last written synchronously — potentially hours stale.
 func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveStrikeThreshold(1),
 		WithAdaptiveRecoveryThreshold(1),
@@ -1377,6 +1339,7 @@ func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
 		// absoluteMax must be large enough to not reject our fast write.
 		WithAdaptiveAbsoluteMax(10*time.Second),
 	)
+	a.latencyNow = clock.now
 
 	// Pre-seed sibling (B) with a known latency so the delta path is exercised.
 	a.stateB.lastLatency.Store((50 * time.Millisecond).Nanoseconds())
@@ -1392,11 +1355,8 @@ func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
 	ctx := t.Context()
 
 	errA, _ := a.Execute(ctx,
-		func(context.Context) error {
-			// Simulate a fast write (~1ms) — well within absoluteMax and delta.
-			time.Sleep(1 * time.Millisecond)
-			return nil
-		},
+		// Simulate a fast write (~1ms) — well within absoluteMax and delta.
+		latencyStep(clock, types.ClusterA, 1*time.Millisecond),
 		func(context.Context) error { return nil },
 	)
 
@@ -1420,24 +1380,20 @@ func TestAdaptiveDualWrite_LastLatencyUpdatedInFireForget(t *testing.T) {
 // degraded. Previously, updateHealthState returned early when only one cluster
 // had valid latency, leaving the healthy cluster's slowStrikes frozen.
 func TestAdaptiveDualWrite_HealthyClusterClearsStrikesWhileSiblingDegraded(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(50*time.Millisecond),
 		WithAdaptiveStrikeThreshold(3),
 		WithAdaptiveRecoveryThreshold(3),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Accumulate 2 slow strikes on cluster A (one short of degradation).
 	for range 2 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(60 * time.Millisecond) // Exceeds absoluteMax
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond)
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 60*time.Millisecond), // Exceeds absoluteMax
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 		)
 	}
 	require.False(t, a.IsDegraded(types.ClusterA), "A not yet degraded (2/3 strikes)")
@@ -1447,17 +1403,11 @@ func TestAdaptiveDualWrite_HealthyClusterClearsStrikesWhileSiblingDegraded(t *te
 	a.ForceDegrade(types.ClusterB)
 	require.True(t, a.IsDegraded(types.ClusterB))
 
-	// Execute a fast write where only A returns latency. With the fix,
-	// A's slowStrikes should be cleared by recordFastIfNoViolation.
+	// Execute a fast write where only A returns latency.
+	// With the fix, A's slowStrikes should be cleared by recordFastIfNoViolation.
 	_, _ = a.Execute(ctx,
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond) // Fast, no cap violation
-			return nil
-		},
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		},
+		latencyStep(clock, types.ClusterA, 10*time.Millisecond), // Fast, no cap violation
+		latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 	)
 
 	assert.Equal(t, int32(0), a.stateA.slowStrikes,
@@ -1624,24 +1574,20 @@ func TestAdaptiveDualWrite_HandleErrors_ExcludesStrict(t *testing.T) {
 // recordFastIfNoViolation does NOT reset slowStrikes — the cap-violation
 // strike from checkAbsoluteCap must be preserved.
 func TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(50*time.Millisecond),
 		WithAdaptiveStrikeThreshold(3),
 		WithAdaptiveRecoveryThreshold(3),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
 	// Accumulate 2 slow strikes on cluster A (one short of degradation).
 	for range 2 {
 		_, _ = a.Execute(ctx,
-			func(ctx context.Context) error {
-				time.Sleep(60 * time.Millisecond) // Exceeds absoluteMax
-				return nil
-			},
-			func(ctx context.Context) error {
-				time.Sleep(10 * time.Millisecond)
-				return nil
-			},
+			latencyStep(clock, types.ClusterA, 60*time.Millisecond), // Exceeds absoluteMax
+			latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 		)
 	}
 	require.False(t, a.IsDegraded(types.ClusterA), "A not yet degraded (2/3 strikes)")
@@ -1655,14 +1601,8 @@ func TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded(t *testing
 	// cap-violation strike must be preserved — recordFastIfNoViolation
 	// must NOT clear it.
 	_, _ = a.Execute(ctx,
-		func(ctx context.Context) error {
-			time.Sleep(60 * time.Millisecond) // Still exceeds absoluteMax
-			return nil
-		},
-		func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		},
+		latencyStep(clock, types.ClusterA, 60*time.Millisecond), // Still exceeds absoluteMax
+		latencyStep(clock, types.ClusterB, 10*time.Millisecond),
 	)
 
 	assert.True(t, a.IsDegraded(types.ClusterA),
@@ -1702,21 +1642,23 @@ func TestAdaptiveDualWrite_EmitsDegradeAndRecoverEvents(t *testing.T) {
 }
 
 // TestAdaptiveDualWrite_StrikeThresholdEmitsDegraded exercises the automatic
-// path: latency-delta strikes accumulated through Execute must emit exactly one
-// EventWriteDegraded carrying the strike count and the threshold reason. The
-// sleeps live inside the exec funcs to simulate write latency, which is the
-// established pattern for this strategy's tests.
+// path: latency-delta strikes accumulated through Execute must emit exactly
+// one EventWriteDegraded carrying the strike count and the threshold reason.
+// The exec funcs step an injected clock to simulate write latency instead of
+// sleeping for it.
 func TestAdaptiveDualWrite_StrikeThresholdEmitsDegraded(t *testing.T) {
 	em := &recordingEmitter{}
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveStrikeThreshold(2),
 		WithAdaptiveDeltaThreshold(5*time.Millisecond),
 		WithAdaptiveMinFloor(1*time.Millisecond),
 	)
+	a.latencyNow = clock.now
 	a.SetEventEmitter(em)
 
 	ctx := t.Context()
-	slow := func(_ context.Context) error { time.Sleep(20 * time.Millisecond); return nil }
+	slow := latencyStep(clock, types.ClusterA, 20*time.Millisecond)
 	fast := func(_ context.Context) error { return nil }
 
 	_, _ = a.Execute(ctx, slow, fast)
@@ -2067,7 +2009,15 @@ func TestAdaptiveDualWrite_ConcurrentTransitionsSupersededGaugeSkipped(t *testin
 // a shared slowdown degrades both clusters through the absolute cap, so both carry
 // a slow latency sample. Once the clusters answer quickly again, both must recover:
 // recovery credit must not be judged against a degraded sibling's stale sample.
+// Injects only latencyNow: no dwell is configured, so the hysteresis clock
+// this test never reads can stay real.
+// The require.Eventually wrapper is load-bearing, not vestigial: the
+// recovery threshold is two credits and each lands in a fire-and-forget
+// callback, so recovery does not complete on one Execute.
+// It should still be an awaitWriteLeg subscription rather than a poll,
+// per rule 300-testing — see the note on S5 in the weakness ledger.
 func TestAdaptiveDualWrite_RecoversWhenBothDegradedBySlowWrites(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(20*time.Millisecond),
 		WithAdaptiveDeltaThreshold(5*time.Millisecond),
@@ -2076,17 +2026,20 @@ func TestAdaptiveDualWrite_RecoversWhenBothDegradedBySlowWrites(t *testing.T) {
 		WithAdaptiveRecoveryThreshold(2),
 		WithAdaptiveFireForgetTimeout(5*time.Second),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
-	slow := func(context.Context) error {
-		time.Sleep(30 * time.Millisecond) // Over the 20ms absolute cap.
-		return nil
-	}
+	// 30ms is over the 20ms absolute cap.
+	// Separate closures per cluster: a single shared closure called
+	// concurrently for both legs would double-advance each counter, since it
+	// has no way to tell which leg invoked it.
+	slowA := latencyStep(clock, types.ClusterA, 30*time.Millisecond)
+	slowB := latencyStep(clock, types.ClusterB, 30*time.Millisecond)
 
 	// Both legs are synchronous while healthy, so strikeThreshold rounds of
 	// slow writes degrade both clusters and record their slow latency.
 	for range 2 {
-		errA, errB := a.Execute(ctx, slow, slow)
+		errA, errB := a.Execute(ctx, slowA, slowB)
 		require.NoError(t, errA)
 		require.NoError(t, errB)
 	}
@@ -2148,7 +2101,11 @@ func TestAdaptiveDualWrite_ProbeRecoversWhenBothDegraded(t *testing.T) {
 // band between minFloor and absoluteMax: two clusters that degraded together and
 // now answer in step, fast enough but not fast enough to clear the noise floor,
 // must still recover on the delta between their own fresh samples.
+// Injects only latencyNow, same reasoning as
+// TestAdaptiveDualWrite_RecoversWhenBothDegradedBySlowWrites: no dwell is
+// configured here either.
 func TestAdaptiveDualWrite_RecoversWhenBothDegradedAboveMinFloor(t *testing.T) {
+	clock := &legClock{}
 	a := NewAdaptiveDualWrite(
 		WithAdaptiveAbsoluteMax(200*time.Millisecond),
 		WithAdaptiveDeltaThreshold(50*time.Millisecond),
@@ -2157,14 +2114,16 @@ func TestAdaptiveDualWrite_RecoversWhenBothDegradedAboveMinFloor(t *testing.T) {
 		WithAdaptiveRecoveryThreshold(2),
 		WithAdaptiveFireForgetTimeout(5*time.Second),
 	)
+	a.latencyNow = clock.now
 	ctx := t.Context()
 
-	slow := func(context.Context) error {
-		time.Sleep(300 * time.Millisecond) // Over the 200ms absolute cap.
-		return nil
-	}
+	// 300ms is over the 200ms absolute cap.
+	// Separate closures per cluster, as in
+	// RecoversWhenBothDegradedBySlowWrites above.
+	slowA := latencyStep(clock, types.ClusterA, 300*time.Millisecond)
+	slowB := latencyStep(clock, types.ClusterB, 300*time.Millisecond)
 	for range 2 {
-		errA, errB := a.Execute(ctx, slow, slow)
+		errA, errB := a.Execute(ctx, slowA, slowB)
 		require.NoError(t, errA)
 		require.NoError(t, errB)
 	}
@@ -2173,13 +2132,11 @@ func TestAdaptiveDualWrite_RecoversWhenBothDegradedAboveMinFloor(t *testing.T) {
 
 	// Recovered latency: under the cap and in step across the clusters, but
 	// above minFloor, so credit has to come from the delta comparison.
-	recovered := func(context.Context) error {
-		time.Sleep(50 * time.Millisecond)
-		return nil
-	}
+	recoveredA := latencyStep(clock, types.ClusterA, 50*time.Millisecond)
+	recoveredB := latencyStep(clock, types.ClusterB, 50*time.Millisecond)
 
 	require.Eventually(t, func() bool {
-		_, _ = a.Execute(ctx, recovered, recovered)
+		_, _ = a.Execute(ctx, recoveredA, recoveredB)
 
 		return !a.IsDegraded(types.ClusterA) && !a.IsDegraded(types.ClusterB)
 	}, 3*time.Second, 10*time.Millisecond,

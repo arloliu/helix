@@ -306,9 +306,9 @@ It is the path every real user takes —
 and nothing had asserted a default-built collector was reachable
 from a global scrape.
 
-### S5 — Adaptive-write latency sampling has no clock seam
+### S5 — Adaptive-write latency sampling had no clock seam — CLOSED
 
-`policy/adaptive_write_test.go` holds **42 of the suite's 94 `time.Sleep`s**.
+`policy/adaptive_write_test.go` held **42 of the suite's 94 `time.Sleep`s**.
 They are not condition-waits — the async-wait rule already covers those —
 they are the test *simulating* write latency:
 
@@ -320,10 +320,10 @@ func(ctx context.Context) error {
 ```
 
 The strategy has an injectable clock for hysteresis
-(`nowNanos()` honours `a.now`, `adaptive_write.go:1047`),
-but the latency measurement itself does not:
-`time.Now()` is called directly at
-`adaptive_write.go:798`, `:804`, `:812`, `:824`, `:949`, `:1689`, `:1695`, `:1702`, `:1713`.
+(`nowNanos()` honours `a.now`),
+but the latency measurement itself did not:
+`time.Now()` was called directly at nine sampling sites,
+four per write path plus the fire-and-forget leg.
 
 The consequence is that every threshold assertion in that file is a wall-clock race against the machine running it.
 A 30ms-vs-100ms comparison is comfortable;
@@ -331,9 +331,69 @@ a 5ms-vs-30ms one (`adaptive_write_test.go:430`) on a loaded CI box is not.
 The file also costs ~5.8s of the suite's runtime almost entirely in sleeps.
 
 This is a testability finding, not a correctness one.
-No flake has been observed.
-Extending the existing `a.now` seam to cover latency sampling would let all 42 sleeps become instant clock steps —
-but that is a production change, and the call is the maintainer's.
+No flake was ever observed.
+
+**Closed** by giving latency sampling its own seam rather than extending `a.now`.
+`AdaptiveDualWrite` gained `latencyNow func(types.ClusterID) int64`,
+read through `latencyNanos`, defaulting to the same monotonic source —
+so a caller who injects nothing sees no change.
+
+The two clocks stayed separate deliberately.
+`nowNanos` answers how long the process has been running,
+which dwell and re-degrade need;
+the new one is read in pairs to measure one write.
+Conflating them would have made every existing hysteresis test's dwell
+advance by simulated write latency.
+
+The seam takes a cluster because the two legs run concurrently.
+A single shared counter cannot attribute a duration to one of them —
+the other leg's advance lands between this leg's two reads —
+which the race detector caught on the first version of the change.
+The fake keeps one atomic counter per cluster,
+in separate fields rather than a map,
+since a map written from two goroutines aborts the process.
+
+40 of the 42 sleeps became clock steps across 15 tests.
+The package went from **5.84s to 0.72s**.
+Replacing `time.Since` on a `time.Time` with an int64 subtraction
+also made the healthy dual-write path cheaper,
+median of five runs at `-benchtime=3s`:
+`Execute_BothHealthy` 419 to 390 ns/op,
+`ExecuteStrict_BothHealthy` 432 to 401 ns/op.
+
+The risk in a conversion like this is not breakage, it is silent inertness:
+a threshold test driven by a fake clock can pass while asserting nothing,
+and looks identical to one that works.
+So every converted test was run against a defect that should break it,
+individually rather than per bucket —
+the delta-threshold comparison, the min-floor filter,
+the absolute cap, the double-strike guard,
+the fire-and-forget deferral, and `latencyNanos` ignoring its cluster argument.
+Every one of the 15 has at least one confirmed-breaking mutation.
+The cluster-argument mutation is the one that proves per-leg attribution is load-bearing:
+it fails three tests, and it is why two tests
+that had passed one shared closure as both legs had to be split.
+
+Two sleeps were kept on purpose,
+in `TestAdaptiveDualWrite_RelativeDeltaDegradation`.
+If every test ran on a fake clock,
+nothing would guard the seam's real-clock fallback:
+freezing that fallback fails only this test.
+It is now the most schedule-sensitive assertion in the package —
+cluster A must overshoot its 30ms sleep by under 20ms
+or the nominal 70ms delta drops under the 50ms threshold.
+If it ever flakes, the fix is not to convert it,
+because that leaves the fallback's value unguarded.
+
+**One thing left open.** `TestAdaptiveDualWrite_RecoversWhenBothDegradedBySlowWrites`
+and `..._AboveMinFloor` drive `Execute` inside `require.Eventually`,
+which predates this work.
+A subscribe point exists — `awaitWriteLeg`, used by seven tests in the same file —
+so rule 300-testing says these should not poll.
+They were left alone because the swap is not mechanical:
+round one's legs run concurrently,
+so awaiting both changes how many rounds the recovery takes,
+and that is a change to what the test asserts rather than to how it waits.
 
 ### S6 — `ClusterNames.Validate` rejection branches untested — CLOSED
 
@@ -529,10 +589,11 @@ None warrant their own suite.
 
 ## Status and suggested order
 
-S1, S2, S3, S4, S6, S7 and S8 are closed.
+Every finding is closed: S1 through S8.
 
-**S5** is the only finding left,
-and it is a design question to answer before it is a test task.
+One item is recorded but not done,
+in S5: two tests poll where a subscribe point exists.
+The note there says why, and what changing it would cost.
 
 Per the standing rule, each new guard must be shown to fail against an injected defect before it counts as closing anything.
 Green and inert look identical.
