@@ -3,7 +3,7 @@ package policy
 import (
 	"testing"
 
-	"github.com/arloliu/helix/test/testutil/leak"
+	"github.com/arloliu/helix/internal/leak"
 )
 
 // TestMain fails this package's test binary if a goroutine started during
