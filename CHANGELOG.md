@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   motivated the original design is unchanged. Helix's own replay worker never took this path,
   so this reaches callers using `MemoryReplayer` directly.
 
+### Changed
+
+- **`AdaptiveDualWrite` samples latency through its own clock seam.** The strategy already
+  injected its hysteresis clock; latency measurement called `time.Now` directly, which left
+  every threshold test simulating latency by sleeping for it. Sampling now reads an internal
+  per-cluster clock that defaults to the same monotonic source, so behaviour is unchanged for
+  every caller. The seam is per-cluster because the two legs run concurrently: a single shared
+  counter could not attribute a duration to one of them. Replacing `time.Since` on a
+  `time.Time` with an int64 subtraction also made the healthy dual-write path measurably
+  cheaper — `BenchmarkAdaptiveDualWrite_Execute_BothHealthy` moved from 419 to 390 ns/op and
+  `..._ExecuteStrict_BothHealthy` from 432 to 401 ns/op, each the median of five runs.
+
 ## [1.10.1] — 2026-09-13
 
 A maintenance release. `gorelease` reports it as a patch: no exported API changes. There is
