@@ -1471,6 +1471,12 @@ func WithClusterWriteTimeout(d time.Duration) Option {
 // It does not apply to single-cluster reads, where there is no
 // alternative to preserve budget for, nor to writes.
 //
+// A leg this deadline ends never succeeds, so it yields no latency sample.
+// With a latency-aware failover policy, set that policy's latency cap
+// strictly below d: at or above d every read slow enough to be a soft
+// failure is cut off here and counted as an ordinary failure first, so the
+// latency cap never fires.
+//
 // An iterator's first page is a leg like any other: the page
 // [Query.IterContext] fetches before it hands the iterator over is bounded
 // by d, counts as its cluster's failure when it expires, and is eligible

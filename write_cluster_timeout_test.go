@@ -11,6 +11,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// The counter these tests assert on — statsForCluster(x).consecutiveFailures
+// — is the auto-refresh connectivity counter (clusterStats.failed, threshold
+// DefaultAutoRefreshConfig), not a circuit breaker's.
+// No write path consults the FailoverPolicy at all: clusterHealth.writeLeg,
+// the single funnel every write leg passes through, touches only the
+// holder's stats.
+// So a write leg's deadline can never reach a breaker, whatever policy the
+// client is given.
+
 func TestClusterWriteTimeout_SlowLegIsReplayedAndAcknowledged(t *testing.T) {
 	sa, sb := newBlockingSession(), newMockSession()
 	replayer := &mockReplayer{}
@@ -31,7 +40,7 @@ func TestClusterWriteTimeout_SlowLegIsReplayedAndAcknowledged(t *testing.T) {
 	require.Len(t, replayer.payloads, 1)
 	require.Equal(t, ClusterA, replayer.payloads[0].TargetCluster, "the expired leg is replayed")
 	require.Equal(t, int32(1), client.statsForCluster(ClusterA).consecutiveFailures.Load(),
-		"a leg deadline is Helix's own, so its expiry is a health signal")
+		"a leg deadline is Helix's own, so its expiry counts against A in the auto-refresh stats")
 	require.Equal(t, int32(0), client.statsForCluster(ClusterB).consecutiveFailures.Load())
 }
 
@@ -72,7 +81,7 @@ func TestClusterWriteTimeout_DegradedBackgroundLegIsReplayed(t *testing.T) {
 		return len(replayer.payloads) >= 1 && replayer.payloads[0].TargetCluster == ClusterA
 	}, time.Second, time.Millisecond, "the expired background leg is replayed")
 	require.Eventually(t, func() bool { return client.statsForCluster(ClusterA).consecutiveFailures.Load() >= 1 },
-		time.Second, time.Millisecond, "the background leg's deadline is a health signal")
+		time.Second, time.Millisecond, "the background leg's deadline counts against A in the auto-refresh stats")
 
 	// Close waits for the background legs, so neither count can move after it
 	// returns.

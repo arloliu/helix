@@ -11,6 +11,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// The tests in this file configure no FailoverPolicy, so the counter they
+// assert on — statsForCluster(x).consecutiveFailures — is the auto-refresh
+// connectivity counter (clusterStats.failed, threshold
+// DefaultAutoRefreshConfig), not a circuit breaker's.
+// They pin down which side of the caller/cluster provenance rule an expiry
+// falls on, and nothing about a breaker.
+
 // stalledReadSession is a cql.Session whose reads never answer: every read
 // blocks until the context it was given ends. It stands in for a cluster
 // that accepts connections but leaves the request hanging, which is what a
@@ -140,7 +147,7 @@ func TestClusterReadTimeout_ExpiredLegFailsOverToAlternative(t *testing.T) {
 	require.Equal(t, 42, got)
 	require.Equal(t, 1, sa.readCount(), "A was contacted once")
 	require.Equal(t, int32(1), client.statsForCluster(ClusterA).consecutiveFailures.Load(),
-		"a leg deadline is Helix's own, so its expiry is a health signal for A")
+		"a leg deadline is Helix's own, so its expiry counts against A in the auto-refresh stats")
 	require.Equal(t, int32(0), client.statsForCluster(ClusterB).consecutiveFailures.Load())
 }
 
@@ -179,7 +186,7 @@ func TestClusterReadTimeout_DefaultLeavesTheLegOnTheCallerContext(t *testing.T) 
 		"without a leg deadline the first cluster consumes the caller's whole budget")
 	require.Empty(t, sb.queries, "no budget was left to contact the alternative cluster")
 	require.Equal(t, int32(0), client.statsForCluster(ClusterA).consecutiveFailures.Load(),
-		"the caller's own deadline is not a health signal")
+		"the caller's own deadline leaves the auto-refresh stats untouched")
 }
 
 func TestClusterReadTimeout_SingleClusterRunsOnTheCallerContext(t *testing.T) {
@@ -226,7 +233,7 @@ func TestClusterReadTimeout_BoundsTheFallbackReadProbe(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second, "the probe must end on its own deadline")
 	require.Equal(t, 1, sb.readCount(), "the alternative was probed once")
 	require.Equal(t, int32(1), client.statsForCluster(ClusterB).consecutiveFailures.Load(),
-		"the probe's expiry is a health signal for the alternative")
+		"the probe's expiry counts against the alternative in the auto-refresh stats")
 }
 
 // pacedRowSession answers reads a row at a time, pausing between rows and
@@ -353,5 +360,5 @@ func TestClusterReadTimeout_BoundsASliceFallbackReadProbe(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second, "the slice probe must end on its own deadline")
 	require.Equal(t, 1, sb.readCount(), "the alternative was probed once")
 	require.Equal(t, int32(1), client.statsForCluster(ClusterB).consecutiveFailures.Load(),
-		"the probe's expiry is a health signal for the alternative")
+		"the probe's expiry counts against the alternative in the auto-refresh stats")
 }

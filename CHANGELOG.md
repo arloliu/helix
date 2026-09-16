@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- **`LatencyCircuitBreaker`'s latency threshold and the per-leg read deadline interact.**
+  `RecordLatency` needs a read that *succeeds* slowly, so a leg `WithClusterReadTimeout(d)`
+  cuts off is counted as an ordinary hard failure instead. Setting `absoluteMax` at or above
+  `d` therefore leaves the latency branch dead and the policy behaving exactly like
+  `CircuitBreaker` — failover still works, but nothing is gained and no warning is emitted.
+  Documented in `docs/strategy-policy.md`, `docs/auto-recovery.md` and both options' Godoc.
+- **Two paths never produce a latency sample.** Iterators report at `Close()`, which has no
+  single sample and always calls `RecordSuccess`; no write path consults the `FailoverPolicy`
+  at all, so `WithClusterWriteTimeout` can never trip a breaker.
+
 ## [1.10.2] — 2026-09-15
 
 ### Fixed
