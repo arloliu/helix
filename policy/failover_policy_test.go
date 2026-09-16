@@ -631,6 +631,27 @@ func TestCircuitBreaker_ProbeFailedReopensAndRestartsTimeout(t *testing.T) {
 	reserveProbe(t, cb, types.ClusterB)
 }
 
+// TestCircuitBreaker_ProbeReservationIsSingleFlight races callers at an
+// open breaker past its reset timeout: exactly one reserves the probe.
+func TestCircuitBreaker_ProbeReservationIsSingleFlight(t *testing.T) {
+	cb := NewCircuitBreaker(WithThreshold(1), WithResetTimeout(1*time.Hour))
+	cb.RecordFailure(types.ClusterA) // trips
+	elapseResetTimeout(t, cb, types.ClusterA)
+
+	const callers = 64
+	var wg sync.WaitGroup
+	var reserved atomic.Int32
+	for range callers {
+		wg.Go(func() {
+			if _, ok := cb.TryBeginFailoverProbe(types.ClusterA); ok {
+				reserved.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	require.EqualValues(t, 1, reserved.Load(), "exactly one concurrent caller reserves the probe")
+}
+
 // TestCircuitBreaker_ProbeAbandonedReleasesReservation covers a probe the
 // client cancelled: the breaker returns to open without counting a failure
 // or restarting the timeout, so another client sharing it can reserve at once.
