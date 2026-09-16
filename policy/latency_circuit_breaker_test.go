@@ -369,7 +369,7 @@ func TestLatencyCircuitBreaker_ResetTimeout(t *testing.T) {
 	lcb := NewLatencyCircuitBreaker(
 		WithLatencyAbsoluteMax(100*time.Millisecond),
 		WithLatencyThreshold(2),
-		WithLatencyResetTimeout(20*time.Millisecond),
+		WithLatencyResetTimeout(1*time.Hour),
 	)
 
 	// Slow successes count as failures until the breaker trips.
@@ -378,20 +378,44 @@ func TestLatencyCircuitBreaker_ResetTimeout(t *testing.T) {
 	require.Equal(t, 2, lcb.Failures(types.ClusterA))
 	require.True(t, lcb.ShouldFailover(types.ClusterA, nil))
 	require.True(t, lcb.VetoRoute(types.ClusterA))
+	_, ok := lcb.TryBeginFailoverProbe(types.ClusterA)
+	require.False(t, ok, "no probe before the reset timeout")
 
 	// After the reset timeout the breaker reserves a probe and stays
 	// vetoing until the probe closes it.
-	var token uint64
-	require.Eventually(t, func() bool {
-		var ok bool
-		token, ok = lcb.TryBeginFailoverProbe(types.ClusterA)
-
-		return ok
-	}, time.Second, time.Millisecond)
+	elapseResetTimeout(t, lcb.CircuitBreaker, types.ClusterA)
+	token, ok := lcb.TryBeginFailoverProbe(types.ClusterA)
+	require.True(t, ok, "an open breaker past its reset timeout must reserve a probe")
 	require.True(t, lcb.VetoRoute(types.ClusterA), "half-open still vetoes")
 	lcb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeSucceeded)
 	assert.Equal(t, 0, lcb.Failures(types.ClusterA))
 	assert.False(t, lcb.VetoRoute(types.ClusterA))
+}
+
+// TestLatencyCircuitBreaker_ProbeFailedReopens covers half-open → open on a
+// latency breaker: the cluster stays vetoed, and the reset timeout restarts
+// so the next reservation waits again.
+func TestLatencyCircuitBreaker_ProbeFailedReopens(t *testing.T) {
+	em := &recordingEmitter{}
+	lcb := NewLatencyCircuitBreaker(
+		WithLatencyThreshold(2),
+		WithLatencyResetTimeout(1*time.Hour),
+	)
+	lcb.SetEventEmitter(em)
+
+	lcb.RecordFailure(types.ClusterA)
+	lcb.RecordFailure(types.ClusterA) // trips
+	elapseResetTimeout(t, lcb.CircuitBreaker, types.ClusterA)
+	token, ok := lcb.TryBeginFailoverProbe(types.ClusterA)
+	require.True(t, ok, "an open breaker past its reset timeout must reserve a probe")
+
+	lcb.CompleteFailoverProbe(types.ClusterA, token, types.ProbeFailed)
+
+	assert.True(t, lcb.ShouldFailover(types.ClusterA, nil))
+	assert.True(t, lcb.VetoRoute(types.ClusterA), "a failed probe keeps the cluster vetoed")
+	assert.Equal(t, []types.ClusterEventKind{types.EventCircuitBreakerOpen}, em.kinds(), "a failed probe emits nothing")
+	_, ok = lcb.TryBeginFailoverProbe(types.ClusterA)
+	assert.False(t, ok, "the failed probe restarted the reset timeout")
 }
 
 func TestLatencyCircuitBreaker_SetEventEmitterDelegates(t *testing.T) {
