@@ -169,6 +169,77 @@ func TestLatencyCircuitBreaker_ErrorsAndLatency(t *testing.T) {
 	assert.True(t, lcb.ShouldFailover(types.ClusterA, nil))
 }
 
+// TestLatencyCircuitBreaker_FastLatencyClearsErrors covers recovery from hard
+// failures: a sample at or under absoluteMax clears the errors counted before
+// it, below threshold and after a trip alike, and closes an open breaker at
+// once instead of waiting for the reset timeout.
+func TestLatencyCircuitBreaker_FastLatencyClearsErrors(t *testing.T) {
+	t.Run("below threshold", func(t *testing.T) {
+		lcb := NewLatencyCircuitBreaker(
+			WithLatencyAbsoluteMax(1*time.Second),
+			WithLatencyThreshold(3),
+		)
+
+		lcb.RecordFailure(types.ClusterA)
+		lcb.RecordFailure(types.ClusterA)
+		require.Equal(t, 2, lcb.Failures(types.ClusterA))
+
+		lcb.RecordLatency(types.ClusterA, 500*time.Millisecond)
+		assert.Equal(t, 0, lcb.Failures(types.ClusterA))
+
+		lcb.RecordFailure(types.ClusterA)
+		assert.False(t, lcb.ShouldFailover(types.ClusterA, nil), "the count restarted from zero")
+	})
+
+	t.Run("open breaker closes", func(t *testing.T) {
+		em := &recordingEmitter{}
+		lcb := NewLatencyCircuitBreaker(
+			WithLatencyAbsoluteMax(1*time.Second),
+			WithLatencyThreshold(2),
+			WithLatencyResetTimeout(1*time.Hour),
+		)
+		lcb.SetEventEmitter(em)
+
+		lcb.RecordFailure(types.ClusterA)
+		lcb.RecordFailure(types.ClusterA) // trips
+		require.True(t, lcb.ShouldFailover(types.ClusterA, nil))
+		require.True(t, lcb.VetoRoute(types.ClusterA))
+
+		lcb.RecordLatency(types.ClusterA, 500*time.Millisecond)
+		assert.Equal(t, 0, lcb.Failures(types.ClusterA))
+		assert.False(t, lcb.ShouldFailover(types.ClusterA, nil))
+		assert.False(t, lcb.VetoRoute(types.ClusterA), "closed without waiting for the reset timeout")
+
+		events := em.snapshot()
+		require.Equal(t,
+			[]types.ClusterEventKind{types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed},
+			em.kinds())
+		assert.Equal(t, types.ClusterA, events[1].Cluster)
+		assert.Equal(t, "operation succeeded", events[1].Reason)
+
+		// Fully closed, not merely unvetoed: the next errors trip it again.
+		lcb.RecordFailure(types.ClusterA)
+		lcb.RecordFailure(types.ClusterA)
+		assert.True(t, lcb.VetoRoute(types.ClusterA))
+		assert.Equal(t,
+			[]types.ClusterEventKind{
+				types.EventCircuitBreakerOpen, types.EventCircuitBreakerClosed, types.EventCircuitBreakerOpen,
+			},
+			em.kinds(), "the second trip emits its own open event")
+	})
+
+	t.Run("latency equal to absoluteMax is not slow", func(t *testing.T) {
+		lcb := NewLatencyCircuitBreaker(
+			WithLatencyAbsoluteMax(1*time.Second),
+			WithLatencyThreshold(3),
+		)
+
+		lcb.RecordFailure(types.ClusterA)
+		lcb.RecordLatency(types.ClusterA, 1*time.Second)
+		assert.Equal(t, 0, lcb.Failures(types.ClusterA))
+	})
+}
+
 func TestLatencyCircuitBreaker_IndependentClusters(t *testing.T) {
 	lcb := NewLatencyCircuitBreaker(
 		WithLatencyAbsoluteMax(1*time.Second),
