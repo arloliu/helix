@@ -229,7 +229,11 @@ Trips after consecutive read failures and recovers through the client's recovery
 - **Is probed** once `resetTimeout` (default: 30s) has elapsed since the last failure: the next tick of the client's recovery probe (`WithRecoveryProbe`, default on for dual-cluster clients) reserves the breaker (half-open) and runs one probe against the cluster. A successful probe closes the breaker; a failed one returns it to open and restarts the timeout. No caller's read is sacrificed to test the cluster
 - **Also closes** on any successful read against that cluster
 - Stays open until such a read when `resetTimeout` is 0 or the probe is disabled
-- `LatencyCircuitBreaker` also treats slow reads (above `absoluteMax`) as soft failures, and with `helix.WithRouteVeto(true)` keeps ordinary reads away from the cluster while open or half-open
+- `LatencyCircuitBreaker` also treats slow reads (above `absoluteMax`) as soft failures, and with `helix.WithRouteVeto(true)` keeps ordinary reads away from the cluster while open or half-open.
+  A soft failure needs a read that succeeds slowly,
+  so `absoluteMax` must sit strictly below `helix.WithClusterReadTimeout` to have any effect;
+  at or above it, every such read is cut off as an ordinary failure first.
+  See [`absoluteMax` and the leg deadline](strategy-policy.md#absolutemax-and-the-leg-deadline).
 
 No manual intervention needed. Both transitions emit cluster events; see the
 [Cluster Events Guide](cluster-events.md).

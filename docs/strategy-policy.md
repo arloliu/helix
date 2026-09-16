@@ -645,7 +645,45 @@ if err != nil {
 
 The client calls `RecordLatency()` automatically after each successful read if the configured policy implements `LatencyRecorder` — no manual wiring required.
 
-**Example timeline** (absoluteMax = 2s, threshold = 3, resetTimeout = 30s):
+The counter a soft failure increments is the same one a hard failure increments,
+and `RecordSuccess()` clears both alike.
+A fast successful read after two hard errors resets the count to zero.
+A fast read on a cluster whose breaker is already open closes it outright,
+Reason "operation succeeded", without waiting for `resetTimeout`.
+See the note under the timeline below for when an open cluster can still receive such a read.
+
+#### `absoluteMax` and the leg deadline
+
+`RecordLatency()` needs a read that **succeeds** slowly.
+A read leg that `helix.WithClusterReadTimeout(d)` cuts off does not succeed:
+it returns `types.ErrClusterTimeout`, which is a hard failure.
+So the two settings interact:
+
+| Relation | What the latency threshold does |
+|---|---|
+| `absoluteMax < d` | Works as documented. A read answering between `absoluteMax` and `d` is a soft failure. |
+| `absoluteMax ≥ d` | **Dead config.** Every read slow enough to be a soft failure is cut off at `d` first and counted as a hard failure instead, so the policy behaves exactly like `CircuitBreaker`. |
+
+Failover still works in the second case:
+consecutive expired legs reach the threshold, open the breaker, and move reads to the other cluster.
+But nothing is gained over the plain `CircuitBreaker`, and no startup warning is emitted.
+Set `absoluteMax` strictly below your `WithClusterReadTimeout` if you want the latency branch at all.
+
+Two paths never produce a latency sample at all:
+
+- **Iterators.**
+  `Query.IterContext` reports its outcome at `Close()`, which has no single latency sample to offer,
+  so a clean close is always a plain `RecordSuccess()` however long the pages took.
+  `absoluteMax` does not apply to iterator reads, and a slow iterator resets the breaker exactly as a fast one does.
+  A cluster error at `Close()` is still a `RecordFailure()`.
+- **Writes.**
+  No write path consults the `FailoverPolicy`.
+  A write leg expiring under `helix.WithClusterWriteTimeout(d)` is replayed and counted toward the auto-refresh connectivity stats,
+  but it never reaches a circuit breaker and never causes read failover.
+
+**Example timeline** (absoluteMax = 2s, threshold = 3, resetTimeout = 30s,
+and a `WithClusterReadTimeout` above 2.5s or none at all;
+otherwise the slow reads below would be cut off as hard failures instead):
 
 ```
  t=0s   Read A in 800ms  → RecordSuccess(A) → A.failures=0

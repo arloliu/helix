@@ -19,6 +19,16 @@ const defaultLatencyAbsoluteMax = 2 * time.Second
 // Helix client automatically calls RecordLatency() after successful read
 // operations. No manual integration is required.
 //
+// A latency sample needs a read that succeeds slowly, so absoluteMax only
+// has an effect below the client's helix.WithClusterReadTimeout: a leg that
+// deadline cuts off returns types.ErrClusterTimeout and is counted as an
+// ordinary hard failure instead.
+// Set absoluteMax at or above that deadline and the latency branch never
+// fires, leaving this policy behaving exactly like the embedded
+// CircuitBreaker.
+// Iterator reads and every write path likewise produce no latency sample;
+// see the LatencyCircuitBreaker section of docs/strategy-policy.md.
+//
 // LatencyCircuitBreaker is also the only built-in failover policy that
 // implements the route-veto interface (see [LatencyCircuitBreaker.VetoRoute]
 // and [helix.WithRouteVeto]); the embedded CircuitBreaker does not.
