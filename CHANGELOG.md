@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FallbackRead and normal failover fold a rejection on the alternative cluster the same way they already fold an unreachable alternative.
   See `docs/strategy-policy.md` for the full contract.
   The write path is unchanged: a rejected statement on a write leg is still replayed.
+- **A write leg to a draining cluster now counts as skipped on every path.**
+  With `AdaptiveDualWrite` and the draining cluster also degraded,
+  its leg used to show up in `{prefix}_write_async_total`;
+  it now shows up in `{prefix}_write_skipped_total` instead,
+  and its replay is enqueued at once rather than when the background leg reports.
+  The leg never reached the cluster either way, so the caller's result is unchanged.
+- **A write refused because both clusters are draining is now counted.**
+  Each leg adds one to `{prefix}_write_total` and one to `{prefix}_write_skipped_total`,
+  for plain and `Strict()` writes alike.
+  Previously a plain write counted nothing and a strict write counted only `write_skipped`,
+  so dashboards undercounted writes during a full drain.
+  The errors returned (`ErrBothClustersDraining`, or a `DualClusterError` for a strict write) are unchanged,
+  and nothing is replayed.
+  `write_skipped` needs a collector implementing `types.StrictMetrics`, as the bundled `contrib/metrics/vm` one does.
 
 ### Documentation
 
