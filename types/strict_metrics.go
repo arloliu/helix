@@ -19,6 +19,8 @@ package types
 // A degraded cluster is skipped only by a Strict() write, but a draining
 // cluster's leg is skipped by every write, so an ordinary write to a draining
 // cluster increments it too.
+// A write refused because both clusters are draining counts both legs,
+// each in [MetricsCollector.IncWriteTotal] and here.
 type StrictMetrics interface {
 	// IncWriteSkipped is called when a cluster's write leg is skipped because
 	// the cluster is degraded (Strict() writes only) or draining (any write).
