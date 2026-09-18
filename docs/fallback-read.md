@@ -183,14 +183,22 @@ Helix is an AP system. FallbackRead favors availability over strict consistency:
 | Primary missing, alt has data | not-found | success | return data + divergence metric | OnSuccess(alt), IncReadDivergence(primary) |
 | Both missing | not-found | not-found | ErrNotFound | none |
 | Primary missing, alt down | not-found | error | **ErrNotFound** | IncReadError(alt), RecordFailure(alt) |
+| Primary missing, alt rejects the statement | not-found | error (rejected) | **ErrNotFound** | IncReadError(alt) only — no RecordFailure |
 | Primary down, alt missing | error | not-found | **ErrNotFound** | IncReadError(primary), RecordFailure(primary) |
 | Caller's context ended | any | context error | the context error | none |
 | Primary down, alt has data | error | success | return data via normal failover | IncReadError(primary), RecordFailure(primary), OnSuccess(alt) |
 | Both have real failures | error | error | DualClusterError | failure recorded on both |
 
-The bold rows are the AP availability guarantee: **a healthy cluster's "not found" is always returned to the caller**, even when the other cluster is unreachable. The alternative — returning a cluster error — would make every read for genuinely nonexistent rows fail during single-cluster outages. FallbackRead must not decrease availability compared to not using it.
+The bold rows are the AP availability guarantee:
+**a healthy cluster's "not found" is always returned to the caller**, even when the other cluster is unreachable or rejects the statement.
+The alternative — returning a cluster error — would make every read for genuinely nonexistent rows fail during single-cluster outages.
+FallbackRead must not decrease availability compared to not using it.
 
-> Health recording is unaffected by the return value: `IncReadError` and `RecordFailure` still fire on the cluster that actually failed. Operators see the degradation in dashboards; callers see a usable response.
+> Health recording is unaffected by the return value:
+> `IncReadError` still fires on the cluster that actually failed,
+> and `RecordFailure` fires alongside it unless that failure was a rejected statement
+> — the coordinator answered, so only the metric applies.
+> Operators see the degradation in dashboards; callers see a usable response.
 
 ## Divergence Metric
 

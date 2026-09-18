@@ -651,14 +651,24 @@ replay.WithReplayClassifier(func(err error) replay.ReplayDisposition {
 })
 ```
 
-`errors.As` finds the driver error because the adapter passes a server-side query error through untouched;
-only a connectivity failure is wrapped, as `fmt.Errorf("%w: %w", types.ErrClusterUnreachable, err)`, and that wrapping leaves the driver error in the chain too.
+The adapter no longer passes a server-side query error through untouched.
+A rejected statement is wrapped in `types.ErrStatementRejected`, the same four codes as above (`0x2000`/`0x2100`/`0x2200`/`0x2300`).
+A connectivity failure is wrapped in `types.ErrClusterUnreachable`, as before.
+Both wraps use `fmt.Errorf("%w: %w", sentinel, err)`,
+so the driver error stays in the chain and `errors.As` still finds it — the classifier above still works unchanged.
+`replay/statement_rejected_test.go` proves this pair:
+the classifier reaches the wrapped `gocql.RequestError` and still dead-letters only `ErrCodeSyntax`.
 The v2 adapter's driver, `github.com/apache/cassandra-gocql-driver/v2`, exposes the same `RequestError` interface and `ErrCodeSyntax` constant, so only the import path changes — it additionally returns a typed `*gocql.RequestErrSyntax`, if you would rather match on the type.
 
 **Do not widen the check to `ErrCodeInvalid` (0x2200).**
 Matching the interface alone would also catch 0x2200, so the `Code()` comparison must stay narrow.
 Cassandra returns 0x2200 for an *unconfigured table* — the same code a cluster returns while a schema migration has not reached it yet.
 That lag is precisely what replay exists to absorb, so dead-lettering 0x2200 would discard writes for a table that is about to exist.
+
+On the read path the same rejection is not a retry-and-wait situation.
+A read has no queue to wait in, so a rejected statement is returned to the caller immediately.
+It never trips failover, the failover policy, or the read strategy —
+see [What does not count as a cluster failure](strategy-policy.md#what-does-not-count-as-a-cluster-failure).
 
 ### Memory worker execution model
 
