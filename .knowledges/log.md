@@ -15,3 +15,9 @@
 ## 2026-09-18
 * **Update**: [Observation hub](/root/observation-hub.md) refreshes the `read_path.go` digest;
   the later edits to that file are comments and the routing the entry already describes, so the prose is unchanged.
+* **Update**: [Replay outcome classification](/root/replay-outcome-classification.md) rewritten against `write_path.go`;
+  it still cited `cql_client.go` and `enqueueReplayIfNeeded`, which no longer exist.
+  Now covers the leg kinds, `AckMode` and `NoSynchronousAckError`, deferred background legs,
+  a draining leg classified as draining even when the strategy returned it as async,
+  and the both-draining return counting each leg in `write_total` and `write_skipped`.
+  Status drops to draft pending an independent verification.

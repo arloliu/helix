@@ -306,6 +306,8 @@ When a cluster is in topology drain mode, strict writes treat it the same as a d
 the write is skipped for the draining cluster and the caller receives
 `*PartialWriteError{Cause: ErrClusterDraining}`. No replay is enqueued regardless of whether a
 `Replayer` is configured.
+With both clusters draining the write returns `*DualClusterError{ErrClusterDraining, ErrClusterDraining}`,
+and each leg counts once in `IncWriteTotal` and once in `IncWriteSkipped`.
 
 ```go
 err := client.Query("INSERT INTO t (k) VALUES (?)", key).Strict().ExecContext(ctx)
@@ -402,7 +404,8 @@ They are operational state, not failures.
 
 Despite the interface name, the counter is not confined to strict writes. A degraded cluster is
 skipped only by a `Strict()` write, but a draining cluster's leg is skipped by every write, so an
-ordinary write to a draining cluster increments it too.
+ordinary write to a draining cluster increments it too,
+including one refused with `ErrBothClustersDraining`.
 
 The bundled `contrib/metrics/vm` collector implements the interface and exports the counter as
 `{prefix}_write_skipped_total{cluster}`.
