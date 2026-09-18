@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`types.ErrStatementRejected`**, a new sentinel marking a driver error
+  where the cluster's coordinator rejected the statement itself —
+  not a connectivity or health problem.
+  Both bundled adapters (`adapter/cql/v1`, `adapter/cql/v2`) wrap CQL protocol error codes `0x2000` (syntax), `0x2100` (unauthorized), `0x2200` (invalid, including an unconfigured table), and `0x2300` (config) in this sentinel.
+  The driver error stays reachable through `errors.Is`/`errors.As`.
+
+### Changed
+
+- **A rejected statement on a read no longer triggers failover or trips a circuit breaker.**
+  Previously such an error looked like any other cluster fault:
+  it moved `ReadStrategy`'s preference, called `FailoverPolicy.RecordFailure`, and could open a `CircuitBreaker` or `LatencyCircuitBreaker`.
+  Callers who previously saw a failover or a breaker trip on a bad statement now get the error back directly, on the first read, with one read-error metric for the cluster that returned it —
+  no failover, no breaker state change, no auto-refresh impact.
+  FallbackRead and normal failover fold a rejection on the alternative cluster the same way they already fold an unreachable alternative.
+  See `docs/strategy-policy.md` for the full contract.
+  The write path is unchanged: a rejected statement on a write leg is still replayed.
+
 ### Documentation
 
 - **`LatencyCircuitBreaker`'s latency threshold and the per-leg read deadline interact.**

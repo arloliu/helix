@@ -80,6 +80,24 @@ a leg leaves — see [Caller-expired legs](#caller-expired-legs).
 - **FallbackRead is orthogonal to failover.** FallbackRead activates when a healthy cluster returns not-found; failover activates when a cluster returns a real error. They handle different failure modes and do not interfere with each other. See [FallbackRead Guide](fallback-read.md) for details.
 - **`WithAllowedClusters` overrides the read path at the resolution layer.** When active, it bypasses `ReadStrategy.Select()` and freezes strategy state. See [External Cluster Control](#external-cluster-control-withallowedclusters) for the full operational model.
 
+### What does not count as a cluster failure
+
+A statement the coordinator rejects is surfaced to the caller verbatim, not treated as a cluster fault.
+The bundled adapters wrap four CQL protocol error codes —
+`0x2000` syntax, `0x2100` unauthorized, `0x2200` invalid (including an unconfigured table), and `0x2300` config —
+in `types.ErrStatementRejected`.
+The read path counts it once via `IncReadError` (the `read_errors_total` metric) for the cluster that returned it,
+because the cluster did answer.
+It never *causes* a failover and never reaches `FailoverPolicy` or `ReadStrategy`:
+no `RecordFailure`, no `OnFailure`, no `ShouldFailover` call.
+Under FallbackRead, a rejection on the alternative folds the same way an unreachable alternative does:
+the primary's `types.ErrNotFound` still wins unless the caller opted into strict fallback (`propagateAltErr`).
+Under normal failover, a rejection can still appear as a leg *inside* the result:
+when the primary fails with a real cluster error and the alternative then rejects the statement,
+the caller still gets a `DualClusterError` (or, for an iterator, the rejection surfaces at `Close`)
+— the primary's cluster error drove the failover, not the rejection.
+See [How Auto-refresh Decides](session-refresh.md#how-auto-refresh-decides) for the same statement-vs-connectivity distinction applied to the auto-refresh classifier.
+
 ---
 
 ## Write Path Architecture
@@ -517,7 +535,7 @@ if err != nil {
 > **`resetTimeout` semantics:** this is **not** "close the circuit after N seconds of silence," and it no longer discards a stale failure count. Once the breaker is open and `resetTimeout` has elapsed since the last failure, the client's recovery probe (see `WithRecoveryProbe`) reserves the breaker, which reports half-open, and runs one probe against the cluster; a successful probe closes the breaker (`Reason: "probe succeeded"`), a failed one returns it to open and restarts the timeout. No caller's read is used as the probe. An open circuit also closes immediately on any successful read against that cluster (`Reason: "operation succeeded"`). With `resetTimeout` 0, or on a client with the probe disabled, the breaker stays open until such a read.
 
 **What triggers `RecordFailure` vs `RecordSuccess`:**
-- `RecordFailure`: every hard error returned by the driver (network failure, timeout, unavailable) — all errors except Helix-internal sentinels (`ErrWriteAsync`, `ErrWriteDropped`) which never appear on the read path
+- `RecordFailure`: every hard error returned by the driver (network failure, timeout, unavailable) — all errors except Helix-internal sentinels (`ErrWriteAsync`, `ErrWriteDropped`) which never appear on the read path, and a rejected statement (`types.ErrStatementRejected`), which counts only `IncReadError`
 - `RecordSuccess`: every successful read response, regardless of latency
 
 **State machine (per cluster):**
@@ -639,7 +657,7 @@ if err != nil {
 ```
 
 **What triggers `RecordFailure` vs `RecordSuccess`:**
-- Hard error from driver → `RecordFailure()` directly (same as `CircuitBreaker`)
+- Hard error from driver → `RecordFailure()` directly (same as `CircuitBreaker`), except a rejected statement (`types.ErrStatementRejected`), which counts only `IncReadError`
 - Successful read, `elapsed ≤ absoluteMax` → `RecordSuccess()` (resets counter)
 - Successful read, `elapsed > absoluteMax` → `RecordLatency()` → internally calls `RecordFailure()` (soft failure counted toward threshold)
 
