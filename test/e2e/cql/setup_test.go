@@ -220,23 +220,28 @@ func createKVTableOnBoth(t *testing.T, prefix string) string {
 	a, b := sharedClusters(t)
 
 	tableName := uniqueTableName(prefix)
-	stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-	key TEXT PRIMARY KEY,
-	value TEXT
-)`, tableName)
-
-	if err := a.Session.Query(stmt).Exec(); err != nil {
-		t.Fatalf("create table on A: %v", err)
-	}
-	if err := b.Session.Query(stmt).Exec(); err != nil {
-		t.Fatalf("create table on B: %v", err)
-	}
+	createKVTableOn(t, a, tableName)
+	createKVTableOn(t, b, tableName)
 	t.Cleanup(func() {
 		_ = a.Session.Query("TRUNCATE " + tableName).Exec()
 		_ = b.Session.Query("TRUNCATE " + tableName).Exec()
 	})
 
 	return tableName
+}
+
+// createKVTableOn creates the shared key/value table on one cluster.
+// Callers own the cleanup: a table created on both clusters is truncated,
+// one created on a single cluster is dropped.
+func createKVTableOn(t *testing.T, cluster *testutil.CQLCluster, tableName string) {
+	t.Helper()
+	stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+	key TEXT PRIMARY KEY,
+	value TEXT
+)`, tableName)
+	if err := cluster.Session.Query(stmt).Exec(); err != nil {
+		t.Fatalf("create table on %s: %v", cluster.Host, err)
+	}
 }
 
 // ensureReachable makes sure the driver's session for cluster can answer a
