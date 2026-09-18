@@ -527,9 +527,12 @@ var (
 	// was not sent to that cluster and was not enqueued for replay.
 	ErrClusterDegraded = errors.New("helix: cluster is degraded; strict write skipped")
 
-	// ErrClusterDraining indicates a Strict() write was skipped because the
+	// ErrClusterDraining indicates a write leg was skipped because the
 	// cluster is currently in topology drain mode. The write was not sent to
-	// that cluster and was not enqueued for replay.
+	// that cluster. Every write skips a draining cluster's leg: an ordinary
+	// write enqueues it for replay, which delivers it once the drain lifts,
+	// while a Strict() or NonIdempotent() write does not replay it.
+	// The error text predates that and still reads "strict write skipped".
 	ErrClusterDraining = errors.New("helix: cluster is draining; strict write skipped")
 
 	// ErrStrictUnsupported indicates the configured WriteStrategy does not

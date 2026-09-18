@@ -170,7 +170,8 @@ func (c *CQLClient) recordWriteLegMetrics(cluster ClusterID, leg writeLegErrKind
 // [types.ErrClusterDraining] without contacting the session, the write
 // strategy sees that result like any other skipped leg, and the write is
 // enqueued for replay to that cluster. If both clusters are draining, the
-// write fails with ErrBothClustersDraining.
+// write fails with ErrBothClustersDraining, or a [types.DualClusterError]
+// for a strict write; both legs are counted as skipped and nothing is replayed.
 func (c *CQLClient) executeWriteWithReplay(
 	ctx context.Context,
 	wc writeContext,
@@ -193,13 +194,13 @@ func (c *CQLClient) executeWriteWithReplay(
 
 	drainA, drainB := c.getDrainStates()
 
-	// If both clusters are draining, fail immediately
+	// If both clusters are draining, fail immediately.
+	// Both legs are still counted as draining legs,
+	// so write_total and write_skipped move for a refused write too.
 	if drainA && drainB {
+		c.recordWriteLegMetrics(ClusterA, legDraining, 0, 0)
+		c.recordWriteLegMetrics(ClusterB, legDraining, 0, 0)
 		if wc.strict {
-			if sm, ok := c.config.Metrics.(types.StrictMetrics); ok {
-				sm.IncWriteSkipped(ClusterA)
-				sm.IncWriteSkipped(ClusterB)
-			}
 			return &types.DualClusterError{
 				ErrorA: types.ErrClusterDraining,
 				ErrorB: types.ErrClusterDraining,
@@ -236,12 +237,14 @@ func (c *CQLClient) writeLegs(
 
 // writeLegState is what one leg publishes for the aggregation that follows
 // the strategy: when it started, which session holder it used, and whether
-// the caller's context was already done when it returned. All are atomics
-// because a fire-and-forget leg writes them from its own goroutine.
+// the caller's context was already done when it returned. Those three are
+// atomics because a fire-and-forget leg writes them from its own goroutine.
+// draining is set when the leg is built, before any strategy runs it.
 type writeLegState struct {
 	start      atomic.Int64
 	holder     atomic.Pointer[sessionHolder]
 	callerDone atomic.Bool
+	draining   bool
 }
 
 // classify assigns the kind of the leg's result. A leg that ran recorded
@@ -250,10 +253,17 @@ type writeLegState struct {
 // is the cluster's however long the sibling leg took afterwards. A leg the
 // strategy never dispatched recorded nothing and is classified against ctx
 // as it stands now.
+//
+// A draining cluster's leg is legDraining even when a fire-and-forget
+// strategy handed it back as [types.ErrWriteAsync]: its closure returns
+// before touching the session, so nothing is in flight and there is no
+// background result worth waiting for.
 func (s *writeLegState) classify(ctx context.Context, err error) writeLegErrKind {
 	switch {
 	case err == nil:
 		return legOK
+	case s.draining && errors.Is(err, types.ErrWriteAsync):
+		return legDraining
 	case s.holder.Load() == nil:
 		return classifyWriteErr(err, ctx.Err() != nil)
 	default:
@@ -272,6 +282,8 @@ func (c *CQLClient) writeLeg(
 	state *writeLegState,
 	slot *atomic.Pointer[sessionHolder],
 ) func(context.Context) error {
+	state.draining = draining
+
 	return func(parent context.Context) error {
 		if draining {
 			return types.ErrClusterDraining

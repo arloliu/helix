@@ -644,13 +644,11 @@ func expectBackgroundLeg(result legResult) legExpect {
 	case legResRejected:
 		leg.writeError, leg.replayLater = true, true
 	case legResDraining:
-		// Current behaviour, flagged:
-		// a draining cluster's fire-and-forget leg is counted as async in the foreground,
-		// never as skipped,
-		// though types.StrictMetrics says a draining cluster's leg is skipped by every write
-		// and increments IncWriteSkipped.
-		// The session is never touched; the leg is replayed.
-		leg.contacted, leg.replayLater = false, true
+		// The strategy still hands back ErrWriteAsync,
+		// but the leg never left the client: the draining check ran first.
+		// It is counted as skipped, never as async,
+		// and replayed at once rather than when a background result arrives.
+		return legExpect{class: lecAsync, skipped: true, replay: true}
 	}
 
 	return leg
@@ -852,12 +850,10 @@ func TestWriteClusterTimeoutNeverReachesFailoverPolicy(t *testing.T) {
 }
 
 // With both clusters draining the write fails before any strategy runs.
-// A plain write returns ErrBothClustersDraining and counts nothing;
-// a strict write returns a dual failure and counts both legs as skipped.
-// Current behaviour, flagged:
-// types.StrictMetrics says a draining cluster's leg is skipped by every write
-// and increments IncWriteSkipped,
-// but the plain write here increments nothing.
+// A plain write returns ErrBothClustersDraining,
+// a strict write returns a dual failure,
+// and both count each leg in write_total and write_skipped.
+// Nothing is replayed and no session is contacted.
 func TestWriteClassificationBothDraining(t *testing.T) {
 	for _, strict := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plain", true: "strict"}[strict], func(t *testing.T) {
@@ -875,12 +871,13 @@ func TestWriteClassificationBothDraining(t *testing.T) {
 
 			if strict {
 				require.Equal(t, writeErrShape{kind: shapeDual, a: lecDraining, b: lecDraining}, classifyWriteResult(writeErr))
-				require.Equal(t, []ClusterID{ClusterA, ClusterB}, m.get("write_skipped"))
 			} else {
 				require.ErrorIs(t, writeErr, types.ErrBothClustersDraining)
-				require.Empty(t, m.get("write_skipped"))
 			}
-			require.Empty(t, m.get("write_total"))
+			require.Equal(t, []ClusterID{ClusterA, ClusterB}, m.get("write_total"))
+			require.Equal(t, []ClusterID{ClusterA, ClusterB}, m.get("write_skipped"))
+			require.Empty(t, m.get("write_error"))
+			require.Empty(t, m.get("write_async"))
 			require.Empty(t, replayer.payloads)
 			require.Zero(t, sessionA.calls.Load()+sessionB.calls.Load())
 		})
