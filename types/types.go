@@ -483,6 +483,24 @@ var (
 	// is retained instead of counting the attempt against a poison budget.
 	ErrClusterUnreachable = errors.New("helix: cluster unreachable")
 
+	// ErrStatementRejected marks a driver error that means the coordinator
+	// rejected the statement itself: CQL protocol error codes 0x2000
+	// (syntax), 0x2100 (unauthorized), 0x2200 (invalid, which includes an
+	// unconfigured table or column) and 0x2300 (configuration).
+	// The cluster answered, so the error is not a cluster-health signal,
+	// and Helix deliberately does not fail over on it.
+	// It does not prove the other cluster would reject the statement too:
+	// during a staggered schema migration one cluster may already have a
+	// table the other still rejects.
+	//
+	// The bundled adapters wrap such driver errors so that
+	// errors.Is(err, ErrStatementRejected) holds while the original driver
+	// error stays reachable through errors.Is and errors.As.
+	// A read that fails this way is surfaced to the caller verbatim and
+	// counted as a read error on the cluster that returned it; it moves no
+	// read strategy, trips no failover policy, and triggers no failover.
+	ErrStatementRejected = errors.New("helix: statement rejected by the cluster")
+
 	// ErrClusterTimeout marks an operation that a Helix-owned deadline
 	// ended: a per-cluster write leg that exceeded WithClusterWriteTimeout,
 	// a per-cluster read leg that exceeded WithClusterReadTimeout, or a

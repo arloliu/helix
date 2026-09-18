@@ -150,19 +150,27 @@ func (h *clusterHealth) readSucceeded(holder *sessionHolder, cluster ClusterID, 
 	holder.stats.succeeded(h.now())
 }
 
-// readFailed reports a read attempt on cluster that ended in a cluster
-// error err of the given kind.
+// readFailed reports a read attempt on cluster that ended in the error err
+// of the given kind.
 //
 // Order: the read error metric; the holder's stats when kind is a cluster
 // error; then [FailoverPolicy.RecordFailure]. A single-cluster client
 // records no policy failure, because there is no cluster to fail over to.
 // Neither does a retired holder, whose failure may be its own teardown.
-// Data sentinels and caller-context errors never reach this entry point.
+//
+// Only the kinds readErrKind.isReadError accepts reach this entry point:
+// a cluster error, and a statement the coordinator rejected.
+// The rejected statement stops at the metric — the cluster answered, so the
+// failure is the caller's statement rather than the cluster's health, and
+// neither the auto-refresh stats nor the policy may hear about it.
+// Data sentinels and caller-context errors never reach here at all.
 func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kind readErrKind, err error) {
 	h.metrics.IncReadError(cluster)
-	if kind == readClusterErr {
-		h.failedNow(holder, err)
+	if !kind.isHealthSignal() {
+		return
 	}
+
+	h.failedNow(holder, err)
 	if h.dual && h.policy != nil && !holder.retired.Load() {
 		h.policy.RecordFailure(cluster)
 	}
@@ -180,6 +188,9 @@ func (h *clusterHealth) readFailed(holder *sessionHolder, cluster ClusterID, kin
 // visible on read_errors_total as a failing Scan.
 // The policy always receives RecordSuccess here, never RecordLatency,
 // because an iterator has no single latency sample.
+// A statement the coordinator rejected is counted on read_errors_total like
+// a cluster error, and reaches nothing else: the cluster answered, so the
+// stats, the policy and the strategy are all left where they were.
 //
 // A cluster error moves the read strategy only when failoverAllowed agrees,
 // the same gate a failing Scan passes before the failover flow calls
@@ -200,6 +211,11 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 		// still reaches the metrics: they count what the client did.
 		h.metrics.IncReadError(cluster)
 		h.failedNow(holder, err)
+	case readStatementErr:
+		// The coordinator rejected the statement itself: counted here for
+		// the same reason a cluster error is, and nowhere else, because the
+		// cluster answered and its health is not in question.
+		h.metrics.IncReadError(cluster)
 	case readCtxErr:
 		h.readCallerExpired(cluster)
 	case readNotFound, readRowLimit, readCallerNotFound:
@@ -227,7 +243,7 @@ func (h *clusterHealth) iterClosed(holder *sessionHolder, cluster ClusterID, kin
 		if !overrideActive && h.strategy != nil && h.failoverAllowed(cluster, err) {
 			h.strategy.OnFailure(cluster, err)
 		}
-	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr:
+	case readNotFound, readRowLimit, readCallerNotFound, readCtxErr, readStatementErr:
 	}
 }
 

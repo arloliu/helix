@@ -248,6 +248,7 @@ func TestSentinelErrors(t *testing.T) {
 		{"ErrClusterDraining", ErrClusterDraining, "cluster is draining"},
 		{"ErrStrictUnsupported", ErrStrictUnsupported, "does not support Strict()"},
 		{"ErrStrictMirrorUnsupported", ErrStrictMirrorUnsupported, "Strict() and Mirror() cannot be combined"},
+		{"ErrStatementRejected", ErrStatementRejected, "statement rejected by the cluster"},
 	}
 
 	for _, tt := range tests {
