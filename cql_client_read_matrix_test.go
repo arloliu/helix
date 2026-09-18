@@ -3,6 +3,7 @@ package helix
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,9 +39,10 @@ const (
 	outcomeOK            readOutcome = "ok"
 	outcomeNotFound      readOutcome = "not-found"
 	outcomeRowLimit      readOutcome = "row-limit"
-	outcomeCtxErr        readOutcome = "ctx-error"      // the caller's context ended before the cluster answered
-	outcomeDriverTimeout readOutcome = "driver-timeout" // the driver reports a context error while the caller's context is live
-	outcomeClusterErr    readOutcome = "cluster-error"  // under modeLegTimeout: the cluster never answers inside the leg deadline
+	outcomeCtxErr        readOutcome = "ctx-error"       // the caller's context ended before the cluster answered
+	outcomeDriverTimeout readOutcome = "driver-timeout"  // the driver reports a context error while the caller's context is live
+	outcomeClusterErr    readOutcome = "cluster-error"   // under modeLegTimeout: the cluster never answers inside the leg deadline
+	outcomeStatementErr  readOutcome = "statement-error" // the coordinator rejected the statement itself
 )
 
 // readMode names the routing mode the client is in, or the leg deadline it runs under.
@@ -64,15 +66,36 @@ const (
 	errCtx            errClass = "ctx-error"
 	errCluster        errClass = "cluster-error"
 	errClusterTimeout errClass = "cluster-timeout" // types.ErrClusterTimeout: a leg deadline ended the read
+	errStatement      errClass = "statement-error" // types.ErrStatementRejected, driver error still in the chain
 	errDual           errClass = "dual-cluster"
 )
 
 var errMatrixCluster = errUnreachableForTest
 
+// errStatementDriver stands in for the driver error a coordinator returns
+// when it rejects the statement, and errStatement for what the adapters
+// make of it.
+// It is deliberately distinct from errMatrixCluster: a rejected statement
+// must not be mistakable for a cluster fault.
+// The wrap's shape is the adapters' (adapter/cql/v{1,2}/errors_test.go pins
+// it against the real driver types); the root only classifies the sentinel.
+var (
+	errStatementDriver = errors.New("coordinator rejected the statement")
+	errMatrixStatement = fmt.Errorf("%w: %w", types.ErrStatementRejected, errStatementDriver)
+)
+
 // matrixLegTimeout is the leg deadline modeLegTimeout runs under.
 // A stalled session never answers before its context ends,
 // so the value only decides how long an expiring cell takes, never what it observes.
 const matrixLegTimeout = 10 * time.Millisecond
+
+// A statement-rejection read starts from auto-refresh stats that are
+// neither zero nor fresh, so that a read which reset them — as a success
+// would — is as visible as one which advanced them.
+const (
+	matrixSeedFailures    int32 = 2
+	matrixSeedLastSuccess int64 = 1_000
+)
 
 var readEntries = []readEntry{
 	entryScan, entryMapScan, entryIter, entrySliceMap, entrySliceScan, entryBatchIter,
@@ -80,6 +103,7 @@ var readEntries = []readEntry{
 
 var readOutcomes = []readOutcome{
 	outcomeOK, outcomeNotFound, outcomeRowLimit, outcomeCtxErr, outcomeDriverTimeout, outcomeClusterErr,
+	outcomeStatementErr,
 }
 
 var readModes = []readMode{modePlain, modeOverride, modeDrain, modeFallback, modeLegTimeout}
@@ -92,6 +116,7 @@ type readObservation struct {
 	readTotal    []ClusterID // IncReadTotal calls, in order
 	readErrors   []ClusterID // IncReadError calls, in order
 	failures     []ClusterID // FailoverPolicy.RecordFailure calls, in order
+	successes    []ClusterID // FailoverPolicy.RecordSuccess calls, in order
 	onFailure    []ClusterID // ReadStrategy.OnFailure calls, in order
 	onSuccess    []ClusterID // ReadStrategy.OnSuccess calls, in order
 	healthFail   []ClusterID // clusters whose auto-refresh failure counter advanced
@@ -279,6 +304,9 @@ func scriptSession(entry readEntry, outcome readOutcome, mode readMode) *matrixS
 	case outcomeClusterErr:
 		s.scanErr = errMatrixCluster
 		s.iterErr = errMatrixCluster
+	case outcomeStatementErr:
+		s.scanErr = errMatrixStatement
+		s.iterErr = errMatrixStatement
 	}
 
 	return s
@@ -335,6 +363,15 @@ func classifyMatrixErr(err error) errClass {
 		return errNotFound
 	case errors.Is(err, types.ErrRowLimitExceeded):
 		return errRowLimit
+	case errors.Is(err, types.ErrStatementRejected):
+		// The class names the wrap only while the driver's own error is
+		// still reachable through it, which is what lets a caller match on
+		// the coordinator's error code.
+		if !errors.Is(err, errStatementDriver) {
+			return errClass("statement error lost its driver error")
+		}
+
+		return errStatement
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errCtx
 	case errors.Is(err, errMatrixCluster):
@@ -348,10 +385,29 @@ func classifyMatrixErr(err error) errClass {
 // both return outcome, and records what the read pipeline did.
 func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMode) readObservation {
 	t.Helper()
+	obs, _ := observeSessions(t, entry, outcome, mode,
+		scriptSession(entry, outcome, mode), scriptSession(entry, outcome, mode))
+
+	return obs
+}
+
+// observeSessions is observeRead with the two clusters scripted separately,
+// for the asymmetric results the matrix cannot express — one cluster
+// answers, the other rejects the statement.
+// mode still decides the client's options and outcome still decides how the
+// read is issued; the sessions decide what each cluster returns.
+// It also returns the caller's error itself, for the claims that are about
+// the error chain rather than its class.
+func observeSessions(
+	t *testing.T,
+	entry readEntry,
+	outcome readOutcome,
+	mode readMode,
+	sessionA, sessionB *matrixSession,
+) (readObservation, error) {
+	t.Helper()
 
 	clock := &atomic.Int32{}
-	sessionA := scriptSession(entry, outcome, mode)
-	sessionB := scriptSession(entry, outcome, mode)
 	sessionA.clock, sessionB.clock = clock, clock
 	metrics := newReadTestMetrics()
 	policy := &trackingFailoverPolicy{ShouldFailoverAllow: true}
@@ -380,6 +436,17 @@ func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMo
 	if mode == modeDrain {
 		client.drainA.Store(true)
 	}
+	// Only a rejected statement is seeded: it is the outcome whose claim is
+	// that the stats stay exactly where they were.
+	var seedFailures int32
+	if outcome == outcomeStatementErr {
+		seedFailures = matrixSeedFailures
+		for _, c := range []ClusterID{ClusterA, ClusterB} {
+			stats := client.statsForCluster(c)
+			stats.consecutiveFailures.Store(seedFailures)
+			stats.lastSuccessNanos.Store(matrixSeedLastSuccess)
+		}
+	}
 
 	readErr := runReadEntry(t, client, entry, outcome)
 
@@ -397,18 +464,30 @@ func observeRead(t *testing.T, entry readEntry, outcome readOutcome, mode readMo
 		for range metrics.get(metrics.ReadErrors, c) {
 			obs.readErrors = append(obs.readErrors, c)
 		}
-		if client.statsForCluster(c).consecutiveFailures.Load() > 0 {
+		stats := client.statsForCluster(c)
+		failures := stats.consecutiveFailures.Load()
+		if failures > seedFailures {
 			obs.healthFail = append(obs.healthFail, c)
+		}
+		if outcome == outcomeStatementErr {
+			// No cluster succeeds in a statement-rejection read, so nothing
+			// may reset the seeded stats; an advance is reported through
+			// healthFail and checked against the expected observation.
+			require.GreaterOrEqual(t, failures, seedFailures,
+				"cluster %s: consecutiveFailures went below its seeded value", c)
+			require.Equal(t, matrixSeedLastSuccess, stats.lastSuccessNanos.Load(),
+				"cluster %s: lastSuccess moved", c)
 		}
 	}
 	obs.readTotal = orderFrom(obs.served, obs.readTotal)
 	obs.readErrors = orderFrom(obs.served, obs.readErrors)
 	obs.healthFail = orderFrom(obs.served, obs.healthFail)
 	obs.failures = policy.RecordFailureCalls
+	obs.successes = policy.RecordSuccessCalls
 	obs.onFailure = strategy.OnFailureCalls
 	obs.onSuccess = strategy.OnSuccessCalls
 
-	return obs
+	return obs, readErr
 }
 
 // orderFrom sorts clusters so that first comes before the other cluster,
@@ -448,10 +527,12 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 
 	switch outcome {
 	case outcomeOK:
-		// Success reports to the read strategy unless an override froze it.
+		// Success reports to the read strategy unless an override froze it,
+		// and to the failover policy either way.
 		if mode != modeOverride {
 			obs.onSuccess = []ClusterID{served}
 		}
+		obs.successes = []ClusterID{served}
 	case outcomeNotFound:
 		// Not-found is data, never health: nothing is recorded anywhere.
 		// Slice reads translate the empty drain to a nil error.
@@ -496,31 +577,48 @@ func currentReadBehaviour(entry readEntry, outcome readOutcome, mode readMode) r
 			}
 			break
 		}
-		if entry == entrySliceScan {
-			// SliceScan never fails over: the caller's callback already ran.
-			break
-		}
-		if mode == modeDrain {
-			// The only alternative is draining, so the primary error stands
-			// and the strategy is never asked for a failover it would not get.
-			break
-		}
-		if mode != modeOverride {
-			obs.onFailure = []ClusterID{served}
-		}
-		// Failover contacts the other cluster, which fails the same way,
-		// and the caller sees both errors.
-		obs.altContacted = true
-		obs.err = errDual
-		obs.readErrors = append(obs.readErrors, alt)
-		obs.failures = append(obs.failures, alt)
-		if outcome == outcomeClusterErr {
-			obs.healthFail = append(obs.healthFail, alt)
-		}
+		applyFailoverRules(&obs, entry, outcome, mode, alt)
+	case outcomeStatementErr:
+		// The coordinator rejected the statement itself.
+		// The caller gets that error verbatim, the cluster that answered
+		// counts one read error, and nothing else moves: no auto-refresh
+		// failure, no policy call, no strategy call, and no second cluster —
+		// which also means no failover metric, log or event, since
+		// announceFailover emits those only on its way to the alternative.
+		obs.err = errStatement
+		obs.readErrors = []ClusterID{served}
 	}
 	obs.readTotal = readTotalFor(obs, alt)
 
 	return obs
+}
+
+// applyFailoverRules states what a read that failed with a health signal,
+// and is still allowed to try the other cluster, leaves in the observation.
+// It is the tail of the failure rules, split out of currentReadBehaviour so
+// that each half stays inside the cyclomatic budget.
+func applyFailoverRules(obs *readObservation, entry readEntry, outcome readOutcome, mode readMode, alt ClusterID) {
+	if entry == entrySliceScan {
+		// SliceScan never fails over: the caller's callback already ran.
+		return
+	}
+	if mode == modeDrain {
+		// The only alternative is draining, so the primary error stands
+		// and the strategy is never asked for a failover it would not get.
+		return
+	}
+	if mode != modeOverride {
+		obs.onFailure = []ClusterID{obs.served}
+	}
+	// Failover contacts the other cluster, which fails the same way,
+	// and the caller sees both errors.
+	obs.altContacted = true
+	obs.err = errDual
+	obs.readErrors = append(obs.readErrors, alt)
+	obs.failures = append(obs.failures, alt)
+	if outcome == outcomeClusterErr {
+		obs.healthFail = append(obs.healthFail, alt)
+	}
 }
 
 // readTotalFor states the read_total rule for one cell: every read that
@@ -547,4 +645,111 @@ func TestReadClassificationMatrix(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The matrix scripts both clusters alike, so the cases below are the
+// asymmetric ones: one cluster answers and the other rejects the statement.
+// Each states what the alternative's rejection does to the read's
+// accounting — one read error on the cluster that rejected it, and nothing
+// else anywhere.
+
+// A FallbackRead probe whose alternative rejects the statement keeps the
+// primary's healthy not-found: the probe exists to improve availability,
+// so a rejection on the alternative must not turn an absent row into an
+// error.
+// The alternative still counts the read error it returned.
+func TestFallbackReadAlternativeRejectsStatement(t *testing.T) {
+	primary := scriptSession(entryScan, outcomeNotFound, modeFallback)
+	alternative := scriptSession(entryScan, outcomeStatementErr, modeFallback)
+
+	obs, err := observeSessions(t, entryScan, outcomeNotFound, modeFallback, primary, alternative)
+
+	require.ErrorIs(t, err, types.ErrNotFound)
+	require.NotErrorIs(t, err, types.ErrStatementRejected, "the probe's rejection stays folded")
+	require.Equal(t, readObservation{
+		err:          errNotFound,
+		served:       ClusterA,
+		altContacted: true,
+		readTotal:    []ClusterID{ClusterA, ClusterB},
+		readErrors:   []ClusterID{ClusterB},
+	}, obs)
+}
+
+// SliceScan's strict FallbackRead propagates the alternative's error once
+// the caller's callback has run there, a rejected statement included.
+// The accounting is the same either way: the folding decides what the
+// caller sees, not what the clusters are charged with.
+func TestFallbackReadStrictAlternativeRejectsStatement(t *testing.T) {
+	primary := scriptSession(entrySliceScan, outcomeNotFound, modeFallback)
+	// The alternative yields a row, which arms the propagation predicate by
+	// invoking the caller's callback, and only then reports the rejection.
+	alternative := &matrixSession{rows: 1, iterErr: errMatrixStatement}
+
+	obs, err := observeSessions(t, entrySliceScan, outcomeNotFound, modeFallback, primary, alternative)
+
+	require.ErrorIs(t, err, types.ErrStatementRejected)
+	require.ErrorIs(t, err, errStatementDriver, "the driver error must stay in the chain")
+	require.Equal(t, readObservation{
+		err:          errStatement,
+		served:       ClusterA,
+		altContacted: true,
+		readTotal:    []ClusterID{ClusterA, ClusterB},
+		readErrors:   []ClusterID{ClusterB},
+	}, obs)
+}
+
+// A failover whose alternative rejects the statement keeps today's
+// two-cluster shape: the caller sees both legs, and the rejection is
+// reachable through [types.DualClusterError]'s Unwrap.
+// Only the primary's cluster fault reaches the policy, the strategy and
+// the auto-refresh stats; the alternative contributes its read error alone.
+func TestFailoverAlternativeRejectsStatement(t *testing.T) {
+	primary := scriptSession(entryScan, outcomeClusterErr, modePlain)
+	alternative := scriptSession(entryScan, outcomeStatementErr, modePlain)
+
+	obs, err := observeSessions(t, entryScan, outcomeClusterErr, modePlain, primary, alternative)
+
+	var dual *types.DualClusterError
+	require.ErrorAs(t, err, &dual)
+	require.ErrorIs(t, err, errMatrixCluster, "the primary's fault stays reachable")
+	require.ErrorIs(t, err, types.ErrStatementRejected)
+	require.ErrorIs(t, err, errStatementDriver, "the driver error must stay in the chain")
+	require.Equal(t, readObservation{
+		err:          errDual,
+		served:       ClusterA,
+		altContacted: true,
+		readTotal:    []ClusterID{ClusterA, ClusterB},
+		readErrors:   []ClusterID{ClusterA, ClusterB},
+		failures:     []ClusterID{ClusterA},
+		onFailure:    []ClusterID{ClusterA},
+		healthFail:   []ClusterID{ClusterA},
+	}, obs)
+}
+
+// An iterator whose first page fails over reaches the alternative's
+// rejection at Close, not on the leg: the driver hands back an iterator
+// rather than an error, so the alternative's first page wins and the
+// rejection is the caller's whole error.
+// It is counted once on the alternative and nowhere else, exactly as it is
+// on a Scan.
+func TestIterFailoverAlternativeRejectsStatement(t *testing.T) {
+	// The primary never answers inside the leg deadline, so the iterator's
+	// first page fails over.
+	primary := scriptSession(entryIter, outcomeClusterErr, modeLegTimeout)
+	alternative := scriptSession(entryIter, outcomeStatementErr, modeLegTimeout)
+
+	obs, err := observeSessions(t, entryIter, outcomeStatementErr, modeLegTimeout, primary, alternative)
+
+	require.ErrorIs(t, err, types.ErrStatementRejected)
+	require.ErrorIs(t, err, errStatementDriver, "the driver error must stay in the chain")
+	require.Equal(t, readObservation{
+		err:          errStatement,
+		served:       ClusterA,
+		altContacted: true,
+		readTotal:    []ClusterID{ClusterA, ClusterB},
+		readErrors:   []ClusterID{ClusterA, ClusterB},
+		failures:     []ClusterID{ClusterA},
+		onFailure:    []ClusterID{ClusterA},
+		healthFail:   []ClusterID{ClusterA},
+	}, obs)
 }

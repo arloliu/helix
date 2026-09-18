@@ -215,9 +215,14 @@ func TestClassifyReadErr(t *testing.T) {
 		{"driver timeout with live context", live, context.DeadlineExceeded, readClusterErr},
 		{"cluster", live, errors.New("real cluster error"), readClusterErr},
 		{"session closed", live, types.ErrSessionClosed, readClusterErr},
+		{"statement rejected", live, errMatrixStatement, readStatementErr},
+		{"wrapped statement rejected", live, fmt.Errorf("wrap: %w", errMatrixStatement), readStatementErr},
 		{"context error after cancel", dead, context.Canceled, readCtxErr},
 		{"cluster error after cancel", dead, errors.New("real cluster error"), readCtxErr},
 		{"not-found after cancel", dead, types.ErrNotFound, readNotFound},
+		// Provenance decides: the caller gave up before the coordinator's
+		// answer arrived, so the rejection is not attributed to the read.
+		{"statement rejected after cancel", dead, errMatrixStatement, readCtxErr},
 		{"success after cancel", dead, nil, readOK},
 	}
 	for _, tc := range cases {
@@ -231,5 +236,15 @@ func TestClassifyReadErr(t *testing.T) {
 	require.False(t, readRowLimit.isHealthSignal())
 	require.False(t, readCallerNotFound.isHealthSignal())
 	require.False(t, readCtxErr.isHealthSignal())
+	require.False(t, readStatementErr.isHealthSignal())
 	require.True(t, readClusterErr.isHealthSignal())
+
+	// Only the kinds the observation hub's readFailed accepts are read errors.
+	require.False(t, readOK.isReadError())
+	require.False(t, readNotFound.isReadError())
+	require.False(t, readRowLimit.isReadError())
+	require.False(t, readCallerNotFound.isReadError())
+	require.False(t, readCtxErr.isReadError())
+	require.True(t, readStatementErr.isReadError())
+	require.True(t, readClusterErr.isReadError())
 }

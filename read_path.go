@@ -34,6 +34,13 @@ const (
 	// it is surfaced verbatim, never counted against the cluster's health,
 	// and never followed by a failover attempt.
 	readCtxErr
+	// readStatementErr is [types.ErrStatementRejected]: the coordinator
+	// rejected the statement itself.
+	// The cluster answered, so the error is the caller's to fix and says
+	// nothing about the cluster's health: it is surfaced verbatim, counted
+	// on read_errors_total for the cluster that returned it, and followed
+	// by no failover attempt.
+	readStatementErr
 	// readClusterErr is any other error: a cluster fault. A context error
 	// returned by the driver while the caller's context is still live is a
 	// driver-side timeout and falls in this kind.
@@ -55,6 +62,8 @@ func classifyReadErr(ctx context.Context, err error) readErrKind {
 		return readCallerNotFound
 	case ctx.Err() != nil:
 		return readCtxErr
+	case errors.Is(err, types.ErrStatementRejected):
+		return readStatementErr
 	default:
 		return readClusterErr
 	}
@@ -63,6 +72,15 @@ func classifyReadErr(ctx context.Context, err error) readErrKind {
 // isHealthSignal reports whether the kind counts against the cluster's health.
 func (k readErrKind) isHealthSignal() bool {
 	return k == readClusterErr
+}
+
+// isReadError reports whether the cluster that answered must count the kind
+// on read_errors_total, which is every kind the observation hub's readFailed
+// accepts.
+// A rejected statement is one: the cluster answered and the answer was an
+// error, even though it is not a health signal.
+func (k readErrKind) isReadError() bool {
+	return k == readClusterErr || k == readStatementErr
 }
 
 // getDrainStates returns the current drain state for both clusters.
@@ -502,6 +520,12 @@ func (c *CQLClient) runPrimaryRead(
 	// Only a genuine not-found triggers the FallbackRead probe,
 	// and only in dual-cluster mode (single-cluster has no alternative session).
 	if !kind.isHealthSignal() {
+		// A statement the coordinator rejected is the caller's error, but
+		// the cluster that returned it still counts one read error: the hub
+		// emits the metric alone, and the read ends here.
+		if kind == readStatementErr {
+			c.health.readFailed(holder, selected, kind, err)
+		}
 		if kind == readNotFound && opts.fallbackRead && !c.IsSingleCluster() {
 			err = c.executeFallbackRead(ctx, rt.snap, selected, readFunc, opts.fallbackOpts)
 		}
@@ -779,8 +803,11 @@ func (c *CQLClient) tryFallbackCluster(
 	// ErrRowLimitExceeded reaching this site means the failover cluster
 	// also exceeded the application cap; the caller wants to see that, not
 	// a wrapped two-cluster error.
+	// A statement the alternative's coordinator rejected is not a cluster
+	// fault either, but the alternative answered, so it counts one read
+	// error and the caller still sees what both legs returned.
 	kind := classifyReadErr(ctx, err)
-	if !kind.isHealthSignal() {
+	if !kind.isReadError() {
 		return err
 	}
 
@@ -943,10 +970,13 @@ func (c *CQLClient) executeFallbackRead(
 		// A caller whose context ended while the alternative was being
 		// asked sees its own context error, again with no health impact.
 		return err
-	case readOK, readClusterErr:
+	case readOK, readClusterErr, readStatementErr:
 	}
 
 	// Alternative returned a real error: record health on the alt.
+	// A rejected statement records only the metric (the hub decides), and
+	// the folding below is unchanged: the primary's healthy not-found still
+	// stands unless the caller opted into propagation.
 	c.health.readFailed(alternative, alternativeCluster, kind, err)
 
 	// Propagation is governed independently: opts.propagateAltErr lets the

@@ -47,6 +47,27 @@
 //   - [FromGocqlSerialConsistency]: Converts gocql.SerialConsistency to helix Consistency
 //   - [UnwrapSession]: Returns the underlying gocql.Session
 //
+// # Error Normalization
+//
+// The adapter wraps driver errors at its boundary so callers can classify
+// failures without importing gocql:
+//
+//   - [types.ErrNotFound]: no matching row (gocql.ErrNotFound).
+//   - [types.ErrClusterUnreachable]: the cluster could not be reached
+//     (no connections, connection or session closed, unavailable).
+//   - [types.ErrStatementRejected]: the coordinator rejected the statement
+//     itself — CQL protocol error codes 0x2000 (syntax), 0x2100
+//     (unauthorized), 0x2200 (invalid, including an unconfigured table),
+//     and 0x2300 (config).
+//
+// Codes 0x2400 (already exists) and 0x2500 (unprepared) are deliberately
+// not wrapped: the driver re-prepares an unprepared statement itself, and
+// neither code describes a statement the caller must fix.
+//
+// The unreachable and rejected-statement translations wrap with %w,
+// so the original driver error stays reachable through errors.Is and errors.As.
+// The not-found translation returns [types.ErrNotFound] alone.
+//
 // # Thread Safety
 //
 // All adapter types are safe for concurrent use, matching gocql's thread safety guarantees.

@@ -43,13 +43,43 @@ func mapUnreachable(err error) error {
 	}
 }
 
+// mapRejectedStatement wraps a coordinator response that rejected the
+// statement itself in types.ErrStatementRejected, and returns every other
+// error unchanged.
+// The driver error stays in the chain for errors.Is and errors.As.
+//
+// The match is on the exported gocql.RequestError interface and its code
+// rather than on the concrete *gocql.RequestErrSyntax, RequestErrInvalid
+// and RequestErrUnauthorized types this driver returns: the code
+// comparison covers those types as well as gocql v1, which keeps its
+// equivalents unexported.
+// ErrCodeAlreadyExists (0x2400) and ErrCodeUnprepared (0x2500) are
+// deliberately not here: the driver re-prepares an unprepared statement,
+// and neither describes a statement the caller must fix.
+func mapRejectedStatement(err error) error {
+	var reqErr gocql.RequestError
+	if !errors.As(err, &reqErr) {
+		return err
+	}
+
+	switch reqErr.Code() {
+	case gocql.ErrCodeSyntax, gocql.ErrCodeUnauthorized, gocql.ErrCodeInvalid, gocql.ErrCodeConfig:
+		return fmt.Errorf("%w: %w", types.ErrStatementRejected, err)
+	default:
+		return err
+	}
+}
+
 // mapErr applies every adapter-boundary translation to a driver result.
+// The three translations are disjoint by construction, so the rejected
+// statement and unreachable checks compose; only the not-found check has to
+// come first, because it returns a bare sentinel rather than a wrap.
 func mapErr(err error) error {
 	if err = mapNotFound(err); err == nil || err == types.ErrNotFound { //nolint:errorlint // identity check on the sentinel mapNotFound just returned
 		return err
 	}
 
-	return mapUnreachable(err)
+	return mapUnreachable(mapRejectedStatement(err))
 }
 
 // mapCAS applies mapErr to a lightweight-transaction result.
