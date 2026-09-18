@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Two paths never produce a latency sample.** Iterators report at `Close()`, which has no
   single sample and always calls `RecordSuccess`; no write path consults the `FailoverPolicy`
   at all, so `WithClusterWriteTimeout` can never trip a breaker.
+- **What a `DualClusterError` means for a write.**
+  No cluster confirmed the write and Helix does not replay it,
+  but a leg that timed out or was cancelled may still have applied it,
+  so the caller must retry idempotently or check first.
+  With `SyncDualWrite`, if the first leg fails and the caller's context has ended by then, the second leg is not sent:
+  the write returns `DualClusterError`, nothing is replayed, and the unsent leg is not counted as caller-expired.
+  Documented in `docs/strategy-policy.md`, `docs/strict-write.md`, the package overview, and the Godoc of `DualClusterError`, `SyncDualWrite.Execute` and `Query.Exec`.
 
 ## [1.10.2] — 2026-09-15
 

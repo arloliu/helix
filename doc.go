@@ -54,7 +54,10 @@
 //     only through the replay-dropped callback and event.
 //     WithAckMode(AckOnReplayAdmission) turns the admitted case back into
 //     nil.
-//   - *types.DualClusterError: Both clusters failed (operation completely failed)
+//   - *types.DualClusterError: Both clusters failed. Nothing is replayed,
+//     and a leg that timed out or was cancelled may still have applied the
+//     write: retry it only if it is idempotent, or check whether it landed
+//     first (see types.DualClusterError)
 //
 // When both clusters fail, a types.DualClusterError is returned:
 //

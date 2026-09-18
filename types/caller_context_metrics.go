@@ -65,7 +65,7 @@ type CallerContextMetrics interface {
 	// deadline.
 	IncReadCallerExpired(cluster ClusterID)
 
-	// IncWriteCallerExpired is called when a write leg on cluster was
-	// classified as cancelled by the caller.
+	// IncWriteCallerExpired is called when a dispatched write leg on cluster
+	// was classified as cancelled by the caller.
 	IncWriteCallerExpired(cluster ClusterID)
 }
