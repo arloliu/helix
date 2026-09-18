@@ -895,7 +895,7 @@ func (c *Collector) IncReadCallerExpired(cluster types.ClusterID) {
 	}
 }
 
-// IncWriteCallerExpired increments the counter when a write leg on cluster
+// IncWriteCallerExpired increments the counter when a dispatched write leg on cluster
 // was classified as cancelled by the caller. As with the read counter,
 // write_errors_total is not incremented alongside it.
 func (c *Collector) IncWriteCallerExpired(cluster types.ClusterID) {

@@ -135,7 +135,7 @@
 //     that returned an error after the caller's context was already
 //     cancelled or past its deadline (optional
 //     types.CallerContextMetrics)
-//   - {prefix}_write_caller_expired_total{cluster} - Counter of write legs
+//   - {prefix}_write_caller_expired_total{cluster} - Counter of dispatched write legs
 //     classified as cancelled by the caller (optional
 //     types.CallerContextMetrics)
 //
