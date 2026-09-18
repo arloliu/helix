@@ -42,6 +42,8 @@ For all other writes (ordinary column overwrites), the default behaviour — rep
   the deadline." It does **not** prove the mutation was not applied — the write may have committed
   and the response was lost. Caller retries on `PartialWriteError` can still double-apply for
   non-idempotent operations. This is a fundamental Cassandra/network property.
+  The same holds for each leg of a `*DualClusterError` that reached its cluster —
+  see [When neither cluster confirms a write](strategy-policy.md#when-neither-cluster-confirms-a-write).
 - **Exactly-once delivery.** Helix cannot, and does not claim to, deliver exactly-once across two
   independent clusters.
 - **Divergence detection.** If both clusters have the row but at different values, `Strict()` does

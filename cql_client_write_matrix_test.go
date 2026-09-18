@@ -672,9 +672,11 @@ func currentWriteBehaviour(strategy writeStrategyKind, outcome writeOutcome, mod
 		// SyncDualWrite writes A first and, finding the caller's context done,
 		// hands back its error for B without dispatching B.
 		// A leg that was never sent is not caller-expired either.
-		// Current behaviour, flagged: B was never attempted,
-		// yet the write is reported as a dual failure and nothing is replayed,
-		// where the concurrent strategies replay A and return nil.
+		// This is the documented contract: B was never attempted,
+		// yet the write is a dual failure and nothing is replayed,
+		// because replaying B would apply a write the caller cancelled.
+		// The concurrent strategies send B, so when B acknowledges
+		// they replay A and return nil.
 		b = legExpect{class: lecCtx, replay: true}
 	default:
 		b = expectLeg(outcome.b)

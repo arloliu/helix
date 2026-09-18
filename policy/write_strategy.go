@@ -147,6 +147,15 @@ func NewSyncDualWrite(opts ...SyncDualWriteOption) *SyncDualWrite {
 // is skipped and ctx.Err() is returned for it — avoiding wasted work and an
 // immediate predictable error that the caller would have to handle anyway.
 //
+// If the first write also failed, the client sees two failed legs:
+// the write returns [types.DualClusterError] with both results and nothing
+// is replayed, and the unsent leg is not counted as caller-expired
+// (see [types.CallerContextMetrics]).
+// The first write may still have applied on its cluster;
+// see [types.DualClusterError] for what the caller must do.
+// If the first write succeeded, a non-strict write replays the unsent leg
+// like any other unacknowledged leg.
+//
 // Parameters:
 //   - ctx: Context for the operation
 //   - writeA: Function to write to cluster A

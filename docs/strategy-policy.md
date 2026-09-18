@@ -122,6 +122,17 @@ See [How Auto-refresh Decides](session-refresh.md#how-auto-refresh-decides) for 
 
 `FailoverPolicy` does not participate in the write path. Write resilience comes from the write strategy itself plus the replay system.
 
+### When Neither Cluster Confirms a Write
+
+A `*DualClusterError` from a write means no cluster confirmed the write,
+and Helix does not replay it.
+It does not mean no cluster applied it.
+A leg that timed out — on the leg deadline from `WithClusterWriteTimeout` (`types.ErrClusterTimeout`)
+or on the driver's own write timeout —
+or that ended because the caller's context was cancelled or expired
+may still have applied the write on that cluster.
+Retry such a write only if it is idempotent, or check whether it landed first.
+
 ---
 
 ## Write Strategy Reference
@@ -180,6 +191,12 @@ strategy := policy.NewSyncDualWrite(
 - Writes cluster A (or B) first, records the result, then writes the other
 - Context cancellation is honored by the underlying driver during each write
 - After the first write completes, explicitly checks `ctx.Err()`: if the context is already canceled or deadline-exceeded at that point, returns `ctx.Err()` for the second cluster without executing it — preventing wasted work on an already-dead context
+- If the first write also failed, both legs are failures:
+  the write returns `*DualClusterError` with both results, nothing is replayed,
+  and the unsent leg is not counted as caller-expired.
+  The first write may still have applied —
+  see [When neither cluster confirms a write](#when-neither-cluster-confirms-a-write).
+  If the first write succeeded, a non-strict write replays the unsent leg like any other partial failure
 - Returns `(errA, errB)`; if a `Replayer` is configured, the client enqueues partial failures for replay
 
 **When to use:**
@@ -1226,8 +1243,8 @@ type CallerContextMetrics interface {
     // deadline.
     IncReadCallerExpired(cluster types.ClusterID)
 
-    // IncWriteCallerExpired is called when a write leg on cluster was
-    // classified as cancelled by the caller.
+    // IncWriteCallerExpired is called when a dispatched write leg on cluster
+    // was classified as cancelled by the caller.
     IncWriteCallerExpired(cluster types.ClusterID)
 }
 ```

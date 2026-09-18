@@ -624,6 +624,15 @@ func (e *ClusterError) Unwrap() error {
 }
 
 // DualClusterError represents failures from both clusters.
+//
+// For a write it means no cluster confirmed the write,
+// and Helix does not replay it.
+// It does not mean no cluster applied it:
+// a leg that timed out — on Helix's own leg deadline ([ErrClusterTimeout])
+// or on the driver's write timeout — or that ended because the caller's
+// context was cancelled or expired may still have applied the write on
+// that cluster.
+// Retry such a write only if it is idempotent, or check whether it landed first.
 type DualClusterError struct {
 	// ErrorA is the error from cluster A.
 	ErrorA error

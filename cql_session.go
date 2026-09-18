@@ -253,7 +253,8 @@ type Query interface {
 	// writes are handled via the Replayer). A write no cluster acknowledged
 	// synchronously returns [types.NoSynchronousAckError] unless the client
 	// runs with [AckOnReplayAdmission]; both clusters failing returns
-	// [types.DualClusterError].
+	// [types.DualClusterError], which is not replayed and does not prove
+	// the write was not applied.
 	//
 	// The contents of byte-slice arguments are copied before the write is
 	// dispatched, so a buffer may be reused as soon as this call returns even
