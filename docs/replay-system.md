@@ -690,9 +690,21 @@ see [What does not count as a cluster failure](strategy-policy.md#what-does-not-
 
 ### Memory worker execution model
 
-The first attempt for a payload runs inline on the dequeue loop.
-Later attempts run in a bounded pool of goroutines (100), so a failing
-payload never blocks payloads for the other cluster.
+The memory worker has one dequeue loop, and it serves both clusters.
+The first attempt for each payload runs inline on that loop.
+A target that fails fast costs the loop almost nothing,
+but a target that hangs instead holds it until each attempt ends:
+at most the shorter of the worker's `ExecuteTimeout` (default 30 s) and `WithClusterWriteTimeout` when that is set,
+and sooner when the driver times the request out first.
+While it is held, payloads for the other cluster wait behind it too.
+Later attempts run in a bounded pool of goroutines (100),
+so only first attempts are serialised on the loop.
+
+The gate on a client-built worker (`WithAutoMemoryWorker`)
+consults the cluster's drain state and the operator gate
+(`WithReplayGate`, see [Hold Replay Back per Cluster](#9-hold-replay-back-per-cluster)).
+It does not consult the write strategy:
+a cluster that `AdaptiveDualWrite` has marked degraded is still replayed to.
 
 | Aspect | `RetryBounded` | `RetryWhileRetained` |
 |--------|----------------|----------------------|
@@ -1151,6 +1163,26 @@ on NATS, terminated at decode like a corrupt message.
 1. **Check target cluster availability**
 2. **Review error callbacks for failure patterns**
 3. **Consider temporary rate limiting on writes**
+
+### Load on a Recovering Cluster
+
+Replay has no pacing of its own.
+On the memory worker, first attempts are serial, one payload at a time on the dequeue loop.
+Retries are not: a payload whose attempt failed waits out its backoff
+and then runs in the retry pool, which executes up to 100 attempts at once.
+After an outage that failed fast, most of the backlog is waiting on backoff,
+so when the cluster returns, up to 100 retries can reach it at the same moment,
+alongside the first attempts still coming off the loop.
+
+The NATS worker runs one goroutine per cluster.
+Each fetches a batch and executes its messages one after another,
+and retries come back as redeliveries through the same loop,
+so a cluster sees at most one replay attempt at a time from each worker process.
+
+To hold replay back while a cluster warms up, close its gate:
+`helix.WithReplayGate` on a client-built worker, or `replay.WithClusterGate` on a worker you build
+(see [Hold Replay Back per Cluster](#9-hold-replay-back-per-cluster)).
+Payloads stay queued without spending an attempt, and replay resumes within `PollInterval` once the gate opens.
 
 ---
 
