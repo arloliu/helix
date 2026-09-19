@@ -20,10 +20,10 @@ import (
 	htypes "github.com/arloliu/helix/types"
 )
 
-// outageHold is how long B stays paused after the last write.
+// outageHold is how long the paused cluster stays paused after the last write.
 //
 // It must outlast the driver's 2 s request timeout (SessionTimeout in e2eOptions) plus a margin.
-// A write's background leg to a paused B is sent into a socket the container is not reading;
+// A write's background leg to a paused cluster is sent into a socket the container is not reading;
 // the leg only fails, and only then enqueues its replay payload, when that timeout fires.
 // Unpausing sooner lets Scylla read the buffered request, the leg succeeds, and replay never runs.
 // The hold is the outage itself, not a wait for state:

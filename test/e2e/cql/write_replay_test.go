@@ -75,18 +75,11 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(client.Close)
 
-			// Worker MaxAttempts must outlast the actual realized outage,
-			// not the comment's "~5s." Under sustained suite pressure
-			// AdaptiveDualWrite is observed to NOT always degrade (test
-			// log shows async=0), so each Exec runs sync with a ~2s
-			// gocql timeout against paused A, stretching the loop's
-			// wall-clock to ~200s. The default MaxAttempts=5 is
-			// catastrophically short here; even MaxAttempts=100 with the
-			// default exponential-backoff schedule sits right at the
-			// edge. 1000 gives a 10× margin so payloads survive any
-			// reasonable scheduling jitter from prior tests. S11 covers
-			// the deliberate-overflow conservation law; S1 is the
-			// happy-path drain.
+			// Worker MaxAttempts must outlast the realized outage,
+			// so a payload is never dead-lettered while A is still paused:
+			// 1000 is far above what the outage needs, and a slow suite cannot exhaust it.
+			// S11 covers the deliberate-overflow conservation law;
+			// S1 is the happy-path drain.
 			var (
 				workerSuccess atomic.Int32
 				workerDropped atomic.Int32
@@ -111,14 +104,15 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 			ctx := context.Background()
 			require.NoError(t, a.Pause(ctx))
 
-			// Drive 100 writes at 50ms intervals (~5s of activity). Slow
-			// enough that the replay queue (capacity 1000) cannot overflow,
-			// fast enough to surface degradation. If we drove writes flat-out,
-			// the replayer's drain rate vs the write rate would dominate the
-			// post-Unpause result and mask the question we're actually asking.
+			// Drive 100 writes back to back. The first strikeThreshold of
+			// them run synchronously against the paused A, fail on the
+			// driver timeout and are enqueued at once; after that A is
+			// degraded, and each later write's A leg runs in the
+			// background and is enqueued only when it fails.
+			// A caller never sees ErrWriteAsync here: B acknowledges every
+			// write, so the write returns nil.
 			var (
 				written     atomic.Int32
-				asyncCount  atomic.Int32
 				droppedCnt  atomic.Int32
 				dualErrCnt  atomic.Int32
 				otherErrCnt atomic.Int32
@@ -131,9 +125,6 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 				switch {
 				case err == nil:
 					written.Add(1)
-				case errors.Is(err, htypes.ErrWriteAsync):
-					written.Add(1)
-					asyncCount.Add(1)
 				case errors.Is(err, htypes.ErrWriteDropped):
 					droppedCnt.Add(1)
 				default:
@@ -145,14 +136,22 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 					}
 				}
 			}
-			t.Logf("[%s] writes: ok+async=%d async=%d dropped=%d dualErr=%d other=%d",
-				d.name, written.Load(), asyncCount.Load(), droppedCnt.Load(),
-				dualErrCnt.Load(), otherErrCnt.Load())
+			t.Logf("[%s] writes: ok=%d dropped=%d dualErr=%d other=%d asyncLegs(A)=%d",
+				d.name, written.Load(), droppedCnt.Load(),
+				dualErrCnt.Load(), otherErrCnt.Load(), mc.GetWriteAsync(htypes.ClusterA))
+			require.Equal(t, int32(totalWrites), written.Load(),
+				"[%s] B acknowledges every write, so every write must return nil", d.name)
 
 			assert.True(t, adw.IsDegraded(htypes.ClusterA),
 				"[%s] AdaptiveDualWrite must mark A degraded after a sustained outage", d.name)
-			assert.Greater(t, memReplayer.Len(), 0,
-				"[%s] replay queue should be non-empty while A is paused", d.name)
+
+			// Keep A paused past the driver timeout (see outageHold): a
+			// background leg sent to the paused node fails, and is enqueued,
+			// only when that timeout fires. The count below is the guard
+			// that the drain under test is really a replay drain.
+			time.Sleep(outageHold)
+			require.Equal(t, int64(totalWrites), mc.GetReplayEnqueued(htypes.ClusterA),
+				"[%s] every write's A leg must fail and be enqueued before A returns", d.name)
 
 			// Unpause A and wait for the replay drain to converge.
 			//
@@ -177,7 +176,8 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 
 			converged := waitFor(60*time.Second, 200*time.Millisecond, func() bool {
 				count, err := tryCountRows(a, table)
-				return err == nil && count == int(written.Load())
+				return err == nil && count == int(written.Load()) &&
+					int64(workerSuccess.Load()) == mc.GetReplayEnqueued(htypes.ClusterA)
 			})
 			assert.True(t, converged,
 				"[%s] cluster A did not catch up to %d rows within 60s after Unpause "+
@@ -193,6 +193,9 @@ func TestS1_PauseA_WriteWithReplayDrain(t *testing.T) {
 			t.Logf("[%s] post-drain row counts: A=%d B=%d", d.name, countA, countB)
 			assert.Equal(t, countB, countA,
 				"[%s] cluster A and B disagree on row count after replay drain", d.name)
+			assert.Equal(t, mc.GetReplayEnqueued(htypes.ClusterA), int64(workerSuccess.Load()),
+				"[%s] every enqueued payload must be replayed to A", d.name)
+			assert.Zero(t, workerDropped.Load(), "[%s] no payload may be dropped", d.name)
 		})
 	}
 }
