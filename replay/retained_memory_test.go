@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -170,6 +171,58 @@ func TestMemoryWorker_RetainedPolicyDeadLettersAfterBudget(t *testing.T) {
 	assert.Equal(t, int32(5), attempts.Load(), "3 deferred attempts plus 2 dead-letter attempts")
 	assert.Equal(t, int64(1), mc.GetReplayWorkerDropped(types.ClusterA, types.ReplayDropDeadLetter))
 	assert.Equal(t, 0, replayer.Len(), "slot must be released after the drop")
+}
+
+// A rejected statement is retried under the default classifier and never
+// consumes the poison budget: past MaxAttempts it still holds its slot, and
+// only Stop drops it.
+func TestMemoryWorker_RetainedPolicyRejectedStatementKeepsBudget(t *testing.T) {
+	const maxAttempts = 2
+
+	replayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(4))
+	defer replayer.Close()
+	mc := testutil.NewTestMetricsCollector()
+
+	// The fourth attempt starts only after the third was settled, so by then
+	// three rejections, one more than MaxAttempts, have been classified.
+	var attempts, dropped atomic.Int32
+	var once sync.Once
+	settledPastBudget := make(chan struct{})
+	worker := replay.NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error {
+			if attempts.Add(1) > maxAttempts+1 {
+				once.Do(func() { close(settledPastBudget) })
+			}
+
+			return fmt.Errorf("%w: unconfigured table", types.ErrStatementRejected)
+		},
+		replay.WithRetryPolicy(replay.RetryWhileRetained),
+		replay.WithPollInterval(5*time.Millisecond),
+		replay.WithRetryDelay(time.Millisecond),
+		replay.WithMaxRetryDelay(5*time.Millisecond),
+		replay.WithMaxAttempts(maxAttempts),
+		replay.WithWorkerMetrics(mc),
+		replay.WithOnDrop(func(types.ReplayPayload, error) { dropped.Add(1) }),
+	)
+	enqueueN(t, replayer, 1, types.ClusterB)
+	require.NoError(t, worker.Start())
+
+	select {
+	case <-settledPastBudget:
+	case <-time.After(2 * time.Second):
+		worker.Stop()
+		t.Fatalf("payload was not retried past MaxAttempts: %d attempts, %d dead-letter drops",
+			attempts.Load(), mc.GetReplayWorkerDropped(types.ClusterB, types.ReplayDropDeadLetter))
+	}
+	// Read the backlog before Stop, which drops what is left.
+	assert.Equal(t, 1, replayer.Len(), "the rejected payload keeps its slot")
+
+	worker.Stop()
+
+	assert.Equal(t, int64(0), mc.GetReplayWorkerDropped(types.ClusterB, types.ReplayDropDeadLetter))
+	assert.Equal(t, int64(1), mc.GetReplayWorkerDropped(types.ClusterB, types.ReplayDropShutdown))
+	assert.Equal(t, int32(1), dropped.Load(), "the only drop is the shutdown")
+	assert.Equal(t, 0, replayer.Len(), "Stop releases the slot")
 }
 
 // The retry window bounds how long an unreachable cluster is waited for.

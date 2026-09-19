@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -110,6 +111,45 @@ func TestNATSBackend_SettleRetained_TerminatesAfterDeadLetterBudget(t *testing.T
 	assert.Equal(t, 1, terms, "second dead-letter attempt exhausts MaxAttempts=2")
 	assert.Equal(t, 1, dropped)
 	assert.Empty(t, b.deadLetters, "the counter is released with the message")
+}
+
+// A rejected statement is retried under the default classifier and never
+// consumes the poison budget: every settlement past MaxAttempts is still a
+// delayed Nak on the delivery-count backoff.
+func TestNATSBackend_SettleRetained_RejectedStatementDoesNotConsumeBudget(t *testing.T) {
+	var delays []time.Duration
+	var terms int
+	msg := ReplayMessage{
+		Payload:          types.ReplayPayload{TargetCluster: types.ClusterB, Query: "INSERT test"},
+		nakWithDelayFunc: func(d time.Duration) error { delays = append(delays, d); return nil },
+		termFunc:         func() error { terms++; return nil },
+		StreamSequence:   11,
+	}
+
+	drops := &dropReasonCounter{}
+	cfg := newTestNATSBackendConfig()
+	cfg.Metrics = drops
+	cfg.RetryPolicy = RetryWhileRetained
+	cfg.RetryDelay = 10 * time.Millisecond
+	cfg.MaxRetryDelay = time.Second
+	cfg.MaxAttempts = 2
+	cfg.Classifier = DefaultReplayClassifier
+	var dropped int
+	cfg.OnDrop = func(types.ReplayPayload, error) { dropped++ }
+	b := &natsBackend{config: &cfg, deadLetters: make(map[uint64]int)}
+
+	rejected := fmt.Errorf("%w: unconfigured table", types.ErrStatementRejected)
+	for delivery := uint64(1); delivery <= 3; delivery++ {
+		msg.DeliveryCount = delivery
+		b.settleRetained(msg, rejected)
+	}
+
+	assert.Equal(t, []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}, delays,
+		"every delivery, past MaxAttempts=2 too, is a delayed Nak")
+	assert.Zero(t, terms, "a rejected statement is never terminated")
+	assert.Zero(t, dropped)
+	assert.Empty(t, drops.reasons)
+	assert.Empty(t, b.deadLetters, "a rejected statement is not a dead-letter attempt")
 }
 
 // A refused Term on an exhausted poison budget keeps the budget: the
