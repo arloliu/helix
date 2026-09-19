@@ -175,6 +175,9 @@ func registerScenarios(sim *simulation.Simulation, profile string) {
 		return
 	}
 
+	// Every profile except fallback runs the read-leg deadline group.
+	sim.RegisterStrategyGroup(readLegDeadlineGroup())
+
 	// Add more scenarios based on profile
 	if profile == "comprehensive" || profile == "soak" {
 		sim.RegisterScenario(&scenarios.ReplaySaturation{})
@@ -212,23 +215,30 @@ func makeStrategyGroupClientWithMetrics(
 // replay worker, derived from the loaded configuration.
 var groupWorkerOpts []replay.WorkerOption
 
+// makeStrategyGroupClient returns a StrategyGroupSetupFunc
+// that builds a client from the given strategies.
+// The extra options are applied after the shared ones,
+// so a group can add client settings such as a read-leg deadline.
 func makeStrategyGroupClient(
 	writeStrategy helix.WriteStrategy,
 	readStrategy helix.ReadStrategy,
 	failoverPolicy helix.FailoverPolicy,
+	extra ...helix.Option,
 ) simulation.StrategyGroupSetupFunc {
 	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
 		memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
 		topo := topology.NewLocal()
 
-		client, err := helix.NewCQLClient(sessionA, sessionB,
+		opts := append([]helix.Option{
 			helix.WithWriteStrategy(writeStrategy),
 			helix.WithReadStrategy(readStrategy),
 			helix.WithFailoverPolicy(failoverPolicy),
 			helix.WithReplayer(memReplayer),
 			helix.WithTopologyWatcher(topo),
 			helix.WithMetrics(mc),
-		)
+		}, extra...)
+
+		client, err := helix.NewCQLClient(sessionA, sessionB, opts...)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to create client: %w", err)
 		}
@@ -294,6 +304,34 @@ func latencyCircuitBreakerGroup() simulation.StrategyGroup {
 		),
 		Scenarios: []simtypes.Scenario{
 			&scenarios.LatencyCircuitBreakerTrip{},
+		},
+	}
+}
+
+// readLegDeadlineGroup bounds each read leg with WithClusterReadTimeout
+// and sets the breaker's AbsoluteMax far above it,
+// so a slow cluster can trip the breaker only through read-leg failures.
+func readLegDeadlineGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "read-leg-deadline",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			// Pin reads to ClusterA,
+			// so the latency injected on A is what every read leg meets first.
+			policy.NewStickyRead(policy.WithPreferredCluster(htypes.ClusterA)),
+			policy.NewLatencyCircuitBreaker(
+				policy.WithLatencyAbsoluteMax(2*time.Second),
+				policy.WithLatencyThreshold(3),
+				policy.WithLatencyResetTimeout(15*time.Second),
+			),
+			// 500ms leaves room for B's cold first reads (100-300ms).
+			helix.WithClusterReadTimeout(500*time.Millisecond),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.ReadLegDeadlineTrip{},
 		},
 	}
 }
