@@ -24,7 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no failover, no breaker state change, no auto-refresh impact.
   FallbackRead and normal failover fold a rejection on the alternative cluster the same way they already fold an unreachable alternative.
   See `docs/strategy-policy.md` for the full contract.
-  The write path is unchanged: a rejected statement on a write leg is still replayed.
+  On the write path, a rejected statement on a write leg is still replayed.
+- **A rejected statement no longer degrades a cluster under `AdaptiveDualWrite`.**
+  A write leg that fails with `types.ErrStatementRejected` used to count as a strike,
+  so malformed CQL, or a staggered schema migration where one cluster still rejects a new table,
+  could degrade a healthy cluster and make `Strict()` writes skip it.
+  Such a leg now records no strike, and it neither clears the cluster's slow strikes nor earns it recovery credit.
+  It is still a write error and is still replayed.
 - **A write leg to a draining cluster now counts as skipped on every path.**
   With `AdaptiveDualWrite` and the draining cluster also degraded,
   its leg used to show up in `{prefix}_write_async_total`;

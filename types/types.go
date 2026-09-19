@@ -499,6 +499,8 @@ var (
 	// A read that fails this way is surfaced to the caller verbatim and
 	// counted as a read error on the cluster that returned it; it moves no
 	// read strategy, trips no failover policy, and triggers no failover.
+	// A write leg that fails this way is a write error and is replayed,
+	// but it is never an AdaptiveDualWrite strike.
 	ErrStatementRejected = errors.New("helix: statement rejected by the cluster")
 
 	// ErrClusterTimeout marks an operation that a Helix-owned deadline
