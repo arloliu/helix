@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With `SyncDualWrite`, if the first leg fails and the caller's context has ended by then, the second leg is not sent:
   the write returns `DualClusterError`, nothing is replayed, and the unsent leg is not counted as caller-expired.
   Documented in `docs/strategy-policy.md`, `docs/strict-write.md`, the package overview, and the Godoc of `DualClusterError`, `SyncDualWrite.Execute` and `Query.Exec`.
+- **What waiting on a rejected statement costs.**
+  A write leg rejected for an unconfigured table is retried only while the payload is retained, and is dropped after that.
+  Until then it holds replay capacity like an outage backlog, and once backoff saturates it retries at `MaxRetryDelay` with a `Warn` line per attempt.
+  Documented in `docs/replay-system.md`, next to the advice not to dead-letter `0x2200`.
 
 ## [1.10.2] — 2026-09-15
 

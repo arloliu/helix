@@ -665,6 +665,24 @@ Matching the interface alone would also catch 0x2200, so the `Code()` comparison
 Cassandra returns 0x2200 for an *unconfigured table* — the same code a cluster returns while a schema migration has not reached it yet.
 That lag is precisely what replay exists to absorb, so dead-lettering 0x2200 would discard writes for a table that is about to exist.
 
+Replay absorbs the lag only while it retains the payload:
+until `WithRetryWindow` elapses on the memory worker, counted from the first attempt,
+or until the stream's `MaxAge` elapses on NATS, counted from publish.
+A migration that takes longer loses the write,
+as a `retry_window_expired` drop on memory
+and as a stream expiry on NATS, which Helix reports only through the opt-in `WithEvictionWatch()`
+(see [Drop reasons](#drop-reasons)).
+The worker does not track why a payload is waiting,
+so a backlog of rejected statements holds capacity just as an outage backlog does.
+Once the memory queue is full, new admissions fail with `ErrReplayQueueFull`;
+the client logs each one at `Error`, counts it in `{prefix}_replay_dropped_total{cluster}`, and emits a `replay_dropped` event.
+Under its default `DiscardOld` policy, a full NATS stream evicts its oldest messages instead,
+unless `WithRejectNewOnLimit()` is set.
+Once backoff reaches `MaxRetryDelay` (default 30 s), each waiting payload is retried at that interval,
+so 10,000 of them, the default memory capacity, cost about 333 failing attempts a second,
+each logged at `Warn`.
+To count them by cause, use `WithOnError` and match with `errors.Is(err, types.ErrStatementRejected)`.
+
 On the read path the same rejection is not a retry-and-wait situation.
 A read has no queue to wait in, so a rejected statement is returned to the caller immediately.
 It never trips failover, the failover policy, or the read strategy —
