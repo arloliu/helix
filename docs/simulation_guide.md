@@ -51,7 +51,7 @@ A pprof server starts automatically on `127.0.0.1:6060` during all runs.
 | Name                       | Profile                  | What it verifies                                                                                 |
 |----------------------------|--------------------------|--------------------------------------------------------------------------------------------------|
 | `degraded-cluster`         | quick+                   | Adaptive write degrades gracefully under sustained latency on one cluster                        |
-| `adaptive-recovery`        | quick+                   | Write strategy recovers after a flapping cluster stabilizes                                      |
+| `adaptive-recovery`        | quick+                   | Write strategy recovers after a flapping cluster stabilizes; replay loses nothing when the target fails mid-drain |
 | `complete-failure`         | quick+                   | Replay queue absorbs writes during a total cluster outage                                        |
 | `replay-saturation`        | comprehensive+           | Replay buffer handles prolonged outage without data loss                                         |
 | `drain-mode`               | comprehensive+           | Replay drains cleanly after cluster returns                                                      |
