@@ -79,6 +79,11 @@ Write 2: A=60ms, B=450ms → Strike B (2/3)
 Write 3: A=55ms, B=380ms → Strike B (3/3) → B is now DEGRADED
 ```
 
+A failed write leg is a strike too,
+except a statement the coordinator rejected (`types.ErrStatementRejected`):
+that leg is still a write error and is still replayed,
+but it is never a strike, and it neither clears slow strikes nor earns recovery credit.
+
 ## The MinFloor Filter
 
 To prevent false positives when both clusters are healthy and fast, delta comparison is **skipped** when both latencies are below `minFloor` (default: 100ms).

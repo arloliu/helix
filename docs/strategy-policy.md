@@ -329,6 +329,8 @@ and reaching it does not always recover immediately:
 - `ErrWriteDropped` — semaphore full; background write could not be scheduled (rare)
 - Actual write errors from a healthy cluster count as strikes toward degradation
 - `ErrWriteAsync` and `ErrWriteDropped` are excluded from strike counting
+- A rejected statement (`types.ErrStatementRejected`) is excluded too:
+  it is still a write error and still replayed, but never a strike
 
 **Testing helpers:**
 
