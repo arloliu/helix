@@ -71,6 +71,14 @@ A leg that a strategy completes in the background (an `AdaptiveDualWrite` leg on
 A write that finds every slot held is dropped (`ErrWriteDropped`) and its payload is admitted on the calling goroutine, so the caller waits out the slow `Enqueue` rather than the strategy accumulating goroutines behind it.
 A custom `Enqueue` must return within a bounded time — reject or time out — rather than block until space appears, since while every slot is held no further background write is accepted and each new write to the degraded cluster is dropped and admitted by its own caller; `MemoryReplayer` returns `ErrReplayQueueFull` at once and `NATSReplayer` gives up after `WithPublishTimeout`.
 
+A `NATSReplayer` publish that times out because the connection to the server is down is not necessarily lost.
+The NATS client keeps publishes made while it is reconnecting in its reconnect buffer (`nats.ReconnectBufSize`, 8 MB by default)
+and sends them once the connection is back, so such a payload may still reach the stream and be replayed.
+The client still counts it in `{prefix}_replay_dropped_total`, logs it, and emits `replay_dropped`,
+because `Enqueue` returned an error:
+for a short NATS outage, read that drop as possible loss, not certain loss.
+Once the reconnect buffer is full, publishes fail at once and those payloads are lost.
+
 **Implementations:**
 
 | Implementation | Durability | Use Case |

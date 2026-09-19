@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   After a fast-failing outage, up to 100 retries can reach the cluster at once when it returns;
   `WithReplayGate` is the way to hold replay back.
   Documented in `docs/replay-system.md`, which previously said a failing payload never blocks the other cluster's.
+- **A `replay_dropped` from a `NATSReplayer` publish timeout is possible loss, not certain loss.**
+  A publish made while the NATS client is reconnecting stays in its reconnect buffer
+  and is sent once the connection returns, so a payload counted as dropped during a short NATS outage may still be replayed.
+  Documented in `docs/replay-system.md` and `docs/cluster-events.md`.
 
 ## [1.10.2] — 2026-09-15
 
