@@ -41,5 +41,5 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
-      - name: Run simulation quick profile
-        run: make test-simulation
+      - name: Run simulation comprehensive profile
+        run: make test-simulation SIM_PROFILE=comprehensive
