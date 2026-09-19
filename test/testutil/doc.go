@@ -31,5 +31,6 @@
 // For integration tests, helper functions are provided:
 //
 //   - StartEmbeddedNATS: Starts an embedded NATS server for replay testing
+//   - StartRestartableNATS: Starts an embedded NATS server a test can shut down and restart
 //   - StartCassandraContainer: Starts a Cassandra test container (requires Docker)
 package testutil
