@@ -76,12 +76,18 @@ A strategy group runs its scenarios against a fresh `CQLClient` with a specific 
 
 ## Configuration reference
 
+The config file tunes the main client that the scenarios run against:
+it always uses `AdaptiveDualWrite` and `StickyRead`.
+The strategies themselves are not configurable here.
+Each strategy group builds its own client in `cmd/main.go`,
+so the other read strategies, write settings, and failover policies are covered by the groups, not by YAML.
+Only the keys below have an effect;
+the loader ignores unknown keys without an error.
+
 ```yaml
 simulation:
-  duration: 5m          # Total run time
-  seed: 42              # RNG seed (for reproducibility)
-  report_dir: ./reports # Future: where JSON reports land
-  console_interval: 10s # Progress log interval
+  duration: 5m          # Total run time; overrides -duration
+  seed: 42              # RNG seed (for reproducibility); overrides -seed
 
 workload:
   workers: 1            # Parallel traffic goroutines
@@ -91,18 +97,9 @@ workload:
   batch_ratio: 0.1      # Fraction of write ops that use LOGGED BATCH
 
 helix:
-  write_strategy:
-    type: adaptive              # adaptive | concurrent | single
+  write_strategy:               # AdaptiveDualWrite tuning
     delta_threshold: 100ms      # Latency gap before a "strike" is counted
     strike_threshold: 3         # Strikes before fire-and-forget mode
-    recovery_threshold: 5       # Consecutive fast writes needed to recover
-    fire_forget_timeout: 30s    # Background goroutine timeout
-    fire_forget_limit: 100      # Max concurrent fire-and-forget goroutines
-
-  read_strategy:
-    type: sticky        # sticky | primary_only | round_robin
-    cooldown: 1m        # Time to stay on failover cluster before probing primary
-    preferred: random   # A | B | random (initial preferred cluster)
 
   failover_policy:
     type: active        # active | circuit | latency_circuit
@@ -111,8 +108,8 @@ helix:
     absolute_max: 2s    # (latency_circuit only) max acceptable latency
 
   replay:
-    type: memory        # memory | nats
-    queue_size: 1000    # Max queued payloads
+    queue_size: 1000        # Max queued payloads
+    retry_policy: retained  # retained (default) | bounded; also applies to strategy groups
 ```
 
 ## Writing a new scenario

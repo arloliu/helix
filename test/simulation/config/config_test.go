@@ -42,9 +42,6 @@ func TestLoad_DefaultsOnEmptyYAML(t *testing.T) {
 	if cfg.Simulation.ConsoleInterval != 10*time.Second {
 		t.Errorf("ConsoleInterval = %v, want 10s", cfg.Simulation.ConsoleInterval)
 	}
-	if cfg.Simulation.ReportDir != "./reports" {
-		t.Errorf("ReportDir = %q, want \"./reports\"", cfg.Simulation.ReportDir)
-	}
 	if cfg.Workload.Workers != 1 {
 		t.Errorf("Workers = %d, want 1", cfg.Workload.Workers)
 	}
@@ -62,7 +59,6 @@ func TestLoad_ExplicitValuesPreserved(t *testing.T) {
 simulation:
   duration: 2h
   seed: 12345
-  report_dir: /tmp/myreports
   console_interval: 30s
 
 workload:
@@ -74,21 +70,16 @@ workload:
 
 helix:
   write_strategy:
-    type: adaptive
     delta_threshold: 200ms
     strike_threshold: 5
-  read_strategy:
-    type: sticky
-    cooldown: 2m
-    preferred: A
   failover_policy:
     type: circuit
     threshold: 5
     reset_timeout: 1m
+    absolute_max: 2s
   replay:
-    type: nats
     queue_size: 5000
-    nats_url: nats://localhost:4222
+    retry_policy: bounded
 `
 	path := writeTempFile(t, yaml)
 
@@ -102,9 +93,6 @@ helix:
 	}
 	if cfg.Simulation.Seed != 12345 {
 		t.Errorf("Seed = %d, want 12345", cfg.Simulation.Seed)
-	}
-	if cfg.Simulation.ReportDir != "/tmp/myreports" {
-		t.Errorf("ReportDir = %q, want /tmp/myreports", cfg.Simulation.ReportDir)
 	}
 	if cfg.Simulation.ConsoleInterval != 30*time.Second {
 		t.Errorf("ConsoleInterval = %v, want 30s", cfg.Simulation.ConsoleInterval)
@@ -124,26 +112,29 @@ helix:
 	if cfg.Workload.BatchRatio != 0.2 {
 		t.Errorf("BatchRatio = %v, want 0.2", cfg.Workload.BatchRatio)
 	}
-	if cfg.Helix.WriteStrategy.Type != "adaptive" {
-		t.Errorf("WriteStrategy.Type = %q, want adaptive", cfg.Helix.WriteStrategy.Type)
-	}
 	if cfg.Helix.WriteStrategy.DeltaThreshold != 200*time.Millisecond {
 		t.Errorf("DeltaThreshold = %v, want 200ms", cfg.Helix.WriteStrategy.DeltaThreshold)
 	}
-	if cfg.Helix.ReadStrategy.Cooldown != 2*time.Minute {
-		t.Errorf("Cooldown = %v, want 2m", cfg.Helix.ReadStrategy.Cooldown)
+	if cfg.Helix.WriteStrategy.StrikeThreshold != 5 {
+		t.Errorf("StrikeThreshold = %d, want 5", cfg.Helix.WriteStrategy.StrikeThreshold)
+	}
+	if cfg.Helix.FailoverPolicy.Type != "circuit" {
+		t.Errorf("FailoverPolicy.Type = %q, want circuit", cfg.Helix.FailoverPolicy.Type)
 	}
 	if cfg.Helix.FailoverPolicy.Threshold != 5 {
 		t.Errorf("FailoverPolicy.Threshold = %d, want 5", cfg.Helix.FailoverPolicy.Threshold)
 	}
-	if cfg.Helix.Replay.Type != "nats" {
-		t.Errorf("Replay.Type = %q, want nats", cfg.Helix.Replay.Type)
-	}
 	if cfg.Helix.Replay.QueueSize != 5000 {
 		t.Errorf("Replay.QueueSize = %d, want 5000", cfg.Helix.Replay.QueueSize)
 	}
-	if cfg.Helix.Replay.NATSURL != "nats://localhost:4222" {
-		t.Errorf("Replay.NATSURL = %q, want nats://localhost:4222", cfg.Helix.Replay.NATSURL)
+	if cfg.Helix.FailoverPolicy.ResetTimeout != time.Minute {
+		t.Errorf("FailoverPolicy.ResetTimeout = %v, want 1m", cfg.Helix.FailoverPolicy.ResetTimeout)
+	}
+	if cfg.Helix.FailoverPolicy.AbsoluteMax != 2*time.Second {
+		t.Errorf("FailoverPolicy.AbsoluteMax = %v, want 2s", cfg.Helix.FailoverPolicy.AbsoluteMax)
+	}
+	if cfg.Helix.Replay.RetryPolicy != "bounded" {
+		t.Errorf("Replay.RetryPolicy = %q, want bounded", cfg.Helix.Replay.RetryPolicy)
 	}
 }
 

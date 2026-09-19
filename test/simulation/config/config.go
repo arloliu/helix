@@ -11,7 +11,6 @@ import (
 // Config represents the simulation configuration
 type Config struct {
 	Simulation SimulationConfig `yaml:"simulation"`
-	Clusters   ClustersConfig   `yaml:"clusters"`
 	Helix      HelixConfig      `yaml:"helix"`
 	Workload   WorkloadConfig   `yaml:"workload"`
 }
@@ -19,37 +18,21 @@ type Config struct {
 type SimulationConfig struct {
 	Duration        time.Duration `yaml:"duration"`
 	Seed            int64         `yaml:"seed"`
-	ReportDir       string        `yaml:"report_dir"`
 	ConsoleInterval time.Duration `yaml:"console_interval"`
-}
-
-type ClustersConfig struct {
-	Type     string  `yaml:"type"` // scylladb | cassandra
-	MemoryMB int     `yaml:"memory_mb"`
-	CPULimit float64 `yaml:"cpu_limit"`
 }
 
 type HelixConfig struct {
 	WriteStrategy  WriteStrategyConfig  `yaml:"write_strategy"`
-	ReadStrategy   ReadStrategyConfig   `yaml:"read_strategy"`
 	FailoverPolicy FailoverPolicyConfig `yaml:"failover_policy"`
 	Replay         ReplayConfig         `yaml:"replay"`
 }
 
+// WriteStrategyConfig tunes the main client's AdaptiveDualWrite.
+// The write strategy itself is not configurable:
+// strategy groups in cmd/main.go choose their own strategies.
 type WriteStrategyConfig struct {
-	Type              string        `yaml:"type"` // adaptive | concurrent | single
-	DeltaThreshold    time.Duration `yaml:"delta_threshold"`
-	AbsoluteMax       time.Duration `yaml:"absolute_max"`
-	StrikeThreshold   int           `yaml:"strike_threshold"`
-	RecoveryThreshold int           `yaml:"recovery_threshold"`
-	FireForgetTimeout time.Duration `yaml:"fire_forget_timeout"`
-	FireForgetLimit   int           `yaml:"fire_forget_limit"`
-}
-
-type ReadStrategyConfig struct {
-	Type      string        `yaml:"type"` // sticky | primary_only
-	Cooldown  time.Duration `yaml:"cooldown"`
-	Preferred string        `yaml:"preferred"` // A | B | random
+	DeltaThreshold  time.Duration `yaml:"delta_threshold"`
+	StrikeThreshold int           `yaml:"strike_threshold"`
 }
 
 type FailoverPolicyConfig struct {
@@ -60,9 +43,7 @@ type FailoverPolicyConfig struct {
 }
 
 type ReplayConfig struct {
-	Type        string `yaml:"type"` // memory | nats
 	QueueSize   int    `yaml:"queue_size"`
-	NATSURL     string `yaml:"nats_url"`
 	RetryPolicy string `yaml:"retry_policy"` // retained (default) | bounded
 }
 
@@ -92,9 +73,6 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Simulation.ConsoleInterval == 0 {
 		cfg.Simulation.ConsoleInterval = 10 * time.Second
-	}
-	if cfg.Simulation.ReportDir == "" {
-		cfg.Simulation.ReportDir = "./reports"
 	}
 	if cfg.Workload.Workers <= 0 {
 		cfg.Workload.Workers = 1

@@ -263,27 +263,17 @@ func (s *Simulation) setupEnvironment() error {
 	var memReplayer *replay.MemoryReplayer
 
 	if s.config.Settings != nil {
-		// Configure Write Strategy
+		// The main client always runs AdaptiveDualWrite and StickyRead;
+		// strategy groups cover the other strategies.
 		wsCfg := s.config.Settings.Helix.WriteStrategy
-		switch wsCfg.Type {
-		case "adaptive":
-			opts := []policy.AdaptiveDualWriteOption{}
-			if wsCfg.DeltaThreshold > 0 {
-				opts = append(opts, policy.WithAdaptiveDeltaThreshold(wsCfg.DeltaThreshold))
-			}
-			if wsCfg.StrikeThreshold > 0 {
-				opts = append(opts, policy.WithAdaptiveStrikeThreshold(wsCfg.StrikeThreshold))
-			}
-			writeStrategy = policy.NewAdaptiveDualWrite(opts...)
-		default:
-			writeStrategy = policy.NewAdaptiveDualWrite(
-				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
-				policy.WithAdaptiveStrikeThreshold(3),
-			)
+		opts := []policy.AdaptiveDualWriteOption{}
+		if wsCfg.DeltaThreshold > 0 {
+			opts = append(opts, policy.WithAdaptiveDeltaThreshold(wsCfg.DeltaThreshold))
 		}
-
-		// Configure Read Strategy
-		// rsCfg := s.config.Settings.Helix.ReadStrategy
+		if wsCfg.StrikeThreshold > 0 {
+			opts = append(opts, policy.WithAdaptiveStrikeThreshold(wsCfg.StrikeThreshold))
+		}
+		writeStrategy = policy.NewAdaptiveDualWrite(opts...)
 		readStrategy = policy.NewStickyRead()
 
 		// Configure Failover Policy
