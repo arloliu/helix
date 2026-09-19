@@ -13,8 +13,17 @@ import (
 
 // StickyCooldown verifies the sticky read failover cooldown mechanism using a 3-phase test:
 //  1. Fail Cluster A — StickyRead must switch preferred to B.
-//  2. Immediately fail Cluster B inside the cooldown window — preferred must stay on B.
+//  2. Keep A failing and fail Cluster B inside the cooldown window —
+//     preferred must stay on B while reads keep failing over to A.
 //  3. Wait for cooldown to expire, fail Cluster B again — StickyRead must switch back to A.
+//
+// Phase 2 asserts what the cooldown guarantees:
+// two clusters failing in turn do not swap the preference inside the cooldown.
+// The cooldown does not hold the preference against a known-good other cluster.
+// A cluster that has served a read since its own last failure is known good,
+// and a failure on the preferred cluster moves the preference to it even inside the cooldown.
+// That is why A stays failing through phase 2:
+// a healthy A would serve B's failover reads and become known good.
 //
 // This scenario must run inside a strategy group that configures StickyRead with
 // WithPreferredCluster(ClusterA) and a short WithStickyReadCooldown, otherwise
@@ -31,6 +40,9 @@ func (s *StickyCooldown) Description() string {
 
 func (s *StickyCooldown) Run(ctx context.Context, env *types.Environment) error {
 	env.Logger.Info("Starting StickyCooldown scenario")
+
+	// Matches WithStickyReadCooldown in the sticky-cooldown group.
+	const cooldown = 10 * time.Second
 
 	sr, ok := env.Client.Config().ReadStrategy.(*policy.StickyRead)
 	if !ok || sr == nil {
@@ -49,31 +61,47 @@ func (s *StickyCooldown) Run(ctx context.Context, env *types.Environment) error 
 	}
 	switchTime := time.Now()
 	env.Logger.Info("Phase 1: StickyRead switched to ClusterB")
-	env.ChaosA.SetErrorRate(0)
 
-	// Phase 2: Immediately fail Cluster B while still inside the cooldown window.
-	// StickyRead must stay on B because the cooldown has not expired.
-	env.Logger.Info("Phase 2: failing Cluster B during cooldown — preferred must stay on B")
+	// Phase 2: fail Cluster B inside the cooldown window while A is still failing.
+	// Neither cluster is known good, so the preference must stay on B.
+	env.Logger.Info("Phase 2: failing Cluster B during cooldown with A still failing — preferred must stay on B")
+	clearChaos := func() {
+		env.ChaosA.SetErrorRate(0)
+		env.ChaosB.SetErrorRate(0)
+	}
+	readErrBBefore := env.Metrics.GetReadErrors(htypes.ClusterB)
+	readErrABefore := env.Metrics.GetReadErrors(htypes.ClusterA)
 	env.ChaosB.SetErrorRate(1.0)
 
 	// Allow reads to fail and call OnFailure several times while cooldown is active.
 	select {
 	case <-ctx.Done():
-		env.ChaosB.SetErrorRate(0)
+		clearChaos()
 		return ctx.Err()
 	case <-time.After(3 * time.Second):
 	}
 
 	if sr.Preferred() != htypes.ClusterB {
-		env.ChaosB.SetErrorRate(0)
-		return errors.New("StickyRead switched away from ClusterB during cooldown window")
+		clearChaos()
+		return errors.New("StickyRead switched away from ClusterB during cooldown window while both clusters failed")
 	}
-	env.Logger.Info("Phase 2: preferred correctly held on ClusterB during cooldown")
-	env.ChaosB.SetErrorRate(0)
+	// The hold means nothing unless reads failed on B and failed over to A during the window.
+	readErrB := env.Metrics.GetReadErrors(htypes.ClusterB) - readErrBBefore
+	readErrA := env.Metrics.GetReadErrors(htypes.ClusterA) - readErrABefore
+	if readErrB == 0 || readErrA == 0 {
+		clearChaos()
+		return fmt.Errorf("phase 2 did not exercise failover: read errors on B=%d, on A=%d", readErrB, readErrA)
+	}
+	if time.Since(switchTime) >= cooldown {
+		clearChaos()
+		return errors.New("phase 2 outlasted the cooldown window; the hold was not observed inside it")
+	}
+	env.Logger.Info("Phase 2: preferred correctly held on ClusterB during cooldown",
+		"read_errors_b", readErrB, "read_errors_a", readErrA)
+	clearChaos()
 
 	// Phase 3: Wait for the cooldown window to expire, then fail Cluster B again.
 	// StickyRead must switch back to A.
-	const cooldown = 10 * time.Second
 	if remaining := (cooldown + time.Second) - time.Since(switchTime); remaining > 0 {
 		env.Logger.Info("Phase 3: waiting for cooldown to expire", "wait", remaining)
 		select {

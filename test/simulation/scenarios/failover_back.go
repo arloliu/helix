@@ -102,10 +102,18 @@ func (s *PrimaryOnlyReadFailoverBack) Run(ctx context.Context, env *types.Enviro
 // Phases:
 //  1. Baseline — reads go to the preferred cluster (A).
 //  2. Fail A — StickyRead switches preferred to B, reads go to B.
-//  3. Immediately fail B (within cooldown) — reads must still succeed by
-//     falling back to A, even though preferred stays on B (cooldown blocks
-//     the state change).
-//  4. Recover both — reads go to B (still preferred from step 2).
+//  3. Keep A failing and fail B within cooldown — each failed read on B
+//     still fails over to A, and preferred stays on B.
+//  4. Recover B, then A — reads go to B (still preferred from step 2).
+//
+// Phase 3 asserts what the cooldown guarantees:
+// two clusters failing in turn do not swap the preference inside the cooldown,
+// yet each request is still offered the other cluster.
+// The cooldown does not hold the preference against a known-good other cluster.
+// A cluster that has served a read since its own last failure is known good,
+// and a failure on the preferred cluster moves the preference to it even inside the cooldown.
+// That is why A stays failing through phase 3 and recovers only after B:
+// a healthy A would serve B's failover reads and become known good.
 type StickyReadFailoverBack struct{}
 
 func (s *StickyReadFailoverBack) Name() string {
@@ -150,33 +158,36 @@ func (s *StickyReadFailoverBack) Run(ctx context.Context, env *types.Environment
 		return errors.New("StickyRead did not failover to ClusterB after ClusterA errors")
 	}
 	env.Logger.Info("Phase 2: StickyRead switched preferred to ClusterB")
-	env.ChaosA.SetErrorRate(0)
 
-	// Phase 3: Immediately fail B within cooldown — reads must still succeed.
-	// The fix ensures OnFailure returns (ClusterA, true) even within cooldown,
-	// allowing reads to fall back to A without changing preferred.
-	env.Logger.Info("Phase 3: Failing Cluster B within cooldown (preferred stays B)")
+	// Phase 3: fail B within cooldown while A is still failing.
+	// OnFailure still returns A for each request,
+	// but neither cluster is known good, so preferred must stay on B.
+	env.Logger.Info("Phase 3: Failing Cluster B within cooldown with A still failing (preferred stays B)")
+	clearChaos := func() {
+		env.ChaosA.SetErrorRate(0)
+		env.ChaosB.SetErrorRate(0)
+	}
+	readErrAMid := env.Metrics.GetReadErrors(htypes.ClusterA)
 	env.ChaosB.SetErrorRate(1.0)
 
-	// Reads should fall back to A. Verify A receives reads.
-	_, scanAMid, _ := env.ChaosA.Counters()
-	err = waitUntil(ctx, 10*time.Second, func() bool {
-		_, scanANow, _ := env.ChaosA.Counters()
-		return scanANow > scanAMid+5
+	// Reads failing on B must still be offered A: A's read errors keep rising.
+	err = waitUntil(ctx, 5*time.Second, func() bool {
+		return env.Metrics.GetReadErrors(htypes.ClusterA) > readErrAMid+5
 	})
 	if err != nil {
-		env.ChaosB.SetErrorRate(0)
-		return errors.New("reads did not fall back to Cluster A when B failed within cooldown")
+		clearChaos()
+		return errors.New("reads did not fail over to Cluster A when B failed within cooldown")
 	}
 
-	// Preferred must stay on B — cooldown blocks the state change.
+	// Preferred must stay on B — two failing clusters do not swap it inside the cooldown.
 	if sr.Preferred() != htypes.ClusterB {
-		env.ChaosB.SetErrorRate(0)
+		clearChaos()
 		return fmt.Errorf("preferred should remain ClusterB during cooldown, got %s", sr.Preferred())
 	}
-	env.Logger.Info("Phase 3: Reads fell back to A, preferred correctly held on B")
+	env.Logger.Info("Phase 3: Reads failed over to A, preferred correctly held on B")
 
-	// Phase 4: Recover B — steady-state on B (still preferred).
+	// Phase 4: Recover B, then A — steady-state on B (still preferred).
+	// B recovers first so that no read fails over to a healthy A.
 	env.ChaosB.SetErrorRate(0)
 
 	_, scanBRecov, _ := env.ChaosB.Counters()
@@ -184,8 +195,12 @@ func (s *StickyReadFailoverBack) Run(ctx context.Context, env *types.Environment
 		_, scanBNow, _ := env.ChaosB.Counters()
 		return scanBNow > scanBRecov+3
 	})
+	env.ChaosA.SetErrorRate(0)
 	if err != nil {
 		return errors.New("reads did not return to Cluster B after recovery")
+	}
+	if sr.Preferred() != htypes.ClusterB {
+		return fmt.Errorf("preferred should remain ClusterB after recovery, got %s", sr.Preferred())
 	}
 
 	env.Logger.Info("StickyReadFailoverBack scenario completed successfully")
