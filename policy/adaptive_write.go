@@ -43,6 +43,11 @@ var processStart = time.Now()
 //  2. It is consistently slower than its sibling by more than deltaThreshold
 //     (e.g., 150ms) for strikeThreshold consecutive writes
 //
+// A failed write leg also counts as a strike,
+// except a statement the coordinator rejected ([types.ErrStatementRejected]):
+// that leg is still a write error and is still replayed,
+// but it is never a strike.
+//
 // The "min floor" filter ignores relative differences when both clusters
 // are fast (< minFloor), preventing false positives from minor variations.
 //
@@ -1191,13 +1196,22 @@ func (a *AdaptiveDualWrite) updateHealthState(
 // excluded: they are expected operational states, not genuine write failures.
 // A leg that returned after the caller's context was done (callerDoneA,
 // callerDoneB) is excluded too: its failure is the caller's, not the cluster's.
+// So is a statement the coordinator rejected ([types.ErrStatementRejected]):
+// it says nothing about the cluster's write health,
+// so it neither strikes nor clears the cluster's slow or fast strikes.
 func (a *AdaptiveDualWrite) handleErrors(errA, errB error, callerDoneA, callerDoneB bool) {
-	if errA != nil && !callerDoneA && !isSkippedErr(errA) {
+	if isStrikeErr(errA, callerDoneA) {
 		a.recordStrike(&a.stateA)
 	}
-	if errB != nil && !callerDoneB && !isSkippedErr(errB) {
+	if isStrikeErr(errB, callerDoneB) {
 		a.recordStrike(&a.stateB)
 	}
+}
+
+// isStrikeErr reports whether a synchronous leg's err counts as a write strike.
+func isStrikeErr(err error, callerDone bool) bool {
+	return err != nil && !callerDone && !isSkippedErr(err) &&
+		!errors.Is(err, types.ErrStatementRejected)
 }
 
 // isSkippedErr reports whether err is an expected operational state that should

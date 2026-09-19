@@ -610,15 +610,11 @@ func expectLeg(result legResult) legExpect {
 		// Skipped before the session is touched, and replayed once the drain lifts.
 		return legExpect{class: lecDraining, skipped: true, replay: true}
 	case legResRejected:
-		// A rejected statement is still a failed write leg:
-		// counted, replayed, and an AdaptiveDualWrite strike.
-		// The strike is current behaviour, not a settled contract:
-		// the read path stopped treating a rejection as a health signal,
-		// but AdaptiveDualWrite's isSkippedErr does not exclude it,
-		// so malformed CQL can degrade a healthy write leg.
-		// It is not an auto-refresh failure:
-		// the classifier counts only connectivity errors.
-		return legExpect{class: lecRejected, contacted: true, writeError: true, replay: true, strike: true}
+		// A rejected statement is still a failed write leg, counted and replayed,
+		// but it says nothing about the cluster's health:
+		// never an AdaptiveDualWrite strike,
+		// and not an auto-refresh failure, since the classifier counts only connectivity errors.
+		return legExpect{class: lecRejected, contacted: true, writeError: true, replay: true}
 	}
 
 	return legExpect{class: legErrClass("unknown result " + string(result))}

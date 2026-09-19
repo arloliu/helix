@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1567,6 +1568,93 @@ func TestAdaptiveDualWrite_HandleErrors_ExcludesStrict(t *testing.T) {
 
 	assert.Equal(t, int32(0), a.stateA.slowStrikes)
 	assert.False(t, a.IsDegraded(types.ClusterA), "ErrClusterDegraded/ErrClusterDraining must not cause degradation")
+}
+
+// rejectedStatementErr is a write leg's error the way the bundled adapters
+// wrap a statement the coordinator rejected.
+func rejectedStatementErr() error {
+	return fmt.Errorf("%w: %w", types.ErrStatementRejected, errors.New("unconfigured table events"))
+}
+
+// TestAdaptiveDualWrite_RejectedStatementNeverDegrades pins that a statement
+// the coordinator rejected is not a write strike: far more rejected legs than
+// the strike threshold leave the cluster healthy, through both entry points.
+func TestAdaptiveDualWrite_RejectedStatementNeverDegrades(t *testing.T) {
+	type entryFunc = func(context.Context, func(context.Context) error, func(context.Context) error) (error, error)
+	entries := map[string]func(*AdaptiveDualWrite) entryFunc{
+		"Execute":       func(a *AdaptiveDualWrite) entryFunc { return a.Execute },
+		"ExecuteStrict": func(a *AdaptiveDualWrite) entryFunc { return a.ExecuteStrict },
+	}
+	for name, entry := range entries {
+		t.Run(name, func(t *testing.T) {
+			a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(2))
+			exec := entry(a)
+
+			for range 5 {
+				errA, errB := exec(t.Context(),
+					func(context.Context) error { return rejectedStatementErr() },
+					func(context.Context) error { return nil },
+				)
+				require.ErrorIs(t, errA, types.ErrStatementRejected)
+				require.NoError(t, errB)
+			}
+
+			assert.False(t, a.IsDegraded(types.ClusterA), "a rejected statement must never degrade the cluster")
+			assert.Equal(t, int32(0), a.stateA.slowStrikes)
+		})
+	}
+}
+
+// TestAdaptiveDualWrite_RejectedStatementBetweenStrikesIsNeutral pins that a
+// rejection between two genuine failures neither clears the strikes already
+// recorded nor adds one: the next genuine failure is the one that reaches the
+// threshold.
+func TestAdaptiveDualWrite_RejectedStatementBetweenStrikesIsNeutral(t *testing.T) {
+	a := NewAdaptiveDualWrite(WithAdaptiveStrikeThreshold(3))
+	errRefused := errors.New("connection refused")
+	write := func(errA error) {
+		t.Helper()
+		_, _ = a.Execute(t.Context(),
+			func(context.Context) error { return errA },
+			func(context.Context) error { return nil },
+		)
+	}
+
+	write(errRefused)
+	write(errRefused)
+	require.Equal(t, int32(2), a.stateA.slowStrikes)
+
+	write(rejectedStatementErr())
+	require.Equal(t, int32(2), a.stateA.slowStrikes, "a rejection neither clears nor adds slow strikes")
+	require.False(t, a.IsDegraded(types.ClusterA))
+
+	write(errRefused)
+	assert.True(t, a.IsDegraded(types.ClusterA), "the third genuine failure reaches the threshold")
+}
+
+// TestAdaptiveDualWrite_RejectedStatementOnDegradedClusterIsNeutral pins that
+// a rejected leg reported for a degraded cluster neither earns recovery credit
+// nor resets the credit already earned, and adds no slow strike.
+func TestAdaptiveDualWrite_RejectedStatementOnDegradedClusterIsNeutral(t *testing.T) {
+	a := NewAdaptiveDualWrite(
+		WithAdaptiveStrikeThreshold(1),
+		WithAdaptiveRecoveryThreshold(3),
+	)
+	a.handleErrors(errors.New("connection refused"), nil, false, false)
+	require.True(t, a.IsDegraded(types.ClusterA), "precondition: a genuine failure degrades A")
+
+	a.RecordFastWrite(types.ClusterA)
+	a.RecordFastWrite(types.ClusterA)
+	require.Equal(t, int32(2), a.stateA.fastStrikes)
+	slowBefore := a.stateA.slowStrikes
+
+	a.handleErrors(rejectedStatementErr(), nil, false, false)
+	require.Equal(t, int32(2), a.stateA.fastStrikes, "a rejection must not reset recovery credit")
+	require.Equal(t, slowBefore, a.stateA.slowStrikes, "a rejection must not add a slow strike")
+	require.True(t, a.IsDegraded(types.ClusterA), "a rejection must not earn recovery credit")
+
+	a.RecordFastWrite(types.ClusterA)
+	assert.False(t, a.IsDegraded(types.ClusterA), "the third credited write recovers A")
 }
 
 // TestAdaptiveDualWrite_CapViolationNotClearedWhileSiblingDegraded verifies
