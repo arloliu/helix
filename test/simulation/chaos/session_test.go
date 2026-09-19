@@ -3,6 +3,7 @@ package chaos_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,31 +20,41 @@ type stubSession struct {
 	closed  bool
 	execErr error
 	scanErr error
+	// reached counts the ScanContext and Batch.ExecContext calls
+	// that got through the chaos wrapper to the stub.
+	reached atomic.Int64
 }
 
 func (s *stubSession) Query(_ string, _ ...any) cql.Query {
-	return &stubQuery{execErr: s.execErr, scanErr: s.scanErr}
+	return &stubQuery{execErr: s.execErr, scanErr: s.scanErr, reached: &s.reached}
 }
-func (s *stubSession) Batch(_ cql.BatchType) cql.Batch { return &stubBatch{execErr: s.execErr} }
-func (s *stubSession) Close()                          { s.closed = true }
+
+func (s *stubSession) Batch(_ cql.BatchType) cql.Batch {
+	return &stubBatch{execErr: s.execErr, reached: &s.reached}
+}
+func (s *stubSession) Close() { s.closed = true }
 
 type stubQuery struct {
 	execErr error
 	scanErr error
+	reached *atomic.Int64
 }
 
-func (q *stubQuery) Consistency(c cql.Consistency) cql.Query              { return q }
-func (q *stubQuery) PageSize(int) cql.Query                               { return q }
-func (q *stubQuery) PageState([]byte) cql.Query                           { return q }
-func (q *stubQuery) WithTimestamp(int64) cql.Query                        { return q }
-func (q *stubQuery) SerialConsistency(cql.Consistency) cql.Query          { return q }
-func (q *stubQuery) Statement() string                                    { return "" }
-func (q *stubQuery) Values() []any                                        { return nil }
-func (q *stubQuery) Release()                                             {}
-func (q *stubQuery) Exec() error                                          { return q.execErr }
-func (q *stubQuery) ExecContext(context.Context) error                    { return q.execErr }
-func (q *stubQuery) Scan(...any) error                                    { return q.scanErr }
-func (q *stubQuery) ScanContext(context.Context, ...any) error            { return q.scanErr }
+func (q *stubQuery) Consistency(c cql.Consistency) cql.Query     { return q }
+func (q *stubQuery) PageSize(int) cql.Query                      { return q }
+func (q *stubQuery) PageState([]byte) cql.Query                  { return q }
+func (q *stubQuery) WithTimestamp(int64) cql.Query               { return q }
+func (q *stubQuery) SerialConsistency(cql.Consistency) cql.Query { return q }
+func (q *stubQuery) Statement() string                           { return "" }
+func (q *stubQuery) Values() []any                               { return nil }
+func (q *stubQuery) Release()                                    {}
+func (q *stubQuery) Exec() error                                 { return q.execErr }
+func (q *stubQuery) ExecContext(context.Context) error           { return q.execErr }
+func (q *stubQuery) Scan(...any) error                           { return q.scanErr }
+func (q *stubQuery) ScanContext(context.Context, ...any) error {
+	q.reached.Add(1)
+	return q.scanErr
+}
 func (q *stubQuery) MapScan(map[string]any) error                         { return q.execErr }
 func (q *stubQuery) MapScanContext(context.Context, map[string]any) error { return q.execErr }
 func (q *stubQuery) Iter() cql.Iter                                       { return &stubIter{err: q.execErr} }
@@ -57,16 +68,22 @@ func (q *stubQuery) MapScanCASContext(context.Context, map[string]any) (bool, er
 	return true, q.execErr
 }
 
-type stubBatch struct{ execErr error }
+type stubBatch struct {
+	execErr error
+	reached *atomic.Int64
+}
 
 func (b *stubBatch) Query(string, ...any) cql.Batch              { return b }
 func (b *stubBatch) Consistency(cql.Consistency) cql.Batch       { return b }
 func (b *stubBatch) WithTimestamp(int64) cql.Batch               { return b }
 func (b *stubBatch) SerialConsistency(cql.Consistency) cql.Batch { return b }
 func (b *stubBatch) Exec() error                                 { return b.execErr }
-func (b *stubBatch) ExecContext(context.Context) error           { return b.execErr }
-func (b *stubBatch) IterContext(context.Context) cql.Iter        { return &stubIter{} }
-func (b *stubBatch) ExecCAS(...any) (bool, cql.Iter, error)      { return true, &stubIter{}, b.execErr }
+func (b *stubBatch) ExecContext(context.Context) error {
+	b.reached.Add(1)
+	return b.execErr
+}
+func (b *stubBatch) IterContext(context.Context) cql.Iter   { return &stubIter{} }
+func (b *stubBatch) ExecCAS(...any) (bool, cql.Iter, error) { return true, &stubIter{}, b.execErr }
 func (b *stubBatch) ExecCASContext(context.Context, ...any) (bool, cql.Iter, error) {
 	return true, &stubIter{}, b.execErr
 }
@@ -345,5 +362,57 @@ func TestSession_Counters_AccumulateAcrossMultipleCalls(t *testing.T) {
 	exec, _, _ := s.Counters()
 	if exec != 5 {
 		t.Errorf("exec = %d, want 5", exec)
+	}
+}
+
+// A ctx that ends before the injected latency has elapsed cuts the wait short:
+// the operation returns the ctx error promptly,
+// never reaches the wrapped session,
+// and is not counted as a drop.
+func TestSession_Latency_CutShortByContextDeadline(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(ctx context.Context, s *chaos.Session) error
+	}{
+		{
+			name: "Query.ScanContext",
+			run: func(ctx context.Context, s *chaos.Session) error {
+				var id int
+				return s.Query("SELECT id FROM t WHERE id = ?", 1).ScanContext(ctx, &id)
+			},
+		},
+		{
+			name: "Batch.ExecContext",
+			run: func(ctx context.Context, s *chaos.Session) error {
+				return s.Batch(cql.LoggedBatch).Query("INSERT INTO t (id) VALUES (?)", 1).ExecContext(ctx)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubSession{}
+			s := chaos.NewSession(stub)
+			s.SetLatency(200 * time.Millisecond)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+			defer cancel()
+
+			start := time.Now()
+			err := tt.run(ctx, s)
+			elapsed := time.Since(start)
+
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+			}
+			if elapsed >= 100*time.Millisecond {
+				t.Errorf("returned after %v, want well under the 200ms injected latency", elapsed)
+			}
+			if n := stub.reached.Load(); n != 0 {
+				t.Errorf("wrapped session reached %d times, want 0", n)
+			}
+			if _, _, drop := s.Counters(); drop != 0 {
+				t.Errorf("drop = %d, want 0", drop)
+			}
+		})
 	}
 }
