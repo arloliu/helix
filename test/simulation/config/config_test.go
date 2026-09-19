@@ -39,9 +39,6 @@ func TestLoad_DefaultsOnEmptyYAML(t *testing.T) {
 	if cfg.Simulation.Duration != 5*time.Minute {
 		t.Errorf("Duration = %v, want 5m", cfg.Simulation.Duration)
 	}
-	if cfg.Simulation.ConsoleInterval != 10*time.Second {
-		t.Errorf("ConsoleInterval = %v, want 10s", cfg.Simulation.ConsoleInterval)
-	}
 	if cfg.Workload.Workers != 1 {
 		t.Errorf("Workers = %d, want 1", cfg.Workload.Workers)
 	}
@@ -59,7 +56,6 @@ func TestLoad_ExplicitValuesPreserved(t *testing.T) {
 simulation:
   duration: 2h
   seed: 12345
-  console_interval: 30s
 
 workload:
   workers: 4
@@ -93,9 +89,6 @@ helix:
 	}
 	if cfg.Simulation.Seed != 12345 {
 		t.Errorf("Seed = %d, want 12345", cfg.Simulation.Seed)
-	}
-	if cfg.Simulation.ConsoleInterval != 30*time.Second {
-		t.Errorf("ConsoleInterval = %v, want 30s", cfg.Simulation.ConsoleInterval)
 	}
 	if cfg.Workload.Workers != 4 {
 		t.Errorf("Workers = %d, want 4", cfg.Workload.Workers)

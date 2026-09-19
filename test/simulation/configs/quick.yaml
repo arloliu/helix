@@ -1,7 +1,6 @@
 simulation:
   duration: 5m
   seed: 42
-  console_interval: 5s
 
 helix:
   write_strategy:

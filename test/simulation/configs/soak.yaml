@@ -1,7 +1,6 @@
 simulation:
   duration: 2h
   seed: 42
-  console_interval: 10s
 
 workload:
   workers: 4
