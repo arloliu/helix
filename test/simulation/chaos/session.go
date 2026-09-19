@@ -84,11 +84,34 @@ type Query struct {
 // Compile-time assertion that Query implements cql.Query.
 var _ cql.Query = (*Query)(nil)
 
-func (q *Query) injectChaos() error {
+// waitLatency blocks for d, or until ctx ends, whichever comes first.
+// It returns ctx.Err() when ctx ends first,
+// so a caller's deadline cuts injected latency short
+// the way it would cut short a slow cluster's answer.
+// An operation cut short this way is not counted as a drop.
+func waitLatency(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (q *Query) injectChaos(ctx context.Context) error {
 	cfg := q.config.Load()
 	if cfg != nil {
 		if cfg.LatencyFunc != nil {
-			time.Sleep(cfg.LatencyFunc())
+			if err := waitLatency(ctx, cfg.LatencyFunc()); err != nil {
+				return err
+			}
 		}
 		if cfg.DropRate > 0 {
 			// Use crypto/rand for better randomness distribution
@@ -130,7 +153,7 @@ func (q *Query) WithTimestamp(ts int64) cql.Query {
 }
 
 func (q *Query) Exec() error {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(context.Background()); err != nil {
 		return err
 	}
 
@@ -143,7 +166,7 @@ func (q *Query) Exec() error {
 }
 
 func (q *Query) ExecContext(ctx context.Context) error {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(ctx); err != nil {
 		return err
 	}
 
@@ -156,7 +179,7 @@ func (q *Query) ExecContext(ctx context.Context) error {
 }
 
 func (q *Query) Scan(dest ...any) error {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(context.Background()); err != nil {
 		return err
 	}
 
@@ -169,7 +192,7 @@ func (q *Query) Scan(dest ...any) error {
 }
 
 func (q *Query) ScanContext(ctx context.Context, dest ...any) error {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(ctx); err != nil {
 		return err
 	}
 
@@ -182,7 +205,7 @@ func (q *Query) ScanContext(ctx context.Context, dest ...any) error {
 }
 
 func (q *Query) Iter() cql.Iter {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(context.Background()); err != nil {
 		return &ErrorIter{err: err}
 	}
 
@@ -192,7 +215,7 @@ func (q *Query) Iter() cql.Iter {
 }
 
 func (q *Query) IterContext(ctx context.Context) cql.Iter {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(ctx); err != nil {
 		return &ErrorIter{err: err}
 	}
 
@@ -202,7 +225,7 @@ func (q *Query) IterContext(ctx context.Context) cql.Iter {
 }
 
 func (q *Query) MapScan(m map[string]any) error {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(context.Background()); err != nil {
 		return err
 	}
 
@@ -215,7 +238,7 @@ func (q *Query) MapScan(m map[string]any) error {
 }
 
 func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(ctx); err != nil {
 		return err
 	}
 
@@ -228,7 +251,7 @@ func (q *Query) MapScanContext(ctx context.Context, m map[string]any) error {
 }
 
 func (q *Query) ScanCAS(dest ...any) (applied bool, err error) {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(context.Background()); err != nil {
 		return false, err
 	}
 
@@ -241,7 +264,7 @@ func (q *Query) ScanCAS(dest ...any) (applied bool, err error) {
 }
 
 func (q *Query) ScanCASContext(ctx context.Context, dest ...any) (applied bool, err error) {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(ctx); err != nil {
 		return false, err
 	}
 
@@ -254,7 +277,7 @@ func (q *Query) ScanCASContext(ctx context.Context, dest ...any) (applied bool, 
 }
 
 func (q *Query) MapScanCAS(dest map[string]any) (applied bool, err error) {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(context.Background()); err != nil {
 		return false, err
 	}
 
@@ -267,7 +290,7 @@ func (q *Query) MapScanCAS(dest map[string]any) (applied bool, err error) {
 }
 
 func (q *Query) MapScanCASContext(ctx context.Context, dest map[string]any) (applied bool, err error) {
-	if err := q.injectChaos(); err != nil {
+	if err := q.injectChaos(ctx); err != nil {
 		return false, err
 	}
 
@@ -306,11 +329,13 @@ type Batch struct {
 // Compile-time assertion that Batch implements cql.Batch.
 var _ cql.Batch = (*Batch)(nil)
 
-func (b *Batch) injectChaos() error {
+func (b *Batch) injectChaos(ctx context.Context) error {
 	cfg := b.config.Load()
 	if cfg != nil {
 		if cfg.LatencyFunc != nil {
-			time.Sleep(cfg.LatencyFunc())
+			if err := waitLatency(ctx, cfg.LatencyFunc()); err != nil {
+				return err
+			}
 		}
 		if cfg.DropRate > 0 {
 			n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
@@ -346,7 +371,7 @@ func (b *Batch) WithTimestamp(ts int64) cql.Batch {
 }
 
 func (b *Batch) Exec() error {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(context.Background()); err != nil {
 		return err
 	}
 
@@ -359,7 +384,7 @@ func (b *Batch) Exec() error {
 }
 
 func (b *Batch) ExecContext(ctx context.Context) error {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(ctx); err != nil {
 		return err
 	}
 
@@ -372,7 +397,7 @@ func (b *Batch) ExecContext(ctx context.Context) error {
 }
 
 func (b *Batch) IterContext(ctx context.Context) cql.Iter {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(ctx); err != nil {
 		return &ErrorIter{err: err}
 	}
 
@@ -382,7 +407,7 @@ func (b *Batch) IterContext(ctx context.Context) cql.Iter {
 }
 
 func (b *Batch) ExecCAS(dest ...any) (applied bool, iter cql.Iter, err error) {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(context.Background()); err != nil {
 		return false, nil, err
 	}
 
@@ -395,7 +420,7 @@ func (b *Batch) ExecCAS(dest ...any) (applied bool, iter cql.Iter, err error) {
 }
 
 func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, iter cql.Iter, err error) {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(ctx); err != nil {
 		return false, nil, err
 	}
 
@@ -408,7 +433,7 @@ func (b *Batch) ExecCASContext(ctx context.Context, dest ...any) (applied bool, 
 }
 
 func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(context.Background()); err != nil {
 		return false, nil, err
 	}
 
@@ -421,7 +446,7 @@ func (b *Batch) MapExecCAS(dest map[string]any) (applied bool, iter cql.Iter, er
 }
 
 func (b *Batch) MapExecCASContext(ctx context.Context, dest map[string]any) (applied bool, iter cql.Iter, err error) {
-	if err := b.injectChaos(); err != nil {
+	if err := b.injectChaos(ctx); err != nil {
 		return false, nil, err
 	}
 
