@@ -16,9 +16,8 @@ type Config struct {
 }
 
 type SimulationConfig struct {
-	Duration        time.Duration `yaml:"duration"`
-	Seed            int64         `yaml:"seed"`
-	ConsoleInterval time.Duration `yaml:"console_interval"`
+	Duration time.Duration `yaml:"duration"`
+	Seed     int64         `yaml:"seed"`
 }
 
 type HelixConfig struct {
@@ -70,9 +69,6 @@ func Load(path string) (*Config, error) {
 	// Set defaults if needed
 	if cfg.Simulation.Duration == 0 {
 		cfg.Simulation.Duration = 5 * time.Minute
-	}
-	if cfg.Simulation.ConsoleInterval == 0 {
-		cfg.Simulation.ConsoleInterval = 10 * time.Second
 	}
 	if cfg.Workload.Workers <= 0 {
 		cfg.Workload.Workers = 1
