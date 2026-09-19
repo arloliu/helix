@@ -68,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A write leg rejected for an unconfigured table is retried only while the payload is retained, and is dropped after that.
   Until then it holds replay capacity like an outage backlog, and once backoff saturates it retries at `MaxRetryDelay` with a `Warn` line per attempt.
   Documented in `docs/replay-system.md`, next to the advice not to dead-letter `0x2200`.
+- **How the memory replay worker behaves against a hanging or recovering cluster.**
+  First attempts run one at a time on a single loop that serves both clusters,
+  so a cluster that hangs rather than failing fast
+  holds replay to the other cluster for up to one attempt timeout per payload.
+  The gate on a client-built worker follows drain state and `WithReplayGate`, not `AdaptiveDualWrite`'s degraded state.
+  After a fast-failing outage, up to 100 retries can reach the cluster at once when it returns;
+  `WithReplayGate` is the way to hold replay back.
+  Documented in `docs/replay-system.md`, which previously said a failing payload never blocks the other cluster's.
 
 ## [1.10.2] — 2026-09-15
 
