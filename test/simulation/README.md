@@ -53,8 +53,8 @@ A pprof server starts automatically on `127.0.0.1:6060` for profiling during soa
 
 | Profile | Scenarios | Duration (default) |
 |---|---|---|
-| `quick` | `degraded-cluster`, `adaptive-recovery`, `complete-failure` | 5 min |
-| `comprehensive` | All quick + 5 more + 6 strategy groups | config-driven |
+| `quick` | `degraded-cluster`, `adaptive-recovery`, `complete-failure` + `read-leg-deadline` strategy group | 5 min |
+| `comprehensive` | All quick + 5 more scenarios + 6 more strategy groups | config-driven |
 | `soak` | All comprehensive + `dual-cluster-degradation` | 2 h |
 | `fallback` | 3 baseline scenarios + `fallback-read` strategy group | 5 min |
 
@@ -175,6 +175,7 @@ A strategy group runs a set of scenarios against a client configured with a spec
 |---|---|---|---|
 | `circuit-breaker` | `CircuitBreaker` (3-strike, 15 s reset) | `circuit-breaker-trip` | comprehensive+ |
 | `latency-cb` | `LatencyCircuitBreaker` (500 ms max, 3-strike) | `latency-circuit-breaker-trip` | comprehensive+ |
+| `read-leg-deadline` | `LatencyCircuitBreaker` (2 s max, 3-strike) with `WithClusterReadTimeout(500ms)` | `read-leg-deadline-trip` | quick+ |
 | `primary-only` | `ActiveFailover` | `primary-only-read-recovery` | comprehensive+ |
 | `round-robin` | `ActiveFailover` | `round-robin-read-balance` | comprehensive+ |
 | `sticky-cooldown` | `ActiveFailover` | `sticky-cooldown` | comprehensive+ |
@@ -229,6 +230,10 @@ exec, scan, drop := env.ChaosA.Counters()
 env.ChaosA.SetConfig(chaos.SessionConfig{})
 ```
 
+Injected latency honours the operation's context:
+a `*Context` method whose context ends first returns `ctx.Err()` without reaching the wrapped session,
+and the operation is not counted as a drop.
+
 `Close()` on a chaos session is a no-op — the underlying gocql session lifetime is managed by the cluster container, not by Helix clients.
 
 ## Unit tests
@@ -237,7 +242,7 @@ The simulation infrastructure components have focused unit tests that do not req
 
 | Test file | What it covers |
 |---|---|
-| `chaos/session_test.go` | Drop-rate sampling, latency injection, counter management, error propagation, no-op Close |
+| `chaos/session_test.go` | Drop-rate sampling, latency injection and its cut-off by a context deadline, counter management, error propagation, no-op Close |
 | `config/config_test.go` | YAML parsing, default value injection, error handling |
 | `workload/tracker_test.go` | TrackWrite/Count/RandomKey, WorkloadStats.Reset, VerifyConsistency with mock sessions |
 | `scenarios/wait_test.go` | waitUntil: immediate-true, timeout, context cancellation |
