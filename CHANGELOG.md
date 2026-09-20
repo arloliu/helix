@@ -81,6 +81,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and nothing is replayed.
   `write_skipped` needs a collector implementing `types.StrictMetrics`, as the bundled `contrib/metrics/vm` one does.
 
+### Fixed
+
+- **A failed batch read through `adapter/cql/v1` is no longer reported as a success.**
+  gocql v1 has no batch call that returns an iterator,
+  so the v1 adapter executed the batch and returned an empty iterator, discarding the execution error:
+  `Close`, `SliceMap` and `Scanner().Err()` all answered nil.
+  A batch that never reached the cluster, timed out, or was rejected therefore looked like an empty result set to the caller,
+  and counted as a read success for the cluster's health:
+  the read strategy was told the read succeeded, and the failover policy recorded a success.
+  The iterator now carries the execution error
+  and returns it from `Close`, from `SliceMap`, and from its scanner's `Scan` and `Err`,
+  mapped like every other v1 adapter error,
+  so a rejected statement arrives as `types.ErrStatementRejected`
+  and an unreachable cluster as `types.ErrClusterUnreachable`.
+  `adapter/cql/v2` already behaved this way; this closes a v1-only divergence.
+  A caller who ignored the iterator's error will now see batch failures surface where they previously passed silently.
+
 ### Documentation
 
 - **`LatencyCircuitBreaker`'s latency threshold and the per-leg read deadline interact.**

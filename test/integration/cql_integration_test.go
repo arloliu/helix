@@ -9,6 +9,7 @@ import (
 	"github.com/arloliu/helix/adapter/cql"
 	cqlv1 "github.com/arloliu/helix/adapter/cql/v1"
 	"github.com/arloliu/helix/policy"
+	"github.com/arloliu/helix/types"
 	"github.com/gocql/gocql"
 	"github.com/stretchr/testify/require"
 )
@@ -942,6 +943,23 @@ func TestCQLAdapterContextMethodsIntegration(t *testing.T) {
 	batchIter := batch2.IterContext(ctx)
 	require.NotNil(t, batchIter)
 	require.NoError(t, batchIter.Close())
+
+	// A batch the coordinator rejects must not read as an empty success:
+	// the iterator carries the execution error even though gocql v1 has no
+	// batch call that returns one.
+	rejectedBatch := adapter.Batch(cql.LoggedBatch)
+	rejectedBatch.Query(
+		"INSERT INTO "+usersTable+"_absent (id, name, email, created_at) VALUES (?, ?, ?, ?)",
+		gocql.TimeUUID(), "RejectedUser", "rejected@example.com", time.Now(),
+	)
+	rejectedIter := rejectedBatch.IterContext(ctx)
+	require.NotNil(t, rejectedIter)
+
+	rejectedErr := rejectedIter.Close()
+	t.Logf("rejected batch iterator: closeErr=%v", rejectedErr)
+	require.Error(t, rejectedErr, "a batch against a table that does not exist must not close clean")
+	require.ErrorIs(t, rejectedErr, types.ErrStatementRejected,
+		"the coordinator rejected the statement itself, so the adapter must map it")
 }
 
 // TestCQLQueryConfigPropagation verifies that query configuration options
