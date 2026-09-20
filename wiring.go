@@ -467,7 +467,14 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	// nil-pointer-deref-risk on the holder pointer itself.
 	client.storeSessionB(sessionB)
 
-	// Create auto memory worker if configured. The auto-created worker
+	// The replay gate below asks the write strategy whether a cluster is
+	// degraded, so resolve that reporter before the gate is installed.
+	// config.WriteStrategy is immutable from here on, and singleCluster was
+	// fixed when the client value was built.
+	client.degradedWrites = newDegradedWriteReporter(config, client.singleCluster)
+
+	// Create auto memory worker if configured.
+	// The auto-created worker
 	// inherits the client's metrics collector by default so client and
 	// worker metrics are unified — this prevents the gotcha where
 	// worker-side IncReplaySuccess/Dropped/Error go into a separate
@@ -581,12 +588,56 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	return client, nil
 }
 
+// newDegradedWriteReporter resolves the write strategy's degraded reporter
+// for the replay gate, once, at construction.
+// It returns nil wherever [CQLClient.startRecoveryProbes] would also start
+// no probe for the write strategy — the probe disabled, a single cluster, or
+// a strategy that does not report degradation — because the probe is the one
+// path out of degraded that does not depend on caller traffic.
+// Without it a hold could only be lifted by an operator, so those clients
+// keep replaying to a degraded cluster.
+func newDegradedWriteReporter(config *ClientConfig, singleCluster bool) *degradedWriteReporter {
+	if config.recoveryProbeOff || singleCluster {
+		return nil
+	}
+	pr, _ := probeReporters(config)
+	if pr == nil {
+		return nil
+	}
+	// A latched cluster is the operator's decision, read the same way the
+	// probe reads it.
+	latch, _ := pr.(LatchReporter)
+
+	return &degradedWriteReporter{probe: pr, latch: latch}
+}
+
+// holdsReplay reports whether replay to cluster must wait because the write
+// strategy reports it degraded and the operator has not latched it.
+// Replay keeps running to a latched cluster on purpose: the operator
+// workflow is to latch a cluster, drain its backlog, and only then recover
+// it, so honouring the latch here would make that drain wait on the manual
+// recovery that is waiting on the drain.
+// The receiver is nil for a client that resolved no reporter, and that holds
+// nothing back.
+func (r *degradedWriteReporter) holdsReplay(cluster ClusterID) bool {
+	if r == nil {
+		return false
+	}
+
+	return r.probe.IsDegraded(cluster) && (r.latch == nil || !r.latch.IsLatched(cluster))
+}
+
 // replayAllowed is the cluster gate the client installs on the replay
-// worker it builds: replay to a cluster runs only while the cluster is not
-// draining and the operator's [WithReplayGate] predicate, if any, permits it.
+// worker it builds.
+// Replay to a cluster runs only while the cluster is not draining,
+// the write strategy does not report it degraded,
+// and the operator's [WithReplayGate] predicate, if any, permits it.
 func (c *CQLClient) replayAllowed(cluster ClusterID) bool {
 	drainA, drainB := c.getDrainStates()
 	if c.clusterIsDraining(cluster, drainA, drainB) {
+		return false
+	}
+	if c.degradedWrites.holdsReplay(cluster) {
 		return false
 	}
 

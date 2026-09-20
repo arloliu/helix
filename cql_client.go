@@ -104,6 +104,13 @@ type CQLClient struct {
 	// enabled and the policy implements RouteVeto; nil otherwise.
 	routeVeto RouteVeto
 
+	// degradedWrites lets the replay gate ask the write strategy whether a
+	// cluster is currently degraded.
+	// It is nil unless this client also runs a recovery probe for that
+	// strategy, because the probe is what lifts the hold without caller
+	// traffic; see newDegradedWriteReporter.
+	degradedWrites *degradedWriteReporter
+
 	// overrideErrSeq counts consecutive override errors for power-of-2 log backoff.
 	// Prevents log storms when the AllowedClusters provider is misconfigured.
 	overrideErrSeq atomic.Uint64
@@ -140,6 +147,15 @@ type CQLClient struct {
 	recoveryProbeCtx   context.Context
 	recoveryProbeClose context.CancelFunc
 	recoveryProbeWG    sync.WaitGroup
+}
+
+// degradedWriteReporter is the write strategy's view of per-cluster
+// degradation, resolved once at construction for the replay gate.
+// probe is never nil; latch is nil for a strategy whose degraded state an
+// operator cannot latch.
+type degradedWriteReporter struct {
+	probe ProbeReporter
+	latch LatchReporter
 }
 
 // clientRuntime holds the components NewCQLClient constructs and Close
