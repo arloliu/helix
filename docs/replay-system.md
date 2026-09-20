@@ -157,7 +157,7 @@ ClusterWriteTimeout` rather than `MaxAttempts x ExecuteTimeout`.
 
 | Implementation | Processing Model | Use Case |
 |---------------|------------------|----------|
-| `MemoryWorker` | Single dequeue goroutine + bounded retry pool | Paired with MemoryReplayer |
+| `MemoryWorker` | One dequeue goroutine per cluster + a shared bounded retry pool | Paired with MemoryReplayer |
 | `NATSWorker` | One dequeue goroutine per cluster | Paired with NATSReplayer |
 
 **Configuration validation:**
@@ -168,10 +168,10 @@ ClusterWriteTimeout` rather than `MaxAttempts x ExecuteTimeout`.
     return `error` (joined `*types.OptionError`) when constructor inputs
     or options are invalid.
 
-The memory worker dequeues sequentially but dispatches retry attempts to a
-bounded goroutine pool (default 100), so a single permanently-failing
-payload does not stall the dequeue loop or block work targeting other
-clusters. Retries and drop semantics are detailed in
+The memory worker runs one dequeue loop per cluster
+and dispatches retry attempts to a bounded goroutine pool (default 100) shared by both,
+so neither a permanently-failing payload nor a target that hangs stalls the payloads behind it.
+Retries and drop semantics are detailed in
 [Memory Worker Retries](#memory-worker-retries) below.
 
 ---
@@ -698,25 +698,40 @@ see [What does not count as a cluster failure](strategy-policy.md#what-does-not-
 
 ### Memory worker execution model
 
-The memory worker has one dequeue loop, and it serves both clusters.
-The first attempt for each payload runs inline on that loop.
-A target that fails fast costs the loop almost nothing,
+The memory worker runs one dequeue loop per cluster.
+The first attempt for each payload runs inline on its cluster's loop.
+A target that fails fast costs that loop almost nothing,
 but a target that hangs instead holds it until each attempt ends:
 at most the shorter of the worker's `ExecuteTimeout` (default 30 s) and `WithClusterWriteTimeout` when that is set,
 and sooner when the driver times the request out first.
-While it is held, payloads for the other cluster wait behind it too.
+The other cluster's loop keeps draining throughout.
 Later attempts run in a bounded pool of goroutines (100),
-so only first attempts are serialised on the loop.
+so only first attempts are serialised on a loop.
+
+Two resources stay shared between the loops, and both still couple the clusters.
+
+The retry pool is one pool of 100 slots for both clusters.
+It only bites when *both* clusters are failing:
+under `RetryWhileRetained` a hung cluster's retries occupy slots the other cluster's retries then wait for,
+and under `RetryBounded` the other cluster's payloads are dropped with the reason `retry_pool_saturated`.
+A healthy cluster's payloads never enter the pool, because their first attempt succeeds.
+
+Queue capacity is one budget for both clusters.
+A hung cluster's backlog can reach the capacity on its own,
+and the healthy cluster's enqueues then fail with `types.ErrReplayQueueFull`.
+Size the queue for the worst cluster, not the average one.
 
 The gate on a client-built worker (`WithAutoMemoryWorker`)
 consults the cluster's drain state,
 the write strategy's degraded state,
 and the operator gate
 (`WithReplayGate`, see [Hold Replay Back per Cluster](#9-hold-replay-back-per-cluster)).
+Per-cluster loops do not make that gate redundant.
+The loops keep a hung cluster away from its sibling;
+the gate is what stops the worker spending anything at all on a cluster already known to be bad —
+attempts, log volume, and, under `RetryBounded`, the payload's attempt budget.
 A cluster that `AdaptiveDualWrite` has marked degraded receives no replay until the strategy recovers it,
-so a hung target stops holding the dequeue loop for the other cluster's payloads once it has struck out.
-Two costs remain: the window before that third strike, and the attempt already in flight when the gate closes.
-Each holds the loop for up to one attempt timeout.
+so its own loop stops running first attempts against it rather than working through the backlog one timeout at a time.
 
 | Aspect | `RetryBounded` | `RetryWhileRetained` |
 |--------|----------------|----------------------|
@@ -1119,9 +1134,12 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 
 The client's gate also closes while the write strategy reports the cluster degraded
 and the operator has not latched it.
-The memory worker has one dequeue loop for both clusters,
-so this keeps a hung cluster from holding the healthy cluster's payloads behind it
+The memory worker runs one dequeue loop per cluster,
+so a hung cluster no longer holds the healthy cluster's payloads behind it either way
 (see [Memory worker execution model](#memory-worker-execution-model)).
+What the gate adds on top of that is not spending anything on a cluster already known to be bad:
+no attempts, no failure logs,
+and, under `RetryBounded`, none of the payload's attempt budget.
 
 It applies only where the client also runs the recovery probe for that strategy:
 two clusters, a strategy that reports degradation such as `AdaptiveDualWrite`,
@@ -1236,12 +1254,12 @@ on NATS, terminated at decode like a corrupt message.
 ### Load on a Recovering Cluster
 
 Replay has no pacing of its own.
-On the memory worker, first attempts are serial, one payload at a time on the dequeue loop.
+On the memory worker, first attempts are serial per cluster, one payload at a time on that cluster's dequeue loop.
 Retries are not: a payload whose attempt failed waits out its backoff
-and then runs in the retry pool, which executes up to 100 attempts at once.
+and then runs in the retry pool, which executes up to 100 attempts at once across both clusters.
 After an outage that failed fast, most of the backlog is waiting on backoff,
 so when the cluster returns, up to 100 retries can reach it at the same moment,
-alongside the first attempts still coming off the loop.
+alongside the first attempts still coming off its loop.
 
 The NATS worker runs one goroutine per cluster.
 Each fetches a batch and executes its messages one after another,

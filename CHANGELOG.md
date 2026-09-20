@@ -32,11 +32,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A fourth fix, a panic on a non-positive speculative-execution delay, does not reach helix,
   which exposes no speculative-execution setting.
 
+- **The memory replay worker now runs one dequeue loop per cluster**, the way the NATS worker already does.
+  It ran a single loop for both clusters,
+  so a target that hung held the healthy cluster's payloads behind it for one attempt timeout each —
+  at most the shorter of `WithExecuteTimeout` (30s by default) and `helix.WithClusterWriteTimeout`.
+  A backlog of 1000 payloads behind a hung cluster therefore took hours to drain at the default timeout;
+  it now drains at full speed.
+  No API or option changes, and the public `Dequeue`/`TryDequeue` rotation is unchanged.
+  Two couplings remain on purpose.
+  The 100-slot retry pool is still shared,
+  so when *both* clusters are failing a hung cluster's retries can still delay the other's under `RetryWhileRetained`,
+  or drop them with the reason `retry_pool_saturated` under `RetryBounded`.
+  Queue capacity is still shared,
+  so a hung cluster's backlog can reach the limit on its own and make the healthy cluster's enqueues fail with `types.ErrReplayQueueFull` —
+  size the queue for the worst cluster, not the average one.
 - **Replay to a cluster the write strategy reports degraded is now held back.**
   The gate the client installs on the worker it builds for `WithAutoMemoryWorker` consulted the drain state and `WithReplayGate` only,
-  so a cluster `AdaptiveDualWrite` had already marked degraded was still replayed to —
-  and because the memory worker runs one dequeue loop for both clusters, a hung target held the healthy cluster's payloads behind it.
-  Such a cluster now receives no replay until the strategy recovers it.
+  so a cluster `AdaptiveDualWrite` had already marked degraded was still replayed to.
+  Such a cluster now receives no replay until the strategy recovers it,
+  which stops the worker spending attempts, log volume and (under `RetryBounded`) the payload's attempt budget on a cluster already known to be bad.
+  The per-cluster dequeue loops above are what keep a hung cluster away from its sibling;
+  this gate and those loops are complementary, not alternatives.
   A latched cluster keeps receiving replay on purpose, so the `ForceDegrade`, drain, `ForceRecover` workflow still finishes.
   The rule applies only where the client also runs the recovery probe for the strategy —
   two clusters, a strategy that reports degradation, and no `WithRecoveryProbeDisabled` —
