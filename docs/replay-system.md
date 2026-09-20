@@ -709,10 +709,14 @@ Later attempts run in a bounded pool of goroutines (100),
 so only first attempts are serialised on the loop.
 
 The gate on a client-built worker (`WithAutoMemoryWorker`)
-consults the cluster's drain state and the operator gate
+consults the cluster's drain state,
+the write strategy's degraded state,
+and the operator gate
 (`WithReplayGate`, see [Hold Replay Back per Cluster](#9-hold-replay-back-per-cluster)).
-It does not consult the write strategy:
-a cluster that `AdaptiveDualWrite` has marked degraded is still replayed to.
+A cluster that `AdaptiveDualWrite` has marked degraded receives no replay until the strategy recovers it,
+so a hung target stops holding the dequeue loop for the other cluster's payloads once it has struck out.
+Two costs remain: the window before that third strike, and the attempt already in flight when the gate closes.
+Each holds the loop for up to one attempt timeout.
 
 | Aspect | `RetryBounded` | `RetryWhileRetained` |
 |--------|----------------|----------------------|
@@ -1108,6 +1112,63 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
     helix.WithReplayGate(func(c helix.ClusterID) bool {
         return c != helix.ClusterA || !quarantined.Load()
     }),
+)
+```
+
+#### The write strategy closes that gate too
+
+The client's gate also closes while the write strategy reports the cluster degraded
+and the operator has not latched it.
+The memory worker has one dequeue loop for both clusters,
+so this keeps a hung cluster from holding the healthy cluster's payloads behind it
+(see [Memory worker execution model](#memory-worker-execution-model)).
+
+It applies only where the client also runs the recovery probe for that strategy:
+two clusters, a strategy that reports degradation such as `AdaptiveDualWrite`,
+and no `WithRecoveryProbeDisabled`.
+The probe is the one path out of degraded that does not depend on caller traffic.
+Where there is none, nothing but `ForceRecover` could lift the hold,
+so those clients keep replaying to a degraded cluster as before.
+
+A latched cluster keeps receiving replay.
+The operator workflow is `ForceDegrade`, drain the backlog while latched, then `ForceRecover`
+(see [auto-recovery](auto-recovery.md)),
+and honouring the latch here would make that drain wait on the manual recovery that is waiting on the drain.
+
+What this costs:
+
+- **The drain starts when the strategy leaves degraded, not the moment the cluster answers again.**
+    With the default probe interval (2s) and recovery threshold (5 credited probes)
+    that is at least about 10 seconds later, and longer under `WithAdaptiveMinDegradedDwell`.
+- **With `ExcludeWhileReplayBacklog`, reads stay off the cluster until the strategy recovers *and* the backlog drains.**
+    The backlog used to start draining immediately,
+    so the read exclusion ended a short time after the cluster came back;
+    the two waits are now in series.
+- **A probe earns recovery credit by comparison with the other cluster's last write latency.**
+    Where that cluster holds no write sample, or is itself degraded,
+    a probe must return in under 100ms to earn any credit.
+    A cluster answering more slowly than that stays degraded — and its replay held —
+    until caller traffic resumes or the operator calls `ForceRecover`.
+- A cluster that is slow but alive is degraded by the latency and delta strikes too,
+    and would have replayed fine.
+    Its backlog waits instead, and resumes when the strategy recovers.
+
+A worker supplied through `WithReplayWorker` receives no gate from the client, this one included.
+Build the same rule into the worker's own gate:
+
+```go
+strategy := policy.NewAdaptiveDualWrite()
+worker := replay.NewMemoryWorker(replayer, executeFunc,
+    replay.WithClusterGate(func(c types.ClusterID) bool {
+        // Hold replay back while the strategy reports the cluster
+        // degraded, except while the operator has it latched.
+        return !strategy.IsDegraded(c) || strategy.IsLatched(c)
+    }),
+)
+client, _ := helix.NewCQLClient(sessionA, sessionB,
+    helix.WithWriteStrategy(strategy),
+    helix.WithReplayer(replayer),
+    helix.WithReplayWorker(worker),
 )
 ```
 
