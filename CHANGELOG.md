@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The bundled v2 driver moves to `v2.7.3-otter`,
+  which repairs three connection-pool defects that never healed on their own.**
+  A connection that died between being established and being added to its pool stayed
+  there as a dead slot: it counted toward the pool's size, so no refill was ever due,
+  the host stayed up, and `Pick` preferred it because all of its streams were free.
+  With one connection per host, every query to that host then failed with a closed-connection
+  error until the pool was torn down for some unrelated reason —
+  a per-host fault that presents as a cluster fault, and can trip a circuit breaker
+  and move a sticky read for good.
+  The other two: a connection removal that landed while a fill cycle held the gate left no
+  refill obligation behind, and a fill result was published against the host rather than the
+  pool it ran on.
+  A fourth fix, a panic on a non-positive speculative-execution delay, does not reach helix,
+  which exposes no speculative-execution setting.
+
 - **Replay to a cluster the write strategy reports degraded is now held back.**
   The gate the client installs on the worker it builds for `WithAutoMemoryWorker` consulted the drain state and `WithReplayGate` only,
   so a cluster `AdaptiveDualWrite` had already marked degraded was still replayed to —
