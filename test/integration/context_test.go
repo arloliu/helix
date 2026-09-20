@@ -38,20 +38,20 @@ func TestBatchContextCancellation(t *testing.T) {
 		require.Equal(t, context.Canceled, err)
 	})
 
-	t.Run("IterContext handles canceled context gracefully", func(t *testing.T) {
+	t.Run("IterContext reports the canceled context at Close", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // Cancel immediately
 
 		batch := helixSession.Batch(cql.LoggedBatch)
 		batch.Query("INSERT INTO " + table + " (id, val) VALUES (uuid(), 'test')")
 
-		// IterContext in v1 adapter returns an iterator and swallows execution errors (returning a nil-safe iterator).
-		// We verify that it doesn't panic and returns a non-nil iterator wrapper.
+		// The v1 adapter has no batch call that returns an iterator, so the
+		// batch runs here and the row-less iterator carries its error.
 		iter := batch.IterContext(ctx)
 		require.NotNil(t, iter)
 
-		// The iterator should be empty/closed effectively
-		require.NoError(t, iter.Close())
+		require.ErrorIs(t, iter.Close(), context.Canceled,
+			"a batch that never ran must not close clean")
 	})
 }
 
