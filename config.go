@@ -482,15 +482,30 @@ func WithBehaviorProfile(profile BehaviorProfile) Option {
 // WithReplayGate installs the operator's replay control: replay to a
 // cluster executes only while the predicate returns true for it.
 //
-// The client composes the predicate with drain (a draining cluster never
-// receives replay) and installs the result as the cluster gate of the
-// replay worker it builds for [WithAutoMemoryWorker]: queued payloads for a
-// gated cluster stay queued without consuming attempts or their retry
-// window, and execution resumes within the worker's poll interval once the
-// gate opens. Use it to quarantine a cluster during a repair or a schema
-// change, or to hold replay back until a returning cluster is ready for
-// writes. Mirror workers are never gated by the source client, and a
-// worker supplied through [WithReplayWorker] must carry its own
+// The client composes the predicate with two conditions of its own,
+// and installs the result as the cluster gate of the replay worker it
+// builds for [WithAutoMemoryWorker].
+// A draining cluster never receives replay.
+// Neither does a cluster the write strategy reports degraded,
+// unless the operator has latched it, so that a latched cluster's backlog
+// can still be drained before a manual recovery.
+// That second condition holds only where the client also runs the recovery
+// probe for the strategy, since the probe is what lifts the hold without
+// caller traffic; under [WithRecoveryProbeDisabled] a degraded cluster is
+// replayed to as before.
+// It also means the drain starts when the strategy recovers the cluster
+// rather than the moment the cluster answers again,
+// which with the default probe interval and recovery threshold is at least
+// about ten seconds later.
+//
+// Queued payloads for a gated cluster stay queued without consuming
+// attempts or their retry window,
+// and execution resumes within the worker's poll interval once the gate
+// opens.
+// Use it to quarantine a cluster during a repair or a schema change,
+// or to hold replay back until a returning cluster is ready for writes.
+// Mirror workers are never gated by the source client,
+// and a worker supplied through [WithReplayWorker] must carry its own
 // [replay.WithClusterGate]; the client logs a startup warning in that case.
 //
 // The predicate runs before every replay attempt, so it must be cheap,
@@ -629,11 +644,14 @@ func WithRecoveryProbe(p RecoveryProbe) Option {
 }
 
 // WithRecoveryProbeDisabled disables the background recovery probe for both
-// authorities it serves. A degraded [policy.AdaptiveDualWrite] then recovers
+// authorities it serves.
+// A degraded [policy.AdaptiveDualWrite] then recovers
 // only through fast background writes or [policy.AdaptiveDualWrite.ForceRecover],
 // and an open [policy.CircuitBreaker] closes only when an ordinary operation
 // against the cluster succeeds; with route veto on, reads avoid that cluster
 // until then.
+// Replay to a degraded cluster is not held back either,
+// for the same reason: see [WithReplayGate].
 //
 // Returns:
 //   - Option: Configuration option

@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Replay to a cluster the write strategy reports degraded is now held back.**
+  The gate the client installs on the worker it builds for `WithAutoMemoryWorker` consulted the drain state and `WithReplayGate` only,
+  so a cluster `AdaptiveDualWrite` had already marked degraded was still replayed to —
+  and because the memory worker runs one dequeue loop for both clusters, a hung target held the healthy cluster's payloads behind it.
+  Such a cluster now receives no replay until the strategy recovers it.
+  A latched cluster keeps receiving replay on purpose, so the `ForceDegrade`, drain, `ForceRecover` workflow still finishes.
+  The rule applies only where the client also runs the recovery probe for the strategy —
+  two clusters, a strategy that reports degradation, and no `WithRecoveryProbeDisabled` —
+  because the probe is the only release path that does not depend on caller traffic.
+  Nothing is lost or charged while a payload waits: it keeps its queue slot, counts no attempt, and consumes no retry window.
+  Three consequences to plan for.
+  The drain now starts when the strategy leaves degraded rather than the moment the cluster answers,
+  which is at least about 10 seconds later with the default probe interval and recovery threshold.
+  With `ExcludeWhileReplayBacklog`, reads stay off the cluster until the strategy recovers *and* the backlog drains,
+  where the backlog used to drain immediately.
+  And where the other cluster holds no write sample or is itself degraded,
+  a probe must return in under 100ms to earn recovery credit at all,
+  so a cluster answering more slowly than that stays degraded until caller traffic resumes or `ForceRecover` is called.
+  A worker supplied through `WithReplayWorker` is unaffected, as before;
+  `docs/replay-system.md` shows the equivalent `replay.WithClusterGate` written by hand.
 - **A rejected statement on a read no longer triggers failover or trips a circuit breaker.**
   Previously such an error looked like any other cluster fault:
   it moved `ReadStrategy`'s preference, called `FailoverPolicy.RecordFailure`, and could open a `CircuitBreaker` or `LatencyCircuitBreaker`.
