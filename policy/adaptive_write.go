@@ -1612,10 +1612,15 @@ func (a *AdaptiveDualWrite) Reset() {
 // ForceDegrade manually marks a cluster as degraded and latches it there.
 //
 // The latch is an operator decision: fast background writes and successful
-// recovery probes update nothing while it is set, so the cluster stays in
-// fire-and-forget mode until [AdaptiveDualWrite.ForceRecover] or
-// [AdaptiveDualWrite.Reset] clears it. A client skips the recovery probe for
-// a latched cluster (see [helix.LatchReporter]).
+// recovery probes earn the cluster no recovery credit while it is set,
+// so the cluster stays in fire-and-forget mode until
+// [AdaptiveDualWrite.ForceRecover] or [AdaptiveDualWrite.Reset] clears it.
+// A fast write still clears the cluster's slow strikes, latch or not,
+// because that counter only drives the degrade transition:
+// it cannot move a cluster that is already degraded,
+// and the path that lifts the latch zeroes it anyway.
+// A client skips the recovery probe for a latched cluster
+// (see [helix.LatchReporter]).
 //
 // The call acquires the cluster's mutex so that fastStrikes is reset
 // atomically with the degraded transition.
