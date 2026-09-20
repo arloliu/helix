@@ -20,6 +20,11 @@ import (
 // is reached, further failures drop immediately rather than queue up.
 const defaultMemoryRetryConcurrency = 100
 
+// memoryDequeueLoops is how many dequeue goroutines a memoryBackend runs:
+// one per cluster, so a target that hangs holds up only its own cluster's
+// payloads.
+const memoryDequeueLoops = 2
+
 // errAttemptStopped wraps the error of an attempt that Stop cut short.
 // Such an attempt is settled as a shutdown drop instead of being counted as
 // an execute failure: the payload was never given a fair try, and the
@@ -28,11 +33,14 @@ var errAttemptStopped = errors.New("replay attempt interrupted by shutdown")
 
 // memoryBackend implements workerBackend for MemoryReplayer.
 //
-// Retries run in dedicated goroutines, not on the main dequeue loop, so a
-// permanently-failing payload does not stall unrelated backlog. The
-// retrySem semaphore caps concurrent in-flight retries so a sustained
-// failure storm cannot blow up the goroutine count; once full, further
-// failures drop immediately.
+// One dequeue loop runs per cluster, so a target that hangs holds up only
+// its own cluster's payloads.
+// Retries run in dedicated goroutines, not on either dequeue loop,
+// so a permanently-failing payload does not stall unrelated backlog.
+// The retrySem semaphore caps concurrent in-flight retries so a sustained
+// failure storm cannot blow up the goroutine count;
+// once full, further failures drop immediately.
+// The retry pool and the queue capacity are shared by both clusters.
 type memoryBackend struct {
 	replayer *MemoryReplayer
 	config   *WorkerConfig
@@ -40,10 +48,21 @@ type memoryBackend struct {
 	stopCh   <-chan struct{}
 	wg       *sync.WaitGroup
 
-	// stopCtx is the parent of every attempt context.
-	// start owns it and ends it when the worker stops, so an attempt in
-	// flight cannot hold Worker.Stop for ExecuteTimeout.
-	stopCtx context.Context
+	// stopCtx is the parent of every attempt context, ended by stopCancel
+	// when the worker stops so an attempt in flight cannot hold
+	// Worker.Stop for ExecuteTimeout.
+	// setupOnce publishes both to every dequeue loop; teardownOnce ends
+	// them once, after all of them have exited.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
+	// setupOnce builds the stop context and starts the retained scheduler
+	// exactly once, however many dequeue loops call start.
+	// loopWG is the barrier those loops meet on, and teardownOnce runs the
+	// shutdown sequence once, after the last of them has left its loop.
+	setupOnce    sync.Once
+	loopWG       sync.WaitGroup
+	teardownOnce sync.Once
 
 	retrySem chan struct{} // bounds concurrent retry goroutines
 	retryWG  sync.WaitGroup
@@ -62,46 +81,70 @@ type memoryBackend struct {
 var _ workerBackend = (*memoryBackend)(nil)
 
 func (b *memoryBackend) numWorkers() int {
-	return 1
+	return memoryDequeueLoops
 }
 
 func (b *memoryBackend) backendType() string {
 	return "memory"
 }
 
-// start processes messages from the MemoryReplayer.
+// start runs the dequeue loop for one cluster.
 //
-// The first execution attempt for each payload runs inline on the dequeue
-// loop. On failure, retry attempts are dispatched to a bounded-concurrency
-// goroutine pool so a permanently-failing payload cannot block dequeues
-// for unrelated payloads — including those targeting a different cluster.
+// The worker starts one per cluster, so a target that hangs holds up only
+// its own cluster's payloads.
+// The first execution attempt for each payload runs inline on its
+// cluster's loop.
+// On failure, retry attempts are dispatched to a bounded-concurrency
+// goroutine pool shared by both clusters,
+// so a permanently-failing payload cannot block dequeues for the payloads
+// behind it.
 //
-// The cluster parameter is ignored since memory backend uses a single
-// dequeue worker.
-func (b *memoryBackend) start(_ types.ClusterID) {
+// Setup and teardown are shared by the loops and each runs exactly once:
+// setup publishes the stop context and starts the retained scheduler
+// before any loop dequeues,
+// and teardown runs after the last loop has exited, never beside one.
+func (b *memoryBackend) start(cluster types.ClusterID) {
 	defer b.wg.Done()
 
+	b.setupOnce.Do(b.setup)
+
+	b.dequeueLoop(cluster)
+
+	// The loops meet here, so nothing is still consuming the queue when
+	// teardown sweeps it.
+	// Both then block in the Once until teardown has finished, so
+	// Worker.Stop cannot return part-way through it.
+	b.loopWG.Done()
+	b.loopWG.Wait()
+	b.teardownOnce.Do(b.teardown)
+}
+
+// setup prepares the state every dequeue loop shares.
+// It runs once, before any of them dequeues.
+func (b *memoryBackend) setup() {
 	// Stop ends the attempt in flight, so an ExecuteFunc that honours its
 	// context cannot hold Worker.Stop for ExecuteTimeout.
-	// Every goroutine that runs an attempt is joined below, before the
-	// deferred cancel runs.
-	base, cancelBase := stopContext(b.stopCh)
-	b.stopCtx = base
-	defer cancelBase()
+	// Every goroutine that runs an attempt is joined by teardown, before
+	// the cancel there runs.
+	b.stopCtx, b.stopCancel = stopContext(b.stopCh)
+
+	b.loopWG.Add(memoryDequeueLoops)
 
 	if b.retained() {
 		b.schedWG.Add(1)
 		go b.runRetained()
 	}
+}
 
-	b.dequeueLoop()
-
-	// Teardown, innermost first:
+// teardown settles everything the worker still holds.
+// It runs once, after every dequeue loop has exited.
+func (b *memoryBackend) teardown() {
+	// Innermost first:
 	//   1. schedWG.Wait — the scheduler stops dispatching retries.
 	//   2. drainAndDrop — flush any payloads still in the queue.
-	//   3. retryWG.Wait — in-flight retry goroutines finish. Bounded ones
-	//      observe stopCh during their backoff sleep; retained ones settle
-	//      their last outcome as a shutdown drop.
+	//   3. retryWG.Wait — in-flight retry goroutines finish.
+	//      Bounded ones observe stopCh during their backoff sleep;
+	//      retained ones settle their last outcome as a shutdown drop.
 	//   4. drainRetained — report payloads still waiting for an attempt.
 	b.schedWG.Wait()
 	b.drainAndDrop()
@@ -109,11 +152,17 @@ func (b *memoryBackend) start(_ types.ClusterID) {
 	if b.retained() {
 		b.drainRetained()
 	}
+
+	// Last, so no attempt is cut short by a context the worker ended
+	// before joining the goroutine running it.
+	b.stopCancel()
 }
 
-// dequeueLoop pulls payloads until the worker stops, running each first
-// attempt inline and keeping the backlog gauges current.
-func (b *memoryBackend) dequeueLoop() {
+// dequeueLoop pulls payloads for one cluster until the worker stops,
+// running each first attempt inline and keeping that cluster's backlog
+// gauges current.
+func (b *memoryBackend) dequeueLoop(cluster types.ClusterID) {
+	allow := b.ownCluster(cluster)
 	for {
 		select {
 		case <-b.stopCh:
@@ -121,8 +170,8 @@ func (b *memoryBackend) dequeueLoop() {
 		default:
 		}
 
-		payload, ok := b.replayer.tryDequeueRetained(b.config.allows)
-		b.reportBacklog()
+		payload, ok := b.replayer.tryDequeueRetained(allow)
+		b.reportBacklog(cluster)
 		if !ok {
 			select {
 			case <-b.stopCh:
@@ -137,15 +186,26 @@ func (b *memoryBackend) dequeueLoop() {
 	}
 }
 
-// reportBacklog publishes the per-cluster slot counts as the queue depth
-// gauge and clears the age gauge of every cluster with nothing pending.
-func (b *memoryBackend) reportBacklog() {
-	for _, cluster := range []types.ClusterID{types.ClusterA, types.ClusterB} {
-		pending := b.replayer.PendingByCluster(cluster)
-		b.config.Metrics.SetReplayQueueDepth(cluster, pending)
-		if pending == 0 {
-			b.config.observeIdle(cluster)
-		}
+// ownCluster builds the dequeue filter for one loop.
+// The rotation offers it both clusters, and it claims only its own, so the
+// two loops never take each other's payloads.
+// The sibling is refused before the configured gate is consulted, so a
+// cluster's gate is called by its own loop only.
+func (b *memoryBackend) ownCluster(cluster types.ClusterID) func(types.ClusterID) bool {
+	return func(c types.ClusterID) bool {
+		return c == cluster && b.config.allows(c)
+	}
+}
+
+// reportBacklog publishes one cluster's slot count as its queue depth
+// gauge and clears its age gauge when it has nothing pending.
+// Each loop reports its own cluster only, so neither can clear the other's
+// age gauge between that cluster's dequeue and the age it reports for it.
+func (b *memoryBackend) reportBacklog(cluster types.ClusterID) {
+	pending := b.replayer.PendingByCluster(cluster)
+	b.config.Metrics.SetReplayQueueDepth(cluster, pending)
+	if pending == 0 {
+		b.config.observeIdle(cluster)
 	}
 }
 
@@ -363,13 +423,27 @@ func (b *memoryBackend) clusterName(cluster types.ClusterID) string {
 
 // NewMemoryWorker creates a worker that processes messages from a MemoryReplayer.
 //
+// # Execution model
+//
+// The worker runs one dequeue loop per cluster.
+// A target that hangs holds up only its own cluster's payloads;
+// the other cluster keeps draining at full speed.
+//
+// Two resources stay shared.
+// The retry pool below is one pool for both clusters, so when both
+// clusters are failing a hung cluster's retries can still delay the
+// other's.
+// Queue capacity is shared too, so a hung cluster's backlog can reach the
+// [MemoryReplayer] capacity and make the healthy cluster's enqueues fail
+// with [types.ErrReplayQueueFull].
+//
 // # Retry model
 //
-// The first attempt for each payload runs synchronously on the dequeue
-// loop. Under [RetryBounded], attempts 2..MaxAttempts then run in a
-// dedicated goroutine so the dequeue loop is never blocked behind a
-// permanently-failing payload — including payloads targeting a different
-// cluster.
+// The first attempt for each payload runs synchronously on its cluster's
+// dequeue loop.
+// Under [RetryBounded], attempts 2..MaxAttempts then run in a dedicated
+// goroutine so that loop is never blocked behind a permanently-failing
+// payload.
 //
 // Concurrent in-flight retries are capped (default 100). Under
 // [RetryBounded], further failures drop immediately via OnDrop with the

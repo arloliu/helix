@@ -447,13 +447,12 @@ func (w *Worker) evictionWatcher() (evictionWatcher, bool) {
 // This interface is unexported - users interact with Worker via NewMemoryWorker/NewNATSWorker.
 type workerBackend interface {
 	// start begins processing for a specific cluster.
-	// For memory backend, cluster parameter is ignored (single worker processes all).
-	// For NATS backend, one goroutine per cluster is started.
+	// Both backends start one goroutine per cluster.
 	// Must call wg.Done() when finished.
 	start(cluster types.ClusterID)
 
 	// numWorkers returns how many goroutines should be spawned.
-	// Memory: 1, NATS: 2 (one per cluster)
+	// Both backends: 2, one per cluster.
 	numWorkers() int
 
 	// backendType returns a string identifier for debugging/logging.
@@ -462,9 +461,11 @@ type workerBackend interface {
 
 // Start begins processing replay messages.
 //
-// The number of worker goroutines depends on the backend:
-//   - MemoryBackend: Single goroutine processing all messages
-//   - NATSBackend: Two goroutines, one per cluster for parallel processing
+// Both backends run two goroutines, one per cluster,
+// so a target that hangs holds up only its own cluster's payloads.
+// On the memory backend the two loops share the retry pool and the queue
+// capacity;
+// see [NewMemoryWorker] for what that still couples.
 //
 // Returns:
 //   - error: ErrWorkerAlreadyRunning if already started
@@ -486,10 +487,10 @@ func (w *Worker) Start() error {
 	w.wg.Add(numWorkers)
 
 	if numWorkers == 1 {
-		// Single worker (memory backend)
-		go w.backend.start(types.ClusterA) // cluster param ignored for memory
+		// A backend that serves both clusters from one goroutine.
+		go w.backend.start(types.ClusterA)
 	} else {
-		// One worker per cluster (NATS backend)
+		// One goroutine per cluster, which is what both backends ask for.
 		go w.backend.start(types.ClusterA)
 		go w.backend.start(types.ClusterB)
 	}
