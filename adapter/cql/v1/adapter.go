@@ -449,14 +449,22 @@ func (b *Batch) ExecContext(ctx context.Context) error {
 
 // IterContext executes the batch with context and returns an iterator.
 //
-// WARNING: gocql v1 does not return an iterator from batch execution.
-// The batch is executed, but the execution error is silently discarded
-// and the returned iterator is always empty (nil-backed). Callers that
-// need error visibility should use [Batch.ExecContext] instead.
-// This method exists only for interface compatibility with v2.
+// gocql v1 has no batch call that returns an iterator,
+// so the batch is executed here and the returned iterator carries no rows.
+// It does carry the execution error,
+// mapped like every other adapter error:
+// [Iter.Close], [Iter.SliceMap] and the scanner from [Iter.Scanner] all report it,
+// so a rejected statement still arrives as [types.ErrStatementRejected]
+// and an unreachable cluster as [types.ErrClusterUnreachable].
+// [Batch.ExecContext] is the direct equivalent when no iterator is wanted.
+//
+// Parameters:
+//   - ctx: Context for cancellation and deadlines
+//
+// Returns:
+//   - cql.Iter: A row-less iterator whose Close reports the batch execution error
 func (b *Batch) IterContext(ctx context.Context) cql.Iter {
-	_ = b.session.ExecuteBatch(b.batch.WithContext(ctx))
-	return &Iter{iter: nil}
+	return &Iter{err: mapErr(b.session.ExecuteBatch(b.batch.WithContext(ctx)))}
 }
 
 // ExecCAS executes a batch lightweight transaction.
@@ -522,8 +530,15 @@ func (b *Batch) Size() int {
 }
 
 // Iter wraps a gocql v1 iterator.
+//
+// A nil-backed Iter has no rows to read.
+// When it stands in for a request that already failed — a batch run by
+// [Batch.IterContext] — err holds that failure,
+// so the methods that can return an error report it
+// instead of an empty success.
 type Iter struct {
 	iter *gocql.Iter
+	err  error
 }
 
 // Scan reads the next row.
@@ -536,9 +551,12 @@ func (i *Iter) Scan(dest ...any) bool {
 }
 
 // Close closes the iterator.
+//
+// Returns:
+//   - error: The iterator's error, or the error of the request the iterator stands in for
 func (i *Iter) Close() error {
 	if i.iter == nil {
-		return nil
+		return i.err
 	}
 
 	return mapErr(i.iter.Close())
@@ -554,9 +572,13 @@ func (i *Iter) MapScan(m map[string]any) bool {
 }
 
 // SliceMap reads all rows into a slice of maps.
+//
+// Returns:
+//   - []map[string]any: One map per row, nil when the iterator has no rows
+//   - error: The iterator's error, or the error of the request the iterator stands in for
 func (i *Iter) SliceMap() ([]map[string]any, error) {
 	if i.iter == nil {
-		return nil, nil
+		return nil, i.err
 	}
 
 	rows, err := i.iter.SliceMap()
@@ -603,9 +625,12 @@ func (i *Iter) Columns() []cql.ColumnInfo {
 }
 
 // Scanner returns a database/sql-style scanner for the iterator.
+//
+// A scanner over a row-less iterator reads no rows and reports the
+// iterator's error, so a failed request is not mistaken for an empty result.
 func (i *Iter) Scanner() cql.Scanner {
 	if i.iter == nil {
-		return &scanner{scanner: nil}
+		return &scanner{scanner: nil, err: i.err}
 	}
 
 	return &scanner{scanner: i.iter.Scanner()}
@@ -621,8 +646,12 @@ func (i *Iter) Warnings() []string {
 }
 
 // scanner wraps gocql.Scanner to implement cql.Scanner.
+//
+// err carries the failure of the request a nil scanner stands in for,
+// so Scan and Err report it rather than an empty success.
 type scanner struct {
 	scanner gocql.Scanner
+	err     error
 }
 
 func (s *scanner) Next() bool {
@@ -635,7 +664,7 @@ func (s *scanner) Next() bool {
 
 func (s *scanner) Scan(dest ...any) error {
 	if s.scanner == nil {
-		return nil
+		return s.err
 	}
 
 	return mapErr(s.scanner.Scan(dest...))
@@ -643,7 +672,7 @@ func (s *scanner) Scan(dest ...any) error {
 
 func (s *scanner) Err() error {
 	if s.scanner == nil {
-		return nil
+		return s.err
 	}
 
 	return mapErr(s.scanner.Err())
