@@ -238,6 +238,14 @@ linters:
       - linters:
           - gocritic
         source: //noinspection
+      # golangci-lint reports this file's revive deep-exit directive as
+      # unused on some runs and not others, with the same code and config,
+      # which fails the build at random. The directive is not stale: remove
+      # it and revive reports the deep exit. So the unused-directive check
+      # is turned off for this one file, and nowhere else.
+      - linters:
+          - nolintlint
+        path: internal/leak/leak\.go
       - linters:
           - bodyclose
           - dupl
