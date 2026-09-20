@@ -23,12 +23,16 @@ and why nothing is lost or charged while it waits.
 # How it works
 
 `WorkerConfig.ClusterGate` (set by `WithClusterGate`, composing by AND) is consulted through `WorkerConfig.allows`, which treats a panicking gate as closed.
-The memory dequeue rotation skips a gated cluster (the gate is evaluated before the replayer's mutex is taken).
+The memory backend runs one dequeue loop per cluster, and each loop passes `tryDequeueRetained` an own-cluster filter (`memoryBackend.ownCluster`) that refuses the sibling before consulting `allows`, so a cluster's gate is called by its own loop only.
+The rotation still evaluates that filter for both queue indexes, before the replayer's mutex is taken, and skips the one it refuses.
 A payload the gate refuses between dequeue and execution is put back with `Enqueue` under `RetryBounded`, or parked in the retained scheduler with `gatedSince` set under `RetryWhileRetained`; when it finally runs, `firstAt` is moved forward by the parked time so the retry window is not consumed.
 A bounded retry waits in `waitUngated`, polling every `PollInterval`, without counting an attempt.
 
 The NATS loop skips the fetch for a gated cluster so messages stay server-side.
 A batch already fetched when the gate closes is held by `holdWhileGated`: the gate is polled every `PollInterval`, every unprocessed message's `InProgress` is refreshed once per `max(PollInterval, AckWait/3)`, nothing is NAK'd, and a stop NAKs each unprocessed message once through `nakTail`.
+
+Per-cluster loops do not make the gate redundant: they keep a hung cluster from holding its sibling's payloads, while the gate is what stops the worker spending attempts, log volume and (under `RetryBounded`) the attempt budget on a cluster already known to be bad.
+Two couplings survive both: the 100-slot retry pool is shared, so when both clusters fail a hung cluster's retries delay (retained) or drop (bounded, `retry_pool_saturated`) the other's; and queue capacity is shared, so a hung cluster's backlog can reach the limit and fail the healthy cluster's enqueues with `types.ErrReplayQueueFull`.
 
 The client composes drain, the write strategy's degraded state, and `WithReplayGate` in `replayAllowed`,
 and appends `WithClusterGate(replayAllowed)` after the caller's options on the worker it builds for `WithAutoMemoryWorker`;
@@ -48,6 +52,7 @@ so a `ForceDegrade` in progress can be seen as degraded-and-unlatched for one `P
 # Invariants
 
 - A gated payload never reaches the executor, never counts an attempt, and never consumes a delivery.
+- A cluster's gate is consulted only by that cluster's dequeue loop, so a gate that counts its calls counts one loop.
 - Reopening is observed within `PollInterval`.
 - Every gate wait selects on `stopCh`, so `Worker.Stop` cannot hang on a closed gate.
 - The degraded condition is never the only thing holding a cluster back where no recovery probe runs for the write strategy.
@@ -56,6 +61,7 @@ so a `ForceDegrade` in progress can be seen as degraded-and-unlatched for one `P
 # Where to look
 
 - `replay/worker.go` → `WithClusterGate`, `(*WorkerConfig).allows`
+- `replay/memory_worker.go` → `(*memoryBackend).ownCluster`, `(*memoryBackend).dequeueLoop`
 - `replay/memory_retained.go` → `park`, `attemptRetained`
 - `replay/nats_worker.go` → `holdWhileGated`, `nakTail`
 - `wiring.go` → `(*CQLClient).replayAllowed`, `newDegradedWriteReporter`, `(*degradedWriteReporter).holdsReplay`
