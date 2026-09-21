@@ -14,7 +14,7 @@ import (
 
 	"github.com/arloliu/helix"
 	"github.com/arloliu/helix/adapter/cql"
-	"github.com/arloliu/helix/test/testutil"
+	"github.com/arloliu/helix/internal/test/testutil"
 	"github.com/arloliu/helix/types"
 )
 

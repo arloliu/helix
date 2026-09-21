@@ -9,26 +9,26 @@ The Helix simulation suite is an end-to-end behavioral test harness that spins u
 
 ## Running
 
-All profiles share the same entry point in `test/simulation/cmd/main.go`.
+All profiles share the same entry point in `internal/test/simulation/cmd/main.go`.
 
 ```bash
 # Quick sanity check (~5 min, basic scenarios only)
-go run ./test/simulation/cmd/main.go -profile quick -config test/simulation/configs/quick.yaml
+go run ./internal/test/simulation/cmd/main.go -profile quick -config internal/test/simulation/configs/quick.yaml
 
 # Full behavioral coverage (~10-15 min, all scenarios + strategy groups)
-go run ./test/simulation/cmd/main.go -profile comprehensive -config test/simulation/configs/quick.yaml
+go run ./internal/test/simulation/cmd/main.go -profile comprehensive -config internal/test/simulation/configs/quick.yaml
 
 # Long-running stability run (2 h by default)
-go run ./test/simulation/cmd/main.go -profile soak -config test/simulation/configs/soak.yaml
+go run ./internal/test/simulation/cmd/main.go -profile soak -config internal/test/simulation/configs/soak.yaml
 
 # Targeted FallbackRead verification (~5 min)
-go run ./test/simulation/cmd/main.go -profile fallback -config test/simulation/configs/quick.yaml
+go run ./internal/test/simulation/cmd/main.go -profile fallback -config internal/test/simulation/configs/quick.yaml
 ```
 
 Override individual settings without a config file:
 
 ```bash
-go run ./test/simulation/cmd/main.go -profile quick -duration 2m -seed 123
+go run ./internal/test/simulation/cmd/main.go -profile quick -duration 2m -seed 123
 ```
 
 A pprof server starts automatically on `127.0.0.1:6060` during all runs.
@@ -124,7 +124,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/arloliu/helix/test/simulation/types"
+    "github.com/arloliu/helix/internal/test/simulation/types"
 )
 
 type MyScenario struct{}
@@ -245,5 +245,5 @@ The simulation infrastructure components have focused unit tests that do not req
 | `scenarios/wait_test.go`   | waitUntil: immediate-true, timeout, context cancellation                                  |
 
 ```bash
-go test ./test/simulation/...
+go test ./internal/test/simulation/...
 ```

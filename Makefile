@@ -10,12 +10,12 @@ COVERAGE_HTML   := $(COVERAGE_DIR)/coverage.html
 
 # Source files
 ALL_GO_FILES    := $(shell find . -name "*.go" -not -path "./vendor/*")
-TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./vendor/*" -not -path "./test/integration/*" -not -path "./test/e2e/*")))
-INTEGRATION_DIR := ./test/integration/...
-E2E_DIR         := ./test/e2e/...
+TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./vendor/*" -not -path "./internal/test/integration/*" -not -path "./internal/test/e2e/*")))
+INTEGRATION_DIR := ./internal/test/integration/...
+E2E_DIR         := ./internal/test/e2e/...
 E2E_TIMEOUT     ?= 30m
 SIM_PROFILE     ?= quick
-SIM_CONFIG      ?= test/simulation/configs/quick.yaml
+SIM_CONFIG      ?= internal/test/simulation/configs/quick.yaml
 LATEST_GIT_TAG  := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
 
 # Linter configuration
@@ -37,10 +37,10 @@ help:
 
 ##@ Testing
 
-## test: Run all tests with race detector
+## test: Run unit and integration tests with race detector (Docker required)
 test: test-all
 
-## test-unit: Run only unit tests (same as test)
+## test-unit: Run only unit tests (no Docker; test also runs the integration suite)
 test-unit: clean-test-results
 	@echo "Running unit tests..."
 	@CGO_ENABLED=1 go test $(TEST_DIRS) -count=1 -timeout=$(TEST_TIMEOUT) -race
@@ -76,7 +76,7 @@ test-e2e: clean-test-results
 ## test-simulation: Run the dual-cluster simulation harness (Docker required; SIM_PROFILE, SIM_CONFIG)
 test-simulation:
 	@echo "Running simulation profile '$(SIM_PROFILE)' with $(SIM_CONFIG) (Docker required)..."
-	@go run ./test/simulation/cmd/main.go -profile $(SIM_PROFILE) -config $(SIM_CONFIG)
+	@go run ./internal/test/simulation/cmd/main.go -profile $(SIM_PROFILE) -config $(SIM_CONFIG)
 
 ## coverage: Generate test coverage report (unit packages only)
 coverage: clean-test-results

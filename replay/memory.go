@@ -564,7 +564,7 @@ func (m *MemoryReplayer) TryDequeue() (types.ReplayPayload, bool) {
 // checks; instead observe an authoritative downstream signal (row counts on
 // the destination, success-counter convergence, or worker-callback
 // completion). Misuse of this contract was the root cause of the S1 e2e
-// flake fixed in `test/e2e/cql/write_replay_test.go` — see the comment
+// flake fixed in `internal/test/e2e/cql/write_replay_test.go` — see the comment
 // there.
 //
 // Under [RetryWhileRetained] the worker holds the slot until the payload is

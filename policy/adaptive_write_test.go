@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arloliu/helix/test/testutil"
+	"github.com/arloliu/helix/internal/test/testutil"
 	"github.com/arloliu/helix/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

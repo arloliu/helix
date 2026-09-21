@@ -39,11 +39,11 @@ helix/                        # Root = main public package (CQLClient, options)
 ├── contrib/                  # Supplementary integrations (metrics, logging)
 ├── internal/                 # Private implementation
 │   ├── logging/              # Logger helpers
-│   └── metrics/              # Metrics helpers
-├── test/                     # Integration, simulation & test utilities
-│   ├── integration/
-│   ├── simulation/
-│   └── testutil/
+│   ├── metrics/              # Metrics helpers
+│   └── test/                 # Integration, simulation & test utilities
+│       ├── integration/
+│       ├── simulation/
+│       └── testutil/
 ├── examples/                 # Example programs
 └── docs/                     # Design & user documentation
 ```

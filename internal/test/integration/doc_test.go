@@ -1,0 +1,16 @@
+// Package integration_test provides end-to-end integration tests for the helix library.
+//
+// These tests verify dual-database behavior with real database connections.
+//
+// # Running Integration Tests
+//
+// Integration tests are skipped by default when using -short flag:
+//
+//	go test -short ./...           # Skips integration tests
+//	go test ./internal/test/integration/... # Runs integration tests
+//
+// # CQL Tests
+//
+// CQL integration tests require Docker and use testcontainers to spin up
+// Cassandra instances. They are more resource-intensive and slower.
+package integration_test

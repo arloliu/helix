@@ -61,7 +61,7 @@ func TestUnwrapSessionNil(t *testing.T) {
 }
 
 // The following tests require a real gocql.Session and are run as integration tests.
-// See test/integration/cql_v1_adapter_test.go for those tests.
+// See internal/test/integration/cql_v1_adapter_test.go for those tests.
 
 // TestBatchTypeConstants verifies batch type constants match gocql.
 func TestBatchTypeConstants(t *testing.T) {
@@ -107,7 +107,7 @@ func TestQueryMethodsExist(t *testing.T) {
 // Scan/MapScan/ScanContext/MapScanContext is surfaced as types.ErrNotFound.
 //
 // Full round-trip testing (gocql query returning ErrNotFound) requires a live
-// Cassandra session — see test/integration/ for those tests.
+// Cassandra session — see internal/test/integration/ for those tests.
 func TestNotFoundMapping(t *testing.T) {
 	// gocql.ErrNotFound is a real sentinel error
 	require.Error(t, gocql.ErrNotFound)
