@@ -2,9 +2,12 @@
 
 ## Organization
 - **Unit:** Co-located in `*_test.go`. Same package or `_test` suffix.
-- **Integration:** `test/integration/` directory. Package `integration_test`. Requires running Cassandra/ScyllaDB via testcontainers.
-- **Simulation:** `test/simulation/` directory. Long-running dual-cluster behavior scenarios.
-- **Test Utilities:** `test/testutil/` — shared helpers for integration and simulation tests.
+- **Integration:** `internal/test/integration/` directory.
+  Package `integration_test`.
+  Requires running Cassandra/ScyllaDB via testcontainers.
+- **Simulation:** `internal/test/simulation/` directory.
+  Long-running dual-cluster behavior scenarios.
+- **Test Utilities:** `internal/test/testutil/` — shared helpers for integration and simulation tests.
 
 ## Rules
 - **No Emojis:** Do not use emojis in test log messages.

@@ -400,7 +400,7 @@ func TestClusterEvents_SuccessfulConstructionInjectsBothSlotsBeforeProbes(t *tes
 
 // clusterEventMetricsSpy extends mockMetricsCollector with the optional
 // types.ClusterEventMetrics method. Local spy: internal helix tests
-// cannot import test/testutil (import cycle), the same workaround as
+// cannot import internal/test/testutil (import cycle), the same workaround as
 // mockMetricsCollector itself.
 type clusterEventMetricsSpy struct {
 	mockMetricsCollector

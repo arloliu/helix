@@ -11,7 +11,7 @@ import (
 // These tests verify internal context wiring that cannot be tested from
 // the external _test package because the ctx field is unexported.
 // Full context-propagation verification requires integration tests with
-// a real Cassandra session (see test/integration/).
+// a real Cassandra session (see internal/test/integration/).
 
 // ctxKey is a context key type for testing.
 type ctxKey struct{}

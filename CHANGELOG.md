@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The `test/` tree moved to `internal/test/`.**
+  The simulation, e2e, integration, and testutil packages are no longer
+  importable from outside the module.
+  The next release's `gorelease` run will report these as removed packages;
+  that is expected and accepted.
+
 ## [1.11.0] — 2026-09-20
 
 ### Added

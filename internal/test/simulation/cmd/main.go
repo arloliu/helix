@@ -1,0 +1,440 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	_ "net/http/pprof" //nolint:gosec // pprof is intentional for simulation
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/arloliu/helix"
+	"github.com/arloliu/helix/adapter/cql"
+	"github.com/arloliu/helix/internal/test/simulation"
+	"github.com/arloliu/helix/internal/test/simulation/config"
+	"github.com/arloliu/helix/internal/test/simulation/scenarios"
+	simtypes "github.com/arloliu/helix/internal/test/simulation/types"
+	"github.com/arloliu/helix/internal/test/testutil"
+	"github.com/arloliu/helix/policy"
+	"github.com/arloliu/helix/replay"
+	"github.com/arloliu/helix/topology"
+	htypes "github.com/arloliu/helix/types"
+)
+
+var (
+	flagConfigPath = flag.String("config", "", "Path to configuration file (optional)")
+	flagProfile    = flag.String("profile", "quick", "Simulation profile (quick, comprehensive, soak, fallback)")
+	flagDuration   = flag.Duration("duration", 5*time.Minute, "Total simulation duration (for soak tests)")
+	flagSeed       = flag.Int64("seed", 0, "Random seed (default: current time)")
+)
+
+func main() {
+	flag.Parse()
+
+	// Apply default seed after parsing so time.Now() is evaluated at runtime.
+	if *flagSeed == 0 {
+		*flagSeed = time.Now().UnixNano()
+	}
+
+	if err := run(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	// Setup logger
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	// Load configuration if provided
+	var settings *config.Config
+	if *flagConfigPath != "" {
+		var err error
+		settings, err = config.Load(*flagConfigPath)
+		if err != nil {
+			logger.Error("Failed to load configuration", "path", *flagConfigPath, "error", err)
+			return err
+		}
+		// Override flags with config values if present
+		if settings.Simulation.Duration > 0 {
+			*flagDuration = settings.Simulation.Duration
+		}
+		if settings.Simulation.Seed != 0 {
+			*flagSeed = settings.Simulation.Seed
+		}
+	}
+
+	logger.Info("Starting Helix Simulation",
+		"profile", *flagProfile,
+		"seed", *flagSeed,
+		"duration", *flagDuration,
+	)
+
+	// Start pprof server
+	pprofServer := &http.Server{
+		Addr:              "127.0.0.1:6060",
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+	go func() {
+		logger.Info("Starting pprof server", "addr", pprofServer.Addr)
+		if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("pprof server failed", "error", err)
+		}
+	}()
+
+	// Handle signals for graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer shutdownCancel()
+		if err := pprofServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("pprof server shutdown failed", "error", err)
+		}
+	}()
+
+	// Start Clusters
+	logger.Info("Starting Cluster A...")
+	clusterA, err := testutil.StartCQLCluster(ctx, testutil.DefaultCQLClusterOptions("helix_test_a"))
+	if err != nil {
+		logger.Error("Failed to start Cluster A", "error", err)
+		return err
+	}
+	defer func() {
+		logger.Info("Terminating Cluster A...")
+		if err := clusterA.Terminate(context.Background()); err != nil {
+			logger.Error("Failed to terminate Cluster A", "error", err)
+		}
+	}()
+
+	logger.Info("Starting Cluster B...")
+	clusterB, err := testutil.StartCQLCluster(ctx, testutil.DefaultCQLClusterOptions("helix_test_b"))
+	if err != nil {
+		logger.Error("Failed to start Cluster B", "error", err)
+		return err
+	}
+	defer func() {
+		logger.Info("Terminating Cluster B...")
+		if err := clusterB.Terminate(context.Background()); err != nil {
+			logger.Error("Failed to terminate Cluster B", "error", err)
+		}
+	}()
+
+	// Create simulation config
+	simConfig := simulation.Config{
+		Seed:     *flagSeed,
+		Duration: *flagDuration,
+		Profile:  *flagProfile,
+		ClusterA: clusterA,
+		ClusterB: clusterB,
+		Settings: settings,
+	}
+
+	// Initialize simulation orchestrator
+	sim, err := simulation.New(simConfig, logger)
+	if err != nil {
+		logger.Error("Failed to initialize simulation", "error", err)
+		return err
+	}
+
+	// Strategy groups build their own replay worker; give them the same
+	// retry policy the main client runs with.
+	if settings != nil && settings.Helix.Replay.RetryPolicy == "bounded" {
+		groupWorkerOpts = append(groupWorkerOpts, replay.WithRetryPolicy(replay.RetryBounded))
+	}
+
+	// Register scenarios based on profile
+	registerScenarios(sim, *flagProfile)
+
+	// Run simulation
+	if err := sim.Run(ctx); err != nil {
+		logger.Error("Simulation failed", "error", err)
+		return err
+	}
+
+	logger.Info("Simulation completed successfully")
+
+	return nil
+}
+
+func registerScenarios(sim *simulation.Simulation, profile string) {
+	// Basic scenarios always included
+	sim.RegisterScenario(&scenarios.DegradedCluster{})
+	sim.RegisterScenario(&scenarios.AdaptiveRecovery{})
+	sim.RegisterScenario(&scenarios.CompleteFailure{})
+
+	// fallback profile: 3 baseline scenarios + fallback-read group only.
+	// Use this for quick, targeted verification of FallbackRead divergence detection.
+	if profile == "fallback" {
+		sim.RegisterStrategyGroup(fallbackReadGroup())
+		return
+	}
+
+	// Every profile except fallback runs the read-leg deadline group.
+	sim.RegisterStrategyGroup(readLegDeadlineGroup())
+
+	// Add more scenarios based on profile
+	if profile == "comprehensive" || profile == "soak" {
+		sim.RegisterScenario(&scenarios.ReplaySaturation{})
+		sim.RegisterScenario(&scenarios.DrainMode{})
+		sim.RegisterScenario(&scenarios.FireForgetLimit{})
+		sim.RegisterScenario(&scenarios.PartialDegradation{})
+
+		// Strategy groups for untested policy combinations
+		sim.RegisterStrategyGroup(circuitBreakerGroup())
+		sim.RegisterStrategyGroup(latencyCircuitBreakerGroup())
+		sim.RegisterStrategyGroup(primaryOnlyReadGroup())
+		sim.RegisterStrategyGroup(roundRobinReadGroup())
+		sim.RegisterStrategyGroup(stickyCooldownGroup())
+		sim.RegisterStrategyGroup(fallbackReadGroup())
+	}
+
+	if profile == "soak" {
+		sim.RegisterScenario(&scenarios.DualClusterDegradation{})
+	}
+}
+
+// makeStrategyGroupClientWithMetrics creates a StrategyGroupSetupFunc where the
+// policy factory receives the metrics collector, allowing policies (e.g.
+// CircuitBreaker) to record metrics to the same collector the scenario asserts on.
+func makeStrategyGroupClientWithMetrics(
+	policyFactory func(mc *testutil.TestMetricsCollector) (helix.WriteStrategy, helix.ReadStrategy, helix.FailoverPolicy),
+) simulation.StrategyGroupSetupFunc {
+	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
+		writeStrategy, readStrategy, failoverPolicy := policyFactory(mc)
+		return makeStrategyGroupClient(writeStrategy, readStrategy, failoverPolicy)(sessionA, sessionB, mc)
+	}
+}
+
+// groupWorkerOpts holds worker options shared by every strategy group's
+// replay worker, derived from the loaded configuration.
+var groupWorkerOpts []replay.WorkerOption
+
+// makeStrategyGroupClient returns a StrategyGroupSetupFunc
+// that builds a client from the given strategies.
+// The extra options are applied after the shared ones,
+// so a group can add client settings such as a read-leg deadline.
+func makeStrategyGroupClient(
+	writeStrategy helix.WriteStrategy,
+	readStrategy helix.ReadStrategy,
+	failoverPolicy helix.FailoverPolicy,
+	extra ...helix.Option,
+) simulation.StrategyGroupSetupFunc {
+	return func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
+		memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
+		topo := topology.NewLocal()
+
+		opts := append([]helix.Option{
+			helix.WithWriteStrategy(writeStrategy),
+			helix.WithReadStrategy(readStrategy),
+			helix.WithFailoverPolicy(failoverPolicy),
+			helix.WithReplayer(memReplayer),
+			helix.WithTopologyWatcher(topo),
+			helix.WithMetrics(mc),
+		}, extra...)
+
+		client, err := helix.NewCQLClient(sessionA, sessionB, opts...)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create client: %w", err)
+		}
+
+		worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
+			append([]replay.WorkerOption{replay.WithWorkerMetrics(mc)}, groupWorkerOpts...)...,
+		)
+		if err := worker.Start(); err != nil {
+			client.Close()
+			return nil, nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
+		}
+
+		return client, memReplayer, worker, nil
+	}
+}
+
+func circuitBreakerGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "circuit-breaker",
+		SetupFunc: makeStrategyGroupClientWithMetrics(
+			func(mc *testutil.TestMetricsCollector) (helix.WriteStrategy, helix.ReadStrategy, helix.FailoverPolicy) {
+				return policy.NewAdaptiveDualWrite(
+						policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+						policy.WithAdaptiveStrikeThreshold(3),
+					),
+					// PrimaryOnlyRead ensures reads start on ClusterA (so the CB
+					// observes A's failures) and automatically probes A after the
+					// recovery timeout, calling RecordSuccess to close the CB.
+					policy.NewPrimaryOnlyRead(
+						policy.WithPrimaryOnlyRecoveryTimeout(10 * time.Second),
+					),
+					policy.NewCircuitBreaker(
+						policy.WithThreshold(3),
+						policy.WithResetTimeout(15*time.Second),
+						policy.WithCircuitBreakerMetrics(mc),
+					)
+			},
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.CircuitBreakerTrip{},
+		},
+	}
+}
+
+func latencyCircuitBreakerGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "latency-cb",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			// Pin to ClusterA so the scenario's latency injection on ClusterA
+			// is always observed via RecordLatency. StickyRead uses crypto/rand
+			// for its default selection, which would otherwise route reads to
+			// ClusterB 50% of the time, leaving ClusterA latency unobserved.
+			policy.NewStickyRead(policy.WithPreferredCluster(htypes.ClusterA)),
+			policy.NewLatencyCircuitBreaker(
+				policy.WithLatencyAbsoluteMax(500*time.Millisecond),
+				policy.WithLatencyThreshold(3),
+				policy.WithLatencyResetTimeout(15*time.Second),
+			),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.LatencyCircuitBreakerTrip{},
+		},
+	}
+}
+
+// readLegDeadlineGroup bounds each read leg with WithClusterReadTimeout
+// and sets the breaker's AbsoluteMax far above it,
+// so a slow cluster can trip the breaker only through read-leg failures.
+func readLegDeadlineGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "read-leg-deadline",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			// Pin reads to ClusterA,
+			// so the latency injected on A is what every read leg meets first.
+			policy.NewStickyRead(policy.WithPreferredCluster(htypes.ClusterA)),
+			policy.NewLatencyCircuitBreaker(
+				policy.WithLatencyAbsoluteMax(2*time.Second),
+				policy.WithLatencyThreshold(3),
+				policy.WithLatencyResetTimeout(15*time.Second),
+			),
+			// 500ms leaves room for B's cold first reads (100-300ms).
+			helix.WithClusterReadTimeout(500*time.Millisecond),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.ReadLegDeadlineTrip{},
+		},
+	}
+}
+
+func primaryOnlyReadGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "primary-only",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			policy.NewPrimaryOnlyRead(
+				policy.WithPrimaryOnlyRecoveryTimeout(10*time.Second),
+			),
+			policy.NewActiveFailover(),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.PrimaryOnlyReadRecovery{},
+			&scenarios.PrimaryOnlyReadFailoverBack{},
+		},
+	}
+}
+
+func roundRobinReadGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "round-robin",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			policy.NewRoundRobinRead(),
+			policy.NewActiveFailover(),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.RoundRobinReadBalance{},
+		},
+	}
+}
+
+func stickyCooldownGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "sticky-cooldown",
+		SetupFunc: makeStrategyGroupClient(
+			policy.NewAdaptiveDualWrite(
+				policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+				policy.WithAdaptiveStrikeThreshold(3),
+			),
+			// Pin initial preferred to A so phases 1–3 are deterministic.
+			// Short cooldown so the test completes in reasonable time.
+			policy.NewStickyRead(
+				policy.WithPreferredCluster(htypes.ClusterA),
+				policy.WithStickyReadCooldown(10*time.Second),
+			),
+			policy.NewActiveFailover(),
+		),
+		Scenarios: []simtypes.Scenario{
+			&scenarios.StickyCooldown{},
+			&scenarios.StickyReadFailoverBack{},
+		},
+	}
+}
+
+func fallbackReadGroup() simulation.StrategyGroup {
+	return simulation.StrategyGroup{
+		Name: "fallback-read",
+		SetupFunc: func(sessionA, sessionB cql.Session, mc *testutil.TestMetricsCollector) (*helix.CQLClient, *replay.MemoryReplayer, *replay.Worker, error) {
+			memReplayer := replay.NewMemoryReplayer(replay.WithQueueCapacity(50000))
+			topo := topology.NewLocal()
+
+			client, err := helix.NewCQLClient(sessionA, sessionB,
+				helix.WithWriteStrategy(policy.NewAdaptiveDualWrite(
+					policy.WithAdaptiveDeltaThreshold(100*time.Millisecond),
+					policy.WithAdaptiveStrikeThreshold(3),
+				)),
+				// Pin reads to B so FallbackRead is exercised deterministically:
+				// B returns not-found for A-only rows, then FallbackRead finds them on A.
+				helix.WithReadStrategy(policy.NewStickyRead(
+					policy.WithPreferredCluster(htypes.ClusterB),
+				)),
+				helix.WithFailoverPolicy(policy.NewActiveFailover()),
+				helix.WithReplayer(memReplayer),
+				helix.WithTopologyWatcher(topo),
+				helix.WithMetrics(mc),
+				helix.WithDefaultFallbackRead(true),
+			)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to create client: %w", err)
+			}
+
+			worker := replay.NewMemoryWorker(memReplayer, client.DefaultExecuteFunc(),
+				append([]replay.WorkerOption{replay.WithWorkerMetrics(mc)}, groupWorkerOpts...)...,
+			)
+			if err := worker.Start(); err != nil {
+				client.Close()
+				return nil, nil, nil, fmt.Errorf("failed to start replay worker: %w", err)
+			}
+
+			return client, memReplayer, worker, nil
+		},
+		Scenarios: []simtypes.Scenario{
+			&scenarios.FallbackReadDivergence{},
+		},
+	}
+}

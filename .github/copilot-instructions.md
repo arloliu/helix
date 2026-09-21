@@ -42,10 +42,10 @@ Helix is a high-availability dual-database client library designed to support "S
   │       └── v2/               # gocql v2 adapter
   ├── internal/                 # Private implementation
   │   ├── orchestrator/         # Dual-write orchestration logic
-  │   └── circuit/              # Circuit breaker implementation
-  ├── test/                     # Integration tests
-  │   ├── integration/          # End-to-end scenarios
-  │   └── testutil/             # Test utilities
+  │   ├── circuit/              # Circuit breaker implementation
+  │   └── test/                 # Integration tests
+  │       ├── integration/      # End-to-end scenarios
+  │       └── testutil/         # Test utilities
   ├── examples/                 # Example programs
   │   ├── basic/
   │   ├── failover/
@@ -207,7 +207,7 @@ Example:
 
 **Test Organization** (Hybrid Approach):
 - **Unit tests**: Co-located with implementation (`*_test.go`)
-- **Integration tests**: Dedicated directory (`test/integration/`)
+- **Integration tests**: Dedicated directory (`internal/test/integration/`)
 - See `docs/design/06-implementation/test-organization.md` for complete details
 
 **Unit Test Guidelines:**
@@ -268,7 +268,7 @@ collector.RequireLastState(StateIdle)
 **Implementation Pattern:**
 Create a helper that:
 **Integration Test Guidelines:**
-- Place in `test/integration/` directory
+- Place in `internal/test/integration/` directory
 - Use `t.Context()` for context management in tests
 - Package name: `integration_test`
 - Always include `testing.Short()` guard

@@ -10,7 +10,7 @@ import (
 // These tests verify that ExecCASContext and MapExecCASContext correctly
 // pass the context'd batch to the session, matching the pattern used by
 // ExecContext. Full verification requires integration tests with a real
-// Cassandra session (see test/integration/).
+// Cassandra session (see internal/test/integration/).
 
 // TestBatchExecCASContextUsesSession verifies that ExecCASContext
 // passes the context'd batch (from WithContext) to session.ExecuteBatchCAS,

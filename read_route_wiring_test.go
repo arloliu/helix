@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/arloliu/helix"
+	"github.com/arloliu/helix/internal/test/testutil"
 	"github.com/arloliu/helix/policy"
-	"github.com/arloliu/helix/test/testutil"
 	"github.com/arloliu/helix/topology"
 	"github.com/arloliu/helix/types"
 )
