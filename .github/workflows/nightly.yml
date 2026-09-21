@@ -9,6 +9,7 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -24,6 +25,28 @@ jobs:
 
       - name: Run e2e tests
         run: make test-e2e
+
+  # Its own job rather than a step in e2e: a different build tag, four
+  # ScyllaDB containers instead of two, and a failure signal that should not
+  # be hidden inside the single-node suite's result.
+  e2e-multinode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run the two-node e2e scenario
+        run: make test-e2e-multinode
 
   simulation:
     runs-on: ubuntu-latest

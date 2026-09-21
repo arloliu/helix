@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A nightly-only e2e tier running one ScyllaDB cluster of two nodes at replication factor 2**
+  (`make test-e2e-multinode`), which pins the boundary the single-node tiers cannot express:
+  one node failing inside a cluster must not be escalated to a cluster-level failover.
+
 ### Changed
 
 - **The `test/` tree moved to `internal/test/`.**

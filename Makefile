@@ -14,6 +14,7 @@ TEST_DIRS       := $(sort $(dir $(shell find . -name "*_test.go" -not -path "./v
 INTEGRATION_DIR := ./internal/test/integration/...
 E2E_DIR         := ./internal/test/e2e/...
 E2E_TIMEOUT     ?= 30m
+E2E_MULTINODE_RUN ?= TestS_TwoNode
 SIM_PROFILE     ?= quick
 SIM_CONFIG      ?= internal/test/simulation/configs/quick.yaml
 LATEST_GIT_TAG  := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
@@ -25,7 +26,7 @@ GOLANGCI_LINT_VERSION := 2.12.2
 # Default target
 .DEFAULT_GOAL := help
 
-.PHONY: help test test-unit test-integration test-all test-quick test-e2e test-simulation clean-test-results
+.PHONY: help test test-unit test-integration test-all test-quick test-e2e test-e2e-multinode test-simulation clean-test-results
 .PHONY: coverage coverage-html
 .PHONY: lint linter-update linter-version fmt vet
 .PHONY: generate gomod-tidy clean ci
@@ -72,6 +73,13 @@ test-e2e: clean-test-results
 	@# code. Race detection adds significant overhead and the tests do not
 	@# exercise concurrency-sensitive paths beyond what unit/integration cover.
 	@CGO_ENABLED=1 go test -tags e2e $(E2E_DIR) -count=1 -v -timeout=$(E2E_TIMEOUT)
+
+## test-e2e-multinode: Run the two-node cluster e2e scenario (Docker required, build tags 'e2e multinode')
+test-e2e-multinode: clean-test-results
+	@echo "Running the two-node e2e/cql scenario (Docker required)..."
+	@# -run keeps this to the two-node scenario: the rest of the e2e suite
+	@# is already covered by test-e2e and takes about eleven minutes.
+	@CGO_ENABLED=1 go test -tags "e2e multinode" $(E2E_DIR) -count=1 -v -timeout=$(E2E_TIMEOUT) -run '$(E2E_MULTINODE_RUN)'
 
 ## test-simulation: Run the dual-cluster simulation harness (Docker required; SIM_PROFILE, SIM_CONFIG)
 test-simulation:

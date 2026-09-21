@@ -26,6 +26,19 @@ var e2eClusters struct {
 	b *testutil.CQLCluster
 }
 
+// e2eTeardowns holds cleanups for resources a build-tagged scenario starts once for the whole package.
+// Go allows one TestMain per package,
+// so a scenario that owns a container beyond a single test function has nowhere else to give it back.
+var e2eTeardowns []func(context.Context)
+
+// runE2ETeardowns runs every registered cleanup in reverse registration order.
+func runE2ETeardowns(ctx context.Context) {
+	for i := len(e2eTeardowns) - 1; i >= 0; i-- {
+		e2eTeardowns[i](ctx)
+	}
+	e2eTeardowns = nil
+}
+
 // e2eOptions defines the cluster configuration used for every test in this
 // package. Short timeouts surface failure modes quickly and make v1/v2
 // parity assertions meaningful — divergent default timeouts would otherwise
@@ -61,6 +74,7 @@ func TestMain(m *testing.M) {
 		return
 	}
 	defer teardownE2EClusters(ctx)
+	defer runE2ETeardowns(ctx)
 
 	m.Run()
 }
