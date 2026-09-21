@@ -7,6 +7,10 @@
   Requires running Cassandra/ScyllaDB via testcontainers.
 - **Simulation:** `internal/test/simulation/` directory.
   Long-running dual-cluster behavior scenarios.
+- **Two-node e2e:** `internal/test/e2e/cql/` behind the build tags `e2e multinode`.
+  One ScyllaDB cluster of two nodes at replication factor 2,
+  which is the only tier where a node-level fault is not also a cluster-level fault.
+  Nightly only, via `make test-e2e-multinode`; `make test-e2e` does not build it.
 - **Test Utilities:** `internal/test/testutil/` — shared helpers for integration and simulation tests.
 
 ## Rules
