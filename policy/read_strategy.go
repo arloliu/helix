@@ -12,6 +12,10 @@ import (
 	"github.com/arloliu/helix/types"
 )
 
+// defaultStickyReadCooldown is the failover cooldown [NewStickyRead] applies
+// when [WithStickyReadCooldown] is not used, or its value is negative.
+const defaultStickyReadCooldown = 5 * time.Minute
+
 // StickyRead implements a sticky read strategy that routes reads to a preferred cluster.
 //
 // The preferred cluster is randomly selected at initialization and sticks to it
@@ -37,6 +41,15 @@ type StickyRead struct {
 	// knownBad marks a cluster that failed and has not succeeded since;
 	// index 0 is cluster A and index 1 is cluster B.
 	knownBad [2]atomic.Bool
+
+	// invalidPreferredCluster and invalidCooldown record that some
+	// [WithPreferredCluster] or [WithStickyReadCooldown] call was given an
+	// invalid value, for [validateStickyRead] alone.
+	// Setting either flag never touches initial or failoverCooldown, so
+	// [NewStickyRead] keeps its legacy behavior exactly: an invalid call
+	// is a no-op, and a valid call at any other position still takes effect.
+	invalidPreferredCluster bool
+	invalidCooldown         bool
 
 	route routeReporter
 }
@@ -122,7 +135,12 @@ func otherCluster(cluster types.ClusterID) types.ClusterID {
 // StickyReadOption configures a StickyRead strategy.
 type StickyReadOption func(*StickyRead)
 
-// WithFailoverCooldown sets the cooldown period after a failover.
+// WithStickyReadCooldown sets the cooldown period after a failover.
+//
+// A negative value is ignored by [NewStickyRead], leaving failoverCooldown
+// at whatever it already was — the default, or an earlier valid call's
+// value.
+// Use [NewStickyReadChecked] to reject a negative value instead.
 //
 // Parameters:
 //   - d: Duration to wait before allowing another failover
@@ -132,6 +150,8 @@ type StickyReadOption func(*StickyRead)
 func WithStickyReadCooldown(d time.Duration) StickyReadOption {
 	return func(s *StickyRead) {
 		if d < 0 {
+			s.invalidCooldown = true
+
 			return
 		}
 		s.failoverCooldown = d
@@ -139,6 +159,11 @@ func WithStickyReadCooldown(d time.Duration) StickyReadOption {
 }
 
 // WithPreferredCluster sets the initial preferred cluster.
+//
+// An unknown cluster is ignored by [NewStickyRead], leaving initial at
+// whatever it already was — the random draw, or an earlier valid call's
+// cluster.
+// Use [NewStickyReadChecked] to reject an unknown cluster instead.
 //
 // Parameters:
 //   - cluster: The cluster to prefer initially
@@ -148,6 +173,8 @@ func WithStickyReadCooldown(d time.Duration) StickyReadOption {
 func WithPreferredCluster(cluster types.ClusterID) StickyReadOption {
 	return func(s *StickyRead) {
 		if !isKnownCluster(cluster) {
+			s.invalidPreferredCluster = true
+
 			return
 		}
 		s.initial = cluster
@@ -158,33 +185,94 @@ func WithPreferredCluster(cluster types.ClusterID) StickyReadOption {
 //
 // By default, the preferred cluster is randomly selected (50/50 between A and B)
 // and the failover cooldown is 5 minutes.
+// An unknown [WithPreferredCluster] cluster or a negative
+// [WithStickyReadCooldown] is ignored: that call is a no-op, leaving
+// whichever value already applies — the default, or an earlier valid call's
+// value — in place, and a valid call at any other position still applies.
 //
 // Parameters:
 //   - opts: Optional configuration options
 //
 // Returns:
 //   - *StickyRead: A new sticky read strategy
+//
+// For production configuration that should fail fast on invalid option values,
+// use [NewStickyReadChecked].
 func NewStickyRead(opts ...StickyReadOption) *StickyRead {
-	s := &StickyRead{
-		failoverCooldown: 5 * time.Minute,
-	}
-	s.route.preferred = s.Preferred
-
-	// Random initial selection for load distribution
-	// Use crypto/rand for secure randomness
-	n, err := rand.Int(rand.Reader, big.NewInt(2))
-	if err != nil || n.Int64() == 0 {
-		s.initial = types.ClusterA
-	} else {
-		s.initial = types.ClusterB
-	}
-
-	for _, opt := range opts {
-		opt(s)
-	}
+	s := newStickyReadWithDefaults()
+	applyStickyReadOptions(s, opts...)
 	s.preferred.Store(s.initial)
 
 	return s
+}
+
+// NewStickyReadChecked creates a new StickyRead strategy and returns a
+// validation error when any option value is invalid.
+//
+// An unknown [WithPreferredCluster] cluster or a negative
+// [WithStickyReadCooldown] is rejected even if a later call passes a valid
+// value: a configuration that contains an invalid value is a bug, and this
+// constructor exists to fail fast on it rather than silently drop it.
+//
+// Parameters:
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *StickyRead: A new sticky read strategy
+//   - error: Joined [types.OptionError] values when one or more options are invalid
+func NewStickyReadChecked(opts ...StickyReadOption) (*StickyRead, error) {
+	s := newStickyReadWithDefaults()
+	applyStickyReadOptions(s, opts...)
+	if err := validateStickyRead(s); err != nil {
+		return nil, err
+	}
+	s.preferred.Store(s.initial)
+
+	return s, nil
+}
+
+// newStickyReadWithDefaults builds a StickyRead with its random initial
+// cluster and default cooldown already set, before any option runs.
+func newStickyReadWithDefaults() *StickyRead {
+	s := &StickyRead{
+		failoverCooldown: defaultStickyReadCooldown,
+	}
+	s.route.preferred = s.Preferred
+	s.initial = randomCluster()
+
+	return s
+}
+
+// randomCluster picks ClusterA or ClusterB with even odds, using crypto/rand
+// for secure randomness.
+func randomCluster() types.ClusterID {
+	n, err := rand.Int(rand.Reader, big.NewInt(2))
+	if err != nil || n.Int64() == 0 {
+		return types.ClusterA
+	}
+
+	return types.ClusterB
+}
+
+func applyStickyReadOptions(s *StickyRead, opts ...StickyReadOption) {
+	for _, opt := range opts {
+		opt(s)
+	}
+}
+
+// validateStickyRead reports every invalid option value applied to s, even
+// one a later valid call for the same option superseded.
+func validateStickyRead(s *StickyRead) error {
+	errList := make([]error, 0, 2)
+
+	if s.invalidPreferredCluster {
+		errList = append(errList, optionErrUnknownCluster(stickyReadComponent, "WithPreferredCluster"))
+	}
+	if s.invalidCooldown {
+		errList = append(errList, optionErrNonNegativeDuration(stickyReadComponent, "WithStickyReadCooldown"))
+	}
+
+	return joinValidationErrors(errList)
 }
 
 // knownBadSlot returns the known-bad mark of a cluster, or nil for an
@@ -398,6 +486,8 @@ type PrimaryOnlyReadOption func(*PrimaryOnlyRead)
 // ClusterA. If it fails again (OnFailure called), the failover timer resets.
 //
 // A zero or negative value disables auto-recovery (default: disabled).
+// [NewPrimaryOnlyReadChecked] rejects a negative value instead; zero stays
+// valid there too.
 //
 // Parameters:
 //   - d: Recovery timeout duration
@@ -412,19 +502,70 @@ func WithPrimaryOnlyRecoveryTimeout(d time.Duration) PrimaryOnlyReadOption {
 
 // NewPrimaryOnlyRead creates a new PrimaryOnlyRead strategy.
 //
+// A negative [WithPrimaryOnlyRecoveryTimeout] is kept as-is, which disables
+// auto-recovery the same way zero does.
+//
 // Parameters:
 //   - opts: Optional configuration options
 //
 // Returns:
 //   - *PrimaryOnlyRead: A new primary-only read strategy
+//
+// For production configuration that should fail fast on invalid option values,
+// use [NewPrimaryOnlyReadChecked].
 func NewPrimaryOnlyRead(opts ...PrimaryOnlyReadOption) *PrimaryOnlyRead {
+	p := newPrimaryOnlyReadWithDefaults()
+	applyPrimaryOnlyReadOptions(p, opts...)
+
+	return p
+}
+
+// NewPrimaryOnlyReadChecked creates a new PrimaryOnlyRead strategy and
+// returns a validation error when any option value is invalid.
+//
+// A negative [WithPrimaryOnlyRecoveryTimeout] is rejected; zero remains
+// valid and keeps disabling auto-recovery.
+//
+// Parameters:
+//   - opts: Optional configuration options
+//
+// Returns:
+//   - *PrimaryOnlyRead: A new primary-only read strategy
+//   - error: Joined [types.OptionError] values when one or more options are invalid
+func NewPrimaryOnlyReadChecked(opts ...PrimaryOnlyReadOption) (*PrimaryOnlyRead, error) {
+	p := newPrimaryOnlyReadWithDefaults()
+	applyPrimaryOnlyReadOptions(p, opts...)
+	if err := validatePrimaryOnlyRead(p); err != nil {
+		return nil, err
+	}
+
+	return p, nil
+}
+
+// newPrimaryOnlyReadWithDefaults builds a PrimaryOnlyRead with its route
+// reporter wired up, before any option runs.
+func newPrimaryOnlyReadWithDefaults() *PrimaryOnlyRead {
 	p := &PrimaryOnlyRead{}
 	p.route.preferred = p.preferred
+
+	return p
+}
+
+func applyPrimaryOnlyReadOptions(p *PrimaryOnlyRead, opts ...PrimaryOnlyReadOption) {
 	for _, opt := range opts {
 		opt(p)
 	}
+}
 
-	return p
+// validatePrimaryOnlyRead reports every invalid option value applied to p.
+func validatePrimaryOnlyRead(p *PrimaryOnlyRead) error {
+	errList := make([]error, 0, 1)
+
+	if p.recoveryTimeout < 0 {
+		errList = append(errList, optionErrNonNegativeDuration(primaryOnlyReadComponent, "WithPrimaryOnlyRecoveryTimeout"))
+	}
+
+	return joinValidationErrors(errList)
 }
 
 // Select returns ClusterA unless it has failed over.

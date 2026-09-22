@@ -2,10 +2,12 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/arloliu/helix/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -438,4 +440,178 @@ func TestStickyRead_NonPreferredFailure_NoCooldownBypass(t *testing.T) {
 	require.False(t, ok)
 	require.Empty(t, alt)
 	require.Equal(t, types.ClusterA, strategy.Preferred())
+}
+
+func TestStickyReadChecked_ValidOptions(t *testing.T) {
+	strategy, err := NewStickyReadChecked(
+		WithPreferredCluster(types.ClusterB),
+		WithStickyReadCooldown(10*time.Minute),
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, strategy)
+	assert.Equal(t, types.ClusterB, strategy.Preferred())
+	assert.Equal(t, 10*time.Minute, strategy.failoverCooldown)
+}
+
+func TestStickyReadChecked_InvalidPreferredCluster(t *testing.T) {
+	strategy, err := NewStickyReadChecked(WithPreferredCluster(types.ClusterID("C")))
+
+	require.Nil(t, strategy)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, stickyReadComponent, optionErr.Component)
+	assert.Equal(t, "WithPreferredCluster", optionErr.Option)
+}
+
+func TestStickyReadChecked_InvalidCooldown(t *testing.T) {
+	strategy, err := NewStickyReadChecked(WithStickyReadCooldown(-time.Second))
+
+	require.Nil(t, strategy)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, stickyReadComponent, optionErr.Component)
+	assert.Equal(t, "WithStickyReadCooldown", optionErr.Option)
+}
+
+func TestStickyReadChecked_ZeroCooldownStaysValid(t *testing.T) {
+	strategy, err := NewStickyReadChecked(WithStickyReadCooldown(0))
+
+	require.NoError(t, err)
+	require.NotNil(t, strategy)
+	assert.Equal(t, time.Duration(0), strategy.failoverCooldown)
+}
+
+func TestStickyReadChecked_InvalidOptionsReturnJoinedErrors(t *testing.T) {
+	strategy, err := NewStickyReadChecked(
+		WithPreferredCluster(types.ClusterID("C")),
+		WithStickyReadCooldown(-time.Second),
+	)
+
+	require.Nil(t, strategy)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, stickyReadComponent, optionErr.Component)
+
+	assert.Contains(t, err.Error(), "WithPreferredCluster")
+	assert.Contains(t, err.Error(), "WithStickyReadCooldown")
+}
+
+func TestStickyReadChecked_InvalidThenValidPreferredClusterStillErrors(t *testing.T) {
+	strategy, err := NewStickyReadChecked(
+		WithPreferredCluster(types.ClusterID("C")),
+		WithPreferredCluster(types.ClusterA),
+	)
+
+	require.Nil(t, strategy)
+	require.Error(t, err)
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, stickyReadComponent, optionErr.Component)
+	assert.Equal(t, "WithPreferredCluster", optionErr.Option)
+}
+
+func TestStickyReadChecked_InvalidThenValidCooldownStillErrors(t *testing.T) {
+	strategy, err := NewStickyReadChecked(
+		WithStickyReadCooldown(-time.Second),
+		WithStickyReadCooldown(time.Hour),
+	)
+
+	require.Nil(t, strategy)
+	require.Error(t, err)
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, stickyReadComponent, optionErr.Component)
+	assert.Equal(t, "WithStickyReadCooldown", optionErr.Option)
+}
+
+// TestStickyRead_InvalidOptionsPreserveDefaults (above) already pins
+// NewStickyRead's old silent-ignore behavior for these same invalid values.
+
+// TestStickyRead_RepeatedCooldownKeepsFirstValid pins the legacy parity
+// requirement: an invalid WithStickyReadCooldown call must not undo an
+// earlier valid one.
+// This is fully deterministic — no random draw is involved — and is the
+// case that failed before options recorded invalid attempts separately
+// instead of overwriting failoverCooldown outright.
+func TestStickyRead_RepeatedCooldownKeepsFirstValid(t *testing.T) {
+	strategy := NewStickyRead(
+		WithStickyReadCooldown(time.Hour),
+		WithStickyReadCooldown(-time.Second),
+	)
+
+	require.Equal(t, time.Hour, strategy.failoverCooldown,
+		"a later invalid WithStickyReadCooldown call must not undo an earlier valid one")
+}
+
+// TestStickyRead_RepeatedPreferredClusterKeepsFirstValid pins the same
+// legacy parity requirement for WithPreferredCluster.
+// The failure mode this guards against falls back to a fresh random draw
+// rather than a fixed wrong cluster, so the check runs many times: against
+// the old mechanism each iteration only has even odds of matching by luck,
+// while the fixed mechanism is deterministic and passes every time.
+func TestStickyRead_RepeatedPreferredClusterKeepsFirstValid(t *testing.T) {
+	for range 100 {
+		strategy := NewStickyRead(
+			WithPreferredCluster(types.ClusterB),
+			WithPreferredCluster(types.ClusterID("C")),
+		)
+
+		require.Equal(t, types.ClusterB, strategy.Preferred(),
+			"a later invalid WithPreferredCluster call must not undo an earlier valid one")
+	}
+}
+
+func TestPrimaryOnlyReadChecked_ValidOptions(t *testing.T) {
+	strategy, err := NewPrimaryOnlyReadChecked(WithPrimaryOnlyRecoveryTimeout(2 * time.Minute))
+
+	require.NoError(t, err)
+	require.NotNil(t, strategy)
+	assert.Equal(t, 2*time.Minute, strategy.recoveryTimeout)
+}
+
+func TestPrimaryOnlyReadChecked_ZeroRecoveryTimeoutStaysValid(t *testing.T) {
+	strategy, err := NewPrimaryOnlyReadChecked(WithPrimaryOnlyRecoveryTimeout(0))
+
+	require.NoError(t, err)
+	require.NotNil(t, strategy)
+	assert.Equal(t, time.Duration(0), strategy.recoveryTimeout)
+}
+
+func TestPrimaryOnlyReadChecked_InvalidRecoveryTimeout(t *testing.T) {
+	strategy, err := NewPrimaryOnlyReadChecked(WithPrimaryOnlyRecoveryTimeout(-time.Second))
+
+	require.Nil(t, strategy)
+	require.Error(t, err)
+	assert.True(t, types.IsOptionError(err))
+
+	var optionErr *types.OptionError
+	require.True(t, errors.As(err, &optionErr))
+	assert.Equal(t, primaryOnlyReadComponent, optionErr.Component)
+	assert.Equal(t, "WithPrimaryOnlyRecoveryTimeout", optionErr.Option)
+}
+
+// TestPrimaryOnlyRead_NegativeRecoveryTimeoutStaysDisabled pins
+// NewPrimaryOnlyRead's old behavior for a negative recovery timeout: the raw
+// value is kept as-is, and Select gates auto-recovery on recoveryTimeout > 0,
+// so a negative value disables it exactly like zero does.
+func TestPrimaryOnlyRead_NegativeRecoveryTimeoutStaysDisabled(t *testing.T) {
+	strategy := NewPrimaryOnlyRead(WithPrimaryOnlyRecoveryTimeout(-time.Second))
+
+	assert.Equal(t, -time.Second, strategy.recoveryTimeout)
+	_, ok := strategy.OnFailure(types.ClusterA, nil)
+	require.True(t, ok)
+	require.Equal(t, types.ClusterB, strategy.Select(context.Background()),
+		"a negative recovery timeout must disable auto-recovery like zero does")
 }
