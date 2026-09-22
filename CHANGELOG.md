@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`policy.NewStickyReadChecked` and `policy.NewPrimaryOnlyReadChecked`**,
+  error-returning constructors that reject an unknown `WithPreferredCluster` cluster
+  and a negative `WithStickyReadCooldown` or `WithPrimaryOnlyRecoveryTimeout`
+  instead of silently falling back to the legacy default.
 - **A nightly-only e2e tier running one ScyllaDB cluster of two nodes at replication factor 2**
   (`make test-e2e-multinode`), which pins the boundary the single-node tiers cannot express:
   one node failing inside a cluster must not be escalated to a cluster-level failover.

@@ -380,6 +380,23 @@ strategy := policy.NewStickyRead(
 | `WithPreferredCluster` | random | Which cluster to prefer on startup |
 | `WithStickyReadCooldown` | 5m | Minimum time between cluster switches |
 
+**Configuration validation:**
+
+- `NewStickyRead` is the compatibility constructor.
+  An unknown `WithPreferredCluster` cluster is ignored and the random draw stands;
+  a negative `WithStickyReadCooldown` is ignored and the 5-minute default stands.
+- `NewStickyReadChecked` returns `error` (joined `*types.OptionError`) when any option value is invalid.
+
+```go
+strategy, err := policy.NewStickyReadChecked(
+    policy.WithPreferredCluster(helix.ClusterA),
+    policy.WithStickyReadCooldown(10 * time.Minute),
+)
+if err != nil {
+    return fmt.Errorf("configure sticky read: %w", err)
+}
+```
+
 **Cooldown behavior:**
 
 ```
@@ -458,6 +475,22 @@ strategy.Reset()
 | Option | Default | Description |
 |--------|---------|-------------|
 | `WithPrimaryOnlyRecoveryTimeout` | disabled | After this duration in failed-over state, `Select` returns cluster A as a probe |
+
+**Configuration validation:**
+
+- `NewPrimaryOnlyRead` is the compatibility constructor.
+  A negative `WithPrimaryOnlyRecoveryTimeout` is kept as-is, disabling auto-recovery the same way zero does.
+- `NewPrimaryOnlyReadChecked` returns `error` (joined `*types.OptionError`) when any option value is invalid.
+  Zero remains valid and keeps disabling auto-recovery.
+
+```go
+strategy, err := policy.NewPrimaryOnlyReadChecked(
+    policy.WithPrimaryOnlyRecoveryTimeout(2 * time.Minute),
+)
+if err != nil {
+    return fmt.Errorf("configure primary-only read: %w", err)
+}
+```
 
 **Behavior:**
 - All reads go to cluster A
