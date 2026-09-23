@@ -1360,12 +1360,69 @@ func (a *AdaptiveDualWrite) recordTransitionMetrics(state *clusterWriteState, cl
 	state.reportMu.Unlock()
 }
 
-// logWriteDegraded logs a healthy-to-degraded transition. Must be called
-// after the state mutex is released: a caller-supplied logger may block, and
-// no per-cluster lock may be held while it runs. Log lines are diagnostics —
-// their order across concurrent transitions is not guaranteed, unlike the
-// events. The nil check keeps zero-value instances safe, since the logger is
-// only installed by the constructors.
+// writeTransition is one degrade or recover transition,
+// latched under the state mutex by latchLocked and published after it by report.
+// A recover transition carries no strikes and never flaps.
+type writeTransition struct {
+	cluster  types.ClusterID
+	degraded bool
+	reason   string
+	strikes  int
+	seq      uint64
+	flapping bool
+}
+
+// latchLocked stamps t with the cluster's next report sequence and queues its event,
+// followed by the flapping event when t reached the re-degrade backoff cap.
+// Only the transition itself advances the sequence:
+// the flapping event rides on it, so recordTransitionMetrics still sees the transition as the newest one.
+// The caller holds state.mu and has already applied the transition to the state.
+func (a *AdaptiveDualWrite) latchLocked(state *clusterWriteState, t writeTransition) writeTransition {
+	t.seq = state.reportSeq.Add(1)
+	ev := types.ClusterEvent{Kind: types.EventWriteRecovered, Cluster: t.cluster, Reason: t.reason}
+	if t.degraded {
+		ev.Kind, ev.Count = types.EventWriteDegraded, t.strikes
+	}
+	a.events.enqueue(ev)
+	if t.flapping {
+		a.events.enqueue(types.ClusterEvent{
+			Kind:    types.EventWriteFlapping,
+			Cluster: t.cluster,
+			Reason:  "re-degrade backoff cap reached",
+			Count:   int(state.redegrades),
+		})
+	}
+
+	return t
+}
+
+// report writes the metrics and log side effects of a transition latched by latchLocked.
+// Must be called after state.mu is released and before the caller drains the events,
+// for the reasons given on recordTransitionMetrics and logWriteDegraded.
+// It leaves the drain to the caller so that Reset can deliver both clusters' events at once.
+func (a *AdaptiveDualWrite) report(state *clusterWriteState, t writeTransition) {
+	a.recordTransitionMetrics(state, t.cluster, t.degraded, t.seq)
+	if !t.degraded {
+		a.logWriteRecovered(t.cluster, t.reason)
+
+		return
+	}
+	a.logWriteDegraded(t.cluster, t.reason, t.strikes)
+	if t.flapping {
+		if fm, ok := a.metrics.(types.WriteFlappingMetrics); ok {
+			fm.IncWriteFlapping(t.cluster)
+		}
+		a.logger.Warn("adaptive: cluster is flapping between degraded and healthy",
+			"cluster", a.clusterName(t.cluster))
+	}
+}
+
+// logWriteDegraded logs a healthy-to-degraded transition.
+// Must be called after the state mutex is released:
+// a caller-supplied logger may block, and no per-cluster lock may be held while it runs.
+// Log lines are diagnostics —
+// their order across concurrent transitions is not guaranteed, unlike the events.
+// The nil check keeps zero-value instances safe, since the logger is only installed by the constructors.
 func (a *AdaptiveDualWrite) logWriteDegraded(cluster types.ClusterID, reason string, strikes int) {
 	if a.logger == nil {
 		return
@@ -1412,10 +1469,9 @@ func (a *AdaptiveDualWrite) logWriteRecovered(cluster types.ClusterID, reason st
 // Must be called with state.mu unlocked.
 func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 	// Only the transition branch below needs the cluster identity (for the
-	// event and the log line), so it is derived there rather than on every
+	// event and the log line), so t is built there rather than on every
 	// strike.
-	var cluster types.ClusterID
-	var seq uint64
+	var t writeTransition
 
 	state.mu.Lock()
 	state.fastStrikes = 0
@@ -1435,44 +1491,26 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 	// written under mu, so the read is consistent with the store that
 	// follows.
 	justDegraded := false
-	flapping := false
 	if a.strikeThreshold > 0 && state.slowStrikes >= a.strikeThreshold && !state.isDegraded.Load() {
 		state.isDegraded.Store(true)
 		justDegraded = true
-		flapping = a.markDegradedLocked(state, false)
-		cluster = a.stateCluster(state)
-		seq = state.reportSeq.Add(1)
-		a.events.enqueue(types.ClusterEvent{
-			Kind:    types.EventWriteDegraded,
-			Cluster: cluster,
-			Reason:  "slow-strike threshold reached",
-			Count:   strikes,
+		flapping := a.markDegradedLocked(state, false)
+		t = a.latchLocked(state, writeTransition{
+			cluster:  a.stateCluster(state),
+			degraded: true,
+			reason:   "slow-strike threshold reached",
+			strikes:  strikes,
+			flapping: flapping,
 		})
-		if flapping {
-			a.events.enqueue(types.ClusterEvent{
-				Kind:    types.EventWriteFlapping,
-				Cluster: cluster,
-				Reason:  "re-degrade backoff cap reached",
-				Count:   int(state.redegrades),
-			})
-		}
 	}
 	state.mu.Unlock()
 
 	if justDegraded {
-		a.recordTransitionMetrics(state, cluster, true, seq)
-		a.logWriteDegraded(cluster, "slow-strike threshold reached", strikes)
-		if flapping {
-			if fm, ok := a.metrics.(types.WriteFlappingMetrics); ok {
-				fm.IncWriteFlapping(cluster)
-			}
-			a.logger.Warn("adaptive: cluster is flapping between degraded and healthy",
-				"cluster", a.clusterName(cluster))
-		}
-		// Deliver the queued event last, after the log line above, so a
-		// handler that inspects or changes state from inside the callback
-		// cannot observe diagnostics that contradict the final state. Only
-		// reached on a real transition.
+		a.report(state, t)
+		// Deliver the queued event last, after report's log line,
+		// so a handler that inspects or changes state from inside the callback
+		// cannot observe diagnostics that contradict the final state.
+		// Only reached on a real transition.
 		a.events.drain()
 	}
 }
@@ -1492,10 +1530,9 @@ func (a *AdaptiveDualWrite) recordStrike(state *clusterWriteState) {
 // Must be called with state.mu unlocked.
 func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
 	// A healthy cluster returns below without ever needing the cluster
-	// identity, so it is derived only in the recovery branch that publishes
+	// identity, so t is built only in the recovery branch that publishes
 	// the event and the log line.
-	var cluster types.ClusterID
-	var seq uint64
+	var t writeTransition
 
 	state.mu.Lock()
 	state.slowStrikes = 0 // Always clear, regardless of degraded state.
@@ -1521,19 +1558,15 @@ func (a *AdaptiveDualWrite) recordFast(state *clusterWriteState) {
 		state.lastLatency.Store(0)
 		state.recoveredAt = now
 		justRecovered = true
-		cluster = a.stateCluster(state)
-		seq = state.reportSeq.Add(1)
-		a.events.enqueue(types.ClusterEvent{
-			Kind:    types.EventWriteRecovered,
-			Cluster: cluster,
-			Reason:  "fast-strike recovery",
+		t = a.latchLocked(state, writeTransition{
+			cluster: a.stateCluster(state),
+			reason:  "fast-strike recovery",
 		})
 	}
 	state.mu.Unlock()
 
 	if justRecovered {
-		a.recordTransitionMetrics(state, cluster, false, seq)
-		a.logWriteRecovered(cluster, "fast-strike recovery")
+		a.report(state, t)
 		// Same ordering as recordStrike: the event is the last side effect,
 		// and only a real transition reaches here.
 		a.events.drain()
@@ -1570,8 +1603,8 @@ func (a *AdaptiveDualWrite) stateFor(cluster types.ClusterID) *clusterWriteState
 
 // recoverState clears a cluster's degraded state and latch under its mutex
 // and queues the recovery event when this call performs the transition.
-// The caller reports the transition with the returned sequence.
-func (a *AdaptiveDualWrite) recoverState(state *clusterWriteState, cluster types.ClusterID, reason string) (wasDegraded bool, seq uint64) {
+// The caller reports the returned transition.
+func (a *AdaptiveDualWrite) recoverState(state *clusterWriteState, cluster types.ClusterID, reason string) (wasDegraded bool, t writeTransition) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	wasDegraded = state.isDegraded.Load()
@@ -1585,15 +1618,10 @@ func (a *AdaptiveDualWrite) recoverState(state *clusterWriteState, cluster types
 	state.redegrades = 0
 	state.dwell = 0
 	if wasDegraded {
-		seq = state.reportSeq.Add(1)
-		a.events.enqueue(types.ClusterEvent{
-			Kind:    types.EventWriteRecovered,
-			Cluster: cluster,
-			Reason:  reason,
-		})
+		t = a.latchLocked(state, writeTransition{cluster: cluster, reason: reason})
 	}
 
-	return wasDegraded, seq
+	return wasDegraded, t
 }
 
 // Reset clears all health state, returning both clusters to healthy.
@@ -1622,11 +1650,10 @@ func (a *AdaptiveDualWrite) Reset() {
 
 	for _, state := range []*clusterWriteState{&a.stateA, &a.stateB} {
 		cluster := a.stateCluster(state)
-		wasDegraded, seq := a.recoverState(state, cluster, "manual reset")
+		wasDegraded, t := a.recoverState(state, cluster, "manual reset")
 		if wasDegraded {
 			anyRecovered = true
-			a.recordTransitionMetrics(state, cluster, false, seq)
-			a.logWriteRecovered(cluster, "manual reset")
+			a.report(state, t)
 		}
 	}
 
@@ -1684,25 +1711,18 @@ func (a *AdaptiveDualWrite) ForceDegrade(cluster types.ClusterID) {
 		a.markDegradedLocked(state, true)
 	}
 	strikes := int(state.slowStrikes)
-	var seq uint64
+	var t writeTransition
 	if !wasDegraded {
-		seq = state.reportSeq.Add(1)
-		a.events.enqueue(types.ClusterEvent{
-			Kind:    types.EventWriteDegraded,
-			Cluster: cluster,
-			Reason:  "manual",
-			Count:   strikes,
-		})
+		// A manual degrade clears fastStrikes but leaves slowStrikes
+		// intact, so the event and the log line report the live counter
+		// rather than asserting it is zero.
+		t = a.latchLocked(state, writeTransition{cluster: cluster, degraded: true, reason: "manual", strikes: strikes})
 	}
 	state.mu.Unlock()
 
 	switch {
 	case !wasDegraded:
-		// A manual degrade clears fastStrikes but leaves slowStrikes
-		// intact, so the log line reports the live counter rather than
-		// asserting it is zero.
-		a.recordTransitionMetrics(state, cluster, true, seq)
-		a.logWriteDegraded(cluster, "manual", strikes)
+		a.report(state, t)
 		a.events.drain()
 	case !wasLatched:
 		// No transition to report: the cluster was already degraded,
@@ -1732,10 +1752,9 @@ func (a *AdaptiveDualWrite) ForceRecover(cluster types.ClusterID) {
 		return
 	}
 
-	wasDegraded, seq := a.recoverState(state, cluster, "manual")
+	wasDegraded, t := a.recoverState(state, cluster, "manual")
 	if wasDegraded {
-		a.recordTransitionMetrics(state, cluster, false, seq)
-		a.logWriteRecovered(cluster, "manual")
+		a.report(state, t)
 		a.events.drain()
 	}
 }
