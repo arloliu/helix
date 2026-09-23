@@ -788,74 +788,7 @@ func (a *AdaptiveDualWrite) Execute(
 	degradedA := a.stateA.isDegraded.Load()
 	degradedB := a.stateB.isDegraded.Load()
 
-	var wg sync.WaitGroup
-	var latencyA, latencyB time.Duration
-	var errA, errB error
-	// Whether the caller's context was already done when each leg returned;
-	// recorded at leg return, since the context may end while the sibling
-	// leg is still running.
-	var callerDoneA, callerDoneB bool
-
-	if !degradedA && !degradedB {
-		// Both clusters healthy: spawn one goroutine for B and run A inline
-		// on the calling goroutine instead of spawning two goroutines for
-		// this common case. Both writes still execute concurrently.
-		wg.Go(func() {
-			sample := a.startLatency(types.ClusterB)
-			errB = safeWrite(ctx, writeB, "B")
-			latencyB = sample.elapsed()
-			callerDoneB = ctx.Err() != nil
-		})
-
-		sample := a.startLatency(types.ClusterA)
-		errA = safeWrite(ctx, writeA, "A")
-		latencyA = sample.elapsed()
-		callerDoneA = ctx.Err() != nil
-	} else {
-		// Cluster A
-		if !degradedA {
-			wg.Go(func() {
-				sample := a.startLatency(types.ClusterA)
-				errA = safeWrite(ctx, writeA, "A")
-				latencyA = sample.elapsed()
-				callerDoneA = ctx.Err() != nil
-			})
-		} else {
-			errA = a.fireAndForget(types.ClusterA, writeA, &a.stateA, &a.stateB)
-		}
-
-		// Cluster B
-		if !degradedB {
-			wg.Go(func() {
-				sample := a.startLatency(types.ClusterB)
-				errB = safeWrite(ctx, writeB, "B")
-				latencyB = sample.elapsed()
-				callerDoneB = ctx.Err() != nil
-			})
-		} else {
-			errB = a.fireAndForget(types.ClusterB, writeB, &a.stateB, &a.stateA)
-		}
-	}
-
-	// Wait for healthy clusters to complete
-	wg.Wait()
-
-	// Assign results after all goroutines complete (no race)
-	resultA = errA
-	resultB = errB
-
-	// Store latencies for healthy clusters (used for delta-based recovery)
-	if errA == nil {
-		a.stateA.lastLatency.Store(latencyA.Nanoseconds())
-	}
-	if errB == nil {
-		a.stateB.lastLatency.Store(latencyB.Nanoseconds())
-	}
-
-	// Update health state based on results
-	a.updateHealthState(latencyA, latencyB, resultA, resultB, callerDoneA, callerDoneB)
-
-	return resultA, resultB
+	return a.dispatchWrite(ctx, writeA, writeB, degradedA, degradedB, a.fireAndForget)
 }
 
 // deferredWriteError is the result of a fire-and-forget leg: it matches
@@ -898,6 +831,102 @@ func (d *deferredWriteError) complete(err error) {
 	if fn != nil {
 		fn(err)
 	}
+}
+
+// dispatchWrite runs writeA and writeB concurrently against clusters that
+// are not degraded, routing a degraded cluster's leg through degradedLeg
+// instead of a normal blocking write.
+// Health state is updated from the results before returning,
+// so degradedLeg must return an error handleErrors excludes from strike accounting.
+//
+// degradedA and degradedB are the caller's own isDegraded snapshot, taken
+// once before this call, so Execute and ExecuteStrict each dispatch against
+// a single consistent read of cluster health.
+func (a *AdaptiveDualWrite) dispatchWrite(
+	ctx context.Context,
+	writeA, writeB func(context.Context) error,
+	degradedA, degradedB bool,
+	degradedLeg func(cluster types.ClusterID, write func(context.Context) error, self, sibling *clusterWriteState) error,
+) (resultA, resultB error) {
+	var wg sync.WaitGroup
+	var latencyA, latencyB time.Duration
+	var errA, errB error
+	// Whether the caller's context was already done when each leg returned;
+	// recorded at leg return, since the context may end while the sibling
+	// leg is still running.
+	var callerDoneA, callerDoneB bool
+
+	if !degradedA && !degradedB {
+		// Both clusters healthy: spawn one goroutine for B and run A inline
+		// on the calling goroutine instead of spawning two goroutines for
+		// this common case.
+		// Both writes still execute concurrently.
+		wg.Go(func() {
+			sample := a.startLatency(types.ClusterB)
+			errB = safeWrite(ctx, writeB, "B")
+			latencyB = sample.elapsed()
+			callerDoneB = ctx.Err() != nil
+		})
+
+		sample := a.startLatency(types.ClusterA)
+		errA = safeWrite(ctx, writeA, "A")
+		latencyA = sample.elapsed()
+		callerDoneA = ctx.Err() != nil
+	} else {
+		// Cluster A
+		if !degradedA {
+			wg.Go(func() {
+				sample := a.startLatency(types.ClusterA)
+				errA = safeWrite(ctx, writeA, "A")
+				latencyA = sample.elapsed()
+				callerDoneA = ctx.Err() != nil
+			})
+		} else {
+			errA = degradedLeg(types.ClusterA, writeA, &a.stateA, &a.stateB)
+		}
+
+		// Cluster B
+		if !degradedB {
+			wg.Go(func() {
+				sample := a.startLatency(types.ClusterB)
+				errB = safeWrite(ctx, writeB, "B")
+				latencyB = sample.elapsed()
+				callerDoneB = ctx.Err() != nil
+			})
+		} else {
+			errB = degradedLeg(types.ClusterB, writeB, &a.stateB, &a.stateA)
+		}
+	}
+
+	// Wait for healthy clusters to complete
+	wg.Wait()
+
+	// Assign results after all goroutines complete (no race)
+	resultA = errA
+	resultB = errB
+
+	// Store latencies for healthy clusters (used for delta-based recovery)
+	if errA == nil {
+		a.stateA.lastLatency.Store(latencyA.Nanoseconds())
+	}
+	if errB == nil {
+		a.stateB.lastLatency.Store(latencyB.Nanoseconds())
+	}
+
+	// Update health state based on results
+	a.updateHealthState(latencyA, latencyB, resultA, resultB, callerDoneA, callerDoneB)
+
+	return resultA, resultB
+}
+
+// strictDegradedLeg is the degradedLeg callback ExecuteStrict passes to
+// dispatchWrite: a degraded cluster's leg is skipped rather than sent to
+// fireAndForget, matching ExecuteStrict's contract that a caller only
+// observes a leg that actually ran.
+// handleErrors excludes ErrClusterDegraded from strike accounting,
+// so a skipped leg neither strikes the cluster nor counts as a latency sample.
+func strictDegradedLeg(types.ClusterID, func(context.Context) error, *clusterWriteState, *clusterWriteState) error {
+	return types.ErrClusterDegraded
 }
 
 // fireAndForget executes a write in a background goroutine with its own timeout.
@@ -1753,65 +1782,7 @@ func (a *AdaptiveDualWrite) ExecuteStrict(
 		return types.ErrClusterDegraded, types.ErrClusterDegraded
 	}
 
-	var wg sync.WaitGroup
-	var latencyA, latencyB time.Duration
-	var errA, errB error
-	// See Execute: provenance is recorded at leg return.
-	var callerDoneA, callerDoneB bool
-
-	if !degradedA && !degradedB {
-		// Both clusters healthy: spawn one goroutine for B and run A inline
-		// on the calling goroutine instead of spawning two goroutines for
-		// this common case. Both writes still execute concurrently.
-		wg.Go(func() {
-			sample := a.startLatency(types.ClusterB)
-			errB = safeWrite(ctx, writeB, "B")
-			latencyB = sample.elapsed()
-			callerDoneB = ctx.Err() != nil
-		})
-
-		sample := a.startLatency(types.ClusterA)
-		errA = safeWrite(ctx, writeA, "A")
-		latencyA = sample.elapsed()
-		callerDoneA = ctx.Err() != nil
-	} else {
-		if !degradedA {
-			wg.Go(func() {
-				sample := a.startLatency(types.ClusterA)
-				errA = safeWrite(ctx, writeA, "A")
-				latencyA = sample.elapsed()
-				callerDoneA = ctx.Err() != nil
-			})
-		} else {
-			errA = types.ErrClusterDegraded
-		}
-
-		if !degradedB {
-			wg.Go(func() {
-				sample := a.startLatency(types.ClusterB)
-				errB = safeWrite(ctx, writeB, "B")
-				latencyB = sample.elapsed()
-				callerDoneB = ctx.Err() != nil
-			})
-		} else {
-			errB = types.ErrClusterDegraded
-		}
-	}
-
-	wg.Wait()
-
-	if errA == nil {
-		a.stateA.lastLatency.Store(latencyA.Nanoseconds())
-	}
-	if errB == nil {
-		a.stateB.lastLatency.Store(latencyB.Nanoseconds())
-	}
-
-	// Pass ErrClusterDegraded for skipped clusters — handleErrors excludes it
-	// from strike accounting, and updateHealthState treats non-nil as no latency.
-	a.updateHealthState(latencyA, latencyB, errA, errB, callerDoneA, callerDoneB)
-
-	return errA, errB
+	return a.dispatchWrite(ctx, writeA, writeB, degradedA, degradedB, strictDegradedLeg)
 }
 
 // RecordProbeSuccess credits one successful recovery probe against the cluster.
