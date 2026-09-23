@@ -1940,6 +1940,144 @@ func TestAdaptiveDualWrite_ResetDeliversAfterBothClusters(t *testing.T) {
 	}
 }
 
+// transitionLineLogger records the message of every Warn and Info line,
+// the two levels the degrade and recover log lines use.
+type transitionLineLogger struct {
+	recordingLogger
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *transitionLineLogger) Warn(msg string, _ ...any) { l.record(msg) }
+func (l *transitionLineLogger) Info(msg string, _ ...any) { l.record(msg) }
+
+func (l *transitionLineLogger) record(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, msg)
+}
+
+func (l *transitionLineLogger) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.lines)
+}
+
+// deliveryObservation is what a transition event's handler saw when it ran.
+type deliveryObservation struct {
+	kind   types.ClusterEventKind
+	gauge  bool // degraded-state gauge for the event's cluster
+	logged int  // log lines written so far
+}
+
+// sideEffectInspectingEmitter records, for every transition event, the
+// degraded-state gauge and the number of log lines at the moment the event
+// is delivered.
+type sideEffectInspectingEmitter struct {
+	metrics *testutil.TestMetricsCollector
+	logger  *transitionLineLogger
+
+	mu       sync.Mutex
+	observed []deliveryObservation
+}
+
+func (e *sideEffectInspectingEmitter) EmitClusterEvent(ev types.ClusterEvent) {
+	obs := deliveryObservation{
+		kind:   ev.Kind,
+		gauge:  e.metrics.GetWriteDegradedState(ev.Cluster),
+		logged: e.logger.count(),
+	}
+	e.mu.Lock()
+	e.observed = append(e.observed, obs)
+	e.mu.Unlock()
+}
+
+func (e *sideEffectInspectingEmitter) snapshot() []deliveryObservation {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return slices.Clone(e.observed)
+}
+
+// TestAdaptiveDualWrite_EventsDeliveredAfterMetricsAndLog verifies that
+// every transition path delivers its event last:
+// by the time a handler runs, the degraded-state gauge already reports the
+// state the transition moved to, and the transition's log line is already
+// written.
+// A handler that reads the gauge or correlates with the log must never see
+// the state the cluster just left.
+func TestAdaptiveDualWrite_EventsDeliveredAfterMetricsAndLog(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(a *AdaptiveDualWrite)
+		trigger  func(a *AdaptiveDualWrite)
+		wantKind types.ClusterEventKind
+	}{
+		{
+			name:     "slow-strike degrade",
+			trigger:  func(a *AdaptiveDualWrite) { degradeByStrikes(a, types.ClusterA) },
+			wantKind: types.EventWriteDegraded,
+		},
+		{
+			name:  "fast-strike recovery",
+			setup: func(a *AdaptiveDualWrite) { degradeByStrikes(a, types.ClusterA) },
+			trigger: func(a *AdaptiveDualWrite) {
+				a.RecordProbeSuccess(types.ClusterA)
+				a.RecordProbeSuccess(types.ClusterA)
+			},
+			wantKind: types.EventWriteRecovered,
+		},
+		{
+			name:     "manual degrade",
+			trigger:  func(a *AdaptiveDualWrite) { a.ForceDegrade(types.ClusterA) },
+			wantKind: types.EventWriteDegraded,
+		},
+		{
+			name:     "manual recover",
+			setup:    func(a *AdaptiveDualWrite) { a.ForceDegrade(types.ClusterA) },
+			trigger:  func(a *AdaptiveDualWrite) { a.ForceRecover(types.ClusterA) },
+			wantKind: types.EventWriteRecovered,
+		},
+		{
+			name:     "reset",
+			setup:    func(a *AdaptiveDualWrite) { a.ForceDegrade(types.ClusterA) },
+			trigger:  func(a *AdaptiveDualWrite) { a.Reset() },
+			wantKind: types.EventWriteRecovered,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := testutil.NewTestMetricsCollector()
+			logger := &transitionLineLogger{}
+			a := NewAdaptiveDualWrite(
+				WithAdaptiveStrikeThreshold(2),
+				WithAdaptiveRecoveryThreshold(2),
+				WithAdaptiveMetrics(m),
+				WithAdaptiveLogger(logger),
+			)
+			if tt.setup != nil {
+				tt.setup(a)
+			}
+			linesBefore := logger.count()
+			em := &sideEffectInspectingEmitter{metrics: m, logger: logger}
+			a.SetEventEmitter(em)
+
+			tt.trigger(a)
+
+			observed := em.snapshot()
+			require.Len(t, observed, 1)
+			obs := observed[0]
+			require.Equal(t, tt.wantKind, obs.kind)
+			require.Equal(t, tt.wantKind == types.EventWriteDegraded, obs.gauge,
+				"event delivered before the degraded-state gauge moved")
+			require.Equal(t, linesBefore+1, obs.logged,
+				"event delivered before the transition's log line was written")
+		})
+	}
+}
+
 // TestAdaptiveDualWrite_TransitionMetricsRecorded verifies that every
 // degrade/recover transition path records the optional
 // types.AdaptiveWriteMetrics gauge and transition counters exactly once
