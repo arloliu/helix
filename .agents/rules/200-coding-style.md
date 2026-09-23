@@ -7,7 +7,7 @@
 - **Context:** Use `context.Context` for request-scoped values/cancellation.
 - **Sync:** Prefer `sync/atomic` for simple counters and flags.
 
-## Error Handling (CRITICAL)
+## Error Handling
 - **Static:** Use `errors.New("message")`.
 - **Wrap:** Use `fmt.Errorf("context: %w", err)`.
 - **Check:** Use `errors.Is()` and `errors.As()`.
@@ -22,7 +22,8 @@
 - **Internal pkgs:** Immediately after type definition.
 - **Public pkgs:** In `_test.go` files to avoid import cycles.
 
-## File Layout (STRICT)
+## File Layout
+The linter does not check this order, so keep to it by hand in new and edited files.
 1. Package declaration
 2. Imports (stdlib, external, internal)
 3. Constants (exported first)
@@ -41,8 +42,6 @@
 - **Naked Returns:** Avoid in functions > 40 lines.
 
 ## Naming
-- **Packages:** Short, lowercase.
-- **Functions/Types:** CamelCase (Exported), camelCase (private).
 - **Receivers:** Short, consistent (e.g., `c` for `CQLClient`, `p` for `policy`).
 
 ## Loop Patterns (Go 1.22+)

@@ -3,7 +3,8 @@
 ## Before Commit
 1. Run `go fix ./...` — Modernize deprecated API usage before anything else.
 2. Run `make lint` — Fix all issues.
-3. Run `make test` — All unit tests must pass with race detector.
+3. Run `make test-unit` — unit tests must pass with the race detector.
+   `make test` also runs the integration suite, which needs Docker.
 4. If replay message types changed, run `make generate` and commit generated files.
 5. Verify docs are updated if API changed.
 
@@ -34,7 +35,7 @@
 
 ## Code Review Checklist
 - [ ] Correctness
-- [ ] Dual-write error semantics preserved (nil if ≥1 cluster succeeds)
+- [ ] Dual-write error semantics preserved (nil if ≥1 cluster acknowledged synchronously; see 100-overview.md)
 - [ ] Performance (no unnecessary allocs in hot paths)
 - [ ] Test coverage for new code
 - [ ] Docs updated for exported API changes

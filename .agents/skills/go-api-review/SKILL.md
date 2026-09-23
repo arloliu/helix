@@ -35,7 +35,7 @@ When reviewing specific packages, specify them by name. The reviewable packages 
 
 3. **Error and Context Handling:**
     * Are **`context.Context`** and standard **`error`** returns implemented idiomatically?
-    * Are the dual-write error semantics clearly documented: nil if ≥1 cluster succeeds; `*types.DualClusterError` if both fail?
+    * Are the dual-write error semantics clearly documented: nil if ≥1 cluster acknowledged synchronously; `*types.NoSynchronousAckError` if none did; `*types.DualClusterError` if both fail?
     * Can users reliably use `errors.Is()` with sentinel errors and `errors.As()` with `*types.DualClusterError` / `*types.ClusterError`?
     * Are all sentinel errors in `types/` comprehensive enough to cover common failure modes?
 
@@ -44,7 +44,7 @@ When reviewing specific packages, specify them by name. The reviewable packages 
 1. **Clarity and Purpose:**
     * Does the **package-level Godoc** (`doc.go`) clearly state the package's purpose and value proposition?
     * Are there any exported functions, types, or fields that lack a clear, helpful top-level Godoc comment?
-    * Does the root package doc explain the dual-write error model (nil vs. `DualClusterError`)?
+    * Does the root package doc explain the dual-write error model (nil vs. `NoSynchronousAckError` vs. `DualClusterError`)?
 
 2. **Examples and Learning Curve:**
     * Does the **README** contain a clear, working code example for the most common use case (CQL dual-write)?

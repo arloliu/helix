@@ -19,7 +19,7 @@
 - **[200-coding-style.md](200-coding-style.md)**
   *Go idioms, error handling, file layout, naming, loop patterns.*
 - **[300-testing.md](300-testing.md)**
-  *Unit/integration/simulation organization, **CRITICAL** async testing rules, make targets.*
+  *Unit/integration/simulation organization, async testing rules, make targets.*
 - **[400-documentation.md](400-documentation.md)**
   *Mandatory Godoc format with Helix-specific examples.*
 

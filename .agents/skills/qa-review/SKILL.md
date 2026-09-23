@@ -35,7 +35,7 @@ When reviewing specific packages, specify them by name. Default scope for Helix:
 ## 2. Fault Tolerance and Error Handling
 
 1. **Dual-Write Error Semantics:**
-    * Verify the documented contract: `nil` returned if ≥1 cluster succeeds; `*types.DualClusterError` if both fail.
+    * Verify the documented contract: `nil` if ≥1 cluster acknowledged synchronously; `*types.NoSynchronousAckError` if none did (unless `WithAckMode(AckOnReplayAdmission)`); `*types.DualClusterError` if both fail.
     * Are partial failures reliably enqueued for replay? What happens if the replay queue is full (`ErrReplayQueueFull`)?
     * Does `AdaptiveDualWrite` correctly document `ErrWriteAsync` and `ErrWriteDropped` return conditions?
 

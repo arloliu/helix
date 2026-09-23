@@ -27,7 +27,7 @@
 - ❌ **NEVER** use `assert.Eventually`, or its `f`/`WithT`/`WithTf` spellings, anywhere.
   A soft-failing wait lets the rest of the test run against state it has just failed to establish.
   `forbidigo` enforces all four; there is no case for them, inside the exception below or out.
-- ✅ **ALWAYS** use event-driven collectors that:
+- ✅ Use event-driven collectors (the one exception is below) that:
     1. Subscribe BEFORE triggering action.
     2. Collect all state transitions.
     3. Assert on complete history.

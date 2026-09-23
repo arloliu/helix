@@ -8,10 +8,7 @@ Apply these in **hot paths** (dual-write execution, replay enqueueing, per-query
     - Pre-allocate maps: `make(map[K]V, expectedSize)`
     - Avoid `append` in tight loops if size is predictable.
 - **Dual-Write Concurrency:** Both cluster writes run concurrently via goroutines. Keep per-write allocations minimal to avoid GC pressure under high throughput.
-- **Inlining:** Keep hot functions small and simple.
-- **Pointers:** Pass small structs by value. Use pointers only when mutation is needed.
-- **Interfaces:** Avoid in critical paths (indirect calls have overhead).
-- **Profiling:** Use `pprof` to find bottlenecks before optimizing.
+- **Measure first:** Profile with `pprof` or benchmark before and after any change made for speed (see 050-principles.md).
 - **Concurrency:** Use `sync/atomic` for simple flags/counters. Use `sync.Mutex` for complex state.
 - **Replay Queue:** The in-memory replay queue is bounded — do not grow it unboundedly. Check `ErrReplayQueueFull` handling.
 

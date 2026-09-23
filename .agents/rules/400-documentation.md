@@ -5,7 +5,7 @@
 - **First Line:** Start with the symbol name. One-line summary.
 - **README:** Keep updated with install/usage.
 
-## Godoc Template (MANDATORY)
+## Godoc Template
 
 ```go
 // FunctionName one-line summary.
@@ -48,11 +48,12 @@ func NewCQLClient(sessionA, sessionB CQLSession, opts ...Option) (*CQLClient, er
 ```go
 // Exec executes the query against both clusters concurrently.
 //
-// Returns nil if at least one cluster succeeds. Partial failures
-// are automatically enqueued for replay if a Replayer is configured.
+// Returns nil if at least one cluster acknowledged the write synchronously.
+// Failed legs are enqueued for replay if a Replayer is configured.
 //
 // Returns:
-//   - error: nil on partial or full success; *types.DualClusterError if both clusters fail
+//   - error: nil if at least one cluster acknowledged synchronously;
+//     *types.NoSynchronousAckError if none did; *types.DualClusterError if both clusters fail
 func (q *Query) Exec() error { }
 ```
 

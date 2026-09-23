@@ -55,7 +55,7 @@ helix/                        # Root = main public package (CQLClient, options)
 - **Code generation:** `replay/` uses `msgp` for MessagePack serialization. Run `make generate` after changing generated types.
 
 ## Prime Directives
-1. **Plan First:** Create/update `implementation_plan.md` before architectural changes. Wait for approval.
+1. **Plan First:** Before architectural changes, present the plan and wait for approval.
 2. **Small Diffs:** Break work into small, verifiable chunks. Do not rewrite files unnecessarily.
 3. **Dependencies:** Check `go.mod`. Prefer stdlib. Ask before adding new deps.
     - **Blocked dependencies** (enforced by linter):
