@@ -354,7 +354,7 @@ func TestRecoveryProbe_DefaultProbeAutoCreated(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
-	assert.NotNil(t, client.recoveryProbeCtx, "probe context must be non-nil for AdaptiveDualWrite")
+	assert.NotNil(t, client.recoveryProbe.ctx, "probe context must be non-nil for AdaptiveDualWrite")
 }
 
 // TestRecoveryProbe_CloseWaitsForGoroutines verifies that Close() completes
@@ -420,7 +420,7 @@ func TestRecoveryProbe_ZeroValueUsesDefaults(t *testing.T) {
 	t.Cleanup(func() { client.Close() })
 
 	// Probe context must be non-nil, meaning goroutines started without panicking.
-	require.NotNil(t, client.recoveryProbeCtx, "probe goroutines must start for AdaptiveDualWrite")
+	require.NotNil(t, client.recoveryProbe.ctx, "probe goroutines must start for AdaptiveDualWrite")
 }
 
 // TestRecoveryProbe_NegativeIntervalRejected verifies that a negative

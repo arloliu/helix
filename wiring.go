@@ -537,25 +537,19 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		return client, err
 	}
 
-	// Start topology watcher if configured. The cancel function is stashed so
-	// that it is called on any subsequent initialization error, preventing the
-	// watchTopology goroutine from leaking.
+	// Start topology watcher if configured. It is stopped on any subsequent
+	// initialization error, preventing the watchTopology goroutine from
+	// leaking.
 	if config.TopologyWatcher != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		client.topologyCtx = ctx
-		client.topologyClose = cancel
-		client.topologyWG.Go(client.watchTopology)
+		client.topology.start(client.watchTopology)
 	}
 
 	// Start replay worker if configured. On failure, clean up the topology
 	// watcher and any mirror components setupMirror already started above,
-	// following the same shutdown order as Close: topology watcher, then
-	// mirror engine, then mirror replay worker.
+	// in Close's order.
 	if config.ReplayWorker != nil {
 		if err := client.startReplayWorker(); err != nil {
-			if client.topologyClose != nil {
-				client.topologyClose()
-			}
+			client.topology.stop()
 			client.stopMirrorComponents()
 			client.abortEventDispatcher()
 
@@ -574,10 +568,7 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 	// registered. Without a refresher the detector cannot do anything
 	// useful, so we skip the goroutine entirely.
 	if config.AutoRefresh.Enabled && config.SessionRefresher != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		client.autoRefreshCtx = ctx
-		client.autoRefreshClose = cancel
-		client.autoRefreshWG.Go(client.autoRefreshLoop)
+		client.autoRefresh.start(client.autoRefreshLoop)
 	}
 
 	// Start background recovery probe goroutines when AdaptiveDualWrite is

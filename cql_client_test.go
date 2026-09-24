@@ -391,7 +391,7 @@ func (w *mockTopologyWatcher) SetDrain(cluster ClusterID, drain bool) {
 // neverClosingTopologyWatcher reproduces a misbehaving/custom TopologyWatcher
 // whose Watch ignores ctx cancellation and never closes its returned
 // channel. Used to regression-test that watchTopology's goroutine still
-// exits via topologyCtx.Done() rather than blocking forever on `for range`.
+// exits via topology.ctx.Done() rather than blocking forever on `for range`.
 type neverClosingTopologyWatcher struct {
 	updates chan TopologyUpdate
 }
@@ -430,7 +430,7 @@ func (w *nilChanTopologyWatcher) Watch(_ context.Context) <-chan TopologyUpdate 
 // closes the channel directly, independent of ctx cancellation. Used to
 // prove watchTopology's `case update, ok := <-updates` drain path applies a
 // final buffered update before returning on channel closure alone — as
-// opposed to via topologyCtx.Done() (covered separately).
+// opposed to via topology.ctx.Done() (covered separately).
 type finalUpdateThenCloseWatcher struct {
 	updates chan TopologyUpdate
 }
@@ -455,9 +455,9 @@ func watchTopologyGoroutineRunning() bool {
 
 // TestWatchTopology_MisbehavingWatcherGoroutineExitsOnClose is a regression
 // test for cql_client.go:713 (nil-safety finding): watchTopology previously
-// had no select on topologyCtx.Done(), so a TopologyWatcher that ignores ctx
+// had no select on topology.ctx.Done(), so a TopologyWatcher that ignores ctx
 // cancellation and never closes its channel would leak the goroutine forever
-// and make Close()'s cancellation of topologyCtx a no-op for it.
+// and make Close()'s cancellation of topology.ctx a no-op for it.
 func TestWatchTopology_MisbehavingWatcherGoroutineExitsOnClose(t *testing.T) {
 	sessionA := newMockSession()
 	sessionB := newMockSession()
@@ -508,10 +508,10 @@ func TestWatchTopology_NilChannelReturnsImmediately(t *testing.T) {
 // TestWatchTopology_FinalBufferedUpdateAppliedBeforeCloseReturn verifies the
 // select's `case update, ok := <-updates` drain path: when a well-behaved
 // watcher sends a final update and then closes its channel — WITHOUT the
-// client's topologyCtx ever being cancelled — watchTopology must still
+// client's topology.ctx ever being cancelled — watchTopology must still
 // receive and apply that buffered update before it observes ok == false and
 // returns, exactly like a plain (unselected) `for update := range updates`
-// would. Only client.Close() (in t.Cleanup) cancels topologyCtx, and it runs
+// would. Only client.Close() (in t.Cleanup) cancels topology.ctx, and it runs
 // after both assertions below.
 func TestWatchTopology_FinalBufferedUpdateAppliedBeforeCloseReturn(t *testing.T) {
 	sessionA := newMockSession()

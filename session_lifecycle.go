@@ -24,7 +24,7 @@ func (c *CQLClient) autoRefreshLoop() {
 
 	for {
 		select {
-		case <-c.autoRefreshCtx.Done():
+		case <-c.autoRefresh.ctx.Done():
 			return
 		case <-t.C:
 			c.maybeAutoRefresh(ClusterA)
@@ -107,7 +107,7 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 		"secondsSinceLastSuccess", (now-s.lastSuccessNanos.Load())/int64(time.Second),
 	)
 
-	ctx, cancel := context.WithTimeout(c.autoRefreshCtx, cfg.RefreshTimeout)
+	ctx, cancel := context.WithTimeout(c.autoRefresh.ctx, cfg.RefreshTimeout)
 	defer cancel()
 
 	slot, err := c.sessionSlot(cluster)
@@ -149,11 +149,11 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 // watchTopology monitors topology updates and updates drain state.
 //
 // Cancellation does not rely solely on the configured [TopologyWatcher]
-// closing its update channel when topologyCtx is cancelled — a nil channel,
+// closing its update channel when c.topology.ctx is cancelled — a nil channel,
 // or a custom/misbehaving TopologyWatcher that never closes it, would
 // otherwise block this goroutine forever and defeat [CQLClient.Close]'s
-// cancellation of topologyCtx. The select loop below (mirroring
-// autoRefreshLoop) gives topologyCtx.Done() an independent exit path.
+// cancellation of that context. The select loop below (mirroring
+// autoRefreshLoop) gives c.topology.ctx.Done() an independent exit path.
 //
 // An update channel that closes while the client is still open
 // (the caller closed the watcher, or its watch loop exited)
@@ -164,18 +164,18 @@ func (c *CQLClient) maybeAutoRefresh(cluster ClusterID) {
 // The flags are deliberately not reset — the cluster may well still be draining —
 // so the exit is logged with the state each cluster is frozen at.
 func (c *CQLClient) watchTopology() {
-	updates := c.config.TopologyWatcher.Watch(c.topologyCtx)
+	updates := c.config.TopologyWatcher.Watch(c.topology.ctx)
 	if updates == nil {
 		return
 	}
 
 	for {
 		select {
-		case <-c.topologyCtx.Done():
+		case <-c.topology.ctx.Done():
 			return
 		case update, ok := <-updates:
 			if !ok {
-				if c.topologyCtx.Err() == nil {
+				if c.topology.ctx.Err() == nil {
 					c.warnTopologyStopped()
 				}
 
@@ -332,45 +332,45 @@ func (c *CQLClient) Close() {
 	}
 	defer close(c.closeDone)
 
-	// Stop the topology watcher and the auto-refresh detector, then
-	// wait for both goroutines so nothing of theirs runs after Close returns.
+	// Shutdown follows dependencies between components, not the reverse of
+	// construction order:
+	//  1. Topology watcher and auto-refresh detector.
+	//     They only feed drain state and replacement sessions into the client,
+	//     so stopping them first freezes both for the rest of shutdown.
+	//  2. Deferred legs.
+	//     A write still in progress hands its failed legs to the replay queue,
+	//     so this finishes before the replay worker stops.
+	//  3. Mirror engine, then mirror replay worker.
+	//     The engine produces the failures that worker drains.
+	//     Mirroring and the replay worker do not depend on each other.
+	//  4. Replay worker.
+	//  5. Recovery probe.
+	//     It must stop before the sessions it probes close;
+	//     nothing requires it to run past the replay worker.
+	//  6. Event dispatcher.
+	//     Every step above can emit an event, so it stops after all of them.
+	//  7. Sessions, which every step above may use.
+
 	// A refresh in flight sees its context cancelled and returns;
 	// a refresher that ignores its context delays Close.
-	if c.topologyClose != nil {
-		c.topologyClose()
-	}
-	if c.autoRefreshClose != nil {
-		c.autoRefreshClose()
-	}
-	c.topologyWG.Wait()
-	c.autoRefreshWG.Wait()
+	c.topology.stop()
+	c.autoRefresh.stop()
+	c.topology.wait()
+	c.autoRefresh.wait()
 
-	// Wait for replaying writes in progress and for background legs whose
-	// failure would be enqueued for replay, so nothing is enqueued after
-	// the worker stops.
 	c.deferred.wait()
 
-	// Stop the mirror engine first so it stops generating new failure
-	// captures, then drain any failures that landed in the mirror
-	// replayer through its worker.
 	c.stopMirrorComponents()
 
-	// Stop replay worker
 	if c.config.ReplayWorker != nil {
 		c.config.ReplayWorker.Stop()
 	}
 
-	// Cancel recovery probe goroutines and wait for them to exit before
-	// closing sessions so a probe in flight cannot race against a closed session.
-	if c.recoveryProbeClose != nil {
-		c.recoveryProbeClose()
-		c.recoveryProbeWG.Wait()
-	}
+	c.recoveryProbe.stop()
+	c.recoveryProbe.wait()
 
-	// Stop the event dispatcher: intake halts, buffered events drain to
-	// the handler, and the in-flight handler invocation is awaited. The
-	// topology and auto-refresh goroutines were joined above, so every
-	// event of theirs is already buffered.
+	// Intake halts, buffered events drain to the handler,
+	// and the in-flight handler invocation is awaited.
 	c.runtime.events.stop()
 
 	c.retired.closeAll()

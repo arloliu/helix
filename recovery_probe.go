@@ -34,12 +34,10 @@ func (c *CQLClient) startRecoveryProbes() {
 		def := DefaultRecoveryProbe()
 		p = &def
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	c.recoveryProbeCtx = ctx
-	c.recoveryProbeClose = cancel
-	for _, cluster := range []ClusterID{ClusterA, ClusterB} {
-		c.recoveryProbeWG.Go(func() { c.recoveryProbeLoop(cluster, pr, fp, p) })
-	}
+	c.recoveryProbe.start(
+		func() { c.recoveryProbeLoop(ClusterA, pr, fp, p) },
+		func() { c.recoveryProbeLoop(ClusterB, pr, fp, p) },
+	)
 }
 
 // probeReporters resolves the two authorities a recovery probe can serve:
@@ -71,7 +69,7 @@ type probeDemand struct {
 // failure and no health observation is recorded.
 // So is a probe whose session SwapSession or RefreshSession retired while it ran:
 // its outcome describes the old session, not the one now installed.
-// The loop exits when recoveryProbeCtx is cancelled (i.e. on Close).
+// The loop exits when c.recoveryProbe.ctx is cancelled (i.e. on Close).
 func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp FailoverProbeReporter, p *RecoveryProbe) {
 	// Metrics is immutable after construction, so resolve the optional
 	// interface once. rpm is nil for collectors that do not opt in.
@@ -86,7 +84,7 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp Fa
 	defer ticker.Stop()
 	for {
 		select {
-		case <-c.recoveryProbeCtx.Done():
+		case <-c.recoveryProbe.ctx.Done():
 			return
 		case <-ticker.C:
 		}
@@ -102,7 +100,7 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp Fa
 		}
 
 		holder := c.holderFor(cluster)
-		ctx, cancel := context.WithTimeout(c.recoveryProbeCtx, p.Timeout)
+		ctx, cancel := context.WithTimeout(c.recoveryProbe.ctx, p.Timeout)
 		started := time.Now()
 		err := safeProbe(ctx, p.Probe, holder.s)
 		// Classify before cancel, which would make every error look like
@@ -112,8 +110,8 @@ func (c *CQLClient) recoveryProbeLoop(cluster ClusterID, pr ProbeReporter, fp Fa
 		// a nil after ctx.Done proves nothing about the cluster.
 		// So is a probe whose holder was retired meanwhile:
 		// its error may be the old session's own teardown, and its success says nothing about the installed session.
-		abandoned := c.recoveryProbeCtx.Err() != nil || holder.retired.Load()
-		err = clusterTimeoutIfExpired(ctx, c.recoveryProbeCtx, err)
+		abandoned := c.recoveryProbe.ctx.Err() != nil || holder.retired.Load()
+		err = clusterTimeoutIfExpired(ctx, c.recoveryProbe.ctx, err)
 		cancel()
 		if abandoned {
 			// Not a health observation for anyone, and the breaker gets
