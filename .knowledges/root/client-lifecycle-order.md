@@ -4,14 +4,14 @@ title: Client lifecycle order
 description: What fixes the position of each background component in NewCQLClient's start sequence, in a failed constructor's unwind, and in Close.
 tags: [root, lifecycle, close, shutdown, events, replay, mirror, recovery-probe]
 status: draft
-generated: {by: "claude/opus-5.5", at: 2026-09-24T00:00:00Z}
+generated: {by: "claude/opus-5.5", at: 2026-09-24T12:00:00Z}
 sources:
-  - {resource: wiring.go, digest: sha256:eee09befefa485a1, revision: 6dc89cf}
-  - {resource: session_lifecycle.go, digest: sha256:d4c019cea9db4a23, revision: 6dc89cf}
-  - {resource: background_loop.go, digest: sha256:8a2019a45f53ba18, revision: 6dc89cf}
-  - {resource: recovery_probe.go, digest: sha256:8f5abaeb20268c68, revision: 6dc89cf}
-  - {resource: mirror_dispatch.go, digest: sha256:2cfa64f1379d0b49, revision: 6dc89cf}
-  - {resource: cql_client.go, digest: sha256:a5f7a894a7a06b54, revision: 6dc89cf}
+  - {resource: wiring.go, digest: sha256:56554ceeda09d27e, revision: 3b38f02}
+  - {resource: session_lifecycle.go, digest: sha256:d4c019cea9db4a23, revision: 3b38f02}
+  - {resource: background_loop.go, digest: sha256:8a2019a45f53ba18, revision: 3b38f02}
+  - {resource: recovery_probe.go, digest: sha256:8f5abaeb20268c68, revision: 3b38f02}
+  - {resource: mirror_dispatch.go, digest: sha256:2cfa64f1379d0b49, revision: 3b38f02}
+  - {resource: cql_client.go, digest: sha256:a5f7a894a7a06b54, revision: 3b38f02}
 ---
 
 # What it does
@@ -67,8 +67,9 @@ The loops read `backgroundLoop.ctx` directly rather than taking it as a paramete
 
 # Failure modes
 
-- A `startReplayWorker` failure calls `topology.stop` but not `topology.wait`.
-  `buildCQLClient` can therefore return while `watchTopology` is still exiting.
+- A `startReplayWorker` failure joins the topology watcher before `buildCQLClient` returns.
+  A `TopologyWatcher.Watch` call that never returns therefore blocks a failed constructor,
+  as it already blocks `Close`.
 - A `setupMirror` failure aborts only the dispatcher;
   `setupMirrorTargetMode` stops its own engine when the mirror replay worker fails to start.
 - A custom `RecoveryProbe.Probe` or `SessionRefresher` that ignores its context blocks `Close` at the first join,

@@ -24,3 +24,4 @@
 
 ## 2026-09-24
 * **Creation**: [Client lifecycle order](/root/client-lifecycle-order.md) records the start sequence, the constructor error unwind, and how both relate to the shutdown order Close documents.
+* **Update**: [Client lifecycle order](/root/client-lifecycle-order.md) a replay worker start failure now joins the topology watcher instead of only cancelling it.
