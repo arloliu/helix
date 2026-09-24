@@ -8,6 +8,8 @@ mirror mode conflicts also wrap the relevant sentinel error such as `types.ErrMi
 This page lists every option the root `helix` package accepts.
 Options belonging to `policy/`, `replay/`, `topology/`, `mirror/`, and `contrib/metrics/vm` are documented in their own guides,
 linked from the rows that take them.
+Several `policy` and `replay` constructors offer a `NewXxxChecked` sibling that rejects invalid option values instead of silently defaulting them
+— see the [Migration Guide](option-validation-migration.md).
 
 A read strategy, write strategy, failover policy, replay worker or topology watcher instance serves exactly one client for that client's lifetime.
 `NewCQLClient` installs its own event dispatcher, cluster names, metrics and logger into the strategies and policies that accept them, each as a single slot, so a second client sharing an instance takes them over and the first client's events and names go to the second.
