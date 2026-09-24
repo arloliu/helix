@@ -1,8 +1,6 @@
 package helix
 
 import (
-	"context"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -94,11 +92,10 @@ type CQLClient struct {
 	runtime clientRuntime
 
 	// Drain mode state
-	drainA        atomic.Bool
-	drainB        atomic.Bool
-	topologyCtx   context.Context
-	topologyClose context.CancelFunc
-	topologyWG    sync.WaitGroup // joins watchTopology on Close
+	drainA atomic.Bool
+	drainB atomic.Bool
+	// topology runs watchTopology when a TopologyWatcher is configured.
+	topology backgroundLoop
 
 	// routeVeto is the failover policy's route veto when WithRouteVeto is
 	// enabled and the policy implements RouteVeto; nil otherwise.
@@ -130,23 +127,15 @@ type CQLClient struct {
 	lastRefreshA atomic.Int64
 	lastRefreshB atomic.Int64
 
-	// autoRefreshCtx / autoRefreshClose control the auto-refresh
-	// background goroutine's lifetime. Nil if WithAutoRefresh was not
-	// configured (or if no SessionRefresher was registered, since the
+	// autoRefresh runs autoRefreshLoop. Never started if WithAutoRefresh was
+	// not configured (or if no SessionRefresher was registered, since the
 	// detector cannot do anything useful without a refresher).
-	autoRefreshCtx   context.Context
-	autoRefreshClose context.CancelFunc
-	autoRefreshWG    sync.WaitGroup // joins autoRefreshLoop on Close
+	autoRefresh backgroundLoop
 
-	// recoveryProbeCtx / recoveryProbeClose / recoveryProbeWG control the
-	// lifecycle of the background recovery probe goroutines (one per cluster).
-	// Nil if no probe is running (strategy is not AdaptiveDualWrite, probe
-	// is disabled, or client is in single-cluster mode).
-	// Close() cancels the probe context and waits for all goroutines to exit
-	// before closing sessions so a probe cannot race against a closed session.
-	recoveryProbeCtx   context.Context
-	recoveryProbeClose context.CancelFunc
-	recoveryProbeWG    sync.WaitGroup
+	// recoveryProbe runs one recoveryProbeLoop per cluster.
+	// Never started when no authority can use a probe, the probe is
+	// disabled, or the client is in single-cluster mode.
+	recoveryProbe backgroundLoop
 }
 
 // degradedWriteReporter is the write strategy's view of per-cluster

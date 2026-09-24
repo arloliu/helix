@@ -38,7 +38,7 @@ func AutoRefreshEnabledForTest(c *CQLClient) bool {
 // nil if the detector was not started. Tests use this to assert the
 // goroutine's lifecycle (e.g., that Close cancels it).
 func AutoRefreshCtxForTest(c *CQLClient) context.Context {
-	return c.autoRefreshCtx
+	return c.autoRefresh.ctx
 }
 
 // WithConfigCaptureForTest returns an Option that stashes the *ClientConfig

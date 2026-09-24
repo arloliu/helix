@@ -84,7 +84,7 @@ func (s *degradedDeferredStrategy) RecordProbeSuccess(ClusterID)      {}
 
 // loopsCancelled reports which background loops Close has cancelled.
 func loopsCancelled(c *CQLClient) (topology, autoRefresh, probe bool) {
-	return c.topologyCtx.Err() != nil, c.autoRefreshCtx.Err() != nil, c.recoveryProbeCtx.Err() != nil
+	return c.topology.ctx.Err() != nil, c.autoRefresh.ctx.Err() != nil, c.recoveryProbe.ctx.Err() != nil
 }
 
 // TestClose_StopsComponentsInOrder pins the order in which Close stops the
