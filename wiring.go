@@ -544,12 +544,13 @@ func buildCQLClient(sessionA, sessionB cql.Session, opts ...Option) (*CQLClient,
 		client.topology.start(client.watchTopology)
 	}
 
-	// Start replay worker if configured. On failure, clean up the topology
-	// watcher and any mirror components setupMirror already started above,
-	// in Close's order.
+	// Start replay worker if configured. On failure, stop and join the
+	// topology watcher and stop any mirror components setupMirror already
+	// started above, in Close's order.
 	if config.ReplayWorker != nil {
 		if err := client.startReplayWorker(); err != nil {
 			client.topology.stop()
+			client.topology.wait()
 			client.stopMirrorComponents()
 			client.abortEventDispatcher()
 

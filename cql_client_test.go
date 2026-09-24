@@ -2164,28 +2164,34 @@ func Example_contextUsage() {
 	_ = err
 }
 
-// TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure verifies that the
-// watchTopology goroutine is stopped when ReplayWorker.Start() fails during
-// initialization — i.e., no goroutine is leaked.
-func TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure(t *testing.T) {
-	sessionA := newMockSession()
-	watcher := newMockTopologyWatcher()
-	workerErr := errors.New("worker already running")
-	worker := newMockReplayWorker(workerErr)
+// slowExitWatcher is a TopologyWatcher whose Watch returns only some time
+// after its context is cancelled, and records when it has.
+type slowExitWatcher struct {
+	exited atomic.Bool
+}
 
-	_, err := NewCQLClient(sessionA, nil,
+func (w *slowExitWatcher) Watch(ctx context.Context) <-chan TopologyUpdate {
+	<-ctx.Done()
+	// Fixture latency: a watcher that is slow to return once cancelled.
+	time.Sleep(50 * time.Millisecond)
+	w.exited.Store(true)
+
+	return nil
+}
+
+// TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure verifies
+// that NewCQLClient, when ReplayWorker.Start fails, cancels the topology
+// watcher and returns only after the watchTopology goroutine has exited.
+func TestNewCQLClient_TopologyWatcherCleanedUpOnWorkerStartFailure(t *testing.T) {
+	watcher := &slowExitWatcher{}
+	workerErr := errors.New("worker already running")
+
+	_, err := NewCQLClient(newMockSession(), nil,
 		WithTopologyWatcher(watcher),
-		WithReplayWorker(worker),
+		WithReplayWorker(newMockReplayWorker(workerErr)),
 	)
 	require.ErrorIs(t, err, workerErr)
-
-	// The topology watcher's Watch goroutine should have been unblocked by the
-	// context cancellation. Give it a moment to propagate.
-	require.Eventually(t, func() bool {
-		watcher.mu.RLock()
-		defer watcher.mu.RUnlock()
-		return watcher.closed
-	}, time.Second, 10*time.Millisecond, "topology watcher context should be canceled on init failure")
+	require.True(t, watcher.exited.Load(), "NewCQLClient must not return while watchTopology is still running")
 }
 
 // TestNewCQLClient_MirrorComponentsStoppedOnReplayWorkerStartFailure verifies
