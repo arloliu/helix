@@ -16,6 +16,7 @@ Driver adaptation belongs to `adapter/cql`; policy decisions belong to `policy`;
 
 * [Replay outcome classification](/root/replay-outcome-classification.md) - how normal dual writes choose a caller result and replay work.
 * [Observation hub](/root/observation-hub.md) - how health observations reach the strategy, policy, and session-liveness stats in one order.
+* [Client lifecycle order](/root/client-lifecycle-order.md) - what fixes each background component's place in construction, a failed constructor's unwind, and Close.
 
 # Entry points
 
