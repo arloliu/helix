@@ -530,6 +530,13 @@ func newMemoryWorkerWithConfig(
 		startupErr: startupErr,
 	}
 
+	// The Worker's HighPriorityRatio/StrictPriority become the single
+	// authority over this replayer's dequeue order, even when it was built
+	// with WithMemoryHighPriorityRatio/WithMemoryStrictPriority.
+	if replayer != nil {
+		replayer.setPriorityConfig(config.HighPriorityRatio, config.StrictPriority)
+	}
+
 	b := &memoryBackend{
 		replayer: replayer,
 		config:   &w.config,

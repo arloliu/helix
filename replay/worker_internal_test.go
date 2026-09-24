@@ -91,6 +91,48 @@ func TestWorkerConfigInvalidValuesAreNormalized(t *testing.T) {
 	assert.Equal(t, 1, worker.config.MaxAttempts)
 }
 
+// TestNewMemoryWorkerOverridesReplayerPriorityConfig pins that a Worker's
+// HighPriorityRatio/StrictPriority become the single authority over a
+// MemoryReplayer's dequeue order, even when the replayer was itself built
+// with a different WithMemoryHighPriorityRatio/WithMemoryStrictPriority.
+func TestNewMemoryWorkerOverridesReplayerPriorityConfig(t *testing.T) {
+	replayer := NewMemoryReplayer(
+		WithQueueCapacity(10),
+		WithMemoryHighPriorityRatio(2),
+		WithMemoryStrictPriority(true),
+	)
+	defer replayer.Close()
+
+	worker := NewMemoryWorker(replayer,
+		func(_ context.Context, _ types.ReplayPayload) error { return nil },
+		WithHighPriorityRatio(7),
+		WithStrictPriority(false),
+	)
+
+	assert.Equal(t, 7, worker.config.HighPriorityRatio)
+	assert.Equal(t, 7, replayer.highPriorityRatio)
+	assert.False(t, replayer.strictPriority)
+}
+
+// TestNewMemoryWorkerDefaultPriorityOverridesReplayerEvenUnset pins that the
+// override in TestNewMemoryWorkerOverridesReplayerPriorityConfig applies even
+// when the caller never sets WithHighPriorityRatio/WithStrictPriority: the
+// Worker's defaults (10, false) still replace the replayer's own settings.
+func TestNewMemoryWorkerDefaultPriorityOverridesReplayerEvenUnset(t *testing.T) {
+	replayer := NewMemoryReplayer(
+		WithQueueCapacity(10),
+		WithMemoryHighPriorityRatio(2),
+		WithMemoryStrictPriority(true),
+	)
+	defer replayer.Close()
+
+	NewMemoryWorker(replayer, func(_ context.Context, _ types.ReplayPayload) error { return nil })
+
+	defaults := DefaultWorkerConfig()
+	assert.Equal(t, defaults.HighPriorityRatio, replayer.highPriorityRatio)
+	assert.Equal(t, defaults.StrictPriority, replayer.strictPriority)
+}
+
 // fakeNilableMetrics satisfies types.MetricsCollector purely by embedding
 // the interface, so a nil *fakeNilableMetrics is a valid (if unusable)
 // value of the interface type. It is never invoked in tests that use it

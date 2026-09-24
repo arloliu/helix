@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of only cancelling it.
   A `TopologyWatcher.Watch` call that never returns now blocks that failed constructor,
   as it already blocks `Close`.
+- **`replay.WithHighPriorityRatio` and `replay.WithStrictPriority` now take effect on `NewMemoryWorker` and `NewMemoryWorkerChecked`,**
+  instead of being silently ignored by the memory backend.
+  They override any `WithMemoryHighPriorityRatio` / `WithMemoryStrictPriority`
+  the wrapped `MemoryReplayer` was itself built with,
+  including when left at their defaults.
 
 ## [1.11.0] — 2026-09-20
 
