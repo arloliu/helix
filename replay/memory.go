@@ -116,6 +116,9 @@ func WithQueueCapacity(n int) MemoryReplayerOption {
 // Set to 0 for equal priority processing (1:1 ratio).
 // Default: 10 (10:1 ratio)
 //
+// When this replayer is driven by [NewMemoryWorker] or [NewMemoryWorkerChecked],
+// the Worker's [WithHighPriorityRatio] overrides this setting.
+//
 // Parameters:
 //   - n: Number of high-priority items to process before 1 low-priority item
 //
@@ -226,6 +229,18 @@ func initializeMemoryReplayerQueues(m *MemoryReplayer) {
 		m.queues[i].low = make(chan types.ReplayPayload, m.capacity)
 	}
 	m.done = make(chan struct{})
+}
+
+// setPriorityConfig overrides the replayer's priority-ratio scheduling.
+// [NewMemoryWorker] and [NewMemoryWorkerChecked] call this once at
+// construction so a Worker's [WithHighPriorityRatio] / [WithStrictPriority]
+// become the single authority over dequeue order, even when this replayer
+// was itself built with [WithMemoryHighPriorityRatio] / [WithMemoryStrictPriority].
+func (m *MemoryReplayer) setPriorityConfig(ratio int, strict bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.highPriorityRatio = ratio
+	m.strictPriority = strict
 }
 
 // clusterOrder maps queue indexes to clusters; clusterIndex and clusterAt

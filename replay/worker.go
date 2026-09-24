@@ -83,15 +83,25 @@ type WorkerConfig struct {
 	//     per scheduling cycle.
 	//
 	// This prevents low-priority starvation while ensuring high-priority
-	// messages are preferred. Set to 0 for equal priority processing (1:1).
+	// messages are preferred.
+	// Set to 0 for equal priority processing (1:1).
 	// Default: 10
+	//
+	// [NewMemoryWorker] and [NewMemoryWorkerChecked] apply this value to the
+	// [MemoryReplayer] they wrap, overriding any [WithMemoryHighPriorityRatio]
+	// the replayer was itself built with.
 	HighPriorityRatio int
 
 	// StrictPriority when true, drains all high-priority messages before processing any
-	// low-priority messages. This provides absolute priority but may cause low-priority
+	// low-priority messages.
+	// This provides absolute priority but may cause low-priority
 	// starvation under continuous high-priority load.
 	// When false (default), uses HighPriorityRatio for fair scheduling.
 	// Default: false
+	//
+	// [NewMemoryWorker] and [NewMemoryWorkerChecked] apply this value to the
+	// [MemoryReplayer] they wrap, overriding any [WithMemoryStrictPriority]
+	// the replayer was itself built with.
 	StrictPriority bool
 
 	// Metrics is the metrics collector for recording replay statistics.
