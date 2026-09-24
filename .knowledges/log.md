@@ -25,3 +25,9 @@
 ## 2026-09-24
 * **Creation**: [Client lifecycle order](/root/client-lifecycle-order.md) records the start sequence, the constructor error unwind, and how both relate to the shutdown order Close documents.
 * **Update**: [Client lifecycle order](/root/client-lifecycle-order.md) a replay worker start failure now joins the topology watcher instead of only cancelling it.
+* **Update**: [Cluster gate](/replay/cluster-gate.md) sources gain digests so the freshness pass sees the entry.
+  A verify pass corrected the bounded requeue path, the `holdWhileGated` timing, how a nil `LatchReporter` reads, and which callers consult a cluster's gate.
+* **Update**: [Circuit breaker probe reservation](/policy/circuit-breaker-probe-reservation.md) sources gain digests, and `policy/latency_circuit_breaker.go` is now cited.
+  A verify pass corrected when a probe is abandoned: a retired session abandons it as well as Close.
+* **Update**: [Observation hub](/root/observation-hub.md) now cites `write_path.go` and the other files its pointers name.
+  A verify pass corrected the dual-write leg's holder and clock, the iterator-close and write-leg recording rules, and added the bounded first page and retired holders.
