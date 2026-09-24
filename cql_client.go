@@ -47,7 +47,7 @@ import (
 // After Close() is called:
 //   - New public operations return [types.ErrSessionClosed]
 //   - Replay worker is stopped (enqueued replays are lost if using MemoryReplayer)
-//   - Topology watcher and auto-refresh detector are stopped
+//   - Topology watcher, auto-refresh detector, and recovery probe are stopped
 //   - The currently installed underlying sessions are closed
 //   - Close waits for replaying dual writes in progress and for background
 //     legs reported through [DeferredWriteResult], so their replay is
