@@ -264,8 +264,10 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // Close marks the client closed, stops background components, and closes the
 // currently installed sessions.
 //
-// The topology watcher, auto-refresh detector, and replay worker are stopped
-// first. After Close is called, the client cannot be reused; new public
+// The topology watcher, auto-refresh detector, and recovery probe are stopped
+// first, so the probe cannot release a degraded cluster back to replay during
+// shutdown.
+// After Close is called, the client cannot be reused; new public
 // operations including SwapSession and RefreshSession return
 // [types.ErrSessionClosed].
 //
@@ -289,8 +291,8 @@ func (c *CQLClient) IsDraining(cluster ClusterID) bool {
 // Bound that batch's wall time via the worker's own timeouts if you need
 // a hard upper bound on Close latency.
 //
-// Close also cancels the recovery probe loops and waits for both to return.
-// A loop in the middle of a probe call is not interrupted by that
+// Close waits for both recovery probe loops to return.
+// A loop in the middle of a probe call is not interrupted by the
 // cancellation on its own: [RecoveryProbe.Probe] is invoked with a context
 // derived from it, but the probe itself must honor cancellation for the
 // call to return promptly.
@@ -334,9 +336,11 @@ func (c *CQLClient) Close() {
 
 	// Shutdown follows dependencies between components, not the reverse of
 	// construction order:
-	//  1. Topology watcher and auto-refresh detector.
-	//     They only feed drain state and replacement sessions into the client,
-	//     so stopping them first freezes both for the rest of shutdown.
+	//  1. Topology watcher, auto-refresh detector, and recovery probe.
+	//     They only feed drain state, replacement sessions, and recovery
+	//     credit into the client, so stopping them first keeps those inputs
+	//     from changing the steps below.
+	//     A deferred leg that completes fast can still credit recovery.
 	//  2. Deferred legs.
 	//     A write still in progress hands its failed legs to the replay queue,
 	//     so this finishes before the replay worker stops.
@@ -344,19 +348,18 @@ func (c *CQLClient) Close() {
 	//     The engine produces the failures that worker drains.
 	//     Mirroring and the replay worker do not depend on each other.
 	//  4. Replay worker.
-	//  5. Recovery probe.
-	//     It must stop before the sessions it probes close;
-	//     nothing requires it to run past the replay worker.
-	//  6. Event dispatcher.
+	//  5. Event dispatcher.
 	//     Every step above can emit an event, so it stops after all of them.
-	//  7. Sessions, which every step above may use.
+	//  6. Sessions, which every step above may use.
 
 	// A refresh in flight sees its context cancelled and returns;
 	// a refresher that ignores its context delays Close.
 	c.topology.stop()
 	c.autoRefresh.stop()
+	c.recoveryProbe.stop()
 	c.topology.wait()
 	c.autoRefresh.wait()
+	c.recoveryProbe.wait()
 
 	c.deferred.wait()
 
@@ -365,9 +368,6 @@ func (c *CQLClient) Close() {
 	if c.config.ReplayWorker != nil {
 		c.config.ReplayWorker.Stop()
 	}
-
-	c.recoveryProbe.stop()
-	c.recoveryProbe.wait()
 
 	// Intake halts, buffered events drain to the handler,
 	// and the in-flight handler invocation is awaited.

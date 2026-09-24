@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`CQLClient.Close` stops the recovery probe first,**
+  together with the topology watcher and the auto-refresh detector,
+  instead of after the replay worker.
+  A probe that succeeds while Close waits for in-progress writes
+  and drains the mirror can no longer release a degraded cluster
+  back to replay midway through shutdown.
 - **The `test/` tree moved to `internal/test/`.**
   The simulation, e2e, integration, and testutil packages are no longer
   importable from outside the module.

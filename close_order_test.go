@@ -62,17 +62,6 @@ func (w *closeOrderWorker) Stop() {
 	w.rec.record("replay worker")
 }
 
-// closeOrderWatcher reports when the client cancels its topology context.
-type closeOrderWatcher struct {
-	cancelled chan struct{}
-}
-
-func (w *closeOrderWatcher) Watch(ctx context.Context) <-chan TopologyUpdate {
-	context.AfterFunc(ctx, func() { close(w.cancelled) })
-
-	return make(chan TopologyUpdate)
-}
-
 // degradedDeferredStrategy is a deferredStrategy that reports cluster A
 // degraded, so the recovery probe runs against it.
 type degradedDeferredStrategy struct {
@@ -82,9 +71,10 @@ type degradedDeferredStrategy struct {
 func (s *degradedDeferredStrategy) IsDegraded(cluster ClusterID) bool { return cluster == ClusterA }
 func (s *degradedDeferredStrategy) RecordProbeSuccess(ClusterID)      {}
 
-// loopsCancelled reports which background loops Close has cancelled.
-func loopsCancelled(c *CQLClient) (topology, autoRefresh, probe bool) {
-	return c.topology.ctx.Err() != nil, c.autoRefresh.ctx.Err() != nil, c.recoveryProbe.ctx.Err() != nil
+// loopsCancelled reports whether Close has cancelled the topology and
+// auto-refresh loops.
+func loopsCancelled(c *CQLClient) (topology, autoRefresh bool) {
+	return c.topology.ctx.Err() != nil, c.autoRefresh.ctx.Err() != nil
 }
 
 // TestClose_StopsComponentsInOrder pins the order in which Close stops the
@@ -92,14 +82,13 @@ func loopsCancelled(c *CQLClient) (topology, autoRefresh, probe bool) {
 func TestClose_StopsComponentsInOrder(t *testing.T) {
 	rec := &closeRecorder{}
 	deferred := &manualDeferredError{}
-	watcher := &closeOrderWatcher{cancelled: make(chan struct{})}
 	probeEntered := make(chan struct{})
-	var enterOnce sync.Once
+	probeReturned := make(chan struct{})
 
 	var client *CQLClient
-	var atWorkerStop struct{ topology, autoRefresh, probe bool }
+	var atWorkerStop struct{ topology, autoRefresh bool }
 	worker := &closeOrderWorker{rec: rec, onStop: func() {
-		atWorkerStop.topology, atWorkerStop.autoRefresh, atWorkerStop.probe = loopsCancelled(client)
+		atWorkerStop.topology, atWorkerStop.autoRefresh = loopsCancelled(client)
 	}}
 	var dispatcherStoppedAtSessionClose bool
 	sessionA := &closeOrderSession{mockSession: newMockSession(), name: "session A", rec: rec}
@@ -109,7 +98,7 @@ func TestClose_StopsComponentsInOrder(t *testing.T) {
 		WithWriteStrategy(&degradedDeferredStrategy{deferredStrategy{result: deferred}}),
 		WithReplayer(&mockReplayer{}),
 		WithReplayWorker(worker),
-		WithTopologyWatcher(watcher),
+		WithTopologyWatcher(newMockTopologyWatcher()),
 		WithAutoRefresh(),
 		WithSessionRefresher(func(context.Context, ClusterID, error) (cql.Session, error) {
 			return nil, errors.New("refresh not expected")
@@ -117,9 +106,10 @@ func TestClose_StopsComponentsInOrder(t *testing.T) {
 		WithRecoveryProbe(RecoveryProbe{
 			// Held until Close cancels it, so its return marks the probe's stop.
 			Probe: func(ctx context.Context, _ cql.Session) error {
-				enterOnce.Do(func() { close(probeEntered) })
+				close(probeEntered)
 				<-ctx.Done()
 				rec.record("probe")
+				close(probeReturned)
 
 				return ctx.Err()
 			},
@@ -132,11 +122,7 @@ func TestClose_StopsComponentsInOrder(t *testing.T) {
 	sessionA.onClose = func() { dispatcherStoppedAtSessionClose = client.runtime.events.stopped.Load() }
 
 	require.NoError(t, client.Query("INSERT INTO t (id) VALUES (1)").Exec())
-	select {
-	case <-probeEntered:
-	case <-time.After(regressionWaitTimeout):
-		t.Fatal("recovery probe did not start before Close")
-	}
+	waitSignal(t, probeEntered, "the recovery probe to start before Close")
 
 	closed := make(chan struct{})
 	go func() {
@@ -144,25 +130,18 @@ func TestClose_StopsComponentsInOrder(t *testing.T) {
 		close(closed)
 	}()
 
-	select {
-	case <-watcher.cancelled:
-	case <-time.After(regressionWaitTimeout):
-		t.Fatal("Close did not cancel the topology watcher")
-	}
+	// The deferred leg stays pending until the probe has returned, so a Close
+	// that waits for deferred legs before stopping the probe hangs here.
+	waitSignal(t, probeReturned, "Close to stop the recovery probe before waiting for deferred legs")
 	rec.record("deferred leg")
 	deferred.complete(errors.New("background failure"))
 
-	select {
-	case <-closed:
-	case <-time.After(regressionWaitTimeout):
-		t.Fatal("Close did not return")
-	}
+	waitSignal(t, closed, "Close to return")
 
 	require.Equal(t,
-		[]string{"deferred leg", "replay worker", "probe", "session A", "session B"},
+		[]string{"probe", "deferred leg", "replay worker", "session A", "session B"},
 		rec.recorded())
 	require.True(t, atWorkerStop.topology, "topology watcher must stop before the replay worker")
 	require.True(t, atWorkerStop.autoRefresh, "auto-refresh must stop before the replay worker")
-	require.False(t, atWorkerStop.probe, "recovery probe still runs while the replay worker stops")
 	require.True(t, dispatcherStoppedAtSessionClose, "event dispatcher must stop before sessions close")
 }
