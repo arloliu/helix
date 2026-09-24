@@ -21,3 +21,6 @@
   a draining leg classified as draining even when the strategy returned it as async,
   and the both-draining return counting each leg in `write_total` and `write_skipped`.
   Status drops to draft pending an independent verification.
+
+## 2026-09-24
+* **Creation**: [Client lifecycle order](/root/client-lifecycle-order.md) records the start sequence, the constructor error unwind, and how both relate to the shutdown order Close documents.
