@@ -46,6 +46,10 @@ const twoNodeReadRounds = 20
 // the rest are margin.
 const twoNodeBaselineRounds = 10
 
+// twoNodeWholeStreak is how many polls in a row must find every node of cluster A
+// serving a read at consistency All before the cluster counts as whole again.
+const twoNodeWholeStreak = 3
+
 // twoNodeMembershipTimeout bounds the wait for the cluster's own failure detector
 // to agree on how many nodes are up.
 // Gossip takes about twenty-five seconds to mark a frozen node down.
@@ -147,6 +151,7 @@ func TestS_TwoNodeCluster_NodeFaultIsNotClusterFault(t *testing.T) {
 
 			ctx := context.Background()
 			key := "k-" + d.name
+			waitForClusterWhole(t, a, table, key)
 			seedTwoNode(t, client, table, key, "v")
 
 			// Restore the cluster even if an assertion below fails.
@@ -164,8 +169,7 @@ func TestS_TwoNodeCluster_NodeFaultIsNotClusterFault(t *testing.T) {
 			assertClusterFaultEscalates(t, client, breaker, mc, table, key)
 
 			require.NoError(t, a.UnpauseNode(ctx, 1))
-			waitForUpNodes(t, a, 2)
-			assertClusterWhole(t, a, table, key)
+			waitForClusterWhole(t, a, table, key)
 		})
 	}
 }
@@ -294,20 +298,59 @@ func assertClusterFaultEscalates(
 		"the escalation must be reported as a failover")
 }
 
-// assertClusterWhole checks that cluster A serves a read needing both nodes once the frozen node is back.
+// waitForClusterWhole blocks until every node of cluster A,
+// each acting as the coordinator, serves a read that needs both nodes,
+// and keeps serving it for twoNodeWholeStreak polls in a row.
 //
-// The check goes through the cluster's own session rather than the client,
-// because the client's preference has legitimately moved to cluster B by now,
-// and a read through it would say nothing about cluster A.
-func assertClusterWhole(t *testing.T, a *testutil.TwoNodeCQLCluster, table, key string) {
+// It is the precondition of each subtest's seed write and baseline reads,
+// and the check that a thawed node has really rejoined.
+// One node's nodetool listing is not enough for either:
+// each coordinator judges liveness from its own view,
+// and right after a thaw a coordinator can still answer as if a member were down
+// after node 0 already lists both members up.
+// The baseline reads run at consistency Quorum, which needs both nodes at replication factor 2,
+// so the driver retrying on the other node does not help while either view lags.
+// The streak keeps one lucky poll from passing for a view that has not settled.
+//
+// Liveness lives in the containers and nothing in the test process is notified when it changes,
+// which is the case the async-wait rule allows polling for.
+func waitForClusterWhole(t *testing.T, a *testutil.TwoNodeCQLCluster, table, key string) {
 	t.Helper()
 
-	var got string
-	err := a.Session.Query("SELECT value FROM "+table+" WHERE key = ?", key).
-		Consistency(gocql.All).
-		Scan(&got)
-	require.NoError(t, err, "cluster A must answer a read needing both nodes once the node is back")
-	require.Equal(t, "v", got)
+	streak := 0
+	require.Eventually(t, func() bool {
+		if everyNodeServesAll(a, table, key) {
+			streak++
+		} else {
+			streak = 0
+		}
+
+		return streak >= twoNodeWholeStreak
+	}, twoNodeMembershipTimeout, 500*time.Millisecond,
+		"every node of cluster A must serve a read at consistency All %d polls in a row", twoNodeWholeStreak)
+}
+
+// everyNodeServesAll reports whether each of cluster A's nodes,
+// through a session pinned to it, answers a read at consistency All without an error.
+// The read does not need the row to exist,
+// so the gate can run before the row is written.
+func everyNodeServesAll(a *testutil.TwoNodeCQLCluster, table, key string) bool {
+	for i := range a.NodeCount() {
+		sess, err := a.NodeSession(i)
+		if err != nil {
+			return false
+		}
+		err = sess.Query("SELECT value FROM "+table+" WHERE key = ?", key).
+			Consistency(gocql.All).
+			Iter().
+			Close()
+		sess.Close()
+		if err != nil {
+			return false
+		}
+	}
+
+	return true
 }
 
 // sharedTwoNodeCluster returns the package's two-node cluster,

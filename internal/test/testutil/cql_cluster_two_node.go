@@ -346,6 +346,32 @@ func (c *TwoNodeCQLCluster) UpNodeCount(ctx context.Context, viaIndex int) (int,
 	return countUpNormal(string(out)), nil
 }
 
+// NodeSession opens a v1 session that sends every request to one node,
+// so that node coordinates each request and answers it from its own view of the cluster.
+// The session is bound to the cluster's keyspace and has no retry policy,
+// so a node that cannot serve a request is never hidden behind the other one.
+//
+// Parameters:
+//   - index: the node to pin the session to; it must not be paused
+//
+// Returns:
+//   - *gocql.Session: the pinned session, which the caller must close
+//   - error: if the index is out of range or the node does not accept the session
+func (c *TwoNodeCQLCluster) NodeSession(index int) (*gocql.Session, error) {
+	if index < 0 || index >= len(c.nodeIPs) {
+		return nil, fmt.Errorf("TwoNodeCQLCluster: node index %d out of range", index)
+	}
+
+	cluster := gocql.NewCluster(c.nodeAddr(index))
+	cluster.Timeout = c.opts.SessionTimeout
+	cluster.ConnectTimeout = c.opts.ConnectTimeout
+	cluster.Keyspace = c.Keyspace
+	cluster.DisableInitialHostLookup = true
+	cluster.HostFilter = gocql.WhiteListHostFilter(c.nodeIPs[index].String())
+
+	return cluster.CreateSession()
+}
+
 // Terminate closes both sessions and removes every node and the network.
 // It reports the first failure but still tries every resource.
 //
