@@ -15,9 +15,11 @@ const (
 	EventFailover ClusterEventKind = "failover"
 
 	// EventReadDivergence fires when a fallback read finds a row on the
-	// alternative cluster after the selected cluster returned not-found.
-	// Cluster identifies the cluster that was missing the row (replay lag).
-	// Reason is always "row found on alternative cluster after not-found".
+	// alternative cluster after the selected cluster returned not-found,
+	// or returned a row a Query.ScanVerified callback rejected.
+	// Cluster identifies the cluster that was behind (replay lag).
+	// Reason is "row found on alternative cluster after not-found"
+	// or "row found on alternative cluster after rejected row".
 	EventReadDivergence ClusterEventKind = "read_divergence"
 
 	// EventReadRouteChanged fires when a read strategy moves its preferred
@@ -132,8 +134,9 @@ const (
 //
 // Field population by Kind:
 //   - EventFailover: FromCluster, ToCluster, Cluster (= ToCluster), Err
-//   - EventReadDivergence: Cluster (cluster missing the row), Reason
-//     (always "row found on alternative cluster after not-found")
+//   - EventReadDivergence: Cluster (cluster that was behind), Reason
+//     ("row found on alternative cluster after not-found" or
+//     "... after rejected row")
 //   - EventReadRouteChanged: FromCluster, ToCluster, Cluster (= ToCluster),
 //     Reason
 //   - EventCircuitBreakerOpen: Cluster, Count (failures at trip)

@@ -68,6 +68,12 @@ var ErrNotFound = types.ErrNotFound
 // See [types.ErrRowLimitExceeded].
 var ErrRowLimitExceeded = types.ErrRowLimitExceeded
 
+// ErrReadRejected is the sentinel [Query.ScanVerified] returns when no
+// cluster produced a row the callback accepted.
+//
+// See [types.ErrReadRejected].
+var ErrReadRejected = types.ErrReadRejected
+
 // Sentinel errors for strict write paths.
 var (
 	// ErrClusterDegraded is returned by a Strict() write when a cluster is

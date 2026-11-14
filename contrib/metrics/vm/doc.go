@@ -39,7 +39,8 @@
 //   - {prefix}_read_total{cluster} - Counter of read operations
 //   - {prefix}_read_errors_total{cluster} - Counter of read errors
 //   - {prefix}_read_divergence_total{cluster} - Counter of fallback reads that
-//     found the row on the alternative cluster (cluster = the one missing it)
+//     found the row on the alternative cluster, after not-found or a row
+//     Query.ScanVerified rejected (cluster = the one that was behind)
 //   - {prefix}_read_duration_seconds{cluster} - Histogram of read latencies
 //
 // Write operations:

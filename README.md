@@ -215,6 +215,22 @@ client, _ := helix.NewCQLClient(sessionA, sessionB,
 
 Use `helix.IsNotFound(err)` to check results. See [FallbackRead Guide](docs/fallback-read.md) for availability semantics, activation levels, and best practices.
 
+**Stale rows** — when the caller can tell a stale row from its contents, `ScanVerified` reads the other cluster on a rejected row as well as on not-found:
+
+```go
+var endedAt int64
+err := client.Query("SELECT ended_at FROM runs WHERE id = ?", id).
+    ScanVerified(func(r helix.RowScanner) bool {
+        var v int64
+        if r.Scan(&v) != nil || v == 0 {
+            return false // stale: read the other cluster
+        }
+        endedAt = v
+        return true
+    })
+// errors.Is(err, helix.ErrReadRejected): no cluster returned an accepted row.
+```
+
 **Multi-row reads** — `SliceMap`, `SliceScan`, and `SliceScanAs[T]` collect all rows into memory and also participate in FallbackRead:
 
 ```go

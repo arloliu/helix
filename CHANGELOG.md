@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Query.ScanVerified(accept)`, `Query.ScanVerifiedContext(ctx, accept)`, and `ErrReadRejected`**,
+  a caller-verified single-row read.
+  `accept` scans the row a cluster returned and reports whether it is acceptable;
+  on a rejected row, or on not-found, Helix reads the other cluster once and calls `accept` with that row.
+  A read that obtains no accepted row returns `ErrReadRejected`.
+  It is for a caller that can recognise a stale row after a dual write reached only one cluster.
+  See the [FallbackRead Guide](docs/fallback-read.md#scanverified-caller-verified-rows).
+  Code that implements `helix.Query` itself, such as a hand-written or generated mock, must add the two methods.
 - **`policy.NewStickyReadChecked` and `policy.NewPrimaryOnlyReadChecked`**,
   error-returning constructors that reject an unknown `WithPreferredCluster` cluster
   and a negative `WithStickyReadCooldown` or `WithPrimaryOnlyRecoveryTimeout`

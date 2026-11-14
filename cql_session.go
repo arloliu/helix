@@ -296,6 +296,85 @@ type Query interface {
 	//   - error: nil on success, error if read fails
 	ScanContext(ctx context.Context, dest ...any) error
 
+	// ScanVerified reads a single row, lets the caller judge it,
+	// and reads the other cluster when the row is rejected.
+	//
+	// It is for a caller that can tell a stale row from its contents:
+	// after a dual write that reached only one cluster,
+	// the other serves the older row until replay catches up.
+	//
+	// accept receives the row a cluster returned as a [RowScanner],
+	// scans it into its own variables, and reports whether it is acceptable.
+	// When it returns false, or the selected cluster has no row,
+	// Helix reads the other cluster once and calls accept with that row.
+	// A row accepted there ends the read with a nil error and is counted on
+	// [MetricsCollector.IncReadDivergence] for the cluster that was behind.
+	// accept also judges a row obtained by failing over from a cluster error.
+	//
+	// When no accepted row is obtained the read returns [ErrReadRejected].
+	// That covers a second row accept rejected as well,
+	// and a second read that found nothing, failed,
+	// or was not made because that cluster is draining,
+	// vetoed by an open circuit breaker, or excluded by an override.
+	// When neither cluster has a row the read returns [ErrNotFound].
+	// A caller whose context ended before the second read gets that
+	// context's error, and the other cluster is not read.
+	//
+	// Helix keeps nothing from a row: accept stores what the caller wants,
+	// an accepted row and, if it is of use, a rejected one.
+	// Use what accept stored as the result only when the read returns nil.
+	// accept is called at most twice, on the calling goroutine,
+	// and each call must scan into variables of its own.
+	// The RowScanner is valid only for the duration of that call.
+	//
+	// A rejection is the caller's verdict, not a cluster fault:
+	// the cluster that returned the row is credited with a successful read,
+	// and a rejection never triggers failover.
+	// A failed [RowScanner.Scan] is the read's error, whatever accept returns.
+	// accept runs inside the read it judges, so its time counts toward that
+	// read's latency and [WithClusterReadTimeout]; keep it cheap.
+	// Both reads share the caller's deadline,
+	// so set [WithClusterReadTimeout] to leave the second one a budget.
+	//
+	// A single-cluster client, and a read that carries a PageState,
+	// have no other cluster to read: accept judges the one row,
+	// and a rejection returns [ErrReadRejected] at once.
+	//
+	// Parameters:
+	//   - accept: Scans the row and reports whether it is acceptable; must not be nil
+	//
+	// Returns:
+	//   - error: nil when accept accepted a row; [ErrReadRejected],
+	//     [ErrNotFound], or the read's error otherwise
+	//
+	// Example:
+	//
+	//	var endedAt int64
+	//	err := client.Query("SELECT ended_at FROM runs WHERE id = ?", id).
+	//	    ScanVerified(func(r helix.RowScanner) bool {
+	//	        var v int64
+	//	        if r.Scan(&v) != nil || v == 0 {
+	//	            return false
+	//	        }
+	//	        endedAt = v
+	//	        return true
+	//	    })
+	//	if errors.Is(err, helix.ErrReadRejected) {
+	//	    // Neither cluster has the finished run yet; retry later.
+	//	}
+	ScanVerified(accept func(r RowScanner) bool) error
+
+	// ScanVerifiedContext is [Query.ScanVerified] with a context.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeout, shared by both reads
+	//   - accept: Scans the row and reports whether it is acceptable; must not be nil
+	//
+	// Returns:
+	//   - error: nil when accept accepted a row; [ErrReadRejected],
+	//     [ErrNotFound], or the read's error otherwise
+	ScanVerifiedContext(ctx context.Context, accept func(r RowScanner) bool) error
+
 	// Iter returns an iterator for reading multiple rows.
 	//
 	// This triggers the Read Strategy.

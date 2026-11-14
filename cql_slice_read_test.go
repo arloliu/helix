@@ -23,6 +23,7 @@ type sliceSpec struct {
 	cols       []string
 	rows       [][]any
 	closeErr   error // returned from iter.Close (drain-end / mid-drain captured)
+	scanErr    error // returned from Scanner.Scan instead of filling the destinations
 	midDrainAt int   // if > 0, MapScan / Scanner.Next return false at row index midDrainAt-1 and Err/Close surface midDrainErr
 	midDrain   error // mid-drain error injected after pos == midDrainAt-1
 }
@@ -175,6 +176,9 @@ func (s *sliceTestScanner) Next() bool {
 }
 
 func (s *sliceTestScanner) Scan(dest ...any) error {
+	if s.iter.spec.scanErr != nil {
+		return s.iter.spec.scanErr
+	}
 	if s.iter.pos == 0 || s.iter.pos > len(s.iter.spec.rows) {
 		return errors.New("sliceTestScanner.Scan called outside the active row")
 	}

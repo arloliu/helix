@@ -4,18 +4,19 @@ title: Observation hub
 description: How every health observation reaches the read strategy, failover policy, latency recorder, and session-liveness stats in one fixed order.
 tags: [root, reads, writes, auto-refresh, failover]
 status: draft
-generated: {by: "claude/opus-5.5", at: 2026-09-24T00:00:00Z}
+generated: {by: "claude/fable-5.2", at: 2026-11-14T00:00:00Z}
 sources:
   - {resource: health.go, digest: sha256:7ad4310eb455affe, revision: 6d03193}
   - {resource: cql_client.go, digest: sha256:a5f7a894a7a06b54, revision: 6d03193}
   - {resource: wiring.go, digest: sha256:56554ceeda09d27e, revision: 6d03193}
-  - {resource: read_path.go, digest: sha256:1066e8ece11e92fc, revision: 6d03193}
+  - {resource: read_path.go, digest: sha256:9e286654fa42d1af, revision: d5ce724}
   - {resource: write_path.go, digest: sha256:7be28d0c3c60adc1, revision: 6d03193}
-  - {resource: query.go, digest: sha256:c1b63694c2c76804, revision: 6d03193}
+  - {resource: query.go, digest: sha256:c1b63694c2c76804, revision: d5ce724}
   - {resource: batch.go, digest: sha256:a9366edcea826149, revision: 6d03193}
   - {resource: iter.go, digest: sha256:cb911e5593663158, revision: 6d03193}
   - {resource: iter_first_page.go, digest: sha256:0734e740a7a5ede1, revision: 6d03193}
   - {resource: session_lifecycle.go, digest: sha256:d4c019cea9db4a23, revision: 6d03193}
+  - {resource: scan_verified.go, digest: sha256:09cc1b2257b1f605, revision: d5ce724}
 ---
 
 # What it does
@@ -104,11 +105,16 @@ The hub receives the kind and the original error.
 - The gate is a constructor argument, so a hub cannot exist without one.
 - Every kind `isHealthSignal` accepts is also accepted by `isReadError`, but not the reverse:
   a rejected statement is a read error (`IncReadError` fires) without being a health signal (nothing else does).
+- A `Query.ScanVerified` callback runs inside its leg, so `attemptRead` times it with the read,
+  but its verdict is read only after that leg was reported through `readSucceeded`
+  (`runPrimaryRead`, `executeFallbackRead`, and `executeRead` after `tryFallbackCluster`).
+  A rejection is never an observation: it reaches no entry point.
 
 # Where to look
 
 - `health.go` → `clusterHealth`, `clusterStats.succeeded`, `clusterStats.failed`
 - `cql_client.go` → `sessionHolder`, `holderFor`, `statsForCluster`
 - `write_path.go` → `writeLegState`, `writeLeg`, `reportWriteLegs`
-- `read_path.go` → `runPrimaryRead`, `primaryReadOutcome`, `attemptRead`
+- `read_path.go` → `runPrimaryRead`, `primaryReadOutcome`, `attemptRead`, `executeFallbackRead`, `fallbackReadOptions.accepts`
+- `scan_verified.go` → `ScanVerifiedContext`, `verifiedRow`
 - `wiring.go` → `buildCQLClient` (calls `newClusterHealth`, binding the client's `failoverAllowed` gate)
