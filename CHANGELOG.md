@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-11-14
+
 ### Added
 
 - **`Query.ScanVerified(accept)`, `Query.ScanVerifiedContext(ctx, accept)`, and `ErrReadRejected`**,
@@ -36,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `test/` tree moved to `internal/test/`.**
   The simulation, e2e, integration, and testutil packages are no longer
   importable from outside the module.
-  The next release's `gorelease` run will report these as removed packages;
+  `gorelease` reports these as removed packages for this release;
   that is expected and accepted.
 
 ### Fixed
