@@ -458,7 +458,8 @@ func (c *CQLClient) resolveReadOptions(ctx context.Context, q *cqlQuery) readOpt
 // primaryReadOutcome is what a primary read leaves for its caller once the read has been reported to the observation hub.
 //
 // done means the read is finished and err is the caller's result:
-// a pre-attempt failure, a success, a data sentinel, a caller-context error, or whatever the FallbackRead probe returned.
+// a pre-attempt failure, a success, a data sentinel, a caller-context error, or whatever the FallbackRead probe returned
+// — including the probe a row rejected by a Query.ScanVerified callback triggers.
 // done=false means the primary failed with a health signal that runPrimaryRead already reported, and err is that failure;
 // target is the routing state a caller needs to retry the request on the alternative.
 //
@@ -475,7 +476,7 @@ type primaryReadOutcome struct {
 // cluster selection through resolveReadTarget,
 // the once-per-attempt IncReadTotal / ObserveReadDuration metrics,
 // the terminal signal for a success or a health-signalling failure,
-// and the FallbackRead probe a not-found may trigger.
+// and the FallbackRead probe a not-found, or a row a Query.ScanVerified callback rejected, may trigger.
 //
 // Each fires exactly once per primary attempt, because this is the only place the primary's outcome is written.
 // The alternative's own outcome is reported by tryFallbackCluster and executeFallbackRead, against that cluster.
@@ -508,8 +509,11 @@ func (c *CQLClient) runPrimaryRead(
 
 	if err == nil {
 		c.health.readSucceeded(holder, selected, rt.snap.active, elapsed)
+		if !opts.fallbackOpts.accepts() {
+			err = c.rereadRejected(ctx, rt.snap, selected, readFunc, opts)
+		}
 
-		return primaryReadOutcome{done: true, target: rt}
+		return primaryReadOutcome{done: true, err: err, target: rt}
 	}
 
 	kind := classifyReadErr(ctx, err)
@@ -615,6 +619,12 @@ func (c *CQLClient) attemptRead(
 // If opts.fallbackRead is true and the selected cluster returns not-found,
 // executeFallbackRead silently tries the other cluster before returning not-found.
 //
+// A Query.ScanVerified callback judges every row a leg returns.
+// Its verdict (opts.fallbackOpts.verify) is consulted after that leg was reported as a success.
+// A rejected row on the selected cluster sends the read to the other cluster once.
+// A rejected row after failover ends the read, there being no third cluster.
+// A read that obtains no accepted row returns types.ErrReadRejected.
+//
 // types.ErrRowLimitExceeded is treated identically to ErrNotFound for health
 // purposes (no IncReadError, no RecordFailure) but never triggers
 // FallbackRead empty-retry — it propagates as-is.
@@ -639,7 +649,40 @@ func (c *CQLClient) executeRead(
 		return out.err
 	}
 
-	return c.tryFallbackCluster(ctx, out.target, fallback, out.err, readFunc)
+	err := c.tryFallbackCluster(ctx, out.target, fallback, out.err, readFunc)
+	// The selected cluster failed, so there is no third cluster to ask.
+	if err == nil && !opts.fallbackOpts.accepts() {
+		return types.ErrReadRejected
+	}
+
+	return err
+}
+
+// rereadRejected reads the alternative after the selected cluster returned
+// a row the ScanVerified callback rejected.
+// A single-cluster client has no alternative, and a paging token is
+// meaningless on one, so there the rejection is final.
+// executeFallbackRead reports every way the alternative yields no row as
+// not-found; the selected cluster did return one, so the rejection stands.
+func (c *CQLClient) rereadRejected(
+	ctx context.Context,
+	snap overrideSnapshot,
+	selected ClusterID,
+	readFunc func(context.Context, cql.Session) error,
+	opts readOptions,
+) error {
+	if c.IsSingleCluster() || opts.preserveSelectedCluster {
+		return types.ErrReadRejected
+	}
+
+	fallbackOpts := opts.fallbackOpts
+	fallbackOpts.rejected = true
+	err := c.executeFallbackRead(ctx, snap, selected, readFunc, fallbackOpts)
+	if errors.Is(err, types.ErrNotFound) {
+		return types.ErrReadRejected
+	}
+
+	return err
 }
 
 // executeReadNoFailover runs a primary read and never enters standard failover.
@@ -865,13 +908,38 @@ func dualReadError(selected ClusterID, primaryErr, altErr error) error {
 //     suppressing it to ErrNotFound. Health is recorded for every real alt
 //     error regardless of propagation; caller-context errors never reach
 //     the predicate because classifyReadErr returns them to the caller first.
+//   - verify: reports the verdict a Query.ScanVerified callback gave for
+//     the row the leg just returned; ScanVerified alone sets it.
+//     It is consulted after the leg was reported as a success,
+//     so a rejection is never a health signal.
+//   - rejected: the selected cluster returned a row the callback rejected,
+//     rather than not-found; it only words the log lines and the divergence event.
 type fallbackReadOptions struct {
 	readDrainingAlt bool
+	rejected        bool
 	propagateAltErr func(error) bool
+	verify          func() bool
+}
+
+// accepts reports whether the row a leg just returned may be handed to the
+// caller: always, unless a ScanVerified callback rejected it.
+func (o fallbackReadOptions) accepts() bool {
+	return o.verify == nil || o.verify()
+}
+
+// trigger names what the selected cluster returned that sent the read to
+// the alternative, for the log lines and the divergence event reason.
+func (o fallbackReadOptions) trigger() string {
+	if o.rejected {
+		return "rejected row"
+	}
+
+	return "not-found"
 }
 
 // executeFallbackRead attempts a single silent read on the alternative cluster
-// after the selected cluster returned not-found.
+// after the selected cluster returned not-found, or returned a row the
+// Query.ScanVerified callback rejected (opts.rejected).
 //
 // This is a one-shot check — it does NOT re-enter the main failover sequence.
 // A draining alternative is not contacted unless opts.readDrainingAlt is
@@ -889,6 +957,11 @@ type fallbackReadOptions struct {
 //   - the alt's error verbatim when opts.propagateAltErr returns true, or
 //     when the caller's context ended during the probe
 //   - the caller's context error when it had already ended before the probe
+//   - types.ErrReadRejected when the alternative returned a row opts.verify
+//     rejected; no divergence is recorded for it
+//
+// With opts.rejected the not-found results above stand for "the alternative
+// yielded no row", and rereadRejected turns them into types.ErrReadRejected.
 func (c *CQLClient) executeFallbackRead(
 	ctx context.Context,
 	snap overrideSnapshot,
@@ -923,15 +996,25 @@ func (c *CQLClient) executeFallbackRead(
 		return types.ErrNotFound
 	}
 
-	c.config.Logger.Debug("fallback read: selected cluster returned not-found, trying alternative",
+	c.config.Logger.Debug("fallback read: selected cluster returned "+opts.trigger()+", trying alternative",
 		"fromCluster", c.clusterName(selectedCluster),
 		"toCluster", c.clusterName(alternativeCluster),
 	)
 
 	alternative, elapsed, err := c.attemptRead(ctx, alternativeCluster, readFunc)
 	if err == nil {
-		// Found the data on the alternative cluster — divergence (replay lag).
 		c.health.readSucceeded(alternative, alternativeCluster, snap.active, elapsed)
+		// A row the caller rejects here too proves nothing about which
+		// cluster is behind, so it is not a divergence.
+		if !opts.accepts() {
+			c.config.Logger.Debug("fallback read: caller rejected the alternative cluster's row",
+				"cluster", c.clusterName(alternativeCluster),
+			)
+
+			return types.ErrReadRejected
+		}
+
+		// Found the data on the alternative cluster — divergence (replay lag).
 		c.config.Metrics.IncReadDivergence(selectedCluster)
 		c.config.Logger.Debug("fallback read: found data on alternative cluster",
 			"staleCluster", c.clusterName(selectedCluster),
@@ -939,7 +1022,7 @@ func (c *CQLClient) executeFallbackRead(
 		c.emitClusterEvent(types.ClusterEvent{
 			Kind:    types.EventReadDivergence,
 			Cluster: selectedCluster,
-			Reason:  "row found on alternative cluster after not-found",
+			Reason:  "row found on alternative cluster after " + opts.trigger(),
 		})
 
 		return nil
@@ -992,7 +1075,7 @@ func (c *CQLClient) executeFallbackRead(
 		return err
 	}
 
-	c.config.Logger.Warn("fallback read: alternative cluster returned error, returning primary not-found",
+	c.config.Logger.Warn("fallback read: alternative cluster returned error, returning primary "+opts.trigger(),
 		"cluster", c.clusterName(alternativeCluster),
 		"error", err.Error(),
 	)

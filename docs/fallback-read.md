@@ -115,6 +115,7 @@ if helix.IsRowLimitExceeded(err) {
 | Scenario | Method | Why |
 |----------|--------|-----|
 | Single-row lookup | `Scan` / `MapScan` | Simple; `ErrNotFound` when absent |
+| Single-row lookup where a stale row is recognisable | `ScanVerified` | The callback rejects the stale row and the other cluster is read |
 | Bounded multi-row, fallback wanted | `SliceMap` / `SliceScan` | Collects all rows; FallbackRead recovers missing partitions |
 | Strongly-typed slice | `SliceScanAs[T]` | Generic wrapper over `SliceScan`; all options apply transparently |
 | Streaming or unbounded | `Iter` | No FallbackRead; use when missing rows are tolerable |
@@ -251,6 +252,8 @@ FallbackRead specifically resolves **missing rows** (where the primary cluster h
 
 If the primary cluster has an older version of the row (e.g., `status = 'pending'`) while the alternative cluster has the updated version (`status = 'completed'`), FallbackRead will **not** activate. Because the primary cluster successfully returned a row (no `ErrNotFound` was generated), Helix returns that row immediately and short-circuits. FallbackRead won't compare timestamps across clusters; it strictly activates when zero rows are returned.
 
+When the caller can tell a stale row from its contents, use [`ScanVerified`](#scanverified-caller-verified-rows) instead.
+
 FallbackRead also does **not** repair the stale or missing cluster on read. A fallback hit emits a divergence metric, but convergence still depends on the replay system.
 
 ### Partial-replication blind spot
@@ -258,6 +261,67 @@ FallbackRead also does **not** repair the stale or missing cluster on read. A fa
 For slice methods, FallbackRead only recovers the **entire-partition-missing** case: the primary returned zero rows and the alternative has the full partition. It does not recover row-level partial state. If the primary has *some* rows for a partition (e.g., 40 out of 50) and the alternative has the complete set, the primary's partial result is returned — FallbackRead does not activate because the primary's result was non-empty.
 
 If row-level completeness is critical, the replay system must converge the clusters before the read rather than relying on FallbackRead to compensate at read time.
+
+## ScanVerified: Caller-Verified Rows
+
+`Query.ScanVerified(accept)` covers the stale-row case for a single-row read.
+The caller supplies a callback that scans the row a cluster returned and reports whether it is acceptable.
+When the callback rejects the row, or the selected cluster has no row, Helix reads the other cluster once.
+
+```go
+var endedAt int64
+err := client.Query("SELECT ended_at FROM runs WHERE id = ?", id).
+    ScanVerifiedContext(ctx, func(r helix.RowScanner) bool {
+        var v int64
+        if r.Scan(&v) != nil || v == 0 {
+            return false // stale: read the other cluster
+        }
+        endedAt = v
+        return true
+    })
+if errors.Is(err, helix.ErrReadRejected) {
+    // Neither cluster has the finished run yet; retry later.
+}
+```
+
+Use it only where a correct row can never fail the callback.
+A callback that rejects rows which are correct on both clusters doubles every such read and ends each one in `ErrReadRejected`.
+
+| Selected cluster | Other cluster | Result |
+|------------------|---------------|--------|
+| row accepted | not read | `nil` |
+| row rejected | row accepted | `nil` + divergence metric |
+| row rejected | row rejected | `ErrReadRejected` |
+| row rejected | not found, error, or not read† | `ErrReadRejected` |
+| not found | row accepted | `nil` + divergence metric |
+| not found | row rejected | `ErrReadRejected` |
+| not found | not found, error, or not read† | `ErrNotFound` |
+| error | row accepted (failover) | `nil` |
+| error | row rejected (failover) | `ErrReadRejected` |
+
+† The other cluster is not read while it is draining (unless `WithFallbackReadOnDrainingCluster(true)`),
+vetoed by an open circuit breaker under `WithRouteVeto(true)`, or excluded by an `AllowedClusters` override.
+
+**Key behaviors:**
+
+- `ScanVerified` includes the not-found probe; `FallbackRead()` does not need to be set.
+- Helix keeps nothing from a row.
+  The callback scans into variables of its own and stores what the caller wants:
+  an accepted row and, if it is of use, a rejected one.
+- A rejection is the caller's verdict, not a cluster fault.
+  The cluster that returned the row is credited with a successful read,
+  and nothing reaches `IncReadError`, `RecordFailure`, or failover.
+- A failed `RowScanner.Scan` is the read's error, whatever the callback returns.
+- The callback runs at most twice, on the calling goroutine, and there is never a third read.
+- The callback runs inside the read it judges,
+  so its time counts toward that read's latency and `WithClusterReadTimeout`.
+  Keep it cheap.
+- A caller whose context has ended before the second read gets that context's error, and the other cluster is not read.
+- Both reads share the caller's deadline.
+  Set `helix.WithClusterReadTimeout(d)` so the second read has a budget left.
+- A single-cluster client, and a read carrying a `PageState`, have no other cluster to read.
+  The callback judges the one row, and a rejection returns `ErrReadRejected` at once.
+- Like FallbackRead, it does not repair the stale cluster; convergence still depends on replay.
 
 ## Best Practices
 

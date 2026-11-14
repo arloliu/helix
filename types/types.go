@@ -583,6 +583,21 @@ var (
 	// Use [IsRowLimitExceeded] to check for this error, or
 	// errors.Is(err, ErrRowLimitExceeded).
 	ErrRowLimitExceeded = errors.New("helix: row limit exceeded")
+
+	// ErrReadRejected indicates that a Query.ScanVerified read obtained no
+	// row its callback accepted.
+	//
+	// It is the caller's verdict on the data, not a cluster fault:
+	// Helix never records it as a read error and never fails over on it.
+	// Helix keeps nothing from a rejected row;
+	// a caller that wants one stores it from inside the callback.
+	//
+	// It is distinct from ErrNotFound,
+	// which the same read returns when no cluster had a row:
+	// IsNotFound reports false for it.
+	//
+	// Check for it with errors.Is(err, ErrReadRejected).
+	ErrReadRejected = errors.New("helix: read rejected by the caller's verification")
 )
 
 // IsNotFound reports whether err is a "not found" result.

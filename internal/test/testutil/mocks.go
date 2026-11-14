@@ -329,6 +329,37 @@ func (m *MockQuery) ScanContext(_ context.Context, dest ...any) error {
 	return m.Scan(dest...)
 }
 
+// ScanVerified hands accept the first configured slice-scan row.
+// It returns helix.ErrNotFound when no row is configured
+// and helix.ErrReadRejected when accept rejects the row.
+func (m *MockQuery) ScanVerified(accept func(r helix.RowScanner) bool) error {
+	if accept == nil {
+		return errors.New("helix mock: accept must not be nil")
+	}
+	m.mu.RLock()
+	rows := m.sliceScanData
+	cols := m.sliceScanColumns
+	scanErr := m.scanErr
+	m.mu.RUnlock()
+
+	if scanErr != nil {
+		return scanErr
+	}
+	if len(rows) == 0 {
+		return helix.ErrNotFound
+	}
+	if !accept(&mockRowScanner{values: rows[0], columns: cols}) {
+		return helix.ErrReadRejected
+	}
+
+	return nil
+}
+
+// ScanVerifiedContext is ScanVerified with a context.
+func (m *MockQuery) ScanVerifiedContext(_ context.Context, accept func(r helix.RowScanner) bool) error {
+	return m.ScanVerified(accept)
+}
+
 // Iter returns an iterator.
 func (m *MockQuery) Iter() helix.Iter {
 	m.mu.RLock()

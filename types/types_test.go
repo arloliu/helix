@@ -244,6 +244,7 @@ func TestSentinelErrors(t *testing.T) {
 		{"ErrWriteAsync", ErrWriteAsync, "write sent asynchronously"},
 		{"ErrWriteDropped", ErrWriteDropped, "write dropped"},
 		{"ErrNotFound", ErrNotFound, "not found"},
+		{"ErrReadRejected", ErrReadRejected, "read rejected"},
 		{"ErrClusterDegraded", ErrClusterDegraded, "cluster is degraded"},
 		{"ErrClusterDraining", ErrClusterDraining, "cluster is draining"},
 		{"ErrStrictUnsupported", ErrStrictUnsupported, "does not support Strict()"},
@@ -317,4 +318,11 @@ func TestNoSynchronousAckError(t *testing.T) {
 	assert.ErrorIs(t, withReplay, ErrNoReplayer)
 	assert.Contains(t, withReplay.Error(), "B: <nil>")
 	assert.Contains(t, withReplay.Error(), "replay: "+ErrNoReplayer.Error())
+}
+
+// A caller that maps not-found to its own error must not swallow a rejection.
+func TestErrReadRejected_IsNotNotFound(t *testing.T) {
+	assert.False(t, IsNotFound(ErrReadRejected))
+	assert.False(t, IsNotFound(fmt.Errorf("repo: %w", ErrReadRejected)))
+	assert.False(t, errors.Is(ErrNotFound, ErrReadRejected))
 }

@@ -31,3 +31,7 @@
   A verify pass corrected when a probe is abandoned: a retired session abandons it as well as Close.
 * **Update**: [Observation hub](/root/observation-hub.md) now cites `write_path.go` and the other files its pointers name.
   A verify pass corrected the dual-write leg's holder and clock, the iterator-close and write-leg recording rules, and added the bounded first page and retired holders.
+
+## 2026-11-14
+* **Update**: [Observation hub](/root/observation-hub.md) adds the invariant that a `Query.ScanVerified` callback's verdict is read after its leg was reported as a success,
+  so a rejected row is never an observation.
